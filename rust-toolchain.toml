@@ -1,5 +1,0 @@
-# MSRV pin: CI checks this exact toolchain in its matrix (check/test/lint).
-[toolchain]
-channel = "1.92"
-profile = "minimal"
-components = ["rustfmt", "clippy"]
