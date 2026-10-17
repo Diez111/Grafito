@@ -470,11 +470,13 @@ mod tests {
 
     #[test]
     fn symlink_escape_fuera_del_root_se_detecta() {
-        let root = temp_root("symlink");
-        let outside = temp_root("symlink-out");
-        let _ = std::fs::write(outside.join("nota-fuera.md"), "x");
+        // El symlink trick es unix-only (`os::unix::fs::symlink`): en
+        // Windows el test no tiene cuerpo y no declara `root`.
         #[cfg(unix)]
         {
+            let root = temp_root("symlink");
+            let outside = temp_root("symlink-out");
+            let _ = std::fs::write(outside.join("nota-fuera.md"), "x");
             let _ = std::os::unix::fs::symlink(&outside, root.join("escape"));
             assert!(
                 vault_resolve_in(&root, "escape/nota-fuera.md").is_err(),
