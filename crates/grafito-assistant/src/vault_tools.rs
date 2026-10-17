@@ -272,6 +272,21 @@ pub fn vault_move_file_in(
 
 /// Despacha los 4 tool calls del vault con el root del vault configurado.
 pub fn dispatch(call: &ToolCall) -> ToolResult {
+    // Tool desconocida: el mensaje honesto viene antes del root check (así
+    // un test sin vault configurado no recibe E_VAULT_ROOT en su lugar).
+    if !matches!(
+        call.name.as_str(),
+        "vault_list_dir" | "vault_read_note" | "vault_write_note" | "vault_move_file"
+    ) {
+        return ToolResult::text(
+            &call.id,
+            false,
+            format!(
+                "tool '{}' no es del vault (list/read/write/move)",
+                call.name
+            ),
+        );
+    }
     let root = match vault_root() {
         Ok(root) => root,
         Err(e) => return ToolResult::text(&call.id, false, e),
