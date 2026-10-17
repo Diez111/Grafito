@@ -29,7 +29,7 @@ libc = "0.2"
 
 [dev-dependencies]
 # Sin `html_reports` (ver grafito-anim: plotters fuera de `cargo test`).
-criterion = "0.5"
+criterion = "0.8"
 geo.workspace = true
 proptest = "1"
 

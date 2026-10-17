@@ -50,7 +50,7 @@ cas-nativo = ["dep:alkahest-cas"]
 # F5: bench SSE-truncado informativo (sin gate). Misma version que grafito-geometry.
 # Sin `html_reports`: el HTML de benches arrastraba plotters a cada
 # `cargo test` sin aportar gates (bench informativo F5).
-criterion = "0.5"
+criterion = "0.8"
 
 [[bench]]
 name = "sse_truncation"
