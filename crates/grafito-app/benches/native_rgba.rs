@@ -51,7 +51,7 @@ fn mide_plantilla(template: &str) {
 }
 
 #[test]
-fn plantillas_son_69() {
+fn plantillas_son_70() {
     assert_eq!(
         NATIVE_TEMPLATES,
         &[
@@ -124,6 +124,7 @@ fn plantillas_son_69() {
             "matriz-no-cuadrada",
             "producto-punto-dualidad",
             "sup-laplace-3d",
+            "trig-circulo-unitario",
         ]
     );
 }
