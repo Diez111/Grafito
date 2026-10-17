@@ -705,6 +705,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // arecord/parec son Linux-only: PermissionsExt + from_mode no existen en Windows
     fn grabador_arecord_antes_que_parec_y_ninguno_da_none() {
         use std::os::unix::fs::PermissionsExt as _;
         let base = std::env::temp_dir().join("grafito-stt-test-rec");
