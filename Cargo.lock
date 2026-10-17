@@ -1392,7 +1392,7 @@ dependencies = [
  "clap",
  "criterion-plot",
  "is-terminal",
- "itertools",
+ "itertools 0.10.5",
  "num-traits",
  "once_cell",
  "oorandom",
@@ -1413,7 +1413,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b50826342786a51a89e2da3a28f1c32b06e387201bc2d19791f622c673706b1"
 dependencies = [
  "cast",
- "itertools",
+ "itertools 0.10.5",
 ]
 
 [[package]]
@@ -1563,7 +1563,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c54e03a951783e8b327515db3f2a2fd0e3bed362a96b066f341ce66ed49b4ead"
 dependencies = [
  "data-encoding",
- "syn 1.0.109",
+ "syn 3.0.4",
 ]
 
 [[package]]
@@ -1841,7 +1841,7 @@ dependencies = [
  "parking_lot",
  "percent-encoding",
  "pollster",
- "puffin",
+ "puffin 0.19.1",
  "raw-window-handle",
  "static_assertions",
  "wasm-bindgen",
@@ -1866,7 +1866,7 @@ dependencies = [
  "epaint",
  "log",
  "nohash-hasher",
- "puffin",
+ "puffin 0.19.1",
 ]
 
 [[package]]
@@ -1881,7 +1881,7 @@ dependencies = [
  "egui",
  "epaint",
  "log",
- "puffin",
+ "puffin 0.19.1",
  "thiserror 1.0.69",
  "type-map",
  "web-time",
@@ -1900,7 +1900,7 @@ dependencies = [
  "arboard",
  "egui",
  "log",
- "puffin",
+ "puffin 0.19.1",
  "raw-window-handle",
  "smithay-clipboard",
  "web-time",
@@ -1921,7 +1921,7 @@ dependencies = [
  "glow 0.14.2",
  "log",
  "memoffset",
- "puffin",
+ "puffin 0.19.1",
  "wasm-bindgen",
  "web-sys",
  "winit",
@@ -2045,7 +2045,7 @@ dependencies = [
  "log",
  "nohash-hasher",
  "parking_lot",
- "puffin",
+ "puffin 0.19.1",
  "rayon",
 ]
 
@@ -2684,7 +2684,7 @@ dependencies = [
  "num-complex",
  "pollster",
  "printpdf",
- "puffin",
+ "puffin 0.20.0",
  "puffin_http",
  "qrcode",
  "rayon",
@@ -3684,6 +3684,15 @@ name = "itertools"
 version = "0.10.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b0fd2260e829bddf4cb6ea802289de2f86d6a7a690192fbe91b3f46e0f2c8473"
+dependencies = [
+ "either",
+]
+
+[[package]]
+name = "itertools"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
 dependencies = [
  "either",
 ]
@@ -5617,11 +5626,24 @@ dependencies = [
  "bincode",
  "byteorder",
  "cfg-if",
- "itertools",
+ "itertools 0.10.5",
  "lz4_flex",
  "once_cell",
  "parking_lot",
  "serde",
+]
+
+[[package]]
+name = "puffin"
+version = "0.20.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "84b514d95a258be801fde8a1ff1c974f4a4841d9750f5d1d6690fc07a5ad4049"
+dependencies = [
+ "anyhow",
+ "byteorder",
+ "cfg-if",
+ "itertools 0.14.0",
+ "parking_lot",
 ]
 
 [[package]]
@@ -5634,7 +5656,7 @@ dependencies = [
  "crossbeam-channel",
  "log",
  "parking_lot",
- "puffin",
+ "puffin 0.19.1",
 ]
 
 [[package]]
@@ -6923,7 +6945,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
@@ -8001,7 +8023,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
