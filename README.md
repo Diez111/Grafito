@@ -35,7 +35,7 @@
 
 - **764 commands** (Spanish + English aliases) with a fuzzy bilingual command palette.
 - **GPU-accelerated** 2D/3D canvas: compute shaders compile user expressions to WGSL at runtime (250k cells/dispatch for domain coloring).
-- **Geometry with constraints**: Newton solver with analytic Jacobians; persistent loci; boolean polygon ops; conics by construction.
+- **Geometry with constraints**: Newton solver with analytic Jacobians; persistent **Locus** registry; boolean polygon ops; conics by construction.
 - **Real CAS**: Risch–Norman integration, Gruntz limits, Buchberger Gröbner bases (bounded), exact rational linear algebra up to 32×32, ODEs, Laplace, step-by-step cards.
 - **3D + 4D**: parametric surfaces, implicit surfaces (marching tetrahedra), the six regular polychora and simplex/hypercube/cross-polytope families in 3–10D.
 - **67 physics labs** with a semantic color palette (one color = one meaning) and 64 copy-paste recipes.
