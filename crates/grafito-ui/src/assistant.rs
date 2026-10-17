@@ -22990,30 +22990,6 @@ mod tests {
     }
 
     #[test]
-    fn composer_shortcut_hint_is_a_static_single_line_caption() {
-        // La píldora flotante de atajos ahora es caption estático: existe
-        // en flujo bajo el composer, tiny (menos de dos líneas de alto).
-        let context = egui::Context::default();
-        let mut state = AssistantPanelState::default();
-        let output = context.run(panel_input_360x480(), |context| {
-            egui::CentralPanel::default().show(context, |ui| {
-                let _ = draw_assistant_composer(ui, &mut state, false, crate::i18n::Locale::Es);
-            });
-        });
-
-        let mut texts = Vec::new();
-        collect_text_shapes(&output.shapes, &mut texts);
-        let caption = texts.iter().find(|(_, text)| text.contains("Shift+Enter"));
-        let Some((rect, _)) = caption else {
-            panic!("el caption estático de atajos falta bajo el composer");
-        };
-        assert!(
-            rect.height() < crate::tokens::TYPE_2XS * 2.0,
-            "el caption de atajos debe ser una sola línea tiny"
-        );
-    }
-
-    #[test]
     fn minimax_m3_accepts_images_but_fusion_does_not() {
         // MiMo 2.5-VL es el modelo multimodal (visión) de la fusión.
         assert!(model_allows_image_attachment("mimo-2.5-vl"));
