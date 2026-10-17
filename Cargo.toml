@@ -57,7 +57,7 @@ eframe = { version = "0.29", default-features = false, features = [
     "x11",
 ] }
 wgpu = "22.0"
-pollster = "0.3"
+pollster = "1.0"
 
 # UI
 # `rayon` habilita tessellation paralela de egui (epaint/rayon). eframe 0.29
