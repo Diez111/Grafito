@@ -94,12 +94,6 @@ fn is_executable(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// En Windows todo binario válido pasa por extensión.
-#[cfg(windows)]
-fn is_executable(_path: &Path) -> bool {
-    true
-}
-
 /// Mensaje honesto cuando `espeak-ng` falta: causa + comando instalable
 /// copiable. Puro, para que el handler del toggle y los tests lo compartan
 /// (mismo patrón que `tesseract_missing_message`, sin la alternativa de

@@ -90,9 +90,12 @@ grep -Fq 'rust-version = "1.92"' "$PROJECT_ROOT/Cargo.toml" || {
 for msrv_file in \
     "$PROJECT_ROOT/.github/workflows/ci.yml" \
     "$PROJECT_ROOT/.github/CONTRIBUTING.md" \
-    "$PROJECT_ROOT/AGENTS.md" \
     "$PROJECT_ROOT/README.md" \
-    "$PROJECT_ROOT/README.en.md" \
+    "$PROJECT_ROOT/README.es.md" \
+    "$PROJECT_ROOT/README.pt.md" \
+    "$PROJECT_ROOT/README.it.md" \
+    "$PROJECT_ROOT/README.fr.md" \
+    "$PROJECT_ROOT/README.de.md" \
     "$PROJECT_ROOT/packaging/README.md"; do
     if grep -Fq '1.81' "$msrv_file" || ! grep -Fq '1.92' "$msrv_file"; then
         echo "stale or missing Rust 1.92 MSRV documentation: $msrv_file" >&2

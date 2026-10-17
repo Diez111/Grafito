@@ -1,6 +1,6 @@
 //! Los plugins de ejemplo del repo (`plugins/`) deben cargar y validar
 //! fail-closed contra las capacidades reales. F5: incluye el enforce de
-//! `min_app_version` (los ejemplos declaran `1.3.0`, la app corre `1.3.0`).
+//! `min_app_version` (los ejemplos declaran `1.0.0`, la app corre `1.0.0`).
 
 use grafito_plugins::{PluginRegistry, ValidationContext};
 use std::path::Path;

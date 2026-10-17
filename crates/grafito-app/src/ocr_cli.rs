@@ -65,20 +65,14 @@ fn executable_in_path(name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Bit ejecutable en unix (en Windows `is_file` + extensión ya filtra).
+/// Bit ejecutable en unix. En Windows el scan usa `is_file` + extensión
+/// (el stub `true` se eliminó: en ese target no se llama).
 #[cfg(unix)]
 fn is_executable(path: &std::path::Path) -> bool {
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::metadata(path)
         .map(|meta| meta.permissions().mode() & 0o111 != 0)
         .unwrap_or(false)
-}
-
-/// En Windows todo binario válido pasa por extensión; el chequeo de modo
-/// no aplica.
-#[cfg(windows)]
-fn is_executable(_path: &std::path::Path) -> bool {
-    true
 }
 
 /// Normaliza texto crudo de OCR a entrada apta para el solver:

@@ -5,7 +5,7 @@ version = "1.0.0"
 category = "skills"
 description = "Puente bidireccional con el vault Obsidian-compatible (~/Documentos/GrafitoVault): resúmenes para leer después, wiki-links, tags por materia y búsqueda. Instrucciones de formato y flujo."
 activation = "auto"
-min_app_version = "1.3.0"
+min_app_version = "1.0.0"
 
 [instructions]
 files = ["vault.md"]

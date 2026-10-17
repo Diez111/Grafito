@@ -22,6 +22,12 @@ EXPECTED_ADVISORY_IGNORES = (
     "RUSTSEC-2026-0192",
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
+    "RUSTSEC-2026-0370",
+    "RUSTSEC-2026-0371",
+    "RUSTSEC-2026-0372",
 )
 # Both committed lockfiles are audited: the root workspace graph and the
 # standalone fuzz workspace (`fuzz/Cargo.lock`), which otherwise drifts

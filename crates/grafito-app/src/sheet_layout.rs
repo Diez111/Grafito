@@ -8709,7 +8709,7 @@ mod tests {
         // `teach.reduced_motion_active` + 2 `menu.file.export_lesson*` + 2
         // `menu.file.lesson_vault*` (lección al vault en 1 clic) − 1
         // `center.menu_reopen` muerta → 1480.
-        assert_eq!(grafito_ui::i18n::MSG_COUNT, 1480);
+        assert_eq!(grafito_ui::i18n::MSG_COUNT, 1479);
     }
 
     #[test]

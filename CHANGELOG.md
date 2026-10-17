@@ -5,35 +5,34 @@ Todos los cambios notables de este proyecto se documentarán en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/),
 y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/spec/v2.0.0.html).
 
-> Nota de versiones: las entradas `1.2.x-beta` (2026-08) pertenecen a la línea previa
-> a la renumeración; la versión vigente es `1.3.0` (fuente de verdad: `Cargo.toml`,
-> tag `v1.3.0` y artefactos en `dist/`).
+## [1.0.0] - 2026-10-17
 
-## [1.3.0] - 2026-09-28
+Primera release pública. Rebranding de versión: la línea `1.3.0` interna se
+publica como **1.0.0** (bootstrap público limpio, mismo código, mismos gates).
 
-#### Agregado
-- **Asistente directo para graficar**: `haceme un seno`, `graficá x^2`,
-  `graficame un seno`, `senoidal` y funciones complejas (`DomainColoring`,
-  ej `graficá z^2`) resuelven en local con botón Aplicar, sin preguntas.
-  Sin función compleja nombrada se propone la canónica `1/z` declarada.
-- **Loop agéntico con reintento automático**: si la IA propone sintaxis
-  inválida, reintenta sola hasta salida válida, tope 3 intentos totales,
-  acumulando los errores de todos los intentos para no repetirlos.
-- **Animación IA robusta**: el SPEC sanea prosa pegada (`"x^2", punto
-  móvil...` → `x^2`); el extractor corta comillas internas; el prompt exige
-  fórmula pelada. SPEC inválido sin función propia cae a la canónica con
-  aviso (con función explícita se mantiene el error honesto).
-- **Transporte tolerante**: si la respuesta trae texto + `tool_calls` se usa
-  el texto en vez de tarjeta de error; el prompt prohibe `tool_calls`.
+### Corregido
+- **CI release verde**: check Windows-GNU sin dead-code (stubs `is_executable`
+  Windows eliminados en ocr/stt/tts; `RecorderKind` documentado Linux-only),
+  clippy 1.92 (2 nonminimal_bool en geometry, 3 manual_range_contains en
+  command, 1 find/is_none en ui), rustdoc (link roto en special_functions),
+  include de test apuntando a `README.en.md` (inexistente) → `README.md`,
+  `packaging/README.md` restaurado, lista MSRV del fixture actualizada a los
+  6 READMEs públicos.
+- **Supply-chain**: quinn-proto 0.11.19 (clear RUSTSEC-2026-0338/0340/0343),
+  rustls 0.23.46 (clear RUSTSEC-2026-0346..0349); 6 excepciones nuevas
+  time-boxed con rationale de no-aplicabilidad (zip×3: import nunca extrae a
+  disco; zbus_names/zvariant/zvariant_derive: path keyring→zbus 4).
 
-#### Cambiado
-- **Header del asistente sin solape** (`tokenLimpiar`): Limpiar es icono,
-  títulos y contador truncan en panel angosto.
-- **Defaults**: tutor socrático apagado (respuestas directas) y modo agente
-  (herramientas y actividad) prendido.
-- Respuestas de graficación local en español.
+### Agregado
+- **Attestations de build provenance** en release (repo público → OIDC),
+  SHA pinneado de `actions/attest-build-provenance@v2.2.3`.
+- **rust-toolchain.toml** con MSRV 1.92 pinneado + profile minimal.
 
-## [Unreleased]
+### Cambiado
+- Versionado del workspace: `1.3.0` → **`1.0.0`** (bootstrap público).
+- `min_app_version` de los 3 plugins que declaraban `1.3.0` → `1.0.0`.
+
+### Lo incluido de la sesión previa (bootstrap público)
 
 #### Agregado
 - **Plantilla trigonométrica `trig-circulo-unitario`** (14ª canónica, 70 en el
@@ -108,9 +107,35 @@ y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/spec/
   assistant-types 38, plugins 20, whiteboard 19, tex 12).
 - Binario instalado actualizado a `2a9edc7` + estos cambios.
 
+
+## [1.3.0] - 2026-09-28
+
+
+#### Agregado
+- **Asistente directo para graficar**: `haceme un seno`, `graficá x^2`,
+  `graficame un seno`, `senoidal` y funciones complejas (`DomainColoring`,
+  ej `graficá z^2`) resuelven en local con botón Aplicar, sin preguntas.
+  Sin función compleja nombrada se propone la canónica `1/z` declarada.
+- **Loop agéntico con reintento automático**: si la IA propone sintaxis
+  inválida, reintenta sola hasta salida válida, tope 3 intentos totales,
+  acumulando los errores de todos los intentos para no repetirlos.
+- **Animación IA robusta**: el SPEC sanea prosa pegada (`"x^2", punto
+  móvil...` → `x^2`); el extractor corta comillas internas; el prompt exige
+  fórmula pelada. SPEC inválido sin función propia cae a la canónica con
+  aviso (con función explícita se mantiene el error honesto).
+- **Transporte tolerante**: si la respuesta trae texto + `tool_calls` se usa
+  el texto en vez de tarjeta de error; el prompt prohibe `tool_calls`.
+
+#### Cambiado
+- **Header del asistente sin solape** (`tokenLimpiar`): Limpiar es icono,
+  títulos y contador truncan en panel angosto.
+- **Defaults**: tutor socrático apagado (respuestas directas) y modo agente
+  (herramientas y actividad) prendido.
+- Respuestas de graficación local en español.
+
+
 ## [1.2.1] - 2026-09-19
 
-#### Corregido
 - **ComplexMapping sin rayas**: el camino genérico CPU aplanaba los segmentos de
   marching-squares en una sola polilínea y unía el fin de un segmento con el inicio
   del siguiente; esas cuerdas se veían como rayas verticales densas en

@@ -3626,7 +3626,7 @@ pub fn steps_for_stats_regression(xs_raw: &str, ys_raw: &str) -> Result<Vec<CasS
     };
     let dif = (r2 - r2_check).abs();
     let tol = 1e-9 * (1.0 + ss_yy);
-    if !(dif.is_finite() && dif <= tol) || !(0.0 - 1e-9..=1.0 + 1e-9).contains(&r2_check) {
+    if !(dif.is_finite() && dif <= tol && (0.0 - 1e-9..=1.0 + 1e-9).contains(&r2_check)) {
         return Err(format!(
             "verificación por residuos falló (R² recalculado {r2_check:.6}); revisa los datos"
         ));

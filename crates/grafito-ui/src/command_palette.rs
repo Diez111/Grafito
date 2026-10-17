@@ -1658,10 +1658,7 @@ mod tests {
         let commands = all_commands();
         for key in ["New Quiz", "Mock Exam", "My Exam", "My Space", "View Guide"] {
             assert!(
-                commands
-                    .iter()
-                    .find(|cmd| cmd.selection_key == key)
-                    .is_none(),
+                !commands.iter().any(|cmd| cmd.selection_key == key),
                 "Estudio sigue en paleta ({key})"
             );
         }

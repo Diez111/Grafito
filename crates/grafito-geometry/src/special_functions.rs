@@ -938,7 +938,7 @@ pub fn assoc_legendre(l: i32, m: i32, x: f64) -> f64 {
 /// Armónico esférico REAL Y_l^m(θ,φ) con fase Condon-Shortley.
 ///
 /// m=0: N·P; m>0: √2·N·P·cos(mφ); m<0: √2·N·P·sin(|m|φ),
-/// N=√((2l+1)/4π·(l-|m|)!/(l+|m|)!). |m|>l o l∉[0,32] o ángulos no
+/// N=√((2l+1)/4π·(l-|m|)!/(l+|m|)!). |m|>l o l fuera de \[0,32\] o ángulos no
 /// finitos → `NaN`.
 pub fn spherical_harm_real(l: i32, m: i32, theta: f64, phi: f64) -> f64 {
     if !(0..=MAX_SPHERICAL_DEGREE).contains(&l) || m.abs() > l {

@@ -248,7 +248,8 @@ fn markdown_reference_is_the_registry_projection() {
 
 #[test]
 fn readme_claims_only_implemented_dynamic_locus_support() {
-    let readme = include_str!("../../../README.en.md");
+    // El README público principal (inglés) es el contrato de claims.
+    let readme = include_str!("../../../README.md");
 
     assert!(readme.contains("Locus"));
     assert!(!readme.contains("Slider, Button, Image"));

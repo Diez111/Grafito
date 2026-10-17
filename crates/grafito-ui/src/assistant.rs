@@ -13682,17 +13682,9 @@ fn draw_assistant_composer(
         theme.paint_focus_ring(ui.painter(), composer_frame.response.rect);
     }
 
-    // Caption estático de atajos: una línea tiny dim en flujo bajo el
-    // composer, sin píldora ni fondo — jamás tapa contenido interactivo.
-    ui.add_space(crate::tokens::SPACE_XS);
-    ui.add(
-        egui::Label::new(
-            egui::RichText::new(t("assistant.composer_keys", locale))
-                .color(theme.text_tertiary)
-                .size(crate::tokens::TYPE_2XS),
-        )
-        .truncate(),
-    );
+    // Pulido 2026-10-17 (directiva usuario): la fila "Enter envía…" era
+    // texto de relleno que robaba alto útil al panel — eliminada; los
+    // atajos viven en los tooltips del composer.
 
     if !state.attachments.is_empty() {
         ui.add_space(SPACE_XS);

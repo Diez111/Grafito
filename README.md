@@ -198,7 +198,7 @@ PRs welcome. `cargo fmt --all -- --check` and
 `cargo clippy --workspace --all-targets -- -D warnings` must pass — CI
 enforces both on every push, plus a 17-job matrix (MSRV 1.92 + stable,
 GPU regressions via lavapipe, Debian packaging, supply-chain audit,
-CodeQL, weekly fuzzing). See [CONTRIBUTING.md](CONTRIBUTING.md).
+CodeQL, weekly fuzzing). See [CONTRIBUTING.md](.github/CONTRIBUTING.md).
 
 ## License
 

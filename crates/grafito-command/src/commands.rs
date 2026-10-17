@@ -15268,8 +15268,7 @@ fn handle_remaining_cas_commands(
             if !(n1.is_finite() && n2.is_finite() && t1deg.is_finite())
                 || n1 <= 0.0
                 || n2 <= 0.0
-                || t1deg < 0.0
-                || t1deg >= 90.0
+                || !(0.0..90.0).contains(&t1deg)
             {
                 return CommandOutcome::Error("RayoRefraccion: n1,n2>0, 0≤θ1<90 (grados).".into());
             }
@@ -15706,7 +15705,7 @@ fn handle_remaining_cas_commands(
                 &cmd.args[1],
                 &document.variables,
             ));
-            if !(l.is_finite() && t0deg.is_finite()) || l <= 0.0 || t0deg < 0.0 || t0deg > 60.0 {
+            if !(l.is_finite() && t0deg.is_finite()) || l <= 0.0 || !(0.0..=60.0).contains(&t0deg) {
                 return CommandOutcome::Error("Pendulo: L>0, 0≤θ₀≤60 (grados, serie).".into());
             }
             let t0 = t0deg.to_radians();
@@ -15902,7 +15901,7 @@ fn handle_remaining_cas_commands(
                 &cmd.args[0],
                 &document.variables,
             ));
-            if !th.is_finite() || th < 0.0 || th > 180.0 {
+            if !th.is_finite() || !(0.0..=180.0).contains(&th) {
                 return CommandOutcome::Error("EfectoCompton: 0≤θ≤180 (grados).".into());
             }
             let dl = LC * (1.0 - th.to_radians().cos());

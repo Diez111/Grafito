@@ -7,11 +7,13 @@ no-default-features = false
 
 [advisories]
 version = 2
-# The first three warnings require parent-library or framework migrations rather
-# than a safe lockfile-only update. The final two entries are time-bounded
-# vulnerability exceptions whose exact graph and expiry are enforced in CI.
-# RUSTSEC-2025-0165 (geo/i_overlay) was resolved via geo 0.29.3→0.33.1 and its
-# ignore removed; `fuzz/Cargo.lock` is audited too so a stale fuzz graph fails.
+# Time-bounded, reviewed exceptions. Every entry lists its reachability
+# rationale, expiry (2026-12-31) and owner; the exact set is enforced in CI
+# by `.github/scripts/verify_advisory_exceptions.py` (deny.toml ids, the
+# generated cargo-audit command, and the SECURITY.md reachability graph must
+# all match). Fixed transitives are updated in-lockfile first (quinn-proto
+# 0.11.19 cleared RUSTSEC-2026-0338/0340/0343, rustls 0.23.46 cleared
+# RUSTSEC-2026-0346..0349 — 2026-10-17).
 # See `.github/SECURITY.md` for the complete reachability analysis.
 ignore = [
     { id = "RUSTSEC-2025-0141", reason = "Temporary through 2026-12-31; owner: Grafito maintainers. puffin 0.19.1 requires bincode 1.3.3; bincode 1.x has no maintained replacement and puffin 0.20 requires Rust 1.92." },
@@ -19,6 +21,12 @@ ignore = [
     { id = "RUSTSEC-2026-0192", reason = "Temporary through 2026-12-31; owner: Grafito maintainers. eframe 0.29.1 pins owned_ttf_parser 0.25.1 and ttf-parser 0.25.1; remediation requires a coordinated eframe/wgpu framework migration." },
     { id = "RUSTSEC-2026-0194", reason = "Temporary through 2026-12-31; owner: Grafito maintainers. Affected attribute iteration is reached only when proc macros parse crate-shipped AT-SPI XML at build time; zbus_xml 4 requires quick-xml ^0.30 and wayland-scanner 0.31.11 now uses patched ^0.41, leaving the zbus path blocked for fixed >=0.41. Remove on a compatible zbus_xml release or any reachability change; see .github/SECURITY.md." },
     { id = "RUSTSEC-2026-0195", reason = "Temporary through 2026-12-31; owner: Grafito maintainers. Neither reviewed consumer invokes NsReader (zbus_xml 4 deserialization uses Reader; wayland-scanner 0.31.11 now uses patched quick-xml 0.41.0), so the vulnerable namespace allocation is not reachable; the zbus path still blocks fixed >=0.41. Remove on a compatible zbus_xml release or any reachability change; see .github/SECURITY.md." },
+    { id = "RUSTSEC-2026-0367", reason = "Temporary through 2026-12-31; owner: Grafito maintainers. Not applicable today: grafito-ggb never extracts .ggb entries to disk (in-memory XML parse with our own 64 MiB / 4096-entry / 100:1-ratio caps in zip_read.rs), so SUID/SGID preservation on extraction is unreachable. Real fix is the zip 9.0 major bump of the bounded reader; tracked." },
+    { id = "RUSTSEC-2026-0368", reason = "Temporary through 2026-12-31; owner: Grafito maintainers. Not applicable today: symlink targets are never materialized (read-only .ggb import, in-memory parse); fixed in zip 9.0. Migration tracked with RUSTSEC-2026-0367." },
+    { id = "RUSTSEC-2026-0369", reason = "Temporary through 2026-12-31; owner: Grafito maintainers. Not applicable today: no extraction, so permissions-through-symlinks is unreachable; fixed in zip 9.0. Migration tracked with RUSTSEC-2026-0367." },
+    { id = "RUSTSEC-2026-0370", reason = "Temporary through 2026-12-31; owner: Grafito maintainers. Unmaintained warning on zvariant 4.2 via the Secret Service keyring path (assistant API keys); migration requires a coordinated keyring/zbus 5 major bump. Reachability limited to local D-Bus credential reads." },
+    { id = "RUSTSEC-2026-0371", reason = "Temporary through 2026-12-31; owner: Grafito maintainers. Unmaintained warning on zbus_names 3.0 via keyring → zbus 4; same keyring/zbus 5 migration as RUSTSEC-2026-0370." },
+    { id = "RUSTSEC-2026-0372", reason = "Temporary through 2026-12-31; owner: Grafito maintainers. Unmaintained warning on zvariant_derive 4.2 via keyring → zbus 4; same keyring/zbus 5 migration as RUSTSEC-2026-0370." },
 ]
 
 [bans]

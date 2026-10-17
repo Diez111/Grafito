@@ -479,7 +479,7 @@ where
         }
         let (pa, pb, pval, perr, pdepth) = panels.swap_remove(idx);
         let mid = pa + (pb - pa) * 0.5;
-        if !mid.is_finite() || !(pa < mid && mid < pb) {
+        if !(mid.is_finite() && pa < mid && mid < pb) {
             return Err(HybridIntegralError::InvalidInterval);
         }
         let (lv, le) = gauss_kronrod_qk15(&f, pa, mid)?;

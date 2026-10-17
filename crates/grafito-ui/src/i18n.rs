@@ -99,7 +99,7 @@ impl Msg {
 
 /// Número total de claves del catálogo. [`MESSAGES`] debe tener exactamente
 /// esta longitud (ver test `msg_count_matches_table`).
-pub const MSG_COUNT: usize = 1480;
+pub const MSG_COUNT: usize = 1479;
 
 /// Catálogo completo ES/EN. Ordenado por dominio:
 /// `toolbar.group` (18) + `toolbar.tool` (89) + `palette` (23) +
@@ -278,7 +278,6 @@ pub static MESSAGES: &[Msg] = &[
     Msg { key: "assistant.composer_hint", es: "Escribí tu pregunta", en: "Write your question" },
     Msg { key: "assistant.composer_pending", es: "Estoy pensando… esperá que termine para mandar otra pregunta.", en: "Thinking… wait until it finishes before sending another question." },
     Msg { key: "assistant.composer_empty", es: "Escribí algo para activar Enviar.", en: "Write something to enable Send." },
-    Msg { key: "assistant.composer_keys", es: "Enter envía · Shift+Enter salto de línea", en: "Enter sends · Shift+Enter new line" },
     Msg { key: "assistant.media_tip_play", es: "Retoma donde quedó (Espacio)", en: "Resume where it left off (Space)" },
     Msg { key: "assistant.media_tip_pause", es: "Congela en el fotograma actual (Espacio)", en: "Freeze on the current frame (Space)" },
     Msg { key: "assistant.media_tip_back", es: "Fotograma anterior (<-)", en: "Previous frame (<-)" },
@@ -4881,7 +4880,7 @@ pub fn settings_msg(suffix: &'static str, locale: Locale) -> &'static str {
 // call-site porque añadir la variante rompía matches exhaustivos fuera del
 // frente. W2 levanta esa restricción: `Locale::Pt` existe y `t(key, Pt)`
 // resuelve PT→ES→EN solo (ver `t`). R3.4 completa el overlay al 100%:
-// 1480 claves (18 grupos + 23 paleta + 4 onboarding + 10 cheat + 12 toast +
+// 1479 claves (18 grupos + 23 paleta + 4 onboarding + 10 cheat + 12 toast +
 // 12 app/misc + 2 anim + 14 media.title + 89 `toolbar.tool` + 3
 // `panel.conformal` + 8 `assistant.media_tip_*`/`assistant.live_*` +
 // 4 `orb.*` B-A39 + 5 `profile.*` B-A41 + 7 `profile.*` B-A42
@@ -4921,7 +4920,7 @@ pub fn settings_msg(suffix: &'static str, locale: Locale) -> &'static str {
 // El lint `unwrap_used` sigue prohibido en prod: el fallback se escribe con
 // `match` o `if let`.
 //
-// Cobertura: 1480/1480 (100%). Medida real en el test `pt_covers_main_ui_keys`
+// Cobertura: 1479/1479 (100%). Medida real en el test `pt_covers_main_ui_keys`
 // (imprime el % por `--nocapture`).
 
 /// Una entrada del overlay portugués: clave del catálogo + texto PT.
@@ -4934,7 +4933,7 @@ pub struct PtMsg {
     pub pt: &'static str,
 }
 
-/// Claves principales de UI con traducción PT (1480). Ordenado por dominio como
+/// Claves principales de UI con traducción PT (1479). Ordenado por dominio como
 /// [`MESSAGES`]: grupos (18) + paleta (23) + onboarding (12) + cheat (10) +
 /// toast (12) + app/misc (12) + anim (2) + media.title (14) + tools (89) +
 /// panel.conformal (3).
@@ -5017,7 +5016,6 @@ pub static PT_MESSAGES: &[PtMsg] = &[
     PtMsg { key: "assistant.composer_hint", pt: "Escreva sua pergunta" },
     PtMsg { key: "assistant.composer_pending", pt: "A pensar… aguarde antes de enviar outra pergunta." },
     PtMsg { key: "assistant.composer_empty", pt: "Escreva algo para ativar Enviar." },
-    PtMsg { key: "assistant.composer_keys", pt: "Enter envia · Shift+Enter nova linha" },
     PtMsg { key: "assistant.media_tip_play", pt: "Retoma de onde parou (Espaço)" },
     PtMsg { key: "assistant.media_tip_pause", pt: "Congela no fotograma atual (Espaço)" },
     PtMsg { key: "assistant.media_tip_back", pt: "Fotograma anterior (<-)" },
@@ -6542,7 +6540,7 @@ pub static PT_MESSAGES: &[PtMsg] = &[
 ];
 
 /// Texto PT de `key`, o `None` si la clave no está en el catálogo.
-/// Desde R3.4 el overlay es total (1480/1480): `None` solo para claves
+/// Desde R3.4 el overlay es total (1479/1479): `None` solo para claves
 /// inexistentes. Lookup lineal como [`t`]: el overlay es chico (<200 claves).
 pub fn pt(key: &'static str) -> Option<&'static str> {
     let mut i = 0;
@@ -6567,7 +6565,7 @@ pub fn pt_coverage() -> (usize, usize) {
 /// con conteo para el hover histórico y el test que pinnea el 100%.
 pub const PT_PARTIAL_BADGE: &str = "Português parcial";
 
-/// `true` mientras el overlay PT no cubra el catálogo (R3.4: 1480/1480 = falso).
+/// `true` mientras el overlay PT no cubra el catálogo (R3.4: 1479/1479 = falso).
 pub fn pt_is_partial() -> bool {
     let (cubiertas, total) = pt_coverage();
     cubiertas < total
@@ -6580,7 +6578,7 @@ pub fn pt_partial_badge_text() -> String {
     format!("{PT_PARTIAL_BADGE} · {cubiertas}/{total}")
 }
 
-// ── Italiano / Français / Deutsch: overlays completos (1480/1480 c/u) ──
+// ── Italiano / Français / Deutsch: overlays completos (1479/1479 c/u) ──
 //
 // Generados desde `/tmp/opencode/i18n_table.txt` (190 líneas `clave|it|fr|de`,
 // mismo orden que `MESSAGES`, texto tal cual sin re-traducir). Patrón idéntico
@@ -6600,7 +6598,7 @@ pub struct OverlayMsg {
     pub text: &'static str,
 }
 
-/// Claves principales de UI con traducción al Italiano (1480). Ordenado por dominio
+/// Claves principales de UI con traducción al Italiano (1479). Ordenado por dominio
 /// como [`MESSAGES`]: grupos (18) + tools (89) + paleta (19) + onboarding (12) +
 /// cheat (10) + toast (12) + app/misc (12) + anim (2) + media.title (14) +
 /// panel.conformal (3).
@@ -7255,10 +7253,6 @@ pub static IT_MESSAGES: &[OverlayMsg] = &[
     OverlayMsg {
         key: "assistant.composer_empty",
         text: "Scrivi qualcosa per attivare Invia.",
-    },
-    OverlayMsg {
-        key: "assistant.composer_keys",
-        text: "Invio invia · Shift+Invio a capo",
     },
     OverlayMsg {
         key: "assistant.media_tip_play",
@@ -9872,7 +9866,7 @@ pub static IT_MESSAGES: &[OverlayMsg] = &[
 ];
 
 /// Texto Italiano de `key`, o `None` si la clave no está en el catálogo.
-/// El overlay es total (1480/1480): `None` solo para claves inexistentes.
+/// El overlay es total (1479/1479): `None` solo para claves inexistentes.
 pub fn it(key: &'static str) -> Option<&'static str> {
     let mut i = 0;
     while i < IT_MESSAGES.len() {
@@ -9889,7 +9883,7 @@ pub fn it_coverage() -> (usize, usize) {
     (IT_MESSAGES.len(), MESSAGES.len())
 }
 
-/// Claves principales de UI con traducción al Français (1480). Ordenado por dominio
+/// Claves principales de UI con traducción al Français (1479). Ordenado por dominio
 /// como [`MESSAGES`]: grupos (18) + tools (89) + paleta (19) + onboarding (12) +
 /// cheat (10) + toast (12) + app/misc (12) + anim (2) + media.title (14) +
 /// panel.conformal (3).
@@ -10065,7 +10059,6 @@ pub static FR_MESSAGES: &[OverlayMsg] = &[
     OverlayMsg { key: "assistant.composer_hint", text: "Écrivez votre question" },
     OverlayMsg { key: "assistant.composer_pending", text: "Je réfléchis… attendez avant d'envoyer une autre question." },
     OverlayMsg { key: "assistant.composer_empty", text: "Écrivez quelque chose pour activer Envoyer." },
-    OverlayMsg { key: "assistant.composer_keys", text: "Entrée envoie · Shift+Entrée saut de ligne" },
     OverlayMsg { key: "assistant.media_tip_play", text: "Reprendre où on en était (Espace)" },
     OverlayMsg { key: "assistant.media_tip_pause", text: "Figer sur l'image actuelle (Espace)" },
     OverlayMsg { key: "assistant.media_tip_back", text: "Image précédente (<-)" },
@@ -11497,7 +11490,7 @@ pub static FR_MESSAGES: &[OverlayMsg] = &[
 ];
 
 /// Texto Français de `key`, o `None` si la clave no está en el catálogo.
-/// El overlay es total (1480/1480): `None` solo para claves inexistentes.
+/// El overlay es total (1479/1479): `None` solo para claves inexistentes.
 pub fn fr(key: &'static str) -> Option<&'static str> {
     let mut i = 0;
     while i < FR_MESSAGES.len() {
@@ -11514,7 +11507,7 @@ pub fn fr_coverage() -> (usize, usize) {
     (FR_MESSAGES.len(), MESSAGES.len())
 }
 
-/// Claves principales de UI con traducción al Deutsch (1480). Ordenado por dominio
+/// Claves principales de UI con traducción al Deutsch (1479). Ordenado por dominio
 /// como [`MESSAGES`]: grupos (18) + tools (89) + paleta (19) + onboarding (12) +
 /// cheat (10) + toast (12) + app/misc (12) + anim (2) + media.title (14) +
 /// panel.conformal (3).
@@ -11690,7 +11683,6 @@ pub static DE_MESSAGES: &[OverlayMsg] = &[
     OverlayMsg { key: "assistant.composer_hint", text: "Schreib deine Frage" },
     OverlayMsg { key: "assistant.composer_pending", text: "Denke nach… warte, bevor du eine weitere Frage sendest." },
     OverlayMsg { key: "assistant.composer_empty", text: "Schreib etwas, um Senden zu aktivieren." },
-    OverlayMsg { key: "assistant.composer_keys", text: "Enter sendet · Shift+Enter Zeilenumbruch" },
     OverlayMsg { key: "assistant.media_tip_play", text: "Fortsetzen (Leertaste)" },
     OverlayMsg { key: "assistant.media_tip_pause", text: "Aktuelles Frame anhalten (Leertaste)" },
     OverlayMsg { key: "assistant.media_tip_back", text: "Vorheriges Frame (<-)" },
@@ -13122,7 +13114,7 @@ pub static DE_MESSAGES: &[OverlayMsg] = &[
 ];
 
 /// Texto Deutsch de `key`, o `None` si la clave no está en el catálogo.
-/// El overlay es total (1480/1480): `None` solo para claves inexistentes.
+/// El overlay es total (1479/1479): `None` solo para claves inexistentes.
 pub fn de(key: &'static str) -> Option<&'static str> {
     let mut i = 0;
     while i < DE_MESSAGES.len() {
@@ -13218,7 +13210,7 @@ mod tests {
             MSG_COUNT,
             "MSG_COUNT debe seguir a MESSAGES"
         );
-        assert_eq!(MSG_COUNT, 1480);
+        assert_eq!(MSG_COUNT, 1479);
     }
 
     #[test]
@@ -13246,11 +13238,7 @@ mod tests {
     fn composer_status_keys_resuelven_en_seis_idiomas() {
         // Ola 3: el composer deja de ser solo-ES en el catálogo (el cableado
         // del locale al composer es P2; las claves ya resuelven en 6 idiomas).
-        for key in [
-            "assistant.composer_pending",
-            "assistant.composer_empty",
-            "assistant.composer_keys",
-        ] {
+        for key in ["assistant.composer_pending", "assistant.composer_empty"] {
             for locale in [
                 Locale::Es,
                 Locale::En,
@@ -21794,10 +21782,10 @@ mod tests {
 
     #[test]
     fn pt_covers_main_ui_keys() {
-        // R3.4: overlay total PT — 1480 claves, sin duplicados ni vacíos,
+        // R3.4: overlay total PT — 1479 claves, sin duplicados ni vacíos,
         // cada una existente en el catálogo ES/EN.
-        assert_eq!(PT_MESSAGES.len(), 1480);
-        assert_eq!(pt_coverage(), (1480, 1480));
+        assert_eq!(PT_MESSAGES.len(), 1479);
+        assert_eq!(pt_coverage(), (1479, 1479));
         let mut keys: Vec<&str> = PT_MESSAGES.iter().map(|m| m.key).collect();
         keys.sort_unstable();
         let mut i = 1;
@@ -22030,11 +22018,11 @@ mod tests {
 
     #[test]
     fn pt_coverage_prints_real_percentage() {
-        // Cobertura PT medida: 1480/1480 = 100%. Se imprime el % real con
+        // Cobertura PT medida: 1479/1479 = 100%. Se imprime el % real con
         // `--nocapture`; el assert fija el numerador para que cualquier
         // agregado (o faltante) de PT rompa el test a propósito.
         let (covered, total) = pt_coverage();
-        assert_eq!((covered, total), (1480, 1480));
+        assert_eq!((covered, total), (1479, 1479));
         let pct = covered as f64 * 100.0 / total as f64;
         eprintln!("cobertura PT: {covered}/{total} = {pct:.1}% (overlay total R3.4)");
         assert!((pct - 100.0).abs() < 0.1, "pct real: {pct}");
@@ -22045,16 +22033,16 @@ mod tests {
         // R3.4: cobertura 100% — el badge parcial ya no se muestra (ver
         // `toolbar.rs`: solo dibuja si `pt_is_partial()`). Se pinnea el 100%
         // y el texto con conteo para el hover histórico.
-        assert!(!pt_is_partial(), "R3.4 1480/1480 = 100%: sin badge parcial");
+        assert!(!pt_is_partial(), "R3.4 1479/1479 = 100%: sin badge parcial");
         assert_eq!(PT_PARTIAL_BADGE, "Português parcial");
-        assert_eq!(pt_partial_badge_text(), "Português parcial · 1480/1480");
+        assert_eq!(pt_partial_badge_text(), "Português parcial · 1479/1479");
         let (covered, total) = pt_coverage();
-        assert_eq!((covered, total), (1480, 1480));
+        assert_eq!((covered, total), (1479, 1479));
     }
 
-    // ── Overlays IT/FR/DE (1480/1480 c/u, texto tal cual de la tabla) ──
+    // ── Overlays IT/FR/DE (1479/1479 c/u, texto tal cual de la tabla) ──
 
-    /// Aserciones comunes de overlay total: 1480 entradas, cobertura 1480/1480,
+    /// Aserciones comunes de overlay total: 1479 entradas, cobertura 1479/1479,
     /// sin duplicados ni vacíos, claves dentro del catálogo y en su mismo orden.
     fn assert_overlay_total(
         table: &[OverlayMsg],
@@ -22062,8 +22050,8 @@ mod tests {
         coverage: fn() -> (usize, usize),
         tag: &str,
     ) {
-        assert_eq!(table.len(), 1480, "{tag}: overlay total");
-        assert_eq!(coverage(), (1480, 1480), "{tag}: cobertura total");
+        assert_eq!(table.len(), 1479, "{tag}: overlay total");
+        assert_eq!(coverage(), (1479, 1479), "{tag}: cobertura total");
         let mut keys: Vec<&str> = table.iter().map(|m| m.key).collect();
         keys.sort_unstable();
         let mut i = 1;

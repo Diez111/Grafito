@@ -65,7 +65,12 @@ pub const WHISPER_INSTALL_CMD: &str = "sudo pacman -S whisper-cpp";
 /// Contador para nombres únicos de WAV temporales (sin dependencias).
 static STT_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Grabador disponible en este sistema.
+/// Grabador disponible en este sistema. Hoy los grabadores son Linux-only
+/// (`arecord`/`parec`): en Windows el enum compila para que `SttRecording`
+/// sea idéntico en ambos targets pero las variantes quedan sin construir —
+/// el dictado degrada honesto a "no hay grabador" (mismo patrón que
+/// `PiperMissing`).
+#[cfg_attr(windows, allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecorderKind {
     /// `arecord` (ALSA).
@@ -169,12 +174,6 @@ fn is_executable(path: &Path) -> bool {
     std::fs::metadata(path)
         .map(|meta| meta.permissions().mode() & 0o111 != 0)
         .unwrap_or(false)
-}
-
-/// En Windows todo binario válido pasa por extensión.
-#[cfg(windows)]
-fn is_executable(_path: &Path) -> bool {
-    true
 }
 
 /// Ruta del modelo: override por env [`WHISPER_MODEL_ENV`] si está

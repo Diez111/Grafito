@@ -345,20 +345,20 @@ fn menu_button(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut eg
             // el header con ← volver).
             add_contents(ui);
         } else {
-            // Anidado (Exportar): acordeón inline COLAPSADO por defecto, con
-            // sangría para que los hijos no parezcan hermanos del nivel
-            // superior (antes `GeoGebra (.ggb)…` export parecía hermano
-            // de `Guardar`). 11 filas siempre expandidas = la mitad del
-            // scroll a 320 px. El header es `mobile_menu_row` (52 px + AT).
+            // Anidado (Exportar): acordeón inline COLAPSADO por defecto.
+            // Pulido 2026-10-17 (directiva usuario: las filas quedaban
+            // corridas a la derecha y desbordaban el borde en angosto):
+            // sin `ui.indent` — las filas van flush con los mismos márgenes
+            // simétricos del frame que las filas raíz; la jerarquía la da
+            // el header `mobile_menu_row` (52 px + AT), no sangría.
             let theme = current_theme(ui.ctx());
             ui.add_space(SPACE_XS);
             if mobile_menu_row(ui, theme, title) {
                 MOBILE_SECTION_OPEN.with(|c| c.set(!c.get()));
             }
             if MOBILE_SECTION_OPEN.with(|c| c.get()) {
-                ui.indent(egui::Id::new(title), |ui| {
-                    add_contents(ui);
-                });
+                ui.add_space(SPACE_XS);
+                add_contents(ui);
             }
         }
         MOBILE_DRILL.with(|d| d.set(Some(depth)));
