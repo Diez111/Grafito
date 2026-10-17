@@ -99,7 +99,7 @@ sha2 = "0.10"
 # Utilities
 uuid = { version = "1.20.0", features = ["v4", "serde"] }
 thiserror = "1.0"
-toml = "0.8"
+toml = "1.1"
 gif = "0.13"
 log = "0.4"
 env_logger = "0.11"
