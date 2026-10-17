@@ -1,0 +1,406 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+//! Oleada 1 P2: solo S (aliases/wrappers de motor existente).
+//! Regla de oro: cada comando nuevo visible en paleta + responde por
+//! `process_input` + test e2e. Nada muerto.
+
+use grafito_command::{
+    command_registry,
+    commands::{process_input, CommandOutcome},
+};
+use grafito_core::{Document, GeoObject};
+
+fn run(document: &mut Document, command: &str) -> CommandOutcome {
+    let mut input = command.to_owned();
+    process_input(document, &mut input)
+}
+
+fn assert_message_contains(document: &mut Document, command: &str, needle: &str) {
+    match run(document, command) {
+        CommandOutcome::Message(message) => assert!(
+            message.contains(needle),
+            "{command} → {message} (esperaba '{needle}')"
+        ),
+        CommandOutcome::Ok => panic!("{command} dio Ok, esperaba Message con '{needle}'"),
+        CommandOutcome::Error(message) => {
+            panic!("{command} dio Error: {message} (esperaba '{needle}')")
+        }
+    }
+}
+
+fn assert_ok_or_message(document: &mut Document, command: &str) {
+    match run(document, command) {
+        CommandOutcome::Ok | CommandOutcome::Message(_) => {}
+        CommandOutcome::Error(message) => panic!("{command} dio Error: {message}"),
+    }
+}
+
+fn palette_must_be_visible(canonical: &str) {
+    let spec = command_registry::resolve(canonical)
+        .unwrap_or_else(|| panic!("{canonical} debe estar registrado"));
+    assert!(
+        spec.palette_visible,
+        "{canonical} debe ser visible en paleta"
+    );
+    assert_eq!(spec.canonical, canonical);
+}
+
+fn first_label_matching(document: &Document, pred: impl Fn(&GeoObject) -> bool) -> String {
+    document
+        .objects_iter()
+        .find_map(|(_, obj)| {
+            if pred(obj) {
+                Some(obj.label().to_string())
+            } else {
+                None
+            }
+        })
+        .expect("fixture no creó el objeto esperado")
+}
+
+fn make_datatable_label(document: &mut Document) -> String {
+    assert_ok_or_message(document, "DataTable[{1, 2, 3}, {2, 4, 6}]");
+    first_label_matching(document, |o| matches!(o, GeoObject::DataTable(_)))
+}
+
+fn make_point_label(document: &mut Document) -> String {
+    assert_ok_or_message(document, "Point[(0, 0)]");
+    let labels: Vec<String> = document
+        .objects_iter()
+        .filter_map(|(_, obj)| match obj {
+            GeoObject::Point(p) => Some(p.label.clone()),
+            _ => None,
+        })
+        .collect();
+    labels.into_iter().next_back().expect("punto fixture")
+}
+
+fn make_cube_label(document: &mut Document) -> String {
+    assert_ok_or_message(document, "Cube[0, 0, 0, 2]");
+    first_label_matching(document, |o| matches!(o, GeoObject::Cube3D(_)))
+}
+
+fn make_circle_label(document: &mut Document) -> String {
+    assert_ok_or_message(document, "Circle[(0, 0), 2]");
+    first_label_matching(document, |o| matches!(o, GeoObject::Circle(_)))
+}
+
+fn find_label(document: &Document, label: &str) -> grafito_core::ObjectId {
+    document
+        .try_find_object_by_label(label)
+        .expect("buscar etiqueta")
+        .expect("etiqueta existe")
+}
+
+#[test]
+fn oleada1_todos_visibles_en_paleta() {
+    for canonical in [
+        "FitLine",
+        "Fit",
+        "FitLineX",
+        "IntegralBetween",
+        "IntegralSymbolic",
+        "TaylorPolynomial",
+        "Periods",
+        "Transpose",
+        "Invert",
+        "NInvert",
+        "SolveCubic",
+        "SolveQuartic",
+        "Curvature",
+        "NIntegral",
+        "Dot",
+        "Cross",
+        "UnitVector",
+        "ApplyMatrix",
+        "NDerivative",
+        "IsDefined",
+        "IsInteger",
+        "IsPrime",
+        "IsInRegion",
+        "FormulaText",
+        "ScientificText",
+        "MixedNumber",
+        "Ordinal",
+        "SetColor",
+        "SetCoords",
+        "SetVisible",
+        "Surface",
+        "Volume",
+        "OsculatingCircle",
+        "Cell",
+        "Column",
+        "Row",
+    ] {
+        palette_must_be_visible(canonical);
+    }
+    // Total actualizado por Q2 (+3 visibles S): 284 → 287.
+    // Frente trig+racionalización (+4 visibles S): 287 → 291.
+    // Frente R3.1 (Rename stub→visible): 291 → 292.
+    // Frente 3D-A2 (Vista3D visible S): 292 → 293.
+    // Frente P0.2 (álgebra CAS: +41 visibles S): 293 → 334.
+    // Frente P0.3 (complejo: +7 visibles S): 334 → 341.
+    // Frente P0.4 (demostración: +3 visibles S): 341 → 344.
+    // Frente P0.5 (optimización+gráficos: +8 visibles S): 344 → 352.
+    // Frente P1 (listas+stats: +82 visibles S): 352 → 434.
+    // Frente P1b (constructor List: +1 visible S): 434 → 435.
+    // Frente P2 (medidas/geometría: +25 visibles S): 435 → 460.
+    // Frente P3b (scripting: +11 visibles S + Execute real): 460 → 472.
+    // Frente P4 (CAS+listas/geometría/stats/display: +105 visibles S): 472 → 577.
+    // Frente P4-fix: Shear/Stretch/FractionText/SurdText visibles: 577 → 581.
+    // Frente P5 (cierre nominal: +18 visibles S): 581 → 599.
+    // Ola 0.2 (Groebner/GroebnerLex parten spec único: +2 visibles S): 599 → 601.
+    // Ola 0.3 (StartAnimation/StopAnimation/Delete dejan stub oculto: +3): 601 → 604.
+    // Ola 2.3 (ZTest2/FTest visibles): 604 → 606.
+    // Harness Fase A (medición TOPP 39/57/7: +7 visibles S): 606 → 613.
+    // Frente fantasma+nuevos (7 con handler sin spec + 5 nuevos CAS/Complejos):
+    // 613 → 625 (ver registry_counts_match_documented_architecture).
+    // Frente fantasma-2 (71 con handler en commands.rs sin spec; Image queda
+    // fuera por ser stub honesto): 625 → 696 (delta por categoría en
+    // registry_counts_match_documented_architecture).
+    // Frente G1 (contrato grafito-geometry: +14 visibles S — CAS +9, AM2 +3,
+    // Texto +2): 696 → 710, totales 733 → 747.
+    // O1-cierre (EDPs completas: Transport1D + HeatSeparation, AM2 +2):
+    // 710 → 712 visibles.
+    // O3-cierre (Wolfram bidireccional: ParseWolfram + ToWolfram, Texto +2):
+    // 712 → 714 visibles.
+    // O5-cierre (GaussKronrod + FFT + BfgsMinimize + BigInt + BigRational):
+    // 714 → 719 visibles.
+    // O6-cierre (Polygamma + Hypergeometric2F1 + EllipticK + EllipticE +
+    // AiryAi + AiryBi + BesselK + SphericalHarm): 719 → 727 visibles.
+    // O4.1 (Lemniscate + Cissoid + Folium): 727 → 730.
+    // O4.2 (MannWhitney + WilcoxonSigned + KruskalWallis + Friedman):
+    // 730 → 734. O4.3a (ArgumentPrinciple + ComplexDerivative +
+    // CauchyRiemannCheck): 734 → 737. O4.4 (ANOVA2): 737 → 738.
+    // O4.5 (NPV + IRR): 738 → 740. O4.3b (MobiusFixedPoints +
+    // MobiusClassify + MobiusCircleImage): 740 → 743.
+    // O7 (RiemannSphere + RiemannProject + RiemannUnproject): 743 → 746.
+    // Ola física (55 labs Dinámica visibles S, incl. CampoCargas3D +
+    // SistemaOrbital): 746 → 801.
+    // VelocidadOnda (+1 Dinámica onda viajera): 801 → 802.
+    // CantidadMovimiento (+1 Dinámica p=m·v): 802 → 803.
+    // AceleracionCentripeta (+1 Dinámica a=v²/r): 803 → 804.
+    // LeyGravitacion (+1 Dinámica F=Gm1m2/r²): 804 → 805.
+    // EnergiaBohr (+1 Dinámica E_n): 805 → 806.
+    // LeyFaraday (+1 Dinámica fem): 806 → 807.
+    // FlujoGauss (+1 Dinámica Φ=Q/ε₀): 807 → 808.
+    // CalorLatente (+1 Dinámica Q=m·L): 808 → 809.
+    // ChoqueElastico (+1 Dinámica choque 1D): 809 → 810.
+    // VelocidadSonido (+1 Dinámica v aire): 810 → 811.
+    // AlcanceProyectil (+1 Dinámica tiro): 811 → 812.
+    // EnergiaCapacitor (+1 Dinámica ½CU²): 812 → 813.
+    // SolveODE1/SolveODEHomog (+2 CAS con spec): 813 → 815.
+    assert_eq!(command_registry::palette_commands().count(), 815);
+}
+
+#[test]
+fn oleada1_aliases_puros_delegan_al_motor() {
+    for canonical in ["FitLine", "Fit", "FitLineX"] {
+        let mut document = Document::new();
+        let tabla = make_datatable_label(&mut document);
+        assert_message_contains(&mut document, &format!("{canonical}[{tabla}]"), "RMSE");
+        assert_eq!(command_registry::canonicalize(canonical), Some("FitLinear"));
+    }
+    for (canonical, cmd) in [
+        ("IntegralBetween", "IntegralBetween[x^2, 0, 1]"),
+        ("NIntegral", "NIntegral[x^2, 0, 1]"),
+    ] {
+        let mut document = Document::new();
+        assert_message_contains(&mut document, cmd, "Graficado");
+        assert_eq!(command_registry::canonicalize(canonical), Some("Integral"));
+    }
+    {
+        let mut document = Document::new();
+        assert_message_contains(&mut document, "IntegralSymbolic[x^2]", "∫ x^2 dx");
+        assert_eq!(
+            command_registry::canonicalize("IntegralSymbolic"),
+            Some("RischInt")
+        );
+    }
+    {
+        let mut document = Document::new();
+        assert_message_contains(&mut document, "TaylorPolynomial[x^2, x, 0, 2]", "Taylor");
+        assert_eq!(
+            command_registry::canonicalize("TaylorPolynomial"),
+            Some("Taylor")
+        );
+    }
+    {
+        let mut document = Document::new();
+        assert_message_contains(&mut document, "Periods[0.05, -100, 1000, 0]", "Nper");
+        assert_eq!(command_registry::canonicalize("Periods"), Some("Nper"));
+    }
+    {
+        let mut document = Document::new();
+        assert_message_contains(&mut document, "Transpose[[[1, 2], [3, 4]]]", "Transpose");
+    }
+    for canonical in ["Invert", "NInvert"] {
+        let mut document = Document::new();
+        assert_message_contains(
+            &mut document,
+            &format!("{canonical}[[[1, 2], [3, 4]]]"),
+            "Inverse",
+        );
+        assert_eq!(command_registry::canonicalize(canonical), Some("Inverse"));
+    }
+    {
+        let mut document = Document::new();
+        assert_message_contains(
+            &mut document,
+            "SolveCubic[x^3-6*x^2+11*x-6, x]",
+            "{1, 2, 3}",
+        );
+    }
+    {
+        let mut document = Document::new();
+        assert_message_contains(&mut document, "SolveQuartic[x^4-5*x^2+4, x]", "1");
+    }
+    {
+        let mut document = Document::new();
+        assert_message_contains(&mut document, "Curvature[x^2, 0]", "κ");
+        assert_eq!(
+            command_registry::canonicalize("Curvature"),
+            Some("CurvatureAt")
+        );
+    }
+}
+
+#[test]
+fn oleada1_vectores_y_matrices() {
+    let mut document = Document::new();
+    assert_message_contains(&mut document, "Dot[[1, 2, 3], [4, 5, 6]]", "Dot = 32");
+    assert_message_contains(
+        &mut document,
+        "Cross[[1, 0, 0], [0, 1, 0]]",
+        "Cross = [0, 0, 1]",
+    );
+    assert_message_contains(&mut document, "UnitVector[[3, 4]]", "UnitVector = [0.6");
+    assert_message_contains(
+        &mut document,
+        "ApplyMatrix[[[1, 0], [0, 1]], [5, 7]]",
+        "ApplyMatrix",
+    );
+}
+
+#[test]
+fn oleada1_numericos_y_predicados() {
+    let mut document = Document::new();
+    assert_message_contains(&mut document, "NDerivative[x^2, x, 3]", "NDerivative = 6");
+    assert_message_contains(&mut document, "IsDefined[zz_nuevo_oleada1]", "false");
+    assert_ok_or_message(&mut document, "SetValue[zz_nuevo_oleada1, 5]");
+    assert_message_contains(&mut document, "IsDefined[zz_nuevo_oleada1]", "true");
+    assert_message_contains(&mut document, "IsInteger[3]", "true");
+    assert_message_contains(&mut document, "IsInteger[3.5]", "false");
+    assert_message_contains(&mut document, "IsPrime[7]", "true");
+    assert_message_contains(&mut document, "IsPrime[8]", "false");
+    let mut document = Document::new();
+    let circulo = make_circle_label(&mut document);
+    assert_message_contains(
+        &mut document,
+        &format!("IsInRegion[(0, 0), {circulo}]"),
+        "true",
+    );
+    assert_message_contains(
+        &mut document,
+        &format!("IsInRegion[(10, 10), {circulo}]"),
+        "false",
+    );
+}
+
+#[test]
+fn oleada1_textos_crean_objeto() {
+    let mut document = Document::new();
+    let before = document.object_count();
+    assert_ok_or_message(&mut document, "FormulaText[x^2+1]");
+    assert_ok_or_message(&mut document, "ScientificText[12345]");
+    assert_ok_or_message(&mut document, "MixedNumber[2.5]");
+    assert_ok_or_message(&mut document, "Ordinal[1]");
+    assert_eq!(document.object_count(), before + 4);
+    let texts: Vec<String> = document
+        .objects_iter()
+        .filter_map(|(_, o)| match o {
+            GeoObject::Text(t) => Some(t.content.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        texts.iter().any(|t| t.contains("1/2")),
+        "MixedNumber debe contener 1/2, fue {texts:?}"
+    );
+    assert!(
+        texts.iter().any(|t| t == "1.º"),
+        "Ordinal debe ser 1.º, fue {texts:?}"
+    );
+}
+
+#[test]
+fn oleada1_setters_reflejan_canvas_al_instante() {
+    let mut document = Document::new();
+    let punto = make_point_label(&mut document);
+    assert_message_contains(
+        &mut document,
+        &format!("SetColor[{punto}, red]"),
+        "actualizado",
+    );
+    assert_message_contains(
+        &mut document,
+        &format!("SetCoords[{punto}, (5, 6)]"),
+        "movido",
+    );
+    let pos = match document
+        .get_object(find_label(&document, &punto))
+        .expect("punto")
+    {
+        GeoObject::Point(p) => p.position,
+        other => panic!("esperaba punto, fue {other:?}"),
+    };
+    assert!((pos.x - 5.0).abs() < 1e-9 && (pos.y - 6.0).abs() < 1e-9);
+    assert_message_contains(
+        &mut document,
+        &format!("SetVisible[{punto}, false]"),
+        "oculto",
+    );
+    assert!(!document
+        .get_object(find_label(&document, &punto))
+        .expect("punto")
+        .is_visible());
+    assert_message_contains(
+        &mut document,
+        &format!("SetVisible[{punto}, true]"),
+        "visible",
+    );
+    assert!(document
+        .get_object(find_label(&document, &punto))
+        .expect("punto")
+        .is_visible());
+}
+
+#[test]
+fn oleada1_solidos_miden() {
+    let mut document = Document::new();
+    let cubo = make_cube_label(&mut document);
+    assert_message_contains(&mut document, &format!("Surface[{cubo}]"), "Surface");
+    assert_message_contains(&mut document, &format!("Volume[{cubo}]"), "Volume");
+}
+
+#[test]
+fn oleada1_osculating_circle_crea_circulo() {
+    let mut document = Document::new();
+    let before = document.object_count();
+    assert_message_contains(&mut document, "OsculatingCircle[x^2, 1]", "κ");
+    assert_eq!(document.object_count(), before + 1);
+    assert!(
+        document
+            .objects_iter()
+            .any(|(_, o)| matches!(o, GeoObject::Circle(_))),
+        "OsculatingCircle debe crear un círculo"
+    );
+}
+
+#[test]
+fn oleada1_planilla_lee() {
+    let mut document = Document::new();
+    assert_ok_or_message(&mut document, "FillColumn[A, 5]");
+    assert_message_contains(&mut document, "Cell[A1]", "Cell = 5");
+    assert_message_contains(&mut document, "Column[A]", "Column = {");
+    assert_message_contains(&mut document, "Row[1]", "Row = {");
+}

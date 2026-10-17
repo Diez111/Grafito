@@ -1,0 +1,8912 @@
+use crate::constraints::ConstraintGraph;
+use crate::error::CoreError;
+use crate::numeric_constraints::{
+    AngleEq, CoincidentEq, DistanceEq, EqualLengthEq, HorizontalEq, SymmetryEq, TangentEq,
+    VerticalEq,
+};
+use crate::numeric_solver::{NumericSolver, SolveError, VarIndex};
+use crate::{
+    EllipseObj, GeoObject, HyperbolaObj, ImplicitCurveSegments, LineKind, ObjectId, ParabolaObj,
+    PointObj, RelationOperator,
+};
+use grafito_geometry::expr::evaluate_cached;
+use grafito_geometry::{
+    distance_point_to_segment, matrices::solve_linear_system, matrices::Matrix, Color, Point2,
+    Point3D, ViewTransform,
+};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::hash::{DefaultHasher, Hash, Hasher};
+
+/// Recorrido de un parámetro animado dentro de su intervalo permitido.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum AnimationMode {
+    /// Rebota en ambos extremos, conservando el comportamiento histórico de sliders.
+    #[default]
+    PingPong,
+    /// Vuelve continuamente desde el máximo al mínimo, apropiado para fases angulares.
+    Loop,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VariableMeta {
+    pub position: Point2,
+    pub min: f64,
+    pub max: f64,
+    pub step: f64,
+    pub visible: bool,
+    #[serde(default)]
+    pub animating: bool,
+    #[serde(default = "default_animation_speed")]
+    pub animation_speed: f64,
+    #[serde(default)]
+    pub animation_mode: AnimationMode,
+}
+
+/// Parámetro vivo bound a slider del panel y a la animación paramétrica `p` (F2c).
+///
+/// Vista honesta sobre `variables` + `variable_meta`: no duplica estado.
+/// `name` es el identificador de variable (`p` por defecto en la UI);
+/// `min`/`max` vienen de `VariableMeta` (o del fallback -5..=5 si la
+/// variable existe sin meta); `value` es el valor actual en `variables`.
+/// El slider escribe vía `set_live_param` (que delega en `try_set_variable`:
+/// re-evalúa dependientes, invalida por `version` y por clave de caché con
+/// hash de variables, sin `unwrap`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiveParam {
+    /// Nombre de la variable (ej. `"p"`).
+    pub name: String,
+    /// Mínimo del slider (finito, < max).
+    pub min: f64,
+    /// Máximo del slider (finito, > min).
+    pub max: f64,
+    /// Valor actual (finito, dentro de [min, max]).
+    pub value: f64,
+}
+
+/// Nombre del parámetro vivo por defecto para la animación paramétrica.
+pub const DEFAULT_LIVE_PARAM_NAME: &str = "p";
+/// Rango fallback cuando la variable existe sin `VariableMeta`.
+pub const LIVE_PARAM_FALLBACK_MIN: f64 = -5.0;
+/// Rango fallback cuando la variable existe sin `VariableMeta`.
+pub const LIVE_PARAM_FALLBACK_MAX: f64 = 5.0;
+/// Largo máximo del nombre de un `LiveParam` (igual que `MAX_STRING_LENGTH`).
+pub const MAX_LIVE_PARAM_NAME_LEN: usize = 256;
+
+/// Default `serde` para `Document::number_plane_labels`: JSON viejo sin el
+/// campo migra a plano numerado visible (comportamiento histórico de
+/// `draw_axes` con ticks).
+fn default_number_plane_labels() -> bool {
+    true
+}
+
+/// Binding de una secuencia viva que depende de variables y se re-evalúa en cada cambio.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LiveSequenceBinding {
+    /// Expresión a evaluar con variable local.
+    pub expr: String,
+    /// Variable local de iteración (ej. "k").
+    pub var: String,
+    /// Expresión para inicio (puede referenciar variables del documento).
+    pub start_expr: String,
+    /// Expresión para fin.
+    pub end_expr: String,
+}
+
+/// Presupuestos para secuencias vivas.
+pub const MAX_LIVE_SEQUENCES: usize = 64;
+pub const MAX_LIVE_SEQUENCE_LENGTH: usize = 10_000;
+/// Presupuesto de tiempo por `recompute_live_sequences` (R2-V5, deadline).
+///
+/// Cota dura del loop `eval`: si la expresión es lenta y 10k pasos no
+/// terminan a tiempo, `Err` honesto en vez de colgar la UI. En const para
+/// que el test pinnee el presupuesto sin números mágicos.
+pub const MAX_LIVE_SEQUENCE_EVAL_MS: u64 = 1_000;
+
+/// Presupuestos del gesto de arrastre (frente W-B, geometría dinámica).
+/// Profundidad máxima de la cadena de dependencias re-evaluada por frame de
+/// arrastre (alineada a `MAX_TRANSFORM_DEPTH` de validación).
+pub const MAX_DRAG_PROPAGATION_DEPTH: usize = 64;
+/// Re-evaluaciones constructivas máximas por frame de arrastre: a 60fps el
+/// gesto re-evalúa sólo el subgrafo sucio (`propagation_order`), nunca todo.
+pub const MAX_DRAG_REEVALS_PER_FRAME: usize = 512;
+/// Salidas dependientes máximas alcanzables desde el punto arrastrado.
+pub const MAX_DRAG_FANOUT: usize = 1024;
+
+fn default_animation_speed() -> f64 {
+    1.0
+}
+
+fn to_subscript(n: usize) -> String {
+    let s = n.to_string();
+    s.chars()
+        .map(|c| match c {
+            '0' => '₀',
+            '1' => '₁',
+            '2' => '₂',
+            '3' => '₃',
+            '4' => '₄',
+            '5' => '₅',
+            '6' => '₆',
+            '7' => '₇',
+            '8' => '₈',
+            '9' => '₉',
+            _ => c,
+        })
+        .collect()
+}
+
+const MAX_AUTO_LABEL_NUMBER: usize = crate::validation::MAX_OBJECT_COUNT + 1;
+
+/// Decodifica el parámetro `kind` de `LineByTwoPoints`: 0 = recta infinita,
+/// 1 = segmento, 2 = semirrecta. Ausente = recta (GeoGebra `Line[A, B]`).
+fn line_by_two_points_kind(params: &BTreeMap<String, f64>) -> Result<LineKind, String> {
+    match params.get("kind").copied().unwrap_or(0.0) {
+        0.0 => Ok(LineKind::Line),
+        1.0 => Ok(LineKind::Segment),
+        2.0 => Ok(LineKind::Ray),
+        _ => Err("LineByTwoPoints: el parámetro 'kind' debe ser 0, 1 o 2".to_string()),
+    }
+}
+
+/// ¿La expresión menciona alguna variable del documento? Escaneo léxico por
+/// tokens `[alnum _]+` comparados enteros contra el mapa de variables (así
+/// `1e3` no colisiona con una variable `e`). W-B: distingue fórmula viva
+/// (manejada por su variable, no arrastrable) de constante (`"0"`, liberable
+/// al arrastrar). Sin evaluar: el motor resuelve identificadores desconocidos
+/// sin fallar, así que el `evaluate` no discrimina.
+fn expr_references_variables(expr: &str, variables: &VarMap) -> bool {
+    if variables.is_empty() {
+        return false;
+    }
+    let mut token = String::new();
+    for ch in expr.chars().chain(std::iter::once(' ')) {
+        if ch.is_alphanumeric() || ch == '_' {
+            token.push(ch);
+        } else if !token.is_empty() {
+            if variables.contains_key(&token) {
+                return true;
+            }
+            token.clear();
+        }
+    }
+    false
+}
+
+fn canonical_label_counter(counter: usize) -> usize {
+    if (1..=MAX_AUTO_LABEL_NUMBER).contains(&counter) {
+        counter
+    } else {
+        1
+    }
+}
+
+fn deserialize_next_label_numbers<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let counters = BTreeMap::<String, usize>::deserialize(deserializer)?;
+    Ok(counters
+        .into_iter()
+        .map(|(base, counter)| (base, canonical_label_counter(counter)))
+        .collect())
+}
+
+/// Identifies a scalar geometric property that can participate in numeric
+/// constraint solving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ObjField {
+    PointX,
+    PointY,
+    CircleRadius,
+    LineStartX,
+    LineStartY,
+    LineEndX,
+    LineEndY,
+}
+
+/// Type alias for the cached variables list used in expression resolution.
+pub type CachedVarsList =
+    std::sync::Arc<std::sync::Mutex<Option<(u64, std::sync::Arc<Vec<(String, f64)>>)>>>;
+
+/// A fallible mutation that can be staged as part of a document revision.
+pub type DocumentOperation = Box<dyn FnOnce(&mut Document) -> Result<(), String> + Send>;
+
+/// Puente F4 BTreeMap: mapa ordenado de variables (`String → f64`).
+///
+/// Destino de la migración por dominio de `Document::variables`: mismo
+/// contenido, iteración ordenada (determinismo en hash/baseline/export).
+/// [`Document::sorted_variables`] retorna un clon para call-sites que
+/// necesitan snapshot propio.
+pub type VarMap = BTreeMap<String, f64>;
+
+/// Partes cacheadas del contexto del asistente: `(etiqueta, tipo, huella)`
+/// por objeto visible + variables (alias anti `type_complexity`).
+pub type ContextParts = (Vec<(String, String, String)>, VarMap);
+
+/// Puente F4 BTreeMap: mapa ordenado de metadatos de variable.
+///
+/// Destino de la migración por dominio de `variable_meta` (privado).
+pub type VarMetaMap = BTreeMap<String, VariableMeta>;
+
+/// A group of document mutations that either commits as one revision or leaves
+/// the document untouched.
+#[derive(Default)]
+pub struct OperationBatch {
+    operations: Vec<DocumentOperation>,
+}
+
+/// Contador global de nonces de identidad de documento (ver `cache_nonce`).
+/// `Relaxed` alcanza: solo necesita unicidad por proceso, no orden.
+static CACHE_NONCE_NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Nonce fresco de identidad de documento (serde-default al deserializar).
+fn fresh_cache_nonce() -> u64 {
+    CACHE_NONCE_NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+impl OperationBatch {
+    /// Creates an empty batch.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds a mutation to be validated before the batch commits.
+    pub fn push<F>(&mut self, operation: F)
+    where
+        F: FnOnce(&mut Document) -> Result<(), String> + Send + 'static,
+    {
+        self.operations.push(Box::new(operation));
+    }
+
+    /// Returns the number of staged mutations.
+    pub fn len(&self) -> usize {
+        self.operations.len()
+    }
+
+    /// Returns whether the batch contains no mutations.
+    pub fn is_empty(&self) -> bool {
+        self.operations.is_empty()
+    }
+}
+
+/// Semantically valid document states before and after one committed batch.
+#[derive(Debug, Clone)]
+pub struct ChangeSet {
+    /// State before the operation batch committed.
+    pub before: Document,
+    /// State after the operation batch committed.
+    pub after: Document,
+}
+
+impl ChangeSet {
+    /// Compara por bytes JSON serializados (no por árbol `Value`): mismo
+    /// resultado semántico (los `#[serde(skip)]` no entran en ninguno de los
+    /// dos), pero sin el pico de 2-4× que armaban los dos `Value` en undo/redo
+    /// de documentos grandes.
+    fn same_semantic_state(left: &Document, right: &Document) -> Result<bool, String> {
+        let left = serde_json::to_vec(left).map_err(|error| error.to_string())?;
+        let right = serde_json::to_vec(right).map_err(|error| error.to_string())?;
+        Ok(left == right)
+    }
+
+    fn restore(
+        document: &mut Document,
+        expected_current: &Document,
+        snapshot: &Document,
+    ) -> Result<(), String> {
+        if !Self::same_semantic_state(document, expected_current)? {
+            return Err("ChangeSet cannot be applied after unrelated document changes".into());
+        }
+        crate::validation::validate_document(snapshot)?;
+        if Self::same_semantic_state(document, snapshot)? {
+            return Ok(());
+        }
+        let next_version = document.version.wrapping_add(1);
+        let mut restored = snapshot.clone();
+        restored.version = next_version;
+        restored.spatial_dirty = true;
+        // Memos frescos: el snapshot comparte el `Arc` con su linaje y el
+        // documento restaurado es una versión nueva (no debe leer partes del
+        // clon de origen ni contaminarlo con su contenido).
+        restored.cached_vars_list = Default::default();
+        restored.estimated_bytes_cache = std::sync::Arc::new(std::sync::Mutex::new(None));
+        restored.context_parts_cache = std::sync::Arc::new(std::sync::Mutex::new(None));
+        *document = restored;
+        Ok(())
+    }
+
+    /// Restores the state before the batch as a new document revision.
+    pub fn undo(&self, document: &mut Document) -> Result<(), String> {
+        Self::restore(document, &self.after, &self.before)
+    }
+
+    /// Restores the state after the batch as a new document revision.
+    pub fn redo(&self, document: &mut Document) -> Result<(), String> {
+        Self::restore(document, &self.before, &self.after)
+    }
+}
+
+/// Estado histórico de una celda ejecutada en la hoja CAS local.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CasWorksheetStatus {
+    /// El comando se evaluó sin errores.
+    Success,
+    /// El comando fue rechazado y la celda conserva el diagnóstico local.
+    Error,
+}
+
+/// Resultado inmutable de una entrada enviada desde la hoja CAS.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CasWorksheetEntry {
+    /// Entrada textual enviada al intérprete.
+    pub input: String,
+    /// Resultado o diagnóstico producido al enviar la entrada.
+    pub output: String,
+    /// Si el resultado representa éxito o error.
+    pub status: CasWorksheetStatus,
+}
+
+/// ── Libro de pizarra persistente (región whiteboard) ─────────────────────
+/// La pizarra pasó de una sola hoja (`Document.whiteboard`) a un libro de
+/// hasta `MAX_WHITEBOARD_PAGES` hojas. Formato persistido (JSON del documento):
+///
+/// ```json
+/// {
+///   "whiteboard": { "elements": [...] },
+///   "whiteboard_pages": [
+///     { "title": "Hoja 1", "doc": { "elements": [...] },
+///       "pan": [0.0, 0.0], "zoom": 1.0 }
+///   ],
+///   "whiteboard_current": 0
+/// }
+/// ```
+///
+/// Migración (sin pérdida, sin panic):
+/// - JSON viejo sin `whiteboard_pages` (o vacío) →
+///   `ensure_whiteboard_book_migrated` crea un `Vec` de una hoja ("Hoja 1")
+///   con el contenido legado de `whiteboard`.
+/// - JSON nuevo → se usa `whiteboard_pages` tal cual; `whiteboard` queda como
+///   espejo de la hoja actual para que el export SVG existente y
+///   `ValidatedDocument` sigan funcionando sin cambios.
+/// - La carga acota en deserialización (`deserialize_whiteboard_pages_capped`):
+///   32 hojas, 500 elementos/hoja, 4096 puntos/trazo, 2000 caracteres/texto,
+///   título a 64 caracteres, pan/zoom finitos (zoom 1e-6..=1e6).
+///
+/// Cotas (alineadas con `validation.rs` y `whiteboard_ui.rs`):
+/// `MAX_WHITEBOARD_PAGES = 32`, `MAX_WHITEBOARD_ELEMENTS_PER_PAGE = 500`,
+/// `MAX_WHITEBOARD_POINTS_PER_STROKE = 4096`, `MAX_WHITEBOARD_TEXT_CHARS = 2000`.
+pub const MAX_WHITEBOARD_PAGES: usize = 32;
+/// Máximo de elementos por hoja persistida (igual que `validation.rs:497`).
+pub const MAX_WHITEBOARD_ELEMENTS_PER_PAGE: usize = 500;
+/// Máximo de puntos por trazo persistido (igual que `whiteboard_ui.rs`).
+pub const MAX_WHITEBOARD_POINTS_PER_STROKE: usize = 4096;
+/// Máximo de caracteres por texto persistido (igual que `whiteboard_ui.rs`).
+pub const MAX_WHITEBOARD_TEXT_CHARS: usize = 2000;
+/// Título de hoja más largo persistido (se trunca por caracteres, sin panic).
+pub const MAX_WHITEBOARD_PAGE_TITLE_CHARS: usize = 64;
+/// Tope TOTAL de bytes de trazo de todo el libro (Ola 4): sin esto, el
+/// teórico 32 hojas × 500 elementos × 4096 puntos × 16 B ≈ 1 GiB por
+/// documento (clonado por snapshot de undo). 32 MiB cubre uso real con
+/// margen y falla cerrado con mensaje antes de crecer sin cota.
+pub const MAX_WHITEBOARD_TOTAL_BYTES: usize = 32 * 1024 * 1024;
+/// Zoom persistido mínimo válido (igual que `ZOOM_WB_MIN` de `grafito-ui`).
+pub const WHITEBOARD_PAGE_ZOOM_MIN: f64 = 1e-6;
+/// Zoom persistido máximo válido (igual que `ZOOM_WB_MAX` de `grafito-ui`).
+pub const WHITEBOARD_PAGE_ZOOM_MAX: f64 = 1e6;
+/// Tamaño de texto usado al sanear un tamaño no finito o no positivo.
+const WHITEBOARD_FALLBACK_TEXT_SIZE: f64 = 14.0;
+/// Grosor de trazo usado al sanear un grosor no finito o no positivo.
+const WHITEBOARD_FALLBACK_STROKE_WIDTH: f64 = 2.0;
+
+fn default_whiteboard_zoom() -> f64 {
+    1.0
+}
+
+/// Una hoja del libro de pizarra tal como se persiste en el documento.
+/// `pan`/`zoom` restauran la vista de la hoja; `title` se muestra en la UI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WhiteboardPageData {
+    /// Título de la hoja ("Hoja N"); vacío se sanea a "Hoja".
+    #[serde(default)]
+    pub title: String,
+    /// Contenido de la hoja (`selected` no persiste por `#[serde(skip)]`).
+    #[serde(default)]
+    pub doc: grafito_whiteboard::WhiteboardDoc,
+    /// Desplazamiento de vista en píxeles; componentes no finitas → 0.0.
+    #[serde(default)]
+    pub pan: (f64, f64),
+    /// Zoom de vista; no finito o no positivo → 1.0, acotado a 1e-6..=1e6.
+    #[serde(default = "default_whiteboard_zoom")]
+    pub zoom: f64,
+}
+
+impl WhiteboardPageData {
+    /// Hoja vacía con título dado (pan/zoom por defecto, título truncado).
+    pub fn blank(title: &str) -> Self {
+        Self {
+            title: truncate_title_chars(title),
+            doc: grafito_whiteboard::WhiteboardDoc::new(),
+            pan: (0.0, 0.0),
+            zoom: 1.0,
+        }
+    }
+}
+
+/// Trunca un título a `MAX_WHITEBOARD_PAGE_TITLE_CHARS` por caracteres
+/// (nunca parte un `char` Unicode); vacío/blanco → "Hoja".
+fn truncate_title_chars(title: &str) -> String {
+    let trimmed = title.trim();
+    let base = if trimmed.is_empty() { "Hoja" } else { trimmed };
+    if base.chars().count() > MAX_WHITEBOARD_PAGE_TITLE_CHARS {
+        base.chars().take(MAX_WHITEBOARD_PAGE_TITLE_CHARS).collect()
+    } else {
+        base.to_string()
+    }
+}
+
+/// Sanea un elemento para persistencia acotada (sin panic, sin rechazar):
+/// trazo a 4096 puntos y grosor finito positivo; texto a 2000 caracteres y
+/// tamaño finito positivo; el resto se conserva (la validación fail-closed de
+/// `ValidatedDocument` sigue cubriendo la finitud de coordenadas).
+fn sanitize_whiteboard_element(
+    element: &grafito_whiteboard::WhiteboardElement,
+) -> grafito_whiteboard::WhiteboardElement {
+    use grafito_whiteboard::WhiteboardElement as El;
+    match element {
+        El::Stroke {
+            points,
+            color,
+            width,
+        }
+        | El::Highlighter {
+            points,
+            color,
+            width,
+        } => {
+            let mut kept = points.clone();
+            kept.truncate(MAX_WHITEBOARD_POINTS_PER_STROKE);
+            let safe_width = if width.is_finite() && *width > 0.0 {
+                *width
+            } else {
+                WHITEBOARD_FALLBACK_STROKE_WIDTH
+            };
+            if matches!(element, El::Highlighter { .. }) {
+                El::Highlighter {
+                    points: kept,
+                    color: *color,
+                    width: safe_width,
+                }
+            } else {
+                El::Stroke {
+                    points: kept,
+                    color: *color,
+                    width: safe_width,
+                }
+            }
+        }
+        El::Text { at, text, size } => {
+            let kept = if text.chars().count() > MAX_WHITEBOARD_TEXT_CHARS {
+                text.chars().take(MAX_WHITEBOARD_TEXT_CHARS).collect()
+            } else {
+                text.clone()
+            };
+            let safe_size = if size.is_finite() && *size > 0.0 {
+                *size
+            } else {
+                WHITEBOARD_FALLBACK_TEXT_SIZE
+            };
+            El::Text {
+                at: *at,
+                text: kept,
+                size: safe_size,
+            }
+        }
+        other => other.clone(),
+    }
+}
+
+/// Sanea una hoja para persistencia acotada: título, pan/zoom y contenido.
+fn sanitize_whiteboard_page(page: WhiteboardPageData) -> WhiteboardPageData {
+    let pan = (
+        if page.pan.0.is_finite() {
+            page.pan.0
+        } else {
+            0.0
+        },
+        if page.pan.1.is_finite() {
+            page.pan.1
+        } else {
+            0.0
+        },
+    );
+    let zoom = if !page.zoom.is_finite() || page.zoom <= 0.0 {
+        1.0
+    } else {
+        page.zoom
+            .clamp(WHITEBOARD_PAGE_ZOOM_MIN, WHITEBOARD_PAGE_ZOOM_MAX)
+    };
+    let mut doc = grafito_whiteboard::WhiteboardDoc::new();
+    for element in page
+        .doc
+        .elements()
+        .iter()
+        .take(MAX_WHITEBOARD_ELEMENTS_PER_PAGE)
+    {
+        doc.add(sanitize_whiteboard_element(element));
+    }
+    WhiteboardPageData {
+        title: truncate_title_chars(&page.title),
+        doc,
+        pan,
+        zoom,
+    }
+}
+
+/// Deserializador acotado de `whiteboard_pages`: capa páginas a 32 y sanea
+/// cada hoja para que la carga nunca supere los presupuestos de memoria ni
+/// rompa `ValidatedDocument`. JSON viejo sin el campo → `Vec` vacío y la
+/// migración (`ensure_whiteboard_book_migrated`) lo rellena desde `whiteboard`.
+/// Tolerante por hoja: una hoja corrupta (p. ej. `null` donde iba un `f64`,
+/// que es como `serde_json` serializa NaN/Inf) se omite sin tumbar el libro.
+/// Nota: el formato de persistencia del documento es JSON en todas las rutas
+/// de guardado/carga (`serde_json`), por eso se usa `serde_json::Value` aquí.
+fn deserialize_whiteboard_pages_capped<'de, D>(
+    deserializer: D,
+) -> Result<Vec<WhiteboardPageData>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let values = Vec::<serde_json::Value>::deserialize(deserializer).unwrap_or_default();
+    let mut pages = Vec::new();
+    for value in values.into_iter().take(MAX_WHITEBOARD_PAGES) {
+        if let Ok(page) = serde_json::from_value::<WhiteboardPageData>(value) {
+            pages.push(sanitize_whiteboard_page(page));
+        }
+    }
+    Ok(pages)
+}
+
+impl Document {
+    /// Número efectivo de hojas (legado sin `whiteboard_pages` cuenta como 1).
+    pub fn whiteboard_book_len(&self) -> usize {
+        if self.whiteboard_pages.is_empty() {
+            1
+        } else {
+            self.whiteboard_pages.len()
+        }
+    }
+
+    /// Índice actual acotado al libro efectivo (legado → 0, sin panic).
+    pub fn whiteboard_book_current(&self) -> usize {
+        let len = self.whiteboard_book_len();
+        if self.whiteboard_pages.is_empty() {
+            0
+        } else {
+            self.whiteboard_current.min(len - 1)
+        }
+    }
+
+    /// Migración sin pérdida: si no hay `whiteboard_pages` (JSON viejo), crea
+    /// el `Vec` con la hoja legada de `whiteboard`; si ya hay libro, lo sanea
+    /// y acota el índice. Al salir, `whiteboard` es espejo de la hoja actual.
+    pub fn ensure_whiteboard_book_migrated(&mut self) {
+        if self.whiteboard_pages.is_empty() {
+            self.whiteboard_pages = vec![WhiteboardPageData {
+                title: "Hoja 1".to_string(),
+                doc: self.whiteboard.clone(),
+                pan: (0.0, 0.0),
+                zoom: 1.0,
+            }];
+            self.whiteboard_current = 0;
+        } else {
+            if self.whiteboard_pages.len() > MAX_WHITEBOARD_PAGES {
+                self.whiteboard_pages.truncate(MAX_WHITEBOARD_PAGES);
+            }
+            let current = self.whiteboard_current.min(self.whiteboard_pages.len() - 1);
+            self.whiteboard_current = current;
+        }
+        self.sync_whiteboard_mirror_from_book();
+    }
+
+    /// Copia `whiteboard_pages[current].doc` a `whiteboard` (espejo para el
+    /// export SVG existente y `ValidatedDocument`); sin libro no hace nada.
+    pub fn sync_whiteboard_mirror_from_book(&mut self) {
+        if self.whiteboard_pages.is_empty() {
+            return;
+        }
+        let current = self.whiteboard_current.min(self.whiteboard_pages.len() - 1);
+        self.whiteboard_current = current;
+        if let Some(page) = self.whiteboard_pages.get(current) {
+            self.whiteboard = page.doc.clone();
+        }
+    }
+
+    /// Libro efectivo para UI/export: páginas persistidas, o el `Vec` migrado
+    /// de una hoja si el documento es legado. No muta.
+    pub fn whiteboard_export_pages(&self) -> (Vec<WhiteboardPageData>, usize) {
+        if self.whiteboard_pages.is_empty() {
+            (
+                vec![WhiteboardPageData {
+                    title: "Hoja 1".to_string(),
+                    doc: self.whiteboard.clone(),
+                    pan: (0.0, 0.0),
+                    zoom: 1.0,
+                }],
+                0,
+            )
+        } else {
+            let current = self.whiteboard_current.min(self.whiteboard_pages.len() - 1);
+            (self.whiteboard_pages.clone(), current)
+        }
+    }
+
+    /// Guarda el libro completo: rechaza en español libro vacío o con más de
+    /// 32 hojas (sin panic); sanea hojas, acota el índice, sincroniza el
+    /// espejo `whiteboard`, sube versión e invalida cachés.
+    pub fn set_whiteboard_book(
+        &mut self,
+        pages: Vec<WhiteboardPageData>,
+        current: usize,
+    ) -> Result<(), String> {
+        if pages.is_empty() {
+            return Err("El libro de pizarra necesita al menos una hoja".to_string());
+        }
+        if pages.len() > MAX_WHITEBOARD_PAGES {
+            return Err(format!(
+                "La pizarra alcanzó el máximo de {MAX_WHITEBOARD_PAGES} hojas"
+            ));
+        }
+        self.whiteboard_pages = pages.into_iter().map(sanitize_whiteboard_page).collect();
+        let current = current.min(self.whiteboard_pages.len() - 1);
+        self.whiteboard_current = current;
+        self.sync_whiteboard_mirror_from_book();
+        self.bump_version();
+        self.invalidate_all_caches();
+        Ok(())
+    }
+}
+
+/// ── Export SVG del libro (región whiteboard) ─────────────────────────────
+/// Proyección pura (sin I/O ni `spawn`) del libro persistido a un SVG por
+/// hoja: el libro se guarda en `Document.whiteboard_pages` y aquí se vuelve
+/// archivo(s) `.svg` (uno por hoja, con su título). Complementa al export
+/// existente de la hoja actual en `grafito-app/src/export.rs`, que sigue
+/// leyendo el espejo `Document.whiteboard` sin cambios. Calcula `viewBox`
+/// desde los elementos con margen de 20 unidades (hoja vacía: el tamaño
+/// pedido), omite elementos no finitos y escapa el XML. Lados 64..=4096.
+const WHITEBOARD_SVG_MIN_SIDE: u32 = 64;
+const WHITEBOARD_SVG_MAX_SIDE: u32 = 4096;
+
+fn clamp_svg_side(value: u32) -> u32 {
+    value.clamp(WHITEBOARD_SVG_MIN_SIDE, WHITEBOARD_SVG_MAX_SIDE)
+}
+
+/// Escapa texto para el XML del SVG (omite caracteres de control).
+fn escape_svg_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ if c.is_control() => {}
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Número con 2 decimales para atributos SVG ("0" si no es finito).
+fn svg_num(value: f64) -> String {
+    if value.is_finite() {
+        format!("{value:.2}")
+    } else {
+        "0".to_string()
+    }
+}
+
+fn svg_color(rgb: (u8, u8, u8)) -> String {
+    format!("#{:02X}{:02X}{:02X}", rgb.0, rgb.1, rgb.2)
+}
+
+/// Dibuja un elemento como fragmento SVG (omite no finitos; sin panic).
+fn push_whiteboard_element_svg(out: &mut String, element: &grafito_whiteboard::WhiteboardElement) {
+    use grafito_whiteboard::WhiteboardElement as El;
+    match element {
+        El::Stroke {
+            points,
+            color,
+            width,
+        }
+        | El::Highlighter {
+            points,
+            color,
+            width,
+        } => {
+            let safe_width = if width.is_finite() && *width > 0.0 {
+                *width
+            } else {
+                WHITEBOARD_FALLBACK_STROKE_WIDTH
+            };
+            let mut pts = String::new();
+            for (x, y) in points {
+                if x.is_finite() && y.is_finite() {
+                    pts.push_str(&format!("{},{} ", svg_num(*x), svg_num(*y)));
+                }
+            }
+            if pts.trim().is_empty() {
+                return;
+            }
+            // El resaltado viaja con su alfa fijo (misma capa honesta que
+            // en el canvas: debajo de la tinta por orden de documento).
+            let opacity = if matches!(element, El::Highlighter { .. }) {
+                format!(
+                    " stroke-opacity=\"{:.2}\"",
+                    grafito_whiteboard::HIGHLIGHTER_ALPHA
+                )
+            } else {
+                String::new()
+            };
+            out.push_str(&format!(
+                "<polyline points=\"{}\" fill=\"none\" stroke=\"{}\" stroke-width=\"{}\"{opacity} stroke-linecap=\"round\" stroke-linejoin=\"round\"/>",
+                pts.trim_end(),
+                svg_color(*color),
+                svg_num(safe_width)
+            ));
+        }
+        El::Rectangle { min, max, .. } => {
+            if !min.0.is_finite() || !min.1.is_finite() || !max.0.is_finite() || !max.1.is_finite()
+            {
+                return;
+            }
+            out.push_str(&format!(
+                "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" fill=\"none\" stroke=\"#1A1A1A\" stroke-width=\"1.8\"/>",
+                svg_num(min.0.min(max.0)),
+                svg_num(min.1.min(max.1)),
+                svg_num((max.0 - min.0).abs()),
+                svg_num((max.1 - min.1).abs())
+            ));
+        }
+        El::Ellipse { center, rx, ry } => {
+            if !center.0.is_finite() || !center.1.is_finite() || !rx.is_finite() || !ry.is_finite()
+            {
+                return;
+            }
+            out.push_str(&format!(
+                "<ellipse cx=\"{}\" cy=\"{}\" rx=\"{}\" ry=\"{}\" fill=\"none\" stroke=\"#1A1A1A\" stroke-width=\"1.8\"/>",
+                svg_num(center.0),
+                svg_num(center.1),
+                svg_num(rx.abs()),
+                svg_num(ry.abs())
+            ));
+        }
+        El::Arrow { from, to } => {
+            if !from.0.is_finite() || !from.1.is_finite() || !to.0.is_finite() || !to.1.is_finite()
+            {
+                return;
+            }
+            out.push_str(&format!(
+                "<line x1=\"{}\" y1=\"{}\" x2=\"{}\" y2=\"{}\" stroke=\"#1A1A1A\" stroke-width=\"1.8\"/>",
+                svg_num(from.0),
+                svg_num(from.1),
+                svg_num(to.0),
+                svg_num(to.1)
+            ));
+            let (right, left) = grafito_whiteboard::arrow_tip(*from, *to, 0.55);
+            for wing in [right, left] {
+                if wing.0.is_finite() && wing.1.is_finite() {
+                    out.push_str(&format!(
+                        "<line x1=\"{}\" y1=\"{}\" x2=\"{}\" y2=\"{}\" stroke=\"#1A1A1A\" stroke-width=\"1.8\"/>",
+                        svg_num(wing.0),
+                        svg_num(wing.1),
+                        svg_num(to.0),
+                        svg_num(to.1)
+                    ));
+                }
+            }
+        }
+        El::Text { at, text, size } => {
+            if text.is_empty()
+                || !at.0.is_finite()
+                || !at.1.is_finite()
+                || !size.is_finite()
+                || *size <= 0.0
+            {
+                return;
+            }
+            out.push_str(&format!(
+                "<text x=\"{}\" y=\"{}\" font-size=\"{}\" font-family=\"monospace\" fill=\"#1A1A1A\">{}</text>",
+                svg_num(at.0),
+                svg_num(at.1),
+                svg_num(*size),
+                escape_svg_text(text)
+            ));
+        }
+        El::Image { .. } => {
+            // `<image>` base64 con la única implementación del fragmento
+            // (`grafito-whiteboard`); inválida → se omite, como acá se
+            // omiten los NaN. Sin presupuesto de 100 KiB: ese tope es del
+            // Compartir (`WhiteboardDoc::to_svg`), no del export a archivo.
+            if let Some(fragment) = grafito_whiteboard::image_svg_fragment(element) {
+                out.push_str(&fragment);
+            }
+        }
+    }
+}
+
+/// Exporta páginas del libro a un SVG por hoja (título, svg). Pura, sin I/O.
+pub fn whiteboard_pages_to_svg(
+    pages: &[WhiteboardPageData],
+    width: u32,
+    height: u32,
+) -> Vec<(String, String)> {
+    let (width, height) = (clamp_svg_side(width), clamp_svg_side(height));
+    pages
+        .iter()
+        .map(|page| {
+            let mut min = (f64::INFINITY, f64::INFINITY);
+            let mut max = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+            let mut has_finite = false;
+            for element in page.doc.elements() {
+                if let Some((a, b)) = element.bounds() {
+                    if a.0.is_finite() && a.1.is_finite() && b.0.is_finite() && b.1.is_finite() {
+                        min.0 = min.0.min(a.0.min(b.0));
+                        min.1 = min.1.min(a.1.min(b.1));
+                        max.0 = max.0.max(a.0.max(b.0));
+                        max.1 = max.1.max(a.1.max(b.1));
+                        has_finite = true;
+                    }
+                }
+            }
+            let (vx, vy, vw, vh) = if has_finite {
+                (
+                    min.0 - 20.0,
+                    min.1 - 20.0,
+                    (max.0 - min.0 + 40.0).max(1.0),
+                    (max.1 - min.1 + 40.0).max(1.0),
+                )
+            } else {
+                (0.0, 0.0, f64::from(width), f64::from(height))
+            };
+            let mut svg = format!(
+                "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\" viewBox=\"{} {} {} {}\"><rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" fill=\"#FAFAF9\"/>",
+                svg_num(vx),
+                svg_num(vy),
+                svg_num(vw),
+                svg_num(vh),
+                svg_num(vx),
+                svg_num(vy),
+                svg_num(vw),
+                svg_num(vh)
+            );
+            for element in page.doc.elements() {
+                push_whiteboard_element_svg(&mut svg, element);
+            }
+            svg.push_str("</svg>");
+            (page.title.clone(), svg)
+        })
+        .collect()
+}
+
+/// Guiones asociados a una etiqueta de objeto (comandos `OnClick`/`OnUpdate`).
+///
+/// Los guiones ya pasaron el allowlist al guardarse. `OnClick` se ejecuta
+/// desde la piel; `OnUpdate` queda diferido a P3c con su diseño de
+/// ejecución (tracking de cambios + presupuesto de recursión en el commit).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObjectScripts {
+    /// Guion al hacer click sobre el objeto (una o varias líneas `;`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_click: Option<String>,
+    /// Guion al actualizarse el objeto (almacenado; ejecución en P3c).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_update: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Document {
+    /// The main document containing all geometric objects.
+    // Migración P0 HashMap→BTreeMap (cerebro-audit 2026-09-10): `objects`,
+    // `next_label_number`, `spreadsheet_coordinate_points`, `variables`
+    // (`VarMap`), `variable_meta` (`VarMetaMap`), `live_sequences` y
+    // `variables_assumptions` son BTreeMap (determinismo total en
+    // serialización, hashing e iteración; JSON idéntico en contenido, claves
+    // ordenadas). Determinismo reforzado vía `semantic_document_baseline`
+    // (BTreeMap sort en `to_value`) y `ValidatedDocument`.
+    // `sorted_variables()` queda como vista clonada (compatibilidad).
+    // `spreadsheet_variables` es `BTreeSet` (no `HashSet`): se serializa
+    // como arreglo ordenado (determinismo byte-igual en saves).
+    objects: BTreeMap<ObjectId, GeoObject>,
+    view: ViewTransform,
+    #[serde(skip)]
+    selection: Vec<ObjectId>,
+    #[serde(default, deserialize_with = "deserialize_next_label_numbers")]
+    next_label_number: BTreeMap<String, usize>,
+    pub variables: VarMap,
+    /// Hipótesis simbólicas por variable (ej. "x" -> "positive" para `Assume[x>0]`).
+    /// Stub persistido para el CAS; las claves son identificadores válidos y los
+    /// valores describen la restricción (positive, nonzero, real, integer, etc.).
+    #[serde(default)]
+    pub variables_assumptions: BTreeMap<String, String>,
+    /// Guiones por etiqueta (`OnClick`/`OnUpdate`, comandos P3b).
+    ///
+    /// Se validan contra el allowlist en `validate_document`
+    /// (`validation::validate_object_scripts`, espejo de
+    /// `check_script_allowlist` de `grafito-command`); la ejecución de
+    /// `OnClick` vive en la piel (click) y la de `OnUpdate` queda diferida
+    /// a P3c (requiere tracking de cambios por objeto en el commit).
+    #[serde(default)]
+    pub object_scripts: BTreeMap<String, ObjectScripts>,
+    /// Guion `OnLoad` del documento (P3b: almacenado; ejecución en P3c).
+    #[serde(default)]
+    pub on_load_script: Option<String>,
+    #[serde(default)]
+    variable_meta: VarMetaMap,
+    pub spreadsheet: Vec<Vec<String>>,
+    /// Celdas CAS locales enviadas explícitamente; no hay borradores en este
+    /// modelo para que save/open no puedan perder texto parcialmente editado.
+    #[serde(default)]
+    cas_worksheet: Vec<CasWorksheetEntry>,
+    #[serde(default)]
+    spreadsheet_variables: BTreeSet<String>,
+    #[serde(default)]
+    spreadsheet_coordinate_points: BTreeMap<String, ObjectId>,
+    #[serde(skip)]
+    pub spatial: crate::spatial::SpatialIndex,
+    #[serde(skip)]
+    pub spatial_dirty: bool,
+    #[serde(skip)]
+    spatial_variables_hash: u64,
+    pub complex_base_symbol: String,
+    #[serde(default)]
+    pub constraints: ConstraintGraph,
+    /// Pizarra libre persistente (Scandinavian, inline teaching) — opcional y
+    /// acotada: se serializa en el documento y aparece en Mora/pizarra.
+    #[serde(default)]
+    pub whiteboard: grafito_whiteboard::WhiteboardDoc,
+    /// Libro completo de pizarra (hojas 1..=32 con título, vista y contenido).
+    /// Vacío = documento legado: se migra desde `whiteboard` sin pérdida vía
+    /// `ensure_whiteboard_book_migrated`; `whiteboard` es el espejo de la hoja
+    /// actual para el export SVG existente y `ValidatedDocument`.
+    #[serde(default, deserialize_with = "deserialize_whiteboard_pages_capped")]
+    pub whiteboard_pages: Vec<WhiteboardPageData>,
+    /// Índice de la hoja actual en `whiteboard_pages` (acotado al leer).
+    #[serde(default)]
+    pub whiteboard_current: usize,
+    #[serde(skip)]
+    pub render_quality: crate::RenderQuality,
+    #[serde(skip)]
+    pub last_solution: HashMap<(ObjectId, ObjField), f64>,
+    #[serde(skip)]
+    pub version: u64,
+    /// Nonce de identidad para caches thread-local keyeados por versión
+    /// (`ORDERED_VISIBLE_CACHE`, `DISPLAY_OVERRIDE_CACHE` en render): dos
+    /// documentos distintos pueden compartir versión (nuevo archivo tras
+    /// cerrar otro) y sin esto el segundo dibuja los ids del primero.
+    /// Fresco en `new`/deserialize, preservado en `clone` (los snapshots
+    /// de undo son el mismo documento lógico y comparten caché).
+    #[serde(skip_serializing, default = "fresh_cache_nonce")]
+    pub cache_nonce: u64,
+    #[serde(skip)]
+    pub cached_vars_list: CachedVarsList,
+    /// Memo de `estimated_bytes` por `version` (Ola 2 B3): el peso solo se
+    /// re-serializa cuando la versión cambia (cada commit la bumpea). Sin
+    /// esto, cada push/evicción de undo serializaba el documento entero a
+    /// JSON (hasta ~50 serializaciones por edición con la pila llena).
+    /// `Arc<Mutex<..>>` (y no `Cell`): `Document` debe seguir `Send + Sync`
+    /// (callbacks wgpu, temp-data de egui). Compartir el memo entre clones
+    /// es correcto porque va keyeado por versión.
+    #[serde(skip, default)]
+    estimated_bytes_cache: std::sync::Arc<std::sync::Mutex<Option<(u64, usize)>>>,
+    /// Memo de partes del contexto del asistente por `version` (Ola 4):
+    /// `document_context` serializaba cada objeto visible en CADA envío
+    /// (5000 objetos = miles de `String`s por mensaje del agente).
+    /// Acá se cachean las partes caras (etiqueta/tipo/huella + variables);
+    /// el ensamblado final (`from_parts`: sort + FNV, sin serde) corre
+    /// siempre. `Arc` para compartir entre clones e hilos de workers.
+    #[serde(skip, default)]
+    context_parts_cache: std::sync::Arc<std::sync::Mutex<Option<(u64, ContextParts)>>>,
+    /// Secuencias vivas: DataTable backing con recálculo automático al cambiar variables.
+    #[serde(default)]
+    pub live_sequences: BTreeMap<ObjectId, LiveSequenceBinding>,
+    /// Rastro por objeto (GeoGebra "trace"): ids con estela activada. Persiste
+    /// (`#[serde(default)]` = migración automática desde JSON viejo); el
+    /// contenido de la estela (`trails`) es efímero y nunca se serializa.
+    #[serde(default)]
+    trace_enabled: BTreeMap<ObjectId, bool>,
+    /// Muestras de la estela por objeto (efímeras, fuera de `PartialEq`/hash).
+    #[serde(skip)]
+    trails: BTreeMap<ObjectId, TrailBuffer>,
+    /// Plano numerado 2D (F2c): `true` = ticks + labels + origen en el canvas.
+    /// Toggle en panel Vista. `#[serde(default = ...)]` migra JSON viejo a
+    /// visible (comportamiento histórico). Solo vista, sin validación.
+    #[serde(default = "default_number_plane_labels")]
+    pub number_plane_labels: bool,
+    /// Capas de dibujo por objeto (frente Q2: capas reales persistentes).
+    ///
+    /// `objeto → capa 0..=255` (0 = fondo, como GeoGebra). `#[serde(default)]`
+    /// migra JSON viejo a "todo en capa 0" = orden histórico. El orden de
+    /// pintado es `(capa, ObjectId)` en `ordered_visible_2d_objects`.
+    /// Solo crece vía [`Self::set_layer`] (objeto existente + rango válido);
+    /// se poda en [`Self::remove_object`] y [`Self::prune_layers`].
+    #[serde(default)]
+    layers: BTreeMap<ObjectId, u32>,
+    /// Flags de display por etiqueta (`Set*[etiqueta, …]`, frente P4).
+    ///
+    /// `etiqueta → DisplayFlags` (ver `object.rs::DisplayFlags` + store
+    /// `ggbscript::DisplayStore`). `#[serde(default)]` migra JSON viejo a
+    /// vacío = comportamiento histórico. Se poda en `remove_object` por
+    /// etiqueta; el renombrado deja la entrada vieja huérfana (lookup por
+    /// etiqueta nueva da default, sin mentir).
+    #[serde(default)]
+    pub display_flags: BTreeMap<String, crate::DisplayFlags>,
+}
+
+/// Máximo de muestras por estela de rastro (512 pts × 16 B ≈ 8 KiB/objeto).
+pub const MAX_TRAIL_POINTS: usize = 512;
+
+/// Buffer FIFO de muestras 2D para el rastro de un objeto.
+///
+/// Ola 2: `VecDeque` en vez de `Vec` — la evicción del más antiguo es
+/// `pop_front` O(1) en lugar de `remove(0)` O(n).
+///
+/// Efímero: filtra `NaN`/`Inf` al empujar, evicciona el más antiguo al superar
+/// [`MAX_TRAIL_POINTS`]. El renderer lo dibuja con fade `(i+1)/len`.
+#[derive(Debug, Clone, Default)]
+pub struct TrailBuffer {
+    points: VecDeque<Point2>,
+}
+
+impl TrailBuffer {
+    /// Buffer vacío.
+    pub fn new() -> Self {
+        Self {
+            points: VecDeque::new(),
+        }
+    }
+
+    /// Empuja una muestra; ignora no-finitos. Retorna `true` si se guardó.
+    pub fn push(&mut self, p: Point2) -> bool {
+        if !p.x.is_finite() || !p.y.is_finite() {
+            return false;
+        }
+        if self.points.len() >= MAX_TRAIL_POINTS {
+            self.points.pop_front();
+        }
+        self.points.push_back(p);
+        true
+    }
+
+    /// Vacía el buffer.
+    pub fn clear(&mut self) {
+        self.points.clear();
+    }
+
+    /// Número de muestras.
+    pub fn len(&self) -> usize {
+        self.points.len()
+    }
+
+    /// ¿Vacío?
+    pub fn is_empty(&self) -> bool {
+        self.points.is_empty()
+    }
+
+    /// Copia ordenada (más antigua primero) para el renderer.
+    pub fn as_vec(&self) -> Vec<Point2> {
+        self.points.iter().copied().collect()
+    }
+
+    /// Última muestra sin clonar el buffer (throttle del renderer).
+    pub fn last(&self) -> Option<Point2> {
+        self.points.back().copied()
+    }
+
+    /// Rebanada contigua sin clonar. Reordena el anillo si está partido
+    /// (`make_contiguous`, típicamente no-op); la secuencia lógica intacta.
+    pub fn points_contiguous(&mut self) -> &[Point2] {
+        self.points.make_contiguous()
+    }
+}
+
+impl Default for Document {
+    fn default() -> Self {
+        Self {
+            objects: BTreeMap::new(),
+            view: ViewTransform::default(),
+            selection: Vec::new(),
+            next_label_number: BTreeMap::new(),
+            variables: BTreeMap::new(),
+            variables_assumptions: BTreeMap::new(),
+            object_scripts: BTreeMap::new(),
+            on_load_script: None,
+            variable_meta: BTreeMap::new(),
+            spreadsheet: Vec::new(),
+            cas_worksheet: Vec::new(),
+            spreadsheet_variables: BTreeSet::new(),
+            spreadsheet_coordinate_points: BTreeMap::new(),
+            spatial: crate::spatial::SpatialIndex::new(),
+            spatial_dirty: true,
+            spatial_variables_hash: 0,
+            complex_base_symbol: "z".to_string(),
+            constraints: ConstraintGraph::new(),
+            whiteboard: grafito_whiteboard::WhiteboardDoc::default(),
+            whiteboard_pages: Vec::new(),
+            whiteboard_current: 0,
+            render_quality: crate::RenderQuality::default(),
+            last_solution: HashMap::new(),
+            version: 0,
+            cache_nonce: fresh_cache_nonce(),
+            cached_vars_list: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            estimated_bytes_cache: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            context_parts_cache: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            live_sequences: BTreeMap::new(),
+            trace_enabled: BTreeMap::new(),
+            trails: BTreeMap::new(),
+            number_plane_labels: true,
+            layers: BTreeMap::new(),
+            display_flags: BTreeMap::new(),
+        }
+    }
+}
+
+impl Document {
+    fn auto_label(&mut self, base_name: &str, id: ObjectId) -> Result<String, String> {
+        let used_labels: HashSet<String> = self
+            .objects
+            .values()
+            .map(|object| object.label().to_owned())
+            .collect();
+        let start = self
+            .next_label_number
+            .get(base_name)
+            .copied()
+            .map(canonical_label_counter)
+            .unwrap_or(1);
+
+        for number in (start..=MAX_AUTO_LABEL_NUMBER).chain(1..start) {
+            let label = if number == 1 {
+                base_name.to_string()
+            } else {
+                format!("{}{}", base_name, to_subscript(number - 1))
+            };
+            if used_labels.contains(&label) {
+                continue;
+            }
+            if label.len() > crate::validation::MAX_STRING_LENGTH {
+                return Err("Generated object label exceeds maximum length".to_string());
+            }
+
+            let next = number
+                .checked_add(1)
+                .filter(|next| *next <= MAX_AUTO_LABEL_NUMBER)
+                .unwrap_or(1);
+            self.next_label_number.insert(base_name.to_string(), next);
+            return Ok(label);
+        }
+
+        // A valid document contains at most MAX_OBJECT_COUNT objects, so this
+        // fallback is only reachable for malformed in-memory documents.
+        let label = format!("{base_name}_{}", id.0);
+        if label.len() > crate::validation::MAX_STRING_LENGTH {
+            Err("Generated object label exceeds maximum length".to_string())
+        } else {
+            Ok(label)
+        }
+    }
+
+    pub(crate) fn validate_label_counters(&self) -> Result<(), String> {
+        for (base, counter) in &self.next_label_number {
+            if base.len() > crate::validation::MAX_STRING_LENGTH {
+                return Err("Automatic label base exceeds maximum length".to_string());
+            }
+            if *counter != canonical_label_counter(*counter) {
+                return Err("Automatic label counter is outside its valid range".to_string());
+            }
+        }
+        Ok(())
+    }
+
+    /// Clones semantic state for a transaction without sharing mutable runtime
+    /// caches with the live document. This keeps rejected staged work from
+    /// invalidating render caches or expression-variable caches in place.
+    pub fn detached_clone_for_staging(&self) -> Self {
+        let mut staged = self.clone();
+        staged.spatial = crate::spatial::SpatialIndex::new();
+        staged.spatial_dirty = true;
+        staged.spatial_variables_hash = 0;
+        staged.cached_vars_list = Default::default();
+        // Memos por versión frescos: un clon staged puede mutar antes de
+        // asignar su próxima versión; compartir el `Arc` del memo con el
+        // documento vivo permitiría guardar partes/pesos de un contenido que
+        // no le corresponde a esa versión (lectura stale en el memo del vivo).
+        staged.estimated_bytes_cache = std::sync::Arc::new(std::sync::Mutex::new(None));
+        staged.context_parts_cache = std::sync::Arc::new(std::sync::Mutex::new(None));
+        for object in staged.objects.values_mut() {
+            object.detach_runtime_caches();
+        }
+        staged
+    }
+
+    /// Stages and validates several mutations before committing one revision.
+    ///
+    /// Optimización vs 3 clones previos:
+    /// - `before` es el único `clone()` completo del documento vivo.
+    /// - `staged` se deriva de `before.detached_clone_for_staging()` reutilizando
+    ///   el clon ya hecho (evita `self.clone()` + `self.detached_clone`).
+    /// - `after` se obtiene clonando `staged` una sola vez; `*self = staged`
+    ///   mueve sin clone adicional. Esto reduce de 3 clones + `detached` a
+    ///   2 clones + `detached` (antes: `before.clone` + `self.detached_clone`
+    ///   (clone interno) + `staged.clone` para `after`). Futuro: migrar
+    ///   `ChangeSet` a `Arc<Document>` para compartir `before`/`after` sin
+    ///   clones; por ahora se mantiene `Document` por compatibilidad con
+    ///   `VecDeque<ChangeSet>` y `undo` existentes (task: usar `Arc` si existe
+    ///   o `std::mem::take`/`detached_clone_for_staging`; se elige lo segundo
+    ///   para evitar breaking change de API pública en esta ventana).
+    pub fn commit(&mut self, batch: OperationBatch) -> Result<ChangeSet, String> {
+        let before = self.clone();
+        let mut staged = before.detached_clone_for_staging();
+        for operation in batch.operations {
+            operation(&mut staged)?;
+        }
+        crate::validation::validate_document(&staged)?;
+        if ChangeSet::same_semantic_state(&before, &staged)? {
+            return Ok(ChangeSet {
+                before: before.clone(),
+                after: before,
+            });
+        }
+        staged.version = before.version.wrapping_add(1);
+        staged.spatial_dirty = true;
+        let after = staged.clone();
+        *self = staged;
+        Ok(ChangeSet { before, after })
+    }
+
+    pub fn bump_version(&mut self) {
+        self.version = self.version.wrapping_add(1);
+    }
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn invalidate_all_caches(&self) {
+        for obj in self.objects.values() {
+            obj.invalidate_cache();
+        }
+    }
+
+    pub fn migrate_complex_symbol(&mut self, new_symbol: &str) {
+        let old = self.complex_base_symbol.clone();
+        if old == new_symbol {
+            return;
+        }
+
+        self.complex_base_symbol = new_symbol.to_string();
+        self.bump_version();
+
+        // Helper: reemplaza `old` por `new_symbol` sólo cuando aparezca como
+        // word (boundary chars no alfanum/underscore/subscripts). Trabaja en
+        // `char` para no romper con Unicode (subíndices son multibyte).
+        let rewrite_expr = |expr: &str| -> String {
+            if expr.is_empty() || old.is_empty() {
+                return expr.to_string();
+            }
+            let chars: Vec<char> = expr.chars().collect();
+            let old_chars: Vec<char> = old.chars().collect();
+            let n = chars.len();
+            let m = old_chars.len();
+            let mut out = String::with_capacity(expr.len());
+            let mut i = 0;
+            while i < n {
+                if i + m <= n && chars[i..i + m] == old_chars[..] {
+                    let prev = if i == 0 { ' ' } else { chars[i - 1] };
+                    let next = if i + m >= n { ' ' } else { chars[i + m] };
+                    let is_boundary = |c: char| {
+                        !c.is_alphanumeric()
+                            && c != '_'
+                            && !matches!(
+                                c,
+                                '₀' | '₁' | '₂' | '₃' | '₄' | '₅' | '₆' | '₇' | '₈' | '₉'
+                            )
+                    };
+                    if is_boundary(prev) && is_boundary(next) {
+                        out.push_str(new_symbol);
+                        i += m;
+                        continue;
+                    }
+                }
+                out.push(chars[i]);
+                i += 1;
+            }
+            out
+        };
+
+        let mut label_updates: Vec<(ObjectId, String)> = Vec::new();
+        let mut expr_updates: Vec<(ObjectId, String)> = Vec::new();
+        for (id, obj) in &self.objects {
+            // --- Label rename ---
+            let label = obj.label().to_string();
+            if label.starts_with(&old) {
+                let rest = &label[old.len()..];
+                let is_subscript = rest.is_empty()
+                    || rest.chars().all(|c| {
+                        matches!(c, '₀' | '₁' | '₂' | '₃' | '₄' | '₅' | '₆' | '₇' | '₈' | '₉')
+                    });
+                if is_subscript {
+                    label_updates.push((*id, format!("{}{}", new_symbol, rest)));
+                }
+            }
+            // --- Expr token rewrite ---
+            let new_expr_opt = match obj {
+                GeoObject::ComplexGrid(o) => {
+                    let r = rewrite_expr(&o.expr);
+                    if r != o.expr {
+                        Some(r)
+                    } else {
+                        None
+                    }
+                }
+                GeoObject::ComplexMapping(o) => {
+                    let r = rewrite_expr(&o.expr);
+                    if r != o.expr {
+                        Some(r)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            if let Some(new_expr) = new_expr_opt {
+                expr_updates.push((*id, new_expr));
+            }
+        }
+
+        for (id, new_label) in label_updates {
+            if let Some(obj) = self.objects.get_mut(&id) {
+                match obj {
+                    GeoObject::ComplexGrid(o) => o.label = new_label,
+                    GeoObject::ComplexMapping(o) => o.label = new_label,
+                    _ => {}
+                }
+            }
+        }
+        for (id, new_expr) in expr_updates {
+            if let Some(obj) = self.objects.get_mut(&id) {
+                match obj {
+                    GeoObject::ComplexGrid(o) => o.expr = new_expr,
+                    GeoObject::ComplexMapping(o) => o.expr = new_expr,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Inserta un punto libre sólo si su posición y estilo son válidos.
+    pub fn try_add_point(&mut self, pos: Point2) -> Result<ObjectId, String> {
+        self.try_add_object(GeoObject::Point(PointObj::new(pos)))
+    }
+
+    /// Crea un lugar geométrico persistente que registra la posición final del
+    /// punto objetivo cada vez que el grafo alcanza un estado válido.
+    pub fn try_add_locus(
+        &mut self,
+        driver: ObjectId,
+        target: ObjectId,
+    ) -> Result<(ObjectId, usize), String> {
+        if driver == target {
+            return Err("Locus: los puntos de entrada deben ser distintos".to_string());
+        }
+        if !matches!(self.get_object(driver), Some(GeoObject::Point(_)))
+            || !matches!(self.get_object(target), Some(GeoObject::Point(_)))
+        {
+            return Err("Locus: las entradas deben ser puntos".to_string());
+        }
+        let target_position = match self.get_object(target) {
+            Some(GeoObject::Point(point)) => point.position,
+            _ => return Err("Locus: no se encontró el punto objetivo".to_string()),
+        };
+        if !target_position.x.is_finite() || !target_position.y.is_finite() {
+            return Err("Locus: el punto objetivo debe tener coordenadas finitas".to_string());
+        }
+
+        let locus = crate::PencilObj::new(vec![target_position]).with_locus_binding(driver, target);
+        self.try_add_constructed_object(GeoObject::Pencil(locus), "Locus", &[driver, target])
+    }
+
+    /// Variante de compatibilidad que falla de forma visible ante un punto inválido.
+    #[deprecated(note = "use try_add_point")]
+    #[track_caller]
+    pub fn add_point(&mut self, pos: Point2) -> ObjectId {
+        match self.try_add_point(pos) {
+            Ok(id) => id,
+            Err(error) => {
+                log::error!("Document::add_point rejected point: {error}");
+                debug_assert!(false, "Document::add_point rejected point: {error}");
+                ObjectId::new()
+            }
+        }
+    }
+
+    /// Inserts one free object while enforcing document-wide hard limits and
+    /// unambiguous labels. Rejection leaves the document untouched.
+    pub fn try_add_object(&mut self, obj: GeoObject) -> Result<ObjectId, String> {
+        let id = obj.id();
+        if self.objects.len() >= crate::validation::MAX_OBJECT_COUNT {
+            return Err(format!(
+                "Document reached the maximum of {} objects",
+                crate::validation::MAX_OBJECT_COUNT
+            ));
+        }
+        if self.objects.contains_key(&id) {
+            return Err(format!("Object {id} already exists"));
+        }
+        crate::validation::validate_object_candidate(self, &obj)?;
+        if !obj.label().is_empty()
+            && self
+                .objects
+                .values()
+                .any(|existing| existing.label() == obj.label())
+        {
+            return Err(format!("Object label '{}' is already in use", obj.label()));
+        }
+
+        // Auto-label if empty
+        let obj = if obj.label().is_empty() {
+            let mut obj = obj;
+            let name = obj.name();
+            let base_name = match &obj {
+                GeoObject::ComplexGrid(_) | GeoObject::ComplexMapping(_) => {
+                    self.complex_base_symbol.clone()
+                }
+                _ => name
+                    .chars()
+                    .next()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "?".to_string()),
+            };
+            let label = self.auto_label(&base_name, id)?;
+            obj.set_label(label);
+            crate::validation::validate_object_candidate(self, &obj)?;
+            obj
+        } else {
+            obj
+        };
+        self.objects.insert(id, obj);
+        self.constraints.add_free_object(id);
+        self.spatial_dirty = true;
+        self.bump_version();
+        Ok(id)
+    }
+
+    /// Reemplaza un objeto existente sólo cuando el documento completo sigue
+    /// siendo válido. El candidato se aplica sobre una copia aislada para que
+    /// un rechazo no altere el documento vivo ni sus cachés de ejecución.
+    pub fn try_replace_object(
+        &mut self,
+        id: ObjectId,
+        candidate: GeoObject,
+    ) -> Result<bool, String> {
+        Ok(self
+            .try_replace_object_with_previous(id, candidate)?
+            .is_some())
+    }
+
+    /// Reemplaza un objeto validado y devuelve el documento anterior sólo tras
+    /// un commit exitoso. Los editores usan ese estado para el historial sin
+    /// clonar el documento ni comparar JSON en rechazos o no-ops.
+    pub fn try_replace_object_with_previous(
+        &mut self,
+        id: ObjectId,
+        mut candidate: GeoObject,
+    ) -> Result<Option<Self>, String> {
+        if candidate.id() != id {
+            return Err(format!(
+                "Replacement candidate id {} does not match target id {}",
+                candidate.id(),
+                id
+            ));
+        }
+        let Some(existing) = self.objects.get(&id) else {
+            return Ok(None);
+        };
+        if existing == &candidate {
+            return Ok(None);
+        }
+        if !candidate.label().is_empty()
+            && candidate.label() != existing.label()
+            && self.objects.iter().any(|(existing_id, object)| {
+                *existing_id != id && object.label() == candidate.label()
+            })
+        {
+            return Err(format!(
+                "Object label '{}' is already in use",
+                candidate.label()
+            ));
+        }
+
+        let mut staged = self.detached_clone_for_staging();
+        let Some(slot) = staged.objects.get_mut(&id) else {
+            return Ok(None);
+        };
+        candidate.detach_runtime_caches();
+        *slot = candidate;
+        crate::validation::validate_document(&staged)?;
+        staged.version = self.version.wrapping_add(1);
+        staged.spatial_dirty = true;
+        Ok(Some(std::mem::replace(self, staged)))
+    }
+
+    /// Compatibility wrapper for callers that cannot return insertion errors.
+    ///
+    /// # Panics
+    ///
+    /// Hace panic si la inserción fue rechazada. Antes devolvía `ObjectId::new()`
+    /// — un id **que no existe en `objects`**: el `debug_assert` que lo cubría
+    /// desaparece en release, así que el caller creía haber insertado el objeto y
+    /// quedaba con un id colgado. Todo uso posterior (`get_object`, restricciones,
+    /// `ChangeSet`) devolvía `None` en silencio, y el fallo se manifestaba mucho
+    /// más lejos: un objeto que no responde al zoom, un undo que no deshace lo que
+    /// el usuario acaba de crear.
+    ///
+    /// Devolver un id falso era peor que fallar — escondía el error detrás de un
+    /// `ObjectId` plausible. Los callers que pueden propagar el error usan
+    /// [`Document::try_add_object`]; el guard `production_insertions.rs` impide que
+    /// los nuevos usen este wrapper.
+    #[deprecated(note = "use try_add_object")]
+    #[track_caller]
+    pub fn add_object(&mut self, obj: GeoObject) -> ObjectId {
+        match self.try_add_object(obj) {
+            Ok(id) => id,
+            Err(error) => {
+                log::error!("Document::add_object rejected object: {error}");
+                panic!("Document::add_object rejected object: {error}");
+            }
+        }
+    }
+
+    pub fn add_constructed_object(
+        &mut self,
+        obj: GeoObject,
+        constraint_name: &str,
+        inputs: &[ObjectId],
+    ) -> (ObjectId, usize) {
+        self.add_constructed_object_with_params(obj, constraint_name, inputs, BTreeMap::new())
+    }
+
+    /// Add a constructed object only when its constraint can be registered.
+    pub fn try_add_constructed_object(
+        &mut self,
+        obj: GeoObject,
+        constraint_name: &str,
+        inputs: &[ObjectId],
+    ) -> Result<(ObjectId, usize), String> {
+        self.try_add_constructed_object_with_params(obj, constraint_name, inputs, BTreeMap::new())
+    }
+
+    /// Legacy construction API. On rejection it logs the error and returns an
+    /// unregistered object ID with `usize::MAX` as the constraint ID.
+    pub fn add_constructed_object_with_params(
+        &mut self,
+        obj: GeoObject,
+        constraint_name: &str,
+        inputs: &[ObjectId],
+        params: BTreeMap<String, f64>,
+    ) -> (ObjectId, usize) {
+        self.try_add_constructed_object_with_params(obj, constraint_name, inputs, params)
+            .unwrap_or_else(|error| {
+                log::warn!("{error}");
+                (ObjectId::new(), usize::MAX)
+            })
+    }
+
+    /// Add a constructed object with constraint parameters only when the graph
+    /// has capacity and a representable next identifier.
+    pub fn try_add_constructed_object_with_params(
+        &mut self,
+        obj: GeoObject,
+        constraint_name: &str,
+        inputs: &[ObjectId],
+        params: BTreeMap<String, f64>,
+    ) -> Result<(ObjectId, usize), String> {
+        let id = obj.id();
+        self.validate_constructive_constraint_parts(constraint_name, inputs, &obj, &params)?;
+        self.constraints
+            .validate_new_constraint(constraint_name, inputs, &[id], &params)?;
+        // W-B: el grafo es un DAG; la creación que cerraría un ciclo se rechaza
+        // aquí (fail-closed) en vez de degradar el orden topológico.
+        if self.constraints.would_create_cycle(inputs, &[id]) {
+            return Err(format!(
+                "{constraint_name}: la construcción cerraría un ciclo de dependencias"
+            ));
+        }
+
+        let mut staged = self.detached_clone_for_staging();
+        let id = staged.try_add_object(obj)?;
+        let constraint_id = staged.constraints.try_add_constraint(
+            constraint_name,
+            inputs.to_vec(),
+            vec![id],
+            params,
+        )?;
+        staged.apply_constructive_constraints(&[constraint_id])?;
+        crate::validation::validate_document(&staged)?;
+        staged.version = self.version.wrapping_add(1);
+        staged.spatial_dirty = true;
+        *self = staged;
+        Ok((id, constraint_id))
+    }
+
+    pub fn remove_object(&mut self, id: ObjectId) -> Option<GeoObject> {
+        self.bump_version();
+        let referencing_objects: Vec<ObjectId> = self
+            .objects
+            .iter()
+            .filter_map(|(candidate_id, object)| {
+                object
+                    .referenced_object_ids()
+                    .contains(&id)
+                    .then_some(*candidate_id)
+            })
+            .collect();
+        // Eliminar del grafo de restricciones y recolectar los outputs que
+        // quedaron huérfanos (constraints eliminadas que producían esos
+        // objetos). Esos outputs ya no son impulsados por ninguna
+        // restricción, así que también deben eliminarse del documento de
+        // forma recursiva: un output huérfano podría ser a su vez input de
+        // otra restricción, lo que dispara una nueva cascada.
+        let orphaned = self.constraints.remove_object(id);
+        self.spatial_dirty = true;
+        self.selection.retain(|&s| s != id);
+        self.trace_enabled.remove(&id);
+        self.trails.remove(&id);
+        self.layers.remove(&id);
+        // Frente P4: poda del store de display por etiqueta (lookup honesto:
+        // sin entrada → flags default, comportamiento histórico).
+        if let Some(obj) = self.objects.get(&id) {
+            let label = obj.label().to_string();
+            if !label.is_empty() {
+                self.display_flags.remove(&label);
+            }
+        }
+        self.spreadsheet_coordinate_points
+            .retain(|_, point_id| *point_id != id);
+        self.live_sequences.remove(&id);
+        let removed = self.objects.remove(&id);
+        for out in orphaned {
+            // Evitar doble eliminación si el output era el propio `id`.
+            if out != id {
+                let _ = self.remove_object(out);
+            }
+        }
+        for dependent in referencing_objects {
+            if dependent != id {
+                let _ = self.remove_object(dependent);
+            }
+        }
+        removed
+    }
+
+    /// Compatibility wrapper that moves a free point and propagates every
+    /// dependency atomically. Failure is logged and reported as no affected IDs.
+    pub fn move_point(&mut self, id: ObjectId, new_pos: Point2) -> Vec<ObjectId> {
+        if !self.constraints.is_free(&id)
+            || !matches!(self.objects.get(&id), Some(GeoObject::Point(point)) if point.position != new_pos)
+        {
+            return vec![];
+        }
+        let mut affected = vec![id];
+        let constraint_order = self.constraints.get_update_order(&[id]);
+        for cons_id in constraint_order {
+            if let Some(cons) = self.constraints.get_constraint(cons_id) {
+                affected.extend(cons.outputs.iter().cloned());
+            }
+        }
+        match self.try_move_point_and_re_evaluate(id, new_pos) {
+            Ok(true) => affected,
+            Ok(false) => Vec::new(),
+            Err(error) => {
+                log::warn!("{error}");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Moves a free point and reevaluates every affected constraint as one
+    /// transaction. A failed numeric solve leaves the live source and all
+    /// derived geometry exactly as they were before the drag update.
+    pub fn try_move_point_and_re_evaluate(
+        &mut self,
+        id: ObjectId,
+        new_pos: Point2,
+    ) -> Result<bool, String> {
+        if !new_pos.x.is_finite() || !new_pos.y.is_finite() {
+            return Err("Point position must be finite".to_string());
+        }
+        self.try_update_point_and_re_evaluate(id, |point| {
+            point.position = new_pos;
+            Ok(())
+        })
+    }
+
+    /// Applies a free-point mutation and all dependent constraints on a
+    /// detached document, committing only a fully valid final state.
+    pub fn try_update_point_and_re_evaluate<F>(
+        &mut self,
+        id: ObjectId,
+        update: F,
+    ) -> Result<bool, String>
+    where
+        F: FnOnce(&mut PointObj) -> Result<(), String>,
+    {
+        if self
+            .spreadsheet_coordinate_points
+            .values()
+            .any(|point_id| *point_id == id)
+        {
+            return Err("spreadsheet coordinate points must be edited in their cell".to_string());
+        }
+        if !self.constraints.is_free(&id)
+            || !matches!(self.objects.get(&id), Some(GeoObject::Point(_)))
+        {
+            return Ok(false);
+        }
+
+        let mut staged = self.detached_clone_for_staging();
+        {
+            let Some(GeoObject::Point(point)) = staged.objects.get_mut(&id) else {
+                return Ok(false);
+            };
+            update(point)?;
+        }
+
+        if ChangeSet::same_semantic_state(self, &staged)? {
+            return Ok(false);
+        }
+        // W-B: el arrastre redefine el punto (GeoGebra). Sólo tras confirmar
+        // que hubo cambio real: un binding de fórmula constante (`A = (0, 0)`
+        // guarda `x_expr = "0"`) se libera y la mutación geométrica pasa a ser
+        // la definición. Una fórmula viva (menciona variables del documento)
+        // se rechaza con error honesto en vez del anterior snap-back
+        // silencioso que revertía el gesto sin avisar.
+        let Some(GeoObject::Point(point)) = staged.objects.get_mut(&id) else {
+            return Ok(false);
+        };
+        let live_axis = ["x", "y"]
+            .into_iter()
+            .zip([&point.x_expr, &point.y_expr])
+            .find(|(_, binding)| {
+                binding
+                    .as_deref()
+                    .is_some_and(|expr| expr_references_variables(expr, &self.variables))
+            })
+            .map(|(axis, _)| axis);
+        if let Some(axis) = live_axis {
+            return Err(format!(
+                "Point {id}: la coordenada {axis} tiene fórmula viva; se edita con SetValue o su expresión"
+            ));
+        }
+        point.x_expr = None;
+        point.y_expr = None;
+
+        let order = staged.propagation_order(&[id]);
+        // W-B: presupuestos por frame de arrastre (I/O cero: todo en memoria).
+        // Sólo se re-evalúa el subgrafo sucio; un gesto a 60fps nunca recorre
+        // el documento entero. El rechazo deja el estado vivo intacto.
+        if order.len() > MAX_DRAG_REEVALS_PER_FRAME {
+            return Err(format!(
+                "Arrastre: {} re-evaluaciones exceden el máximo por frame {MAX_DRAG_REEVALS_PER_FRAME}",
+                order.len()
+            ));
+        }
+        let depth = staged.constraints.downstream_depth(&[id]);
+        if depth > MAX_DRAG_PROPAGATION_DEPTH {
+            return Err(format!(
+                "Arrastre: profundidad {depth} excede el máximo {MAX_DRAG_PROPAGATION_DEPTH}"
+            ));
+        }
+        let fanout: usize = order
+            .iter()
+            .filter_map(|cons_id| staged.constraints.get_constraint(*cons_id))
+            .map(|cons| cons.outputs.len())
+            .sum();
+        if fanout > MAX_DRAG_FANOUT {
+            return Err(format!(
+                "Arrastre: fan-out {fanout} excede el máximo {MAX_DRAG_FANOUT}"
+            ));
+        }
+        staged.re_evaluate_constraints_in_place(&order)?;
+        // F3b: mover un punto es cambiar la fuente de `=x(A)` y de las
+        // coordenadas con fórmulas: se recomputa la hoja vinculada (incluye
+        // secuencias vivas y sync de gráficos) antes de validar.
+        staged.recompute_spreadsheet_variables()?;
+        crate::validation::validate_document(&staged)?;
+        staged.version = self.version.wrapping_add(1);
+        staged.spatial_dirty = true;
+        *self = staged;
+        Ok(true)
+    }
+
+    /// Move a free 3D point and return IDs of all affected objects.
+    pub fn move_point3d(
+        &mut self,
+        id: ObjectId,
+        new_pos: grafito_geometry::Point3D,
+    ) -> Vec<ObjectId> {
+        if !self.constraints.is_free(&id) {
+            return vec![];
+        }
+        let mut affected = vec![id];
+        if let Some(GeoObject::Point3D(p)) = self.get_object_mut(id) {
+            p.position = new_pos;
+            self.touch();
+        }
+        let constraint_order = self.constraints.get_update_order(&[id]);
+        for cons_id in constraint_order {
+            if let Some(cons) = self.constraints.get_constraint(cons_id) {
+                affected.extend(cons.outputs.iter().cloned());
+            }
+        }
+        affected
+    }
+
+    /// Get the update order for re-evaluating dependent objects when these IDs change.
+    pub fn propagation_order(&self, changed: &[ObjectId]) -> Vec<usize> {
+        self.constraints.get_update_order(changed)
+    }
+
+    pub fn is_free_object(&self, id: &ObjectId) -> bool {
+        self.constraints.is_free(id)
+    }
+
+    pub fn creator_of(&self, id: &ObjectId) -> Option<&crate::constraints::Constraint> {
+        self.constraints.creator_of(id)
+    }
+
+    /// Collect all free numeric variables that participate in any numeric
+    /// constraint (`Distance`, `Angle`, or `Tangent`).
+    pub fn build_solver_variables(&self) -> Vec<(ObjectId, ObjField)> {
+        let numeric_ids: Vec<usize> = self
+            .constraints
+            .iter()
+            .filter(|c| Self::is_numeric_constraint_name(&c.name))
+            .map(|c| c.id)
+            .collect();
+        self.build_solver_variables_for_constraints(&numeric_ids)
+    }
+
+    fn build_solver_variables_for_constraints(
+        &self,
+        numeric_ids: &[usize],
+    ) -> Vec<(ObjectId, ObjField)> {
+        let mut seen = HashSet::new();
+        let mut vars = Vec::new();
+
+        for &id in numeric_ids {
+            let Some(cons) = self.constraints.get_constraint(id) else {
+                continue;
+            };
+            for &input in &cons.inputs {
+                if !self.constraints.is_free(&input) {
+                    continue;
+                }
+                if let Some(obj) = self.get_object(input) {
+                    match obj {
+                        GeoObject::Point(_) => {
+                            if seen.insert((input, ObjField::PointX)) {
+                                vars.push((input, ObjField::PointX));
+                            }
+                            if seen.insert((input, ObjField::PointY)) {
+                                vars.push((input, ObjField::PointY));
+                            }
+                        }
+                        GeoObject::Circle(_) if seen.insert((input, ObjField::CircleRadius)) => {
+                            vars.push((input, ObjField::CircleRadius));
+                        }
+                        GeoObject::Line(_) => {
+                            if seen.insert((input, ObjField::LineStartX)) {
+                                vars.push((input, ObjField::LineStartX));
+                            }
+                            if seen.insert((input, ObjField::LineStartY)) {
+                                vars.push((input, ObjField::LineStartY));
+                            }
+                            if seen.insert((input, ObjField::LineEndX)) {
+                                vars.push((input, ObjField::LineEndX));
+                            }
+                            if seen.insert((input, ObjField::LineEndY)) {
+                                vars.push((input, ObjField::LineEndY));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        vars
+    }
+
+    fn get_field_value(&self, id: ObjectId, field: ObjField) -> Option<f64> {
+        match (self.get_object(id), field) {
+            (Some(GeoObject::Point(p)), ObjField::PointX) => Some(p.position.x),
+            (Some(GeoObject::Point(p)), ObjField::PointY) => Some(p.position.y),
+            (Some(GeoObject::Circle(c)), ObjField::CircleRadius) => Some(c.radius),
+            (Some(GeoObject::Line(l)), ObjField::LineStartX) => Some(l.start.x),
+            (Some(GeoObject::Line(l)), ObjField::LineStartY) => Some(l.start.y),
+            (Some(GeoObject::Line(l)), ObjField::LineEndX) => Some(l.end.x),
+            (Some(GeoObject::Line(l)), ObjField::LineEndY) => Some(l.end.y),
+            _ => None,
+        }
+    }
+
+    /// Lee un campo del solver con error honesto ante desync tipo↔campo.
+    ///
+    /// Si `var_map` quedó desincronizado (objeto reemplazado de Point→Circle
+    /// tras construir el mapa), antes se leía `0.0` en silencio y el único
+    /// síntoma era un residual críptico en `verify_numeric_constraints`.
+    fn solver_field(&self, id: ObjectId, field: ObjField) -> Result<f64, String> {
+        self.get_field_value(id, field).ok_or_else(|| {
+            let nombre = self
+                .get_object(id)
+                .map(|obj| obj.name().to_string())
+                .unwrap_or_else(|| format!("{id}"));
+            format!("solver variable ({id},{field:?}) incompatible con {nombre}")
+        })
+    }
+
+    fn set_field_value(&mut self, id: ObjectId, field: ObjField, value: f64) -> Result<(), String> {
+        let objeto = self.objects.get_mut(&id).ok_or_else(|| {
+            format!("solver variable ({id},{field:?}) incompatible: objeto inexistente")
+        })?;
+        match (objeto, field) {
+            (GeoObject::Point(p), ObjField::PointX) => p.position.x = value,
+            (GeoObject::Point(p), ObjField::PointY) => p.position.y = value,
+            (GeoObject::Circle(c), ObjField::CircleRadius) => c.radius = value,
+            (GeoObject::Line(l), ObjField::LineStartX) => l.start.x = value,
+            (GeoObject::Line(l), ObjField::LineStartY) => l.start.y = value,
+            (GeoObject::Line(l), ObjField::LineEndX) => l.end.x = value,
+            (GeoObject::Line(l), ObjField::LineEndY) => l.end.y = value,
+            (objeto, _) => {
+                let nombre = objeto.name().to_string();
+                return Err(format!(
+                    "solver variable ({id},{field:?}) incompatible con {nombre}"
+                ));
+            }
+        }
+        self.touch();
+        Ok(())
+    }
+
+    pub fn point_position(&self, id: ObjectId) -> Option<Point2> {
+        match self.get_object(id)? {
+            GeoObject::Point(p) => Some(p.position),
+            _ => None,
+        }
+    }
+
+    fn build_numeric_equations(
+        &self,
+        numeric_ids: &[usize],
+        var_index: &HashMap<(ObjectId, ObjField), VarIndex>,
+    ) -> Result<Vec<Box<dyn crate::numeric_solver::ConstraintEquation>>, String> {
+        let mut equations: Vec<Box<dyn crate::numeric_solver::ConstraintEquation>> = Vec::new();
+        for &id in numeric_ids {
+            let cons = self
+                .constraints
+                .get_constraint(id)
+                .ok_or_else(|| format!("Numeric constraint {id} is missing"))?;
+            self.validate_numeric_constraint_definition(&cons.name, &cons.inputs, &cons.params)?;
+            match cons.name.as_str() {
+                "Distance" => {
+                    let target = cons.params.get("distance").copied().unwrap_or(0.0);
+                    let (Some(i0), Some(i1)) =
+                        (cons.inputs.first().copied(), cons.inputs.get(1).copied())
+                    else {
+                        return Err(
+                            "Distance: restricción malformada (faltan entradas)".to_string()
+                        );
+                    };
+                    let eq = DistanceEq::from_inputs(self, i0, i1, target, var_index)
+                        .ok_or_else(|| "Distance: no se pudo construir la ecuación".to_string())?;
+                    equations.push(Box::new(eq));
+                }
+                "Angle" => {
+                    let target = cons.params.get("angle").copied().unwrap_or(0.0);
+                    let eq = AngleEq::from_inputs(self, &cons.inputs, target, var_index)
+                        .ok_or_else(|| "Angle: no se pudo construir la ecuación".to_string())?;
+                    equations.push(Box::new(eq));
+                }
+                "Tangent" => {
+                    let (Some(i0), Some(i1)) =
+                        (cons.inputs.first().copied(), cons.inputs.get(1).copied())
+                    else {
+                        return Err("Tangent: restricción malformada (faltan entradas)".to_string());
+                    };
+                    let eq = TangentEq::from_inputs(self, i0, i1, var_index)
+                        .ok_or_else(|| "Tangent: no se pudo construir la ecuación".to_string())?;
+                    equations.push(Box::new(eq));
+                }
+                "Coincident" => {
+                    let (Some(i0), Some(i1)) =
+                        (cons.inputs.first().copied(), cons.inputs.get(1).copied())
+                    else {
+                        return Err(
+                            "Coincident: restricción malformada (faltan entradas)".to_string()
+                        );
+                    };
+                    let eq =
+                        CoincidentEq::from_inputs(self, i0, i1, var_index).ok_or_else(|| {
+                            "Coincident: no se pudo construir la ecuación".to_string()
+                        })?;
+                    equations.push(Box::new(eq));
+                }
+                "Horizontal" => {
+                    let Some(i0) = cons.inputs.first().copied() else {
+                        return Err(
+                            "Horizontal: restricción malformada (faltan entradas)".to_string()
+                        );
+                    };
+                    let eq = HorizontalEq::from_inputs(self, i0, var_index).ok_or_else(|| {
+                        "Horizontal: no se pudo construir la ecuación".to_string()
+                    })?;
+                    equations.push(Box::new(eq));
+                }
+                "Vertical" => {
+                    let Some(i0) = cons.inputs.first().copied() else {
+                        return Err(
+                            "Vertical: restricción malformada (faltan entradas)".to_string()
+                        );
+                    };
+                    let eq = VerticalEq::from_inputs(self, i0, var_index)
+                        .ok_or_else(|| "Vertical: no se pudo construir la ecuación".to_string())?;
+                    equations.push(Box::new(eq));
+                }
+                "EqualLength" => {
+                    let (Some(i0), Some(i1)) =
+                        (cons.inputs.first().copied(), cons.inputs.get(1).copied())
+                    else {
+                        return Err(
+                            "EqualLength: restricción malformada (faltan entradas)".to_string()
+                        );
+                    };
+                    let eq =
+                        EqualLengthEq::from_inputs(self, i0, i1, var_index).ok_or_else(|| {
+                            "EqualLength: no se pudo construir la ecuación".to_string()
+                        })?;
+                    equations.push(Box::new(eq));
+                }
+                "Symmetry" => {
+                    let (Some(i0), Some(i1), Some(i2)) = (
+                        cons.inputs.first().copied(),
+                        cons.inputs.get(1).copied(),
+                        cons.inputs.get(2).copied(),
+                    ) else {
+                        return Err(
+                            "Symmetry: restricción malformada (faltan entradas)".to_string()
+                        );
+                    };
+                    let eq = SymmetryEq::from_inputs(self, i0, i1, i2, var_index)
+                        .ok_or_else(|| "Symmetry: no se pudo construir la ecuación".to_string())?;
+                    equations.push(Box::new(eq));
+                }
+                _ => {}
+            }
+        }
+        Ok(equations)
+    }
+
+    fn write_solver_variables(
+        &mut self,
+        var_map: &[(ObjectId, ObjField)],
+        vars: &[f64],
+    ) -> Result<Vec<ObjectId>, String> {
+        let mut changed = Vec::new();
+        for ((id, field), value) in var_map.iter().zip(vars.iter()) {
+            let old = self.solver_field(*id, *field)?;
+            if (old - *value).abs() > 1e-12 {
+                self.set_field_value(*id, *field, *value)?;
+                if changed.last() != Some(id) {
+                    changed.push(*id);
+                }
+            }
+        }
+        Ok(changed)
+    }
+
+    pub(crate) fn is_numeric_constraint_name(name: &str) -> bool {
+        matches!(
+            name,
+            "Distance"
+                | "Angle"
+                | "Tangent"
+                | "Coincident"
+                | "Horizontal"
+                | "Vertical"
+                | "EqualLength"
+                | "Symmetry"
+        )
+    }
+
+    pub(crate) fn validate_numeric_constraint_definition(
+        &self,
+        name: &str,
+        inputs: &[ObjectId],
+        params: &BTreeMap<String, f64>,
+    ) -> Result<(), String> {
+        let object_is = |id: ObjectId, predicate: fn(&GeoObject) -> bool| {
+            self.get_object(id).is_some_and(predicate)
+        };
+        let finite_param = |key: &str| {
+            params
+                .get(key)
+                .copied()
+                .filter(|value| value.is_finite())
+                .ok_or_else(|| format!("{name}: el parámetro '{key}' debe ser finito"))
+        };
+
+        match name {
+            "Distance" => {
+                if inputs.len() != 2
+                    || !inputs
+                        .iter()
+                        .all(|id| object_is(*id, |object| matches!(object, GeoObject::Point(_))))
+                {
+                    return Err("Distance: requiere dos puntos".to_string());
+                }
+                if finite_param("distance")? < 0.0 {
+                    return Err("Distance: la distancia debe ser no negativa".to_string());
+                }
+            }
+            "Angle" => {
+                if inputs.len() != 2
+                    || !inputs
+                        .iter()
+                        .all(|id| object_is(*id, |object| matches!(object, GeoObject::Line(_))))
+                {
+                    return Err("Angle: requiere dos rectas".to_string());
+                }
+                finite_param("angle")?;
+            }
+            "Tangent" => {
+                if inputs.len() != 2
+                    || !((object_is(inputs[0], |object| matches!(object, GeoObject::Circle(_)))
+                        && object_is(inputs[1], |object| matches!(object, GeoObject::Line(_))))
+                        || (object_is(inputs[0], |object| matches!(object, GeoObject::Line(_)))
+                            && object_is(inputs[1], |object| {
+                                matches!(object, GeoObject::Circle(_))
+                            })))
+                {
+                    return Err("Tangent: requiere un círculo y una recta".to_string());
+                }
+            }
+            "Coincident" => {
+                if inputs.len() != 2
+                    || !inputs
+                        .iter()
+                        .all(|id| object_is(*id, |object| matches!(object, GeoObject::Point(_))))
+                {
+                    return Err("Coincident: requiere dos puntos".to_string());
+                }
+            }
+            "Horizontal" | "Vertical" => {
+                if inputs.len() != 1
+                    || !object_is(inputs[0], |object| matches!(object, GeoObject::Line(_)))
+                {
+                    return Err(format!("{name}: requiere una recta"));
+                }
+            }
+            "EqualLength" => {
+                if inputs.len() != 2
+                    || !inputs.iter().all(|id| {
+                        matches!(
+                            self.get_object(*id),
+                            Some(GeoObject::Line(line)) if line.kind == LineKind::Segment
+                        )
+                    })
+                {
+                    return Err("EqualLength: requiere dos segmentos".to_string());
+                }
+            }
+            "Symmetry" => {
+                if inputs.len() != 3
+                    || !object_is(inputs[0], |object| matches!(object, GeoObject::Point(_)))
+                    || !object_is(inputs[1], |object| matches!(object, GeoObject::Point(_)))
+                    || !object_is(inputs[2], |object| matches!(object, GeoObject::Line(_)))
+                {
+                    return Err("Symmetry: requiere dos puntos y una recta".to_string());
+                }
+            }
+            _ => return Err(format!("{name}: restricción numérica desconocida")),
+        }
+        Ok(())
+    }
+
+    fn validate_constructive_constraint_parts(
+        &self,
+        name: &str,
+        inputs: &[ObjectId],
+        output: &GeoObject,
+        params: &BTreeMap<String, f64>,
+    ) -> Result<(), String> {
+        if inputs.is_empty() {
+            return Err(format!("{name}: requiere objetos de entrada"));
+        }
+        let mut distinct = HashSet::new();
+        for id in inputs {
+            if self.get_object(*id).is_none() {
+                return Err(format!("{name}: no se encontró el objeto de entrada {id}"));
+            }
+            if !distinct.insert(*id) {
+                return Err(format!(
+                    "{name}: los objetos de entrada deben ser distintos"
+                ));
+            }
+        }
+
+        let require_arity = |expected: usize| {
+            if inputs.len() == expected {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{name}: requiere exactamente {expected} objeto(s) de entrada"
+                ))
+            }
+        };
+        let input = |index: usize| -> Result<&GeoObject, String> {
+            let id = inputs
+                .get(index)
+                .ok_or_else(|| format!("{name}: falta la entrada {index}"))?;
+            self.get_object(*id)
+                .ok_or_else(|| format!("{name}: no se encontró la entrada {index}"))
+        };
+        let point = |index: usize| -> Result<Point2, String> {
+            match input(index)? {
+                GeoObject::Point(point) => Ok(point.position),
+                _ => Err(format!(
+                    "{name}: la entrada {} debe ser un punto",
+                    index + 1
+                )),
+            }
+        };
+        let finite_point = |point: Point2, operation: &str| {
+            if point.x.is_finite() && point.y.is_finite() {
+                Ok(point)
+            } else {
+                Err(format!(
+                    "{name}: {operation} produjo coordenadas no finitas"
+                ))
+            }
+        };
+        let line_direction = |line: &crate::LineObj| -> Result<(f64, f64), String> {
+            let dx = line.end.x - line.start.x;
+            let dy = line.end.y - line.start.y;
+            let length = dx.hypot(dy);
+            if dx.is_finite()
+                && dy.is_finite()
+                && length.is_finite()
+                && length > crate::validation::GEOM_EPS
+            {
+                Ok((dx, dy))
+            } else {
+                Err(format!(
+                    "{name}: la recta de entrada no puede ser degenerada"
+                ))
+            }
+        };
+        let paired_point = |prefix: &str| -> Result<Option<Point2>, String> {
+            let x = params.get(&format!("{prefix}_x")).copied();
+            let y = params.get(&format!("{prefix}_y")).copied();
+            match (x, y) {
+                (Some(x), Some(y)) if x.is_finite() && y.is_finite() => Ok(Some(Point2::new(x, y))),
+                (None, None) => Ok(None),
+                _ => Err(format!(
+                    "{name}: los parámetros {prefix}_x y {prefix}_y deben aparecer juntos"
+                )),
+            }
+        };
+        let required_param = |key: &str| {
+            params
+                .get(key)
+                .copied()
+                .filter(|value| value.is_finite())
+                .ok_or_else(|| format!("{name}: requiere el parámetro finito '{key}'"))
+        };
+
+        match name {
+            "Midpoint" => {
+                require_arity(2)?;
+                let a = point(0)?;
+                let b = point(1)?;
+                if !matches!(output, GeoObject::Point(_)) {
+                    return Err("Midpoint: el resultado debe ser un punto".into());
+                }
+                finite_point(
+                    Point2::new(a.x * 0.5 + b.x * 0.5, a.y * 0.5 + b.y * 0.5),
+                    "el punto medio",
+                )?;
+            }
+            "Translate" => {
+                require_arity(1)?;
+                let source = point(0)?;
+                if !matches!(output, GeoObject::Point(_)) {
+                    return Err("Translate: el resultado debe ser un punto".into());
+                }
+                let dx = required_param("dx")?;
+                let dy = required_param("dy")?;
+                finite_point(Point2::new(source.x + dx, source.y + dy), "la traslación")?;
+            }
+            "Rotate" => {
+                if !(1..=2).contains(&inputs.len()) {
+                    return Err("Rotate: requiere un punto de origen y un centro opcional".into());
+                }
+                let source = point(0)?;
+                if !matches!(output, GeoObject::Point(_)) {
+                    return Err("Rotate: el resultado debe ser un punto".into());
+                }
+                let angle = required_param("angle")?.to_radians();
+                let literal_center = paired_point("center")?;
+                let center = if inputs.len() == 2 {
+                    if literal_center.is_some() {
+                        return Err("Rotate: el centro no puede estar duplicado".into());
+                    }
+                    point(1)?
+                } else {
+                    literal_center.unwrap_or_else(|| Point2::new(0.0, 0.0))
+                };
+                let dx = source.x - center.x;
+                let dy = source.y - center.y;
+                finite_point(
+                    Point2::new(
+                        center.x + dx * angle.cos() - dy * angle.sin(),
+                        center.y + dx * angle.sin() + dy * angle.cos(),
+                    ),
+                    "la rotación",
+                )?;
+            }
+            "Dilate" => {
+                if !matches!(output, GeoObject::Point(_)) {
+                    return Err("Dilate: el resultado debe ser un punto".into());
+                }
+                required_param("factor")?;
+                let literal_source = paired_point("source")?;
+                let literal_center = paired_point("center")?;
+                let (source, center) = if let Some(source) = literal_source {
+                    if inputs.len() != 1 || literal_center.is_some() {
+                        return Err(
+                            "Dilate: una fuente literal requiere un único centro etiquetado".into(),
+                        );
+                    }
+                    (source, point(0)?)
+                } else {
+                    if !(1..=2).contains(&inputs.len()) {
+                        return Err("Dilate: requiere un punto de origen".into());
+                    }
+                    let source = point(0)?;
+                    let center = if inputs.len() == 2 {
+                        if literal_center.is_some() {
+                            return Err("Dilate: el centro no puede estar duplicado".into());
+                        }
+                        point(1)?
+                    } else {
+                        literal_center.ok_or_else(|| "Dilate: requiere un centro".to_string())?
+                    };
+                    (source, center)
+                };
+                let factor = required_param("factor")?;
+                finite_point(
+                    Point2::new(
+                        center.x + (source.x - center.x) * factor,
+                        center.y + (source.y - center.y) * factor,
+                    ),
+                    "la dilatación",
+                )?;
+            }
+            "Perpendicular" => {
+                require_arity(2)?;
+                let GeoObject::Line(line) = input(0)? else {
+                    return Err("Perpendicular: el primer argumento debe ser una recta".into());
+                };
+                let (dx, dy) = line_direction(line)?;
+                let through = point(1)?;
+                let GeoObject::Line(output) = output else {
+                    return Err("Perpendicular: el resultado debe ser una recta".into());
+                };
+                if output.kind != LineKind::Line {
+                    return Err("Perpendicular: el resultado debe ser una recta infinita".into());
+                }
+                finite_point(
+                    Point2::new(through.x - dy, through.y + dx),
+                    "la perpendicular",
+                )?;
+                finite_point(
+                    Point2::new(through.x + dy, through.y - dx),
+                    "la perpendicular",
+                )?;
+            }
+            "Parallel" => {
+                require_arity(2)?;
+                let GeoObject::Line(line) = input(0)? else {
+                    return Err("Parallel: el primer argumento debe ser una recta".into());
+                };
+                let (dx, dy) = line_direction(line)?;
+                let through = point(1)?;
+                let GeoObject::Line(output) = output else {
+                    return Err("Parallel: el resultado debe ser una recta".into());
+                };
+                if output.kind != LineKind::Line {
+                    return Err("Parallel: el resultado debe ser una recta infinita".into());
+                }
+                finite_point(Point2::new(through.x - dx, through.y - dy), "la paralela")?;
+                finite_point(Point2::new(through.x + dx, through.y + dy), "la paralela")?;
+            }
+            "Intersect" => {
+                require_arity(2)?;
+                if !matches!(output, GeoObject::Point(_)) {
+                    return Err("Intersect: cada resultado debe ser un punto".into());
+                }
+                if doc_intersect(input(0)?, input(1)?).is_empty() {
+                    return Err("Intersect: la intersección requerida no está definida".into());
+                }
+            }
+            "Extrude" => {
+                require_arity(1)?;
+                let GeoObject::Polygon(polygon) = input(0)? else {
+                    return Err("Extrude: la entrada debe ser un polígono".into());
+                };
+                if polygon.vertices.len() < 3 {
+                    return Err("Extrude: el polígono requiere al menos tres vértices".into());
+                }
+                if !matches!(output, GeoObject::Segment3D(_)) {
+                    return Err("Extrude: el resultado debe ser un segmento 3D".into());
+                }
+                let height = required_param("height")?;
+                if height.abs() <= 1e-12 {
+                    return Err("Extrude: la altura debe ser distinta de cero".into());
+                }
+                let edge_index = required_param("edge_index")?;
+                if edge_index < 0.0
+                    || edge_index.fract() != 0.0
+                    || edge_index >= polygon.vertices.len() as f64
+                {
+                    return Err("Extrude: edge_index está fuera del polígono".into());
+                }
+                let edge_kind = required_param("edge_kind")?;
+                if edge_kind.fract() != 0.0 || !(0.0..=2.0).contains(&edge_kind) {
+                    return Err("Extrude: edge_kind debe ser 0, 1 o 2".into());
+                }
+            }
+            "PointOnObject" => {
+                require_arity(2)?;
+                let probe = point(1)?;
+                if !matches!(output, GeoObject::Point(_)) {
+                    return Err("PointOnObject: el resultado debe ser un punto".into());
+                }
+                let projected = match input(0)? {
+                    GeoObject::Line(line) => {
+                        line_direction(line)?;
+                        project_point_to_line(probe, line.start, line.end)
+                    }
+                    GeoObject::Circle(circle)
+                        if circle.radius.is_finite() && circle.radius > 0.0 =>
+                    {
+                        project_point_to_circle(probe, circle.center, circle.radius)
+                    }
+                    GeoObject::Polygon(polygon) if polygon.vertices.len() >= 2 => {
+                        project_point_to_polygon_edges(probe, &polygon.vertices)
+                    }
+                    _ => {
+                        return Err(
+                            "PointOnObject: la primera entrada debe ser una curva proyectable"
+                                .into(),
+                        )
+                    }
+                };
+                finite_point(projected, "la proyección")?;
+            }
+            "CircleByCenterRadius" => {
+                require_arity(1)?;
+                point(0)?;
+                if !matches!(output, GeoObject::Circle(_)) {
+                    return Err("CircleByCenterRadius: el resultado debe ser un círculo".into());
+                }
+                if required_param("radius")? <= 0.0 {
+                    return Err("CircleByCenterRadius: el radio debe ser positivo".into());
+                }
+            }
+            "CircleByThreePoints" => {
+                require_arity(3)?;
+                if !matches!(output, GeoObject::Circle(_)) {
+                    return Err("CircleByThreePoints: el resultado debe ser un círculo".into());
+                }
+                let (center, radius) = circle_from_three_points(point(0)?, point(1)?, point(2)?)
+                    .ok_or_else(|| {
+                        "CircleByThreePoints: los puntos no definen un círculo".to_string()
+                    })?;
+                if !center.x.is_finite()
+                    || !center.y.is_finite()
+                    || !radius.is_finite()
+                    || radius <= 0.0
+                {
+                    return Err("CircleByThreePoints: el círculo no es representable".into());
+                }
+            }
+            // W-B: geometría dinámica arrastrable. Estas tres construcciones
+            // re-ejecutan su definición paramétrica en cada frame del gesto
+            // (`apply_constructive_constraints`); el resto de tipos queda libre
+            // y congelado de forma documentada, jamás en silencio.
+            "LineByTwoPoints" => {
+                require_arity(2)?;
+                if !matches!(output, GeoObject::Line(_)) {
+                    return Err("LineByTwoPoints: el resultado debe ser una recta".into());
+                }
+                let a = point(0)?;
+                let b = point(1)?;
+                if a.distance(&b) <= crate::validation::GEOM_EPS {
+                    return Err("LineByTwoPoints: los puntos deben ser distintos".into());
+                }
+                line_by_two_points_kind(params)?;
+            }
+            "CircleByCenterPoint" => {
+                require_arity(2)?;
+                if !matches!(output, GeoObject::Circle(_)) {
+                    return Err("CircleByCenterPoint: el resultado debe ser un círculo".into());
+                }
+                let radius = point(0)?.distance(&point(1)?);
+                if !radius.is_finite() || radius <= crate::validation::GEOM_EPS {
+                    return Err("CircleByCenterPoint: el radio debe ser positivo".into());
+                }
+            }
+            "MeasureDistance" => {
+                require_arity(2)?;
+                if !matches!(output, GeoObject::Text(_)) {
+                    return Err("MeasureDistance: el resultado debe ser un texto".into());
+                }
+                if !point(0)?.distance(&point(1)?).is_finite() {
+                    return Err("MeasureDistance: la distancia no es finita".into());
+                }
+            }
+            "EllipseByFoci" => {
+                require_arity(3)?;
+                if !matches!(output, GeoObject::Ellipse(_)) {
+                    return Err("EllipseByFoci: el resultado debe ser una elipse".into());
+                }
+                let f1 = point(0)?;
+                let f2 = point(1)?;
+                let on_ellipse = point(2)?;
+                let d1 = on_ellipse.distance(&f1);
+                let d2 = on_ellipse.distance(&f2);
+                let a = d1 * 0.5 + d2 * 0.5;
+                let c = f1.distance(&f2) * 0.5;
+                let b = ((a - c) * (a + c)).sqrt();
+                if !a.is_finite() || !b.is_finite() || a <= c + 1e-12 || b <= 1e-12 {
+                    return Err("EllipseByFoci: las entradas no definen una elipse".into());
+                }
+            }
+            "ParabolaByFocusDirectrix" => {
+                require_arity(2)?;
+                let focus = point(0)?;
+                let GeoObject::Line(directrix) = input(1)? else {
+                    return Err(
+                        "ParabolaByFocusDirectrix: la segunda entrada debe ser una recta".into(),
+                    );
+                };
+                line_direction(directrix)?;
+                if !matches!(output, GeoObject::Parabola(_)) {
+                    return Err(
+                        "ParabolaByFocusDirectrix: el resultado debe ser una parábola".into(),
+                    );
+                }
+                let projection = project_point_to_line(focus, directrix.start, directrix.end);
+                let p = focus.distance(&projection) * 0.5;
+                if !projection.x.is_finite()
+                    || !projection.y.is_finite()
+                    || !p.is_finite()
+                    || p <= 1e-12
+                {
+                    return Err(
+                        "ParabolaByFocusDirectrix: el foco no define una parábola con la directriz"
+                            .into(),
+                    );
+                }
+            }
+            "HyperbolaByFoci" => {
+                require_arity(3)?;
+                if !matches!(output, GeoObject::Hyperbola(_)) {
+                    return Err("HyperbolaByFoci: el resultado debe ser una hipérbola".into());
+                }
+                let f1 = point(0)?;
+                let f2 = point(1)?;
+                let on_hyperbola = point(2)?;
+                let a = (on_hyperbola.distance(&f1) - on_hyperbola.distance(&f2)).abs() * 0.5;
+                let c = f1.distance(&f2) * 0.5;
+                let b = ((c - a) * (c + a)).sqrt();
+                if !a.is_finite() || !b.is_finite() || a <= 1e-12 || a >= c - 1e-12 || b <= 1e-12 {
+                    return Err("HyperbolaByFoci: las entradas no definen una hipérbola".into());
+                }
+            }
+            "ConicByFivePoints" => {
+                require_arity(5)?;
+                if !matches!(output, GeoObject::Ellipse(_) | GeoObject::Hyperbola(_)) {
+                    return Err("ConicByFivePoints: el resultado debe ser una cónica".into());
+                }
+                let points = (0..5).map(point).collect::<Result<Vec<_>, _>>()?;
+                if conic_from_five_points(&points).is_none() {
+                    return Err("ConicByFivePoints: los puntos no definen una cónica válida".into());
+                }
+            }
+            "Locus" => {
+                require_arity(2)?;
+                if inputs[0] == inputs[1] {
+                    return Err("Locus: los puntos de entrada deben ser distintos".into());
+                }
+                point(0)?;
+                point(1)?;
+                let GeoObject::Pencil(locus) = output else {
+                    return Err("Locus: el resultado debe ser un trazo persistente".into());
+                };
+                let Some(binding) = locus.locus_binding() else {
+                    return Err("Locus: el trazo debe conservar driver y target".into());
+                };
+                if binding.driver != inputs[0] || binding.target != inputs[1] {
+                    return Err(
+                        "Locus: las referencias del trazo no coinciden con sus entradas".into(),
+                    );
+                }
+                if locus.points.is_empty() {
+                    return Err("Locus: el trazo requiere una muestra inicial".into());
+                }
+            }
+            _ if Self::is_numeric_constraint_name(name) => {}
+            _ => return Err(format!("{name}: construcción desconocida")),
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_constructive_constraint_definition(
+        &self,
+        name: &str,
+        inputs: &[ObjectId],
+        outputs: &[ObjectId],
+        params: &BTreeMap<String, f64>,
+    ) -> Result<(), String> {
+        if Self::is_numeric_constraint_name(name) {
+            return Ok(());
+        }
+        if outputs.is_empty() {
+            return Err(format!("{name}: requiere al menos un resultado"));
+        }
+        if name != "Intersect" && outputs.len() != 1 {
+            return Err(format!("{name}: requiere exactamente un resultado"));
+        }
+        for output_id in outputs {
+            let output = self
+                .get_object(*output_id)
+                .ok_or_else(|| format!("{name}: no se encontró el resultado"))?;
+            self.validate_constructive_constraint_parts(name, inputs, output, params)?;
+        }
+        if name == "Intersect" {
+            let intersections = doc_intersect(
+                self.get_object(inputs[0])
+                    .ok_or_else(|| "Intersect: falta la primera entrada".to_string())?,
+                self.get_object(inputs[1])
+                    .ok_or_else(|| "Intersect: falta la segunda entrada".to_string())?,
+            );
+            if intersections.len() < outputs.len() {
+                return Err("Intersect: no hay suficientes intersecciones definidas".into());
+            }
+        }
+        Ok(())
+    }
+
+    fn try_add_numeric_constraint(
+        &mut self,
+        name: &str,
+        inputs: Vec<ObjectId>,
+        params: BTreeMap<String, f64>,
+    ) -> Result<usize, String> {
+        self.validate_numeric_constraint_definition(name, &inputs, &params)?;
+        self.constraints
+            .try_add_constraint(name, inputs, vec![], params)
+    }
+
+    /// Add a numeric distance constraint between two objects.
+    pub fn add_distance_constraint(&mut self, a: ObjectId, b: ObjectId, distance: f64) -> usize {
+        self.try_add_distance_constraint(a, b, distance)
+            .unwrap_or_else(|error| {
+                log::warn!("{error}");
+                usize::MAX
+            })
+    }
+
+    pub fn try_add_distance_constraint(
+        &mut self,
+        a: ObjectId,
+        b: ObjectId,
+        distance: f64,
+    ) -> Result<usize, String> {
+        let mut params = BTreeMap::new();
+        params.insert("distance".to_string(), distance);
+        self.try_add_numeric_constraint("Distance", vec![a, b], params)
+    }
+
+    /// Add a numeric angle constraint between two objects (lines) or three points.
+    pub fn add_angle_constraint(&mut self, a: ObjectId, b: ObjectId, angle_deg: f64) -> usize {
+        self.try_add_angle_constraint(a, b, angle_deg)
+            .unwrap_or_else(|error| {
+                log::warn!("{error}");
+                usize::MAX
+            })
+    }
+
+    pub fn try_add_angle_constraint(
+        &mut self,
+        a: ObjectId,
+        b: ObjectId,
+        angle_deg: f64,
+    ) -> Result<usize, String> {
+        let mut params = BTreeMap::new();
+        params.insert("angle".to_string(), angle_deg);
+        self.try_add_numeric_constraint("Angle", vec![a, b], params)
+    }
+
+    /// Add a numeric tangent constraint between two objects.
+    pub fn add_tangent_constraint(&mut self, a: ObjectId, b: ObjectId) -> usize {
+        self.try_add_tangent_constraint(a, b)
+            .unwrap_or_else(|error| {
+                log::warn!("{error}");
+                usize::MAX
+            })
+    }
+
+    pub fn try_add_tangent_constraint(
+        &mut self,
+        a: ObjectId,
+        b: ObjectId,
+    ) -> Result<usize, String> {
+        self.try_add_numeric_constraint("Tangent", vec![a, b], BTreeMap::new())
+    }
+
+    /// Add a numeric coincident constraint between two points.
+    pub fn add_coincident_constraint(&mut self, a: ObjectId, b: ObjectId) -> usize {
+        self.try_add_coincident_constraint(a, b)
+            .unwrap_or_else(|error| {
+                log::warn!("{error}");
+                usize::MAX
+            })
+    }
+
+    pub fn try_add_coincident_constraint(
+        &mut self,
+        a: ObjectId,
+        b: ObjectId,
+    ) -> Result<usize, String> {
+        self.try_add_numeric_constraint("Coincident", vec![a, b], BTreeMap::new())
+    }
+
+    /// Add a numeric horizontal constraint to a line.
+    pub fn add_horizontal_constraint(&mut self, line: ObjectId) -> usize {
+        self.try_add_horizontal_constraint(line)
+            .unwrap_or_else(|error| {
+                log::warn!("{error}");
+                usize::MAX
+            })
+    }
+
+    pub fn try_add_horizontal_constraint(&mut self, line: ObjectId) -> Result<usize, String> {
+        self.try_add_numeric_constraint("Horizontal", vec![line], BTreeMap::new())
+    }
+
+    /// Add a numeric vertical constraint to a line.
+    pub fn add_vertical_constraint(&mut self, line: ObjectId) -> usize {
+        self.try_add_vertical_constraint(line)
+            .unwrap_or_else(|error| {
+                log::warn!("{error}");
+                usize::MAX
+            })
+    }
+
+    pub fn try_add_vertical_constraint(&mut self, line: ObjectId) -> Result<usize, String> {
+        self.try_add_numeric_constraint("Vertical", vec![line], BTreeMap::new())
+    }
+
+    /// Add a numeric equal-length constraint between two line segments.
+    pub fn add_equal_length_constraint(&mut self, line1: ObjectId, line2: ObjectId) -> usize {
+        self.try_add_equal_length_constraint(line1, line2)
+            .unwrap_or_else(|error| {
+                log::warn!("{error}");
+                usize::MAX
+            })
+    }
+
+    pub fn try_add_equal_length_constraint(
+        &mut self,
+        line1: ObjectId,
+        line2: ObjectId,
+    ) -> Result<usize, String> {
+        self.try_add_numeric_constraint("EqualLength", vec![line1, line2], BTreeMap::new())
+    }
+
+    /// Add a numeric symmetry constraint: `mirror_point` is the mirror of
+    /// `point` across `mirror_line`.
+    pub fn add_symmetry_constraint(
+        &mut self,
+        point: ObjectId,
+        mirror_point: ObjectId,
+        mirror_line: ObjectId,
+    ) -> usize {
+        self.try_add_symmetry_constraint(point, mirror_point, mirror_line)
+            .unwrap_or_else(|error| {
+                log::warn!("{error}");
+                usize::MAX
+            })
+    }
+
+    pub fn try_add_symmetry_constraint(
+        &mut self,
+        point: ObjectId,
+        mirror_point: ObjectId,
+        mirror_line: ObjectId,
+    ) -> Result<usize, String> {
+        self.try_add_numeric_constraint(
+            "Symmetry",
+            vec![point, mirror_point, mirror_line],
+            BTreeMap::new(),
+        )
+    }
+
+    /// Add a constructive constraint that creates an ellipse from two foci and
+    /// a point on the ellipse.
+    pub fn add_ellipse_by_foci_constraint(
+        &mut self,
+        f1: ObjectId,
+        f2: ObjectId,
+        p: ObjectId,
+    ) -> usize {
+        let (_, cons_id) = self.add_constructed_object(
+            GeoObject::Ellipse(EllipseObj::new(Point2::new(0.0, 0.0), 1.0, 1.0)),
+            "EllipseByFoci",
+            &[f1, f2, p],
+        );
+        cons_id
+    }
+
+    /// Add a constructive constraint that creates a parabola from a focus point
+    /// and a directrix line.
+    pub fn add_parabola_by_focus_directrix_constraint(
+        &mut self,
+        focus: ObjectId,
+        directrix: ObjectId,
+    ) -> usize {
+        let (_, cons_id) = self.add_constructed_object(
+            GeoObject::Parabola(ParabolaObj::new(Point2::new(0.0, 0.0), 1.0)),
+            "ParabolaByFocusDirectrix",
+            &[focus, directrix],
+        );
+        cons_id
+    }
+
+    /// Add a constructive constraint that creates a hyperbola from two foci and
+    /// a point on the hyperbola.
+    pub fn add_hyperbola_by_foci_constraint(
+        &mut self,
+        f1: ObjectId,
+        f2: ObjectId,
+        p: ObjectId,
+    ) -> usize {
+        let (_, cons_id) = self.add_constructed_object(
+            GeoObject::Hyperbola(HyperbolaObj::new(Point2::new(0.0, 0.0), 1.0, 1.0)),
+            "HyperbolaByFoci",
+            &[f1, f2, p],
+        );
+        cons_id
+    }
+
+    /// Add a constructive constraint that fits a conic through five points.
+    pub fn add_conic_by_five_points_constraint(&mut self, points: &[ObjectId]) -> usize {
+        self.try_add_conic_by_five_points_constraint(points)
+            .unwrap_or_else(|error| {
+                log::warn!("{error}");
+                usize::MAX
+            })
+    }
+
+    /// Fits and registers a conic only when all five inputs form a
+    /// representable ellipse or hyperbola. Failed fits leave the document
+    /// untouched instead of registering a placeholder ellipse.
+    pub fn try_add_conic_by_five_points_constraint(
+        &mut self,
+        points: &[ObjectId],
+    ) -> Result<usize, String> {
+        if points.len() != 5 {
+            return Err("ConicByFivePoints: requiere exactamente cinco puntos".to_string());
+        }
+
+        let positions = points
+            .iter()
+            .map(|id| match self.get_object(*id) {
+                Some(GeoObject::Point(point)) => Ok(point.position),
+                _ => Err("ConicByFivePoints: requiere cinco puntos válidos".to_string()),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut conic = conic_from_five_points(&positions).ok_or_else(|| {
+            "ConicByFivePoints: los puntos no definen una cónica válida".to_string()
+        })?;
+        match &mut conic {
+            GeoObject::Ellipse(ellipse) => ellipse.label = "C".to_string(),
+            GeoObject::Hyperbola(hyperbola) => hyperbola.label = "C".to_string(),
+            _ => return Err("ConicByFivePoints: ajuste no representable".to_string()),
+        }
+        let (_, constraint_id) =
+            self.try_add_constructed_object(conic, "ConicByFivePoints", points)?;
+        Ok(constraint_id)
+    }
+
+    /// Re-evaluate constraints atomically and return a diagnostic when the
+    /// numeric system cannot satisfy the document state.
+    pub fn try_re_evaluate_constraints(&mut self, order: &[usize]) -> Result<(), String> {
+        if self.constraints.constraint_count() == 0 {
+            return Ok(());
+        }
+        let mut staged = self.detached_clone_for_staging();
+        crate::validation::validate_document(&staged)?;
+        staged.re_evaluate_constraints_in_place(order)?;
+        crate::validation::validate_document(&staged)?;
+        *self = staged;
+        Ok(())
+    }
+
+    /// Legacy fire-and-forget propagation for UI paths that cannot yet return
+    /// a diagnostic. Command paths use [`Self::try_re_evaluate_constraints`].
+    pub fn re_evaluate_constraints(&mut self, order: &[usize]) {
+        if let Err(error) = self.try_re_evaluate_constraints(order) {
+            log::warn!("{error}");
+        }
+    }
+
+    fn re_evaluate_constraints_in_place(&mut self, order: &[usize]) -> Result<(), String> {
+        if self.constraints.constraint_count() == 0 {
+            return Ok(());
+        }
+        self.bump_version();
+        // Numeric constraints have no outputs, so they never appear in a
+        // propagation order rooted at changed objects. Always include them.
+        let numeric_ids: Vec<usize> = self
+            .constraints
+            .iter()
+            .filter(|c| Self::is_numeric_constraint_name(&c.name))
+            .map(|c| c.id)
+            .collect();
+
+        let constructive_ids: Vec<usize> = order
+            .iter()
+            .cloned()
+            .filter(|&id| {
+                self.constraints
+                    .get_constraint(id)
+                    .map(|c| !Self::is_numeric_constraint_name(&c.name))
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        if numeric_ids.is_empty() {
+            self.apply_constructive_constraints(&constructive_ids)?;
+            self.capture_locus_samples(&constructive_ids);
+            return Ok(());
+        }
+
+        for id in &numeric_ids {
+            let constraint = self
+                .constraints
+                .get_constraint(*id)
+                .ok_or_else(|| format!("Numeric constraint {id} is missing"))?;
+            self.validate_numeric_constraint_definition(
+                &constraint.name,
+                &constraint.inputs,
+                &constraint.params,
+            )?;
+        }
+
+        let var_map = self.build_solver_variables_for_constraints(&numeric_ids);
+        let var_index: HashMap<(ObjectId, ObjField), VarIndex> = var_map
+            .iter()
+            .enumerate()
+            .map(|(i, (id, field))| ((*id, *field), i))
+            .collect();
+
+        let solver = NumericSolver::default();
+        let mut changed: Vec<ObjectId> = Vec::new();
+        let bounds: Vec<crate::numeric_solver::Bounds> =
+            std::iter::repeat_with(crate::numeric_solver::Bounds::default)
+                .take(var_map.len())
+                .collect();
+
+        // `HashSet` para el filtro por pasada: `contains` sobre `Vec` era
+        // O(C·N_num) por pasada (×5); con C=5000 constructivas y N_num=8 son
+        // ~200k comparaciones por re-evaluación.
+        let numeric_set: HashSet<usize> = numeric_ids.iter().copied().collect();
+        for _ in 0..5 {
+            // Sin `constructive_ids.clone()`: la primera pasada (sin cambios)
+            // usa el orden completo por referencia; las siguientes filtran el
+            // subgrafo sucio.
+            if changed.is_empty() {
+                self.apply_constructive_constraints(&constructive_ids)?;
+            } else {
+                let current_order: Vec<usize> = self
+                    .propagation_order(&changed)
+                    .into_iter()
+                    .filter(|id| !numeric_set.contains(id))
+                    .collect();
+                self.apply_constructive_constraints(&current_order)?;
+            }
+
+            // Constructed inputs are captured as constants by numeric equations,
+            // so they must be rebound after every propagation pass.
+            let equations = self.build_numeric_equations(&numeric_ids, &var_index)?;
+
+            let mut vars: Vec<f64> = Vec::with_capacity(var_map.len());
+            for (id, field) in &var_map {
+                vars.push(self.solver_field(*id, *field)?);
+            }
+
+            // Cold start intencional desde el estado actual: `last_solution`
+            // puede corresponder a un documento anterior (p. ej. un punto
+            // arrastrado después del último solve) y usarlo como punto
+            // inicial revertiría la edición (el solver converge ahí y
+            // `write_solver_variables` lo re-escribe). El bucle previo que
+            // sincronizaba `last_solution` con el estado actual antes de
+            // resolver hacía exactamente este cold start pero disfrazado de
+            // warm-start (`warm_start == vars` siempre); se elimina ese
+            // plumbing muerto. `last_solution` se actualiza tras converger,
+            // solo como caché coherente para lectores externos.
+            let warm_start = vars.clone();
+
+            match solver.solve_with_warm_start_and_bounds(
+                &mut vars,
+                &equations,
+                Some(&warm_start),
+                &bounds,
+            ) {
+                Ok(stats) => {
+                    for ((id, field), value) in var_map.iter().zip(vars.iter()) {
+                        self.last_solution.insert((*id, *field), *value);
+                    }
+                    changed = self.write_solver_variables(&var_map, &vars)?;
+                    if stats.final_residual < solver.tol && changed.is_empty() {
+                        break;
+                    }
+                }
+                Err(error) => return Err(format!("Numeric constraint solver failed: {error}")),
+            }
+        }
+
+        let mut capture_order = constructive_ids.clone();
+        if !changed.is_empty() {
+            let final_order: Vec<usize> = self
+                .propagation_order(&changed)
+                .into_iter()
+                .filter(|id| !numeric_set.contains(id))
+                .collect();
+            self.apply_constructive_constraints(&final_order)?;
+            capture_order.extend(final_order);
+        }
+
+        self.verify_numeric_constraints(&numeric_ids, &var_map, &var_index)?;
+        self.capture_locus_samples(&capture_order);
+        Ok(())
+    }
+
+    /// Captura una sola posición distinta por salida Locus, después de terminar
+    /// toda propagación constructiva y numérica. Nunca se invoca dentro de los
+    /// pases intermedios del solver.
+    fn capture_locus_samples(&mut self, order: &[usize]) {
+        let samples: Vec<(ObjectId, Point2)> = order
+            .iter()
+            .filter_map(|constraint_id| self.constraints.get_constraint(*constraint_id))
+            .filter(|constraint| constraint.name == "Locus")
+            .filter_map(|constraint| {
+                let locus_id = *constraint.outputs.first()?;
+                let GeoObject::Pencil(locus) = self.get_object(locus_id)? else {
+                    return None;
+                };
+                let binding = locus.locus_binding()?;
+                if binding.driver != *constraint.inputs.first()?
+                    || binding.target != *constraint.inputs.get(1)?
+                {
+                    return None;
+                }
+                let GeoObject::Point(target) = self.get_object(binding.target)? else {
+                    return None;
+                };
+                (target.position.x.is_finite() && target.position.y.is_finite())
+                    .then_some((locus_id, target.position))
+            })
+            .collect();
+
+        let mut changed = false;
+        for (locus_id, target_position) in samples {
+            if let Some(GeoObject::Pencil(locus)) = self.objects.get_mut(&locus_id) {
+                changed |= locus.capture_locus_sample(target_position);
+            }
+        }
+        if changed {
+            self.spatial_dirty = true;
+        }
+    }
+
+    fn verify_numeric_constraints(
+        &self,
+        numeric_ids: &[usize],
+        var_map: &[(ObjectId, ObjField)],
+        var_index: &HashMap<(ObjectId, ObjField), VarIndex>,
+    ) -> Result<(), String> {
+        let equations = self.build_numeric_equations(numeric_ids, var_index)?;
+        let mut vars: Vec<f64> = Vec::with_capacity(var_map.len());
+        for (id, field) in var_map {
+            vars.push(self.solver_field(*id, *field)?);
+        }
+        let verifier = NumericSolver {
+            max_iter: 0,
+            ..NumericSolver::default()
+        };
+        match verifier.solve(&mut vars, &equations) {
+            Ok(_) => Ok(()),
+            Err(SolveError::MaxIterations { final_residual })
+            | Err(SolveError::Unsatisfied { final_residual }) => Err(format!(
+                "Numeric constraints remain unsatisfied (residual {final_residual:.3e})"
+            )),
+            Err(error) => Err(format!("Numeric constraint solver failed: {error}")),
+        }
+    }
+
+    fn apply_constructive_constraints(&mut self, order: &[usize]) -> Result<(), String> {
+        // Sin clones de `GeoObject` por restricción y por pasada: cada brazo
+        // lee los escalares necesarios por referencia (fase inmutable) y solo
+        // después pide el préstamo mutable de la salida. El `Constraint` sí
+        // se clona (nombre + ids + puñado de params; despreciable frente a un
+        // polígono de 8192 vértices) porque el préstamo sobre
+        // `self.constraints` no conviviría con el `&mut` de la escritura.
+        // `BTreeMap` de params no se toca: determinismo byte-idéntico.
+        for cons_id in order {
+            let cons = self
+                .constraints
+                .get_constraint(*cons_id)
+                .cloned()
+                .ok_or_else(|| format!("Constructive constraint {cons_id} is missing"))?;
+            self.validate_constructive_constraint_definition(
+                &cons.name,
+                &cons.inputs,
+                &cons.outputs,
+                &cons.params,
+            )?;
+            // Parámetro finito requerido: la validación previa lo garantiza,
+            // así que esto solo dispara si alguien relaja validar/aplicar
+            // (fail-closed en vez de geometría inventada en silencio).
+            let required_param = |key: &str| {
+                cons.params
+                    .get(key)
+                    .copied()
+                    .filter(|value| value.is_finite())
+                    .ok_or_else(|| format!("{}: requiere el parámetro finito '{key}'", cons.name))
+            };
+            match cons.name.as_str() {
+                "Midpoint" if cons.inputs.len() >= 2 && !cons.outputs.is_empty() => {
+                    let (a, b) = match (
+                        self.get_object(cons.inputs[0]),
+                        self.get_object(cons.inputs[1]),
+                    ) {
+                        (Some(GeoObject::Point(a)), Some(GeoObject::Point(b))) => {
+                            (a.position, b.position)
+                        }
+                        _ => continue,
+                    };
+                    let out_id = cons.outputs[0];
+                    if let Some(GeoObject::Point(out)) = self.get_object_mut_touch(out_id) {
+                        out.position = grafito_geometry::Point2::new(
+                            a.x * 0.5 + b.x * 0.5,
+                            a.y * 0.5 + b.y * 0.5,
+                        );
+                    }
+                }
+                "Translate" if !cons.inputs.is_empty() && !cons.outputs.is_empty() => {
+                    let dx = required_param("dx")?;
+                    let dy = required_param("dy")?;
+                    let p = match self.get_object(cons.inputs[0]) {
+                        Some(GeoObject::Point(p)) => p.position,
+                        _ => continue,
+                    };
+                    let out_id = cons.outputs[0];
+                    if let Some(GeoObject::Point(out)) = self.get_object_mut_touch(out_id) {
+                        out.position = grafito_geometry::Point2::new(p.x + dx, p.y + dy);
+                    }
+                }
+                "Rotate" if !cons.inputs.is_empty() && !cons.outputs.is_empty() => {
+                    let angle = required_param("angle")?;
+                    let source = match self.get_object(cons.inputs[0]) {
+                        Some(GeoObject::Point(p)) => p.position,
+                        _ => continue,
+                    };
+                    // Centro: punto de entrada, par literal o (0,0) por defecto
+                    // (la validación previa ya garantizó la combinación).
+                    let center = cons
+                        .inputs
+                        .get(1)
+                        .and_then(|id| self.get_object(*id))
+                        .and_then(|object| match object {
+                            GeoObject::Point(point) => Some(point.position),
+                            _ => None,
+                        })
+                        .or_else(|| {
+                            Some(Point2::new(
+                                *cons.params.get("center_x")?,
+                                *cons.params.get("center_y")?,
+                            ))
+                        })
+                        .unwrap_or_else(|| Point2::new(0.0, 0.0));
+                    let angle_rad = angle.to_radians();
+                    let out_id = cons.outputs[0];
+                    if let Some(GeoObject::Point(out)) = self.get_object_mut_touch(out_id) {
+                        let dx = source.x - center.x;
+                        let dy = source.y - center.y;
+                        out.position = grafito_geometry::Point2::new(
+                            center.x + dx * angle_rad.cos() - dy * angle_rad.sin(),
+                            center.y + dx * angle_rad.sin() + dy * angle_rad.cos(),
+                        );
+                    }
+                }
+                "Dilate" if !cons.inputs.is_empty() && !cons.outputs.is_empty() => {
+                    let factor = required_param("factor")?;
+                    let literal_source = cons
+                        .params
+                        .get("source_x")
+                        .zip(cons.params.get("source_y"))
+                        .map(|(x, y)| Point2::new(*x, *y));
+                    let point_pos = |id: ObjectId| match self.get_object(id) {
+                        Some(GeoObject::Point(point)) => Some(point.position),
+                        _ => None,
+                    };
+                    let (source, center) = if let Some(source) = literal_source {
+                        let center = cons.inputs.first().and_then(|id| point_pos(*id));
+                        (Some(source), center)
+                    } else {
+                        let source = cons.inputs.first().and_then(|id| point_pos(*id));
+                        let center =
+                            cons.inputs
+                                .get(1)
+                                .and_then(|id| point_pos(*id))
+                                .or_else(|| {
+                                    Some(Point2::new(
+                                        *cons.params.get("center_x")?,
+                                        *cons.params.get("center_y")?,
+                                    ))
+                                });
+                        (source, center)
+                    };
+                    if let (Some(point), Some(center)) = (source, center) {
+                        let out_id = cons.outputs[0];
+                        if let Some(GeoObject::Point(out)) = self.get_object_mut_touch(out_id) {
+                            out.position = Point2::new(
+                                center.x + (point.x - center.x) * factor,
+                                center.y + (point.y - center.y) * factor,
+                            );
+                        }
+                    }
+                }
+                "Intersect" if cons.inputs.len() >= 2 => {
+                    let Some(a) = self.get_object(cons.inputs[0]) else {
+                        continue;
+                    };
+                    let Some(b) = self.get_object(cons.inputs[1]) else {
+                        continue;
+                    };
+                    let pts = doc_intersect(a, b);
+                    for (i, out_id) in cons.outputs.iter().enumerate() {
+                        if let (Some(pt), Some(GeoObject::Point(out))) =
+                            (pts.get(i), self.get_object_mut_touch(*out_id))
+                        {
+                            out.position = *pt;
+                        }
+                    }
+                }
+                "Extrude" if !cons.inputs.is_empty() => {
+                    let height = required_param("height")?;
+                    if height.abs() < 1e-12 {
+                        continue;
+                    }
+                    let Some(GeoObject::Polygon(poly)) = self.get_object(cons.inputs[0]) else {
+                        continue;
+                    };
+                    // Solo los dos vértices de la arista salen por copia
+                    // (`Point2: Copy`); el `Vec` de hasta 8192 vértices jamás
+                    // se clona.
+                    let vert_count = poly.vertices.len();
+                    if vert_count < 3 {
+                        continue;
+                    }
+                    let edge_index = cons
+                        .params
+                        .get("edge_index")
+                        .copied()
+                        .filter(|index| {
+                            index.is_finite()
+                                && *index >= 0.0
+                                && index.fract() == 0.0
+                                && *index < vert_count as f64
+                        })
+                        .map(|index| index as usize)
+                        .ok_or_else(|| {
+                            format!("{}: requiere el parámetro finito 'edge_index'", cons.name)
+                        })?;
+                    let edge_kind = cons
+                        .params
+                        .get("edge_kind")
+                        .copied()
+                        .filter(|kind| {
+                            kind.is_finite() && *kind >= 0.0 && kind.fract() == 0.0 && *kind <= 2.0
+                        })
+                        .map(|kind| kind as usize)
+                        .ok_or_else(|| {
+                            format!("{}: requiere el parámetro finito 'edge_kind'", cons.name)
+                        })?;
+                    let base_y = 0.0;
+                    let top_y = height;
+                    let v = poly.vertices[edge_index];
+                    let vn = poly.vertices[(edge_index + 1) % vert_count];
+                    let base = Point3D::new(v.x, base_y, v.y);
+                    let top = Point3D::new(v.x, top_y, v.y);
+                    let next_base = Point3D::new(vn.x, base_y, vn.y);
+                    let next_top = Point3D::new(vn.x, top_y, vn.y);
+                    let (a, b) = match edge_kind {
+                        0 => (base, top),
+                        1 => (base, next_base),
+                        2 => (top, next_top),
+                        _ => {
+                            debug_assert!(false, "Extrude edge kind was validated above");
+                            continue;
+                        }
+                    };
+                    for output in cons.outputs {
+                        if let Some(GeoObject::Segment3D(segment)) =
+                            self.get_object_mut_touch(output)
+                        {
+                            segment.a = a;
+                            segment.b = b;
+                        }
+                    }
+                }
+                "Perpendicular" if cons.inputs.len() >= 2 && !cons.outputs.is_empty() => {
+                    let (start, end) = match self.get_object(cons.inputs[0]) {
+                        Some(GeoObject::Line(line)) => (line.start, line.end),
+                        _ => continue,
+                    };
+                    let through = match self.get_object(cons.inputs[1]) {
+                        Some(GeoObject::Point(pt)) => pt.position,
+                        _ => continue,
+                    };
+                    let out_id = cons.outputs[0];
+                    if let Some(GeoObject::Line(out)) = self.get_object_mut_touch(out_id) {
+                        let dx = end.x - start.x;
+                        let dy = end.y - start.y;
+                        let direction_length = dx.hypot(dy);
+                        if !dx.is_finite()
+                            || !dy.is_finite()
+                            || !direction_length.is_finite()
+                            || direction_length <= 1e-12
+                        {
+                            continue;
+                        }
+                        out.start = Point2::new(through.x - dy, through.y + dx);
+                        out.end = Point2::new(through.x + dy, through.y - dx);
+                        out.kind = LineKind::Line;
+                    }
+                }
+                "Parallel" if cons.inputs.len() >= 2 && !cons.outputs.is_empty() => {
+                    let (start, end) = match self.get_object(cons.inputs[0]) {
+                        Some(GeoObject::Line(line)) => (line.start, line.end),
+                        _ => continue,
+                    };
+                    let through = match self.get_object(cons.inputs[1]) {
+                        Some(GeoObject::Point(pt)) => pt.position,
+                        _ => continue,
+                    };
+                    let out_id = cons.outputs[0];
+                    if let Some(GeoObject::Line(out)) = self.get_object_mut_touch(out_id) {
+                        let dx = end.x - start.x;
+                        let dy = end.y - start.y;
+                        out.start = Point2::new(through.x - dx, through.y - dy);
+                        out.end = Point2::new(through.x + dx, through.y + dy);
+                        out.kind = LineKind::Line;
+                    }
+                }
+                "PointOnObject" if cons.inputs.len() >= 2 && !cons.outputs.is_empty() => {
+                    let pt = match self.get_object(cons.inputs[1]) {
+                        Some(GeoObject::Point(pt)) => pt.position,
+                        _ => continue,
+                    };
+                    // Proyección calculada en fase inmutable (ni el objeto
+                    // curva ni sus `Vec`s se clonan); la escritura va después.
+                    let projected = match self.get_object(cons.inputs[0]) {
+                        Some(GeoObject::Line(l)) => Some(project_point_to_line(pt, l.start, l.end)),
+                        Some(GeoObject::Circle(c)) => {
+                            Some(project_point_to_circle(pt, c.center, c.radius))
+                        }
+                        Some(GeoObject::Polygon(poly)) => {
+                            Some(project_point_to_polygon_edges(pt, &poly.vertices))
+                        }
+                        Some(_) => Some(pt),
+                        None => None,
+                    };
+                    let out_id = cons.outputs[0];
+                    if let (Some(projected), Some(GeoObject::Point(out))) =
+                        (projected, self.get_object_mut_touch(out_id))
+                    {
+                        out.position = projected;
+                    }
+                }
+                "CircleByCenterRadius" if !cons.inputs.is_empty() && !cons.outputs.is_empty() => {
+                    let radius = required_param("radius")?;
+                    let center = match self.get_object(cons.inputs[0]) {
+                        Some(GeoObject::Point(center)) => center.position,
+                        _ => continue,
+                    };
+                    let out_id = cons.outputs[0];
+                    if let Some(GeoObject::Circle(out)) = self.get_object_mut_touch(out_id) {
+                        out.center = center;
+                        out.radius = radius;
+                    }
+                }
+                "CircleByThreePoints" if cons.inputs.len() >= 3 && !cons.outputs.is_empty() => {
+                    let (pa, pb, pc) = match (
+                        self.get_object(cons.inputs[0]),
+                        self.get_object(cons.inputs[1]),
+                        self.get_object(cons.inputs[2]),
+                    ) {
+                        (
+                            Some(GeoObject::Point(pa)),
+                            Some(GeoObject::Point(pb)),
+                            Some(GeoObject::Point(pc)),
+                        ) => (pa.position, pb.position, pc.position),
+                        _ => continue,
+                    };
+                    if let Some((center, radius)) = circle_from_three_points(pa, pb, pc) {
+                        let out_id = cons.outputs[0];
+                        if let Some(GeoObject::Circle(out)) = self.get_object_mut_touch(out_id) {
+                            out.center = center;
+                            out.radius = radius;
+                        }
+                    }
+                }
+                "EllipseByFoci" if cons.inputs.len() >= 3 && !cons.outputs.is_empty() => {
+                    let (f1, f2, p) = match (
+                        self.get_object(cons.inputs[0]),
+                        self.get_object(cons.inputs[1]),
+                        self.get_object(cons.inputs[2]),
+                    ) {
+                        (
+                            Some(GeoObject::Point(f1)),
+                            Some(GeoObject::Point(f2)),
+                            Some(GeoObject::Point(p)),
+                        ) => (f1.position, f2.position, p.position),
+                        _ => continue,
+                    };
+                    let out_id = cons.outputs[0];
+                    if let Some(GeoObject::Ellipse(out)) = self.get_object_mut_touch(out_id) {
+                        let d1 = p.distance(&f1);
+                        let d2 = p.distance(&f2);
+                        let a = (d1 + d2) * 0.5;
+                        let c = f1.distance(&f2) * 0.5;
+                        let b = (a * a - c * c).max(0.0).sqrt();
+                        out.center = Point2::new((f1.x + f2.x) * 0.5, (f1.y + f2.y) * 0.5);
+                        out.rx = a;
+                        out.ry = b;
+                        out.angle = (f2.y - f1.y).atan2(f2.x - f1.x);
+                    }
+                }
+                "ParabolaByFocusDirectrix"
+                    if cons.inputs.len() >= 2 && !cons.outputs.is_empty() =>
+                {
+                    let (f, d_start, d_end) = match (
+                        self.get_object(cons.inputs[0]),
+                        self.get_object(cons.inputs[1]),
+                    ) {
+                        (Some(GeoObject::Point(f)), Some(GeoObject::Line(d))) => {
+                            (f.position, d.start, d.end)
+                        }
+                        _ => continue,
+                    };
+                    let out_id = cons.outputs[0];
+                    if let Some(GeoObject::Parabola(out)) = self.get_object_mut_touch(out_id) {
+                        let proj = project_point_to_line(f, d_start, d_end);
+                        out.vertex = Point2::new((f.x + proj.x) * 0.5, (f.y + proj.y) * 0.5);
+                        out.p = f.distance(&proj) * 0.5;
+                        let dx = d_end.x - d_start.x;
+                        let dy = d_end.y - d_start.y;
+                        // Axis direction points from the directrix toward the focus.
+                        let axis_dx = f.x - proj.x;
+                        let axis_dy = f.y - proj.y;
+                        if dx.abs() < 1e-12 {
+                            // Directrix is vertical => parabola opens horizontally.
+                            out.vertical = false;
+                            out.angle = if axis_dx >= 0.0 {
+                                -std::f64::consts::FRAC_PI_2
+                            } else {
+                                std::f64::consts::FRAC_PI_2
+                            };
+                        } else if dy.abs() < 1e-12 {
+                            // Directrix is horizontal => parabola opens vertically.
+                            out.vertical = true;
+                            out.angle = if axis_dy >= 0.0 {
+                                0.0
+                            } else {
+                                std::f64::consts::PI
+                            };
+                        } else {
+                            // General directrix: the local parabola (t, t^2/(4p))
+                            // opens toward +y, so rotate it so that its axis aligns
+                            // with the focus-directrix axis.
+                            let axis_angle = axis_dy.atan2(axis_dx);
+                            out.vertical = false;
+                            out.angle = axis_angle - std::f64::consts::FRAC_PI_2;
+                        }
+                    }
+                }
+                "HyperbolaByFoci" if cons.inputs.len() >= 3 && !cons.outputs.is_empty() => {
+                    let (f1, f2, p) = match (
+                        self.get_object(cons.inputs[0]),
+                        self.get_object(cons.inputs[1]),
+                        self.get_object(cons.inputs[2]),
+                    ) {
+                        (
+                            Some(GeoObject::Point(f1)),
+                            Some(GeoObject::Point(f2)),
+                            Some(GeoObject::Point(p)),
+                        ) => (f1.position, f2.position, p.position),
+                        _ => continue,
+                    };
+                    let out_id = cons.outputs[0];
+                    if let Some(GeoObject::Hyperbola(out)) = self.get_object_mut_touch(out_id) {
+                        let d1 = p.distance(&f1);
+                        let d2 = p.distance(&f2);
+                        let a = (d1 - d2).abs() * 0.5;
+                        let c = f1.distance(&f2) * 0.5;
+                        let b = (c * c - a * a).max(0.0).sqrt();
+                        out.center = Point2::new((f1.x + f2.x) * 0.5, (f1.y + f2.y) * 0.5);
+                        out.a = a;
+                        out.b = b;
+                        let axis_angle = (f2.y - f1.y).atan2(f2.x - f1.x);
+                        out.angle = axis_angle;
+                        // The renderer rotates the horizontal local transverse axis by
+                        // `angle`; changing `horizontal` here would rotate it twice.
+                        out.horizontal = true;
+                    }
+                }
+                "ConicByFivePoints" if cons.inputs.len() >= 5 && !cons.outputs.is_empty() => {
+                    let mut pts = Vec::with_capacity(5);
+                    for &id in &cons.inputs[..5] {
+                        if let Some(GeoObject::Point(p)) = self.get_object(id) {
+                            pts.push(p.position);
+                        }
+                    }
+                    if pts.len() == 5 {
+                        if let Some(obj) = conic_from_five_points(&pts) {
+                            let out_id = cons.outputs[0];
+                            if let Some(existing) = self.objects.get(&out_id) {
+                                let (label, color, visible, width) = match existing {
+                                    GeoObject::Ellipse(o) => {
+                                        (o.label.clone(), o.color, o.visible, o.width)
+                                    }
+                                    GeoObject::Hyperbola(o) => {
+                                        (o.label.clone(), o.color, o.visible, o.width)
+                                    }
+                                    _ => (String::new(), Color::BLACK, true, 2.0),
+                                };
+                                let new_obj = match obj {
+                                    GeoObject::Ellipse(mut o) => {
+                                        o.id = out_id;
+                                        o.label = label;
+                                        o.color = color;
+                                        o.visible = visible;
+                                        o.width = width;
+                                        GeoObject::Ellipse(o)
+                                    }
+                                    GeoObject::Hyperbola(mut o) => {
+                                        o.id = out_id;
+                                        o.label = label;
+                                        o.color = color;
+                                        o.visible = visible;
+                                        o.width = width;
+                                        GeoObject::Hyperbola(o)
+                                    }
+                                    _ => obj,
+                                };
+                                self.objects.insert(out_id, new_obj);
+                                // `insert` directo no pasa por `touch`: el
+                                // reemplazo de variante invalida versión igual.
+                                self.touch();
+                            }
+                        }
+                    }
+                }
+                "Locus" => {
+                    // La captura ocurre una sola vez tras la estabilización del
+                    // documento en `capture_locus_samples`, nunca por pase.
+                }
+                // W-B: re-ejecución paramétrica por frame de arrastre. La
+                // validación previa ya rechazó padres degenerados (el frame
+                // entero falla y el vivo conserva lo último válido); estos
+                // guardas son defensa en profundidad para no escribir jamás
+                // geometría no finita aunque cambie el orden validar/aplicar.
+                "LineByTwoPoints" if cons.inputs.len() >= 2 && !cons.outputs.is_empty() => {
+                    // `?` en vez de `unwrap_or(Line)`: la validación previa
+                    // ya rechazó `kind` inválido; si se relaja, error honesto.
+                    let kind = line_by_two_points_kind(&cons.params)?;
+                    let (pa, pb) = match (
+                        self.get_object(cons.inputs[0]),
+                        self.get_object(cons.inputs[1]),
+                    ) {
+                        (Some(GeoObject::Point(pa)), Some(GeoObject::Point(pb))) => {
+                            (pa.position, pb.position)
+                        }
+                        _ => continue,
+                    };
+                    if pa.distance(&pb) > crate::validation::GEOM_EPS {
+                        let out_id = cons.outputs[0];
+                        if let Some(GeoObject::Line(out)) = self.get_object_mut_touch(out_id) {
+                            out.start = pa;
+                            out.end = pb;
+                            out.kind = kind;
+                        }
+                    }
+                }
+                "CircleByCenterPoint" if cons.inputs.len() >= 2 && !cons.outputs.is_empty() => {
+                    let (c, e) = match (
+                        self.get_object(cons.inputs[0]),
+                        self.get_object(cons.inputs[1]),
+                    ) {
+                        (Some(GeoObject::Point(c)), Some(GeoObject::Point(e))) => {
+                            (c.position, e.position)
+                        }
+                        _ => continue,
+                    };
+                    let radius = c.distance(&e);
+                    if radius.is_finite() && radius > crate::validation::GEOM_EPS {
+                        let out_id = cons.outputs[0];
+                        if let Some(GeoObject::Circle(out)) = self.get_object_mut_touch(out_id) {
+                            out.center = c;
+                            out.radius = radius;
+                        }
+                    }
+                }
+                "MeasureDistance" if cons.inputs.len() >= 2 && !cons.outputs.is_empty() => {
+                    let (pa, pb) = match (
+                        self.get_object(cons.inputs[0]),
+                        self.get_object(cons.inputs[1]),
+                    ) {
+                        (Some(GeoObject::Point(pa)), Some(GeoObject::Point(pb))) => {
+                            (pa.position, pb.position)
+                        }
+                        _ => continue,
+                    };
+                    let dist = pa.distance(&pb);
+                    if dist.is_finite() {
+                        let out_id = cons.outputs[0];
+                        if let Some(GeoObject::Text(out)) = self.get_object_mut_touch(out_id) {
+                            out.content = format!("{dist:.3}");
+                            out.position = Point2::new((pa.x + pb.x) * 0.5, (pa.y + pb.y) * 0.5);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.spatial_dirty = true;
+        Ok(())
+    }
+
+    pub fn get_object(&self, id: ObjectId) -> Option<&GeoObject> {
+        self.objects.get(&id)
+    }
+
+    pub fn get_object_mut(&mut self, id: ObjectId) -> Option<&mut GeoObject> {
+        // Sin `bump_version`: el préstamo mutable no implica mutación y los
+        // memos keyeados por `version` (`estimated_bytes`,
+        // `context_parts_cache`, cachés de render) deben sobrevivir a un
+        // préstamo de solo lectura. Quien mute debe llamar `touch()`
+        // (o usar `get_object_mut_touch`) tras escribir.
+        self.spatial_dirty = true;
+        self.objects.get_mut(&id)
+    }
+
+    /// Préstamo mutable que invalida versión y marca el índice espacial.
+    ///
+    /// Úsalo en los caminos que escriben geometría fuera de un commit
+    /// (el solver constructivo, `set_field_value`, arrastre). Los préstamos
+    /// de solo lectura usan `get_object_mut` sin quemar los memos.
+    pub fn get_object_mut_touch(&mut self, id: ObjectId) -> Option<&mut GeoObject> {
+        self.touch();
+        self.objects.get_mut(&id)
+    }
+
+    /// Invalida cachés tras una mutación real: bumpea `version` (memos por
+    /// versión) y marca el índice espacial como sucio.
+    pub fn touch(&mut self) {
+        self.bump_version();
+        self.spatial_dirty = true;
+    }
+
+    /// Devuelve una **copia** de los segmentos cacheados de un
+    /// `ImplicitCurveObj`. Si el id no corresponde a una implícita, o si el
+    /// cache aún no está poblado, devuelve un vector vacío (es seguro y
+    /// barato; el render simplemente no dibujará ese `ComplexMapping`).
+    pub fn implicit_curve_segments(&self, id: ObjectId) -> ImplicitCurveSegments {
+        if let Some(GeoObject::ImplicitCurve(ic)) = self.objects.get(&id) {
+            ic.cached_segments
+                .read()
+                .unwrap_or_else(|p| {
+                    log::warn!("cache lock envenenado; recuperando estado parcial");
+                    p.into_inner()
+                })
+                .clone()
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub fn objects(&self) -> &BTreeMap<ObjectId, GeoObject> {
+        &self.objects
+    }
+
+    pub fn objects_iter(&self) -> impl Iterator<Item = (&ObjectId, &GeoObject)> {
+        self.objects.iter()
+    }
+
+    /// Iterador ordenado determinista sobre `objects` (BTreeMap::iter ya es ordenado
+    /// por `ObjectId` ascendente). Se expone para que callers externos no
+    /// necesiten ordenar manualmente y para garantizar hash determinista.
+    pub fn objects_iter_sorted(&self) -> impl Iterator<Item = (&ObjectId, &GeoObject)> {
+        self.objects.iter()
+    }
+
+    /// Capa de dibujo de un objeto (0 por defecto, como GeoGebra; Q2).
+    /// Los ids desconocidos (stale) devuelven 0 sin paniquear.
+    pub fn layer_of(&self, id: ObjectId) -> u32 {
+        self.layers.get(&id).copied().unwrap_or(0)
+    }
+
+    /// Vista prestada de la tabla de capas (para validación y serialización).
+    pub fn layers(&self) -> &BTreeMap<ObjectId, u32> {
+        &self.layers
+    }
+
+    /// Asigna un objeto existente a una capa `0..=255` (Q2).
+    /// Error honesto si el objeto no existe o la capa excede el máximo.
+    pub fn set_layer(&mut self, id: ObjectId, layer: u32) -> Result<(), String> {
+        if !self.objects.contains_key(&id) {
+            return Err(format!("capa: objeto {id} no encontrado"));
+        }
+        if layer > crate::symbolic::exchange::MAX_LAYERS {
+            return Err(format!(
+                "capa {layer} excede el máximo {}",
+                crate::symbolic::exchange::MAX_LAYERS
+            ));
+        }
+        self.bump_version();
+        self.spatial_dirty = true;
+        if layer == 0 {
+            self.layers.remove(&id);
+        } else {
+            self.layers.insert(id, layer);
+        }
+        Ok(())
+    }
+
+    /// Asigna con clamp honesto (Q2): capas >255 caen a 255 y se avisa.
+    /// Devuelve la capa aplicada. Error si el objeto no existe o `layer` < 0.
+    pub fn set_layer_clamped(&mut self, id: ObjectId, layer: i64) -> Result<(u32, bool), String> {
+        if !self.objects.contains_key(&id) {
+            return Err(format!("capa: objeto {id} no encontrado"));
+        }
+        if layer < 0 {
+            return Err(format!("capa {layer} inválida: usa un entero 0..=255"));
+        }
+        let max = i64::from(crate::symbolic::exchange::MAX_LAYERS);
+        let clamped = layer > max;
+        let applied = if clamped {
+            crate::symbolic::exchange::MAX_LAYERS
+        } else {
+            layer as u32
+        };
+        self.set_layer(id, applied)?;
+        Ok((applied, clamped))
+    }
+
+    /// Descarta asignaciones a objetos que ya no existen (documentos viejos
+    /// o borrados en cascada). La piel la llama al dibujar para acotar memoria.
+    pub fn prune_layers(&mut self) {
+        self.layers.retain(|id, _| self.objects.contains_key(id));
+        self.layers
+            .retain(|_, layer| *layer <= crate::symbolic::exchange::MAX_LAYERS);
+    }
+
+    /// Capas no vacías `(capa, cantidad)` en orden ascendente, en una sola
+    /// pasada. La piel la usa para listar sin escanear 256 capas.
+    pub fn used_layers(&self) -> Vec<(u32, usize)> {
+        let mut counts: BTreeMap<u32, usize> = BTreeMap::new();
+        for id in self.objects.keys() {
+            *counts.entry(self.layer_of(*id)).or_default() += 1;
+        }
+        counts.into_iter().collect()
+    }
+
+    /// Visibilidad conjunta de una capa: `true` si todos sus objetos están
+    /// visibles (vacía = `true` por vacuidad; la piel solo la llama con
+    /// capas de [`Self::used_layers`]).
+    pub fn is_layer_visible(&self, layer: u32) -> bool {
+        self.objects
+            .iter()
+            .filter(|(id, _)| self.layer_of(**id) == layer)
+            .all(|(_, object)| object.is_visible())
+    }
+
+    /// Aplica visibilidad a toda la capa; devuelve cuántos objetos tocó.
+    /// La piel lo envuelve en snapshot de undo.
+    pub fn set_layer_visible(&mut self, layer: u32, visible: bool) -> usize {
+        let ids: Vec<ObjectId> = self
+            .objects
+            .iter()
+            .filter(|(id, _)| self.layer_of(**id) == layer)
+            .map(|(id, _)| *id)
+            .collect();
+        let mut touched = 0;
+        for id in ids {
+            if let Some(object) = self.get_object_mut(id) {
+                object.set_visible(visible);
+                touched += 1;
+            }
+        }
+        if touched > 0 {
+            self.touch();
+        }
+        touched
+    }
+
+    /// Fija la capa devolviendo el documento anterior sólo tras un commit
+    /// exitoso (mismo patrón que [`Self::try_replace_object_with_previous`]:
+    /// staging + validación + reemplazo; la piel lo usa para no mutar el
+    /// documento fuera del pipeline validado). `Ok(None)` = sin cambio.
+    pub fn try_set_layer_with_previous(
+        &mut self,
+        id: ObjectId,
+        layer: u32,
+    ) -> Result<Option<Self>, String> {
+        if !self.objects.contains_key(&id) {
+            return Err(format!("capa: objeto {id} no encontrado"));
+        }
+        if layer > crate::symbolic::exchange::MAX_LAYERS {
+            return Err(format!(
+                "capa {layer} excede el máximo {}",
+                crate::symbolic::exchange::MAX_LAYERS
+            ));
+        }
+        if self.layer_of(id) == layer {
+            return Ok(None);
+        }
+        let mut staged = self.detached_clone_for_staging();
+        staged.set_layer(id, layer)?;
+        crate::validation::validate_document(&staged)?;
+        staged.version = self.version.wrapping_add(1);
+        staged.spatial_dirty = true;
+        Ok(Some(std::mem::replace(self, staged)))
+    }
+
+    /// Returns every exact label match in stable object-ID order. Legacy files
+    /// may contain duplicates even though new insertions reject them.
+    pub fn object_ids_by_label(&self, label: &str) -> Vec<ObjectId> {
+        let label = label.trim();
+        let mut matches: Vec<_> = self
+            .objects
+            .iter()
+            .filter_map(|(id, object)| (object.label() == label).then_some(*id))
+            .collect();
+        matches.sort_unstable();
+        matches
+    }
+
+    /// Resolves a label only when it identifies at most one object.
+    pub fn try_find_object_by_label(&self, label: &str) -> Result<Option<ObjectId>, String> {
+        let matches = self.object_ids_by_label(label);
+        match matches.as_slice() {
+            [] => Ok(None),
+            [id] => Ok(Some(*id)),
+            _ => Err(format!(
+                "Object label '{}' is ambiguous across {} objects",
+                label.trim(),
+                matches.len()
+            )),
+        }
+    }
+
+    pub fn objects_iter_mut(&mut self) -> impl Iterator<Item = (&ObjectId, &mut GeoObject)> {
+        self.spatial_dirty = true;
+        self.objects.iter_mut()
+    }
+
+    pub fn view(&self) -> &ViewTransform {
+        &self.view
+    }
+
+    pub fn view_mut(&mut self) -> &mut ViewTransform {
+        self.spatial_dirty = true;
+        &mut self.view
+    }
+
+    /// Actualiza la proyección de pantalla sólo si el canvas cambió realmente.
+    /// Devuelve si se invalidó el índice espacial asociado a la vista.
+    pub fn set_screen_size(&mut self, width: f32, height: f32) -> bool {
+        if self.view.screen_size.x == width && self.view.screen_size.y == height {
+            return false;
+        }
+        self.view.screen_size.x = width;
+        self.view.screen_size.y = height;
+        self.spatial_dirty = true;
+        true
+    }
+
+    pub fn set_view(&mut self, view: ViewTransform) {
+        self.view = view;
+        self.spatial_dirty = true;
+    }
+
+    pub fn selection(&self) -> &[ObjectId] {
+        &self.selection
+    }
+
+    pub fn select(&mut self, id: ObjectId) {
+        if !self.selection.contains(&id) {
+            self.selection.push(id);
+        }
+    }
+
+    pub fn deselect(&mut self, id: ObjectId) {
+        self.selection.retain(|&s| s != id);
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection.clear();
+    }
+
+    pub fn is_selected(&self, id: ObjectId) -> bool {
+        self.selection.contains(&id)
+    }
+
+    /// ¿Tiene el objeto el rastro activado? (`Rastro[etiqueta]`).
+    pub fn is_trace(&self, id: ObjectId) -> bool {
+        self.trace_enabled.get(&id).copied().unwrap_or(false)
+    }
+
+    /// Activa/desactiva el rastro. Desactivar purga la estela residual.
+    /// Retorna `false` si el objeto no existe (sin mutar nada).
+    /// Hace `bump_version` para invalidar cachés de render.
+    pub fn set_trace(&mut self, id: ObjectId, trace: bool) -> bool {
+        if !self.objects.contains_key(&id) {
+            return false;
+        }
+        if trace {
+            self.trace_enabled.insert(id, true);
+        } else {
+            self.trace_enabled.remove(&id);
+            self.trails.remove(&id);
+        }
+        self.bump_version();
+        true
+    }
+
+    /// Empuja una muestra a la estela. Solo guarda si el rastro está activo;
+    /// filtra no-finitos y evicciona FIFO en [`MAX_TRAIL_POINTS`].
+    pub fn push_trail_sample(&mut self, id: ObjectId, p: Point2) -> bool {
+        if !self.is_trace(id) {
+            return false;
+        }
+        let trail = self.trails.entry(id).or_default();
+        trail.push(p)
+    }
+
+    /// Purga la estela sin desactivar el rastro.
+    pub fn clear_trail(&mut self, id: ObjectId) {
+        if let Some(trail) = self.trails.get_mut(&id) {
+            trail.clear();
+        }
+    }
+
+    /// Muestras ordenadas (más antigua primero) para el renderer. Vacío si
+    /// el rastro está apagado o hay <1 muestra.
+    pub fn trail_points(&self, id: ObjectId) -> Vec<Point2> {
+        if !self.is_trace(id) {
+            return Vec::new();
+        }
+        self.trails
+            .get(&id)
+            .map(TrailBuffer::as_vec)
+            .unwrap_or_default()
+    }
+
+    /// Última muestra sin clonar el buffer (el renderer la usa para el
+    /// throttle por movimiento; antes pedía el `Vec` completo para `.last()`).
+    pub fn trail_last(&self, id: ObjectId) -> Option<Point2> {
+        if !self.is_trace(id) {
+            return None;
+        }
+        self.trails.get(&id).and_then(TrailBuffer::last)
+    }
+
+    /// Rebanada contigua de la estela sin clonar (`None` si apagado/vacío).
+    /// Para el draw por frame: antes se clonaba el `Vec` dos veces por
+    /// objeto rastreado y por frame.
+    pub fn trail_slice_mut(&mut self, id: ObjectId) -> Option<&[Point2]> {
+        if !self.is_trace(id) {
+            return None;
+        }
+        let trail = self.trails.get_mut(&id)?;
+        if trail.is_empty() {
+            return None;
+        }
+        Some(trail.points_contiguous())
+    }
+
+    /// Find object near a screen point (in world coordinates).
+    pub fn pick_object(&mut self, world: Point2, tolerance: f64) -> Option<ObjectId> {
+        let variables_hash = self.spatial_variables_hash();
+        if variables_hash != self.spatial_variables_hash {
+            self.spatial_dirty = true;
+            *self.cached_vars_list.lock().unwrap_or_else(|poisoned| {
+                log::warn!("cache lock envenenado; recuperando estado parcial");
+                poisoned.into_inner()
+            }) = None;
+        }
+        if self.spatial_dirty {
+            self.rebuild_spatial_index();
+        }
+        let mut candidates = self.spatial.candidates(world.x, world.y, tolerance);
+        if candidates.is_empty() {
+            candidates.extend(self.objects.keys().copied());
+        }
+
+        let mut hits: Vec<(ObjectId, f64)> = Vec::new();
+        for id in candidates {
+            if let Some(obj) = self.objects.get(&id) {
+                if !obj.is_visible() {
+                    continue;
+                }
+                if self.check_hit(obj, world, tolerance) {
+                    let dist = match obj {
+                        GeoObject::Point(p) => self.resolved_point_position(p).distance(&world),
+                        GeoObject::Line(l) => {
+                            let start = Point2::new(
+                                self.resolve_expr(&l.start_x_expr, l.start.x),
+                                self.resolve_expr(&l.start_y_expr, l.start.y),
+                            );
+                            let end = Point2::new(
+                                self.resolve_expr(&l.end_x_expr, l.end.x),
+                                self.resolve_expr(&l.end_y_expr, l.end.y),
+                            );
+                            match l.kind {
+                                LineKind::Segment => distance_point_to_segment(world, start, end),
+                                LineKind::Ray => {
+                                    grafito_geometry::distance_point_to_ray(world, start, end)
+                                }
+                                LineKind::Line => {
+                                    grafito_geometry::distance_point_to_line(world, start, end)
+                                }
+                            }
+                        }
+                        GeoObject::Circle(c) => {
+                            (c.center.distance(&world) - self.resolved_circle_radius(c)).abs()
+                        }
+                        _ => tolerance,
+                    };
+                    hits.push((id, dist));
+                }
+            }
+        }
+        hits.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        hits.first().map(|(id, _)| *id)
+    }
+
+    fn spatial_variables_hash(&self) -> u64 {
+        // `VarMap` ya es `BTreeMap`: la iteración es ordenada sin sort.
+        let mut hasher = DefaultHasher::new();
+        for (name, value) in &self.variables {
+            name.hash(&mut hasher);
+            value.to_bits().hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    fn resolved_point_position(&self, point: &PointObj) -> Point2 {
+        Point2::new(
+            self.resolve_expr(&point.x_expr, point.position.x),
+            self.resolve_expr(&point.y_expr, point.position.y),
+        )
+    }
+
+    fn resolved_circle_radius(&self, circle: &crate::CircleObj) -> f64 {
+        self.resolve_expr(&circle.radius_expr, circle.radius)
+    }
+
+    fn check_hit(&self, obj: &GeoObject, world: Point2, tolerance: f64) -> bool {
+        match obj {
+            GeoObject::Point(p) => {
+                self.resolved_point_position(p).distance(&world)
+                    <= tolerance.max(p.size as f64 / self.view.scale.abs())
+            }
+            GeoObject::Line(l) => {
+                let start = Point2::new(
+                    self.resolve_expr(&l.start_x_expr, l.start.x),
+                    self.resolve_expr(&l.start_y_expr, l.start.y),
+                );
+                let end = Point2::new(
+                    self.resolve_expr(&l.end_x_expr, l.end.x),
+                    self.resolve_expr(&l.end_y_expr, l.end.y),
+                );
+                let tolerance = tolerance.max(l.width as f64 / (2.0 * self.view.scale.abs()));
+                match l.kind {
+                    LineKind::Segment => {
+                        grafito_geometry::distance_point_to_segment(world, start, end) <= tolerance
+                    }
+                    LineKind::Ray => {
+                        grafito_geometry::distance_point_to_ray(world, start, end) <= tolerance
+                    }
+                    LineKind::Line => {
+                        grafito_geometry::distance_point_to_line(world, start, end) <= tolerance
+                    }
+                }
+            }
+            GeoObject::Circle(c) => {
+                (c.center.distance(&world) - self.resolved_circle_radius(c)).abs() <= tolerance
+            }
+            GeoObject::Polygon(poly) if poly.vertices.len() >= 3 => {
+                let resolved: Vec<Point2> = poly
+                    .vertices
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| {
+                        let x = self.resolve_expr(poly.x_exprs.get(i).unwrap_or(&None), v.x);
+                        let y = self.resolve_expr(poly.y_exprs.get(i).unwrap_or(&None), v.y);
+                        Point2::new(x, y)
+                    })
+                    .collect();
+                distance_point_to_polygon(world, &resolved) <= tolerance
+            }
+            GeoObject::Function(f) => {
+                let x_min = self.resolve_expr(
+                    &f.domain_min_expr,
+                    f.domain_min.unwrap_or(f64::NEG_INFINITY),
+                );
+                let x_max =
+                    self.resolve_expr(&f.domain_max_expr, f.domain_max.unwrap_or(f64::INFINITY));
+                if world.x < x_min - tolerance || world.x > x_max + tolerance {
+                    return false;
+                }
+                if let (Ok(y0), Ok(y1), Ok(y2)) = (
+                    grafito_geometry::expr::evaluate(&f.expr, &[("x".to_string(), world.x)]),
+                    grafito_geometry::expr::evaluate(
+                        &f.expr,
+                        &[("x".to_string(), world.x - tolerance * 2.0)],
+                    ),
+                    grafito_geometry::expr::evaluate(
+                        &f.expr,
+                        &[("x".to_string(), world.x + tolerance * 2.0)],
+                    ),
+                ) {
+                    // Check horizontal distance (if within y range of nearby x)
+                    let min_y = y1.min(y2).min(y0) - tolerance * 2.0;
+                    let max_y = y1.max(y2).max(y0) + tolerance * 2.0;
+                    if world.y >= min_y && world.y <= max_y {
+                        return true;
+                    }
+                    // Fallback to strict vertical distance if curve is very flat
+                    (world.y - y0).abs() <= tolerance * 2.0
+                } else {
+                    false
+                }
+            }
+            GeoObject::Ellipse(el) => {
+                // Check if point is near the ellipse boundary
+                let dx = world.x - el.center.x;
+                let dy = world.y - el.center.y;
+                let cos_a = el.angle.cos();
+                let sin_a = el.angle.sin();
+                let rx = dx * cos_a + dy * sin_a;
+                let ry = -dx * sin_a + dy * cos_a;
+                let ellipse_eq = (rx / el.rx).powi(2) + (ry / el.ry).powi(2);
+                (ellipse_eq - 1.0).abs() <= tolerance / el.rx.min(el.ry)
+            }
+            GeoObject::Parabola(pb) => {
+                if !pb.p.is_finite() || pb.p.abs() < 1e-12 {
+                    return false;
+                }
+                // Transform the test point into the parabola's local coordinate system.
+                let dx = world.x - pb.vertex.x;
+                let dy = world.y - pb.vertex.y;
+                let cos_a = pb.angle.cos();
+                let sin_a = pb.angle.sin();
+                let lx = dx * cos_a + dy * sin_a;
+                let ly = -dx * sin_a + dy * cos_a;
+                let curve_y = lx * lx / (4.0 * pb.p);
+                // Approximate geometric distance by dividing the vertical residual by the
+                // derivative magnitude sqrt(1 + (x/(2p))^2).
+                let residual = (ly - curve_y).abs();
+                let denom = (1.0 + (lx / (2.0 * pb.p)).powi(2)).sqrt();
+                residual / denom.max(1.0) <= tolerance
+            }
+            GeoObject::Hyperbola(hb) => {
+                // Transform the test point into the hyperbola's local coordinate system.
+                let dx = world.x - hb.center.x;
+                let dy = world.y - hb.center.y;
+                let cos_a = hb.angle.cos();
+                let sin_a = hb.angle.sin();
+                let lx = dx * cos_a + dy * sin_a;
+                let ly = -dx * sin_a + dy * cos_a;
+                let a = hb.a.max(1e-12);
+                let b = hb.b.max(1e-12);
+                let hyperbola_eq = if hb.horizontal {
+                    (lx / a).powi(2) - (ly / b).powi(2)
+                } else {
+                    (ly / a).powi(2) - (lx / b).powi(2)
+                };
+                (hyperbola_eq - 1.0).abs() <= tolerance / a.min(b)
+            }
+            GeoObject::Text(txt) => {
+                // Simple bounding box check
+                let width = txt.content.len() as f64 * txt.font_size as f64 * 0.6;
+                let height = txt.font_size as f64;
+                world.x >= txt.position.x
+                    && world.x <= txt.position.x + width
+                    && world.y >= txt.position.y - height
+                    && world.y <= txt.position.y
+            }
+            GeoObject::ParametricCurve2D(pc) => {
+                // Sample the curve and check distance to segments
+                let t_min = self.resolve_expr(&pc.t_min_expr, pc.t_min);
+                let t_max = self.resolve_expr(&pc.t_max_expr, pc.t_max);
+                let steps = 100;
+                let dt = (t_max - t_min) / steps as f64;
+                let mut prev_point: Option<Point2> = None;
+                for i in 0..=steps {
+                    let t = t_min + i as f64 * dt;
+                    if let (Ok(x), Ok(y)) = (
+                        grafito_geometry::expr::evaluate(&pc.expr_x, &[("t".to_string(), t)]),
+                        grafito_geometry::expr::evaluate(&pc.expr_y, &[("t".to_string(), t)]),
+                    ) {
+                        if x.is_finite() && y.is_finite() {
+                            let curr_point = Point2::new(x, y);
+                            if let Some(prev) = prev_point {
+                                if distance_point_to_segment(world, prev, curr_point) <= tolerance {
+                                    return true;
+                                }
+                            }
+                            prev_point = Some(curr_point);
+                        }
+                    }
+                }
+                false
+            }
+            GeoObject::PolarCurve(pol) => {
+                // Sample the curve and check distance to segments
+                let t_min = self.resolve_expr(&pol.t_min_expr, pol.t_min);
+                let t_max = self.resolve_expr(&pol.t_max_expr, pol.t_max);
+                let steps = 100;
+                let dt = (t_max - t_min) / steps as f64;
+                let mut prev_point: Option<Point2> = None;
+                for i in 0..=steps {
+                    let t = t_min + i as f64 * dt;
+                    if let Ok(r) =
+                        grafito_geometry::expr::evaluate(&pol.expr_r, &[("t".to_string(), t)])
+                    {
+                        if r.is_finite() {
+                            let x = r * t.cos();
+                            let y = r * t.sin();
+                            let curr_point = Point2::new(x, y);
+                            if let Some(prev) = prev_point {
+                                if distance_point_to_segment(world, prev, curr_point) <= tolerance {
+                                    return true;
+                                }
+                            }
+                            prev_point = Some(curr_point);
+                        }
+                    }
+                }
+                false
+            }
+            GeoObject::ImplicitCurve(ic) => {
+                // Evaluate both sides and check if close to the relation
+                if let (Ok(lhs), Ok(rhs)) = (
+                    grafito_geometry::expr::evaluate(
+                        &ic.expr_lhs,
+                        &[("x".to_string(), world.x), ("y".to_string(), world.y)],
+                    ),
+                    grafito_geometry::expr::evaluate(
+                        &ic.expr_rhs,
+                        &[("x".to_string(), world.x), ("y".to_string(), world.y)],
+                    ),
+                ) {
+                    let diff = (lhs - rhs).abs();
+                    match ic.operator {
+                        RelationOperator::Eq => diff <= tolerance,
+                        RelationOperator::Less => lhs < rhs + tolerance,
+                        RelationOperator::Greater => lhs > rhs - tolerance,
+                        RelationOperator::LessEq => lhs <= rhs + tolerance,
+                        RelationOperator::GreaterEq => lhs >= rhs - tolerance,
+                    }
+                } else {
+                    false
+                }
+            }
+            GeoObject::ScatterPlot(sp) => {
+                // Check distance to any point
+                for (x, y) in sp.xs.iter().zip(sp.ys.iter()) {
+                    if Point2::new(*x, *y).distance(&world) <= tolerance {
+                        return true;
+                    }
+                }
+                false
+            }
+            GeoObject::RegressionLine(rl) => {
+                // Check distance to the line y = slope * x + intercept
+                let expected_y = rl.slope * world.x + rl.intercept;
+                (world.y - expected_y).abs() <= tolerance
+            }
+            GeoObject::Histogram(h) => {
+                // Check if point is inside any bar
+                let bins = grafito_geometry::statistics::histogram(&h.data, h.bins);
+                let max_count = bins.iter().map(|(_, _, c)| *c).fold(0.0f64, f64::max);
+                if max_count <= 0.0 {
+                    return false;
+                }
+                let y_scale = (h.y_max - h.y_min) / max_count;
+                for (left, right, count) in &bins {
+                    let bar_height = h.y_min + count * y_scale;
+                    if world.x >= *left
+                        && world.x <= *right
+                        && world.y >= h.y_min
+                        && world.y <= bar_height
+                    {
+                        return true;
+                    }
+                }
+                false
+            }
+            GeoObject::BarChart(b) => {
+                // Barras por índice: x en [i-0.4, i+0.4], y entre 0 y el valor.
+                for (index, value) in b.data.iter().enumerate() {
+                    if !value.is_finite() {
+                        continue;
+                    }
+                    let x = index as f64;
+                    let y_lo = 0.0_f64.min(*value);
+                    let y_hi = 0.0_f64.max(*value);
+                    if world.x >= x - 0.4 - tolerance
+                        && world.x <= x + 0.4 + tolerance
+                        && world.y >= y_lo - tolerance
+                        && world.y <= y_hi + tolerance
+                    {
+                        return true;
+                    }
+                }
+                false
+            }
+            GeoObject::PieChart(p) => {
+                // La torta ocupa el disco centro/radio: hit dentro del disco.
+                if !p.radius.is_finite() || p.radius <= 0.0 {
+                    return false;
+                }
+                p.center.distance(&world) <= p.radius + tolerance
+            }
+            GeoObject::BoxPlot(bp) => {
+                // Check if point is inside the box
+                if let Some((_, q1, _, q3, _, _)) =
+                    grafito_geometry::statistics::boxplot_stats(&bp.data)
+                {
+                    let half_w = bp.width_box * 0.5;
+                    world.x >= bp.position - half_w
+                        && world.x <= bp.position + half_w
+                        && world.y >= q1
+                        && world.y <= q3
+                } else {
+                    false
+                }
+            }
+            GeoObject::Fractal2D(fr) => {
+                // Bounding box check
+                world.x >= fr.x_min
+                    && world.x <= fr.x_max
+                    && world.y >= fr.y_min
+                    && world.y <= fr.y_max
+            }
+            GeoObject::Pencil(pencil) => {
+                // Pencil: comprobamos si el punto está cerca de algún
+                // segmento de la polilínea. La tolerancia se escala por
+                // el grosor del trazo para PencilObj gruesos.
+                let eff_tol = tolerance.max(pencil.width as f64 / self.view.scale * 0.5);
+                if pencil.points.len() < 2 {
+                    return pencil.is_dynamic_locus()
+                        && pencil
+                            .points
+                            .first()
+                            .is_some_and(|point| world.distance(point) <= eff_tol);
+                }
+                for w in pencil.points.windows(2) {
+                    let d = grafito_geometry::distance_point_to_segment(world, w[0], w[1]);
+                    if d <= eff_tol {
+                        return true;
+                    }
+                }
+                false
+            }
+            // 3D objects and complex objects - use bounding box or return false
+            GeoObject::VectorField2D(_)
+            | GeoObject::PhasePortrait(_)
+            | GeoObject::Transformed(_)
+            | GeoObject::ComplexGrid(_)
+            | GeoObject::ComplexMapping(_)
+            | GeoObject::ComplexIntegral(_) => false,
+            _ => false, // 3D objects require projection, skip for now
+        }
+    }
+
+    pub fn rebuild_spatial_index(&mut self) {
+        let mut items = Vec::new();
+        let mut unbounded = Vec::new();
+        for (id, obj) in &self.objects {
+            if !obj.is_visible() {
+                continue;
+            }
+            let (min_x, min_y, max_x, max_y) = match obj {
+                GeoObject::Point(p) => {
+                    let position = self.resolved_point_position(p);
+                    let padding = (p.size as f64 / self.view.scale.abs()).max(0.1);
+                    (
+                        position.x - padding,
+                        position.y - padding,
+                        position.x + padding,
+                        position.y + padding,
+                    )
+                }
+                GeoObject::Line(l) => {
+                    if l.kind != LineKind::Segment {
+                        unbounded.push(*id);
+                        continue;
+                    }
+                    let start = Point2::new(
+                        self.resolve_expr(&l.start_x_expr, l.start.x),
+                        self.resolve_expr(&l.start_y_expr, l.start.y),
+                    );
+                    let end = Point2::new(
+                        self.resolve_expr(&l.end_x_expr, l.end.x),
+                        self.resolve_expr(&l.end_y_expr, l.end.y),
+                    );
+                    let padding = l.width as f64 / (2.0 * self.view.scale.abs());
+                    (
+                        start.x.min(end.x) - padding,
+                        start.y.min(end.y) - padding,
+                        start.x.max(end.x) + padding,
+                        start.y.max(end.y) + padding,
+                    )
+                }
+                GeoObject::Circle(c) => {
+                    let radius = self.resolved_circle_radius(c);
+                    (
+                        c.center.x - radius,
+                        c.center.y - radius,
+                        c.center.x + radius,
+                        c.center.y + radius,
+                    )
+                }
+                GeoObject::Polygon(poly) => {
+                    let mut min_x = f64::MAX;
+                    let mut min_y = f64::MAX;
+                    let mut max_x = f64::MIN;
+                    let mut max_y = f64::MIN;
+                    for (i, v) in poly.vertices.iter().enumerate() {
+                        let x = self.resolve_expr(poly.x_exprs.get(i).unwrap_or(&None), v.x);
+                        let y = self.resolve_expr(poly.y_exprs.get(i).unwrap_or(&None), v.y);
+                        min_x = min_x.min(x);
+                        min_y = min_y.min(y);
+                        max_x = max_x.max(x);
+                        max_y = max_y.max(y);
+                    }
+                    if poly.vertices.is_empty() {
+                        continue;
+                    }
+                    (min_x, min_y, max_x, max_y)
+                }
+                GeoObject::Polyline(line) => {
+                    let mut min_x = f64::MAX;
+                    let mut min_y = f64::MAX;
+                    let mut max_x = f64::MIN;
+                    let mut max_y = f64::MIN;
+                    for v in line.points.iter() {
+                        min_x = min_x.min(v.x);
+                        min_y = min_y.min(v.y);
+                        max_x = max_x.max(v.x);
+                        max_y = max_y.max(v.y);
+                    }
+                    if line.points.is_empty() {
+                        continue;
+                    }
+                    (min_x, min_y, max_x, max_y)
+                }
+                GeoObject::Function(f) => {
+                    let x_min =
+                        self.resolve_expr(&f.domain_min_expr, f.domain_min.unwrap_or(-10.0));
+                    let x_max = self.resolve_expr(&f.domain_max_expr, f.domain_max.unwrap_or(10.0));
+                    // Sample function to estimate y bounds
+                    let mut y_min = f64::MAX;
+                    let mut y_max = f64::MIN;
+                    let steps = 50;
+                    let dx = (x_max - x_min) / steps as f64;
+                    for i in 0..=steps {
+                        let x = x_min + i as f64 * dx;
+                        if let Ok(y) =
+                            grafito_geometry::expr::evaluate(&f.expr, &[("x".to_string(), x)])
+                        {
+                            if y.is_finite() {
+                                y_min = y_min.min(y);
+                                y_max = y_max.max(y);
+                            }
+                        }
+                    }
+                    if y_min > y_max {
+                        continue;
+                    }
+                    (x_min, y_min, x_max, y_max)
+                }
+                GeoObject::Ellipse(el) => {
+                    let max_r = el.rx.max(el.ry);
+                    (
+                        el.center.x - max_r,
+                        el.center.y - max_r,
+                        el.center.x + max_r,
+                        el.center.y + max_r,
+                    )
+                }
+                GeoObject::Parabola(pb) => {
+                    let range = 10.0;
+                    if !pb.p.is_finite() || pb.p.abs() < 1e-12 {
+                        continue;
+                    }
+                    let cos_a = pb.angle.cos();
+                    let sin_a = pb.angle.sin();
+                    let mut min_x = f64::INFINITY;
+                    let mut min_y = f64::INFINITY;
+                    let mut max_x = f64::NEG_INFINITY;
+                    let mut max_y = f64::NEG_INFINITY;
+                    for index in 0..=32 {
+                        let t = -range + 2.0 * range * index as f64 / 32.0;
+                        let local_y = t * t / (4.0 * pb.p);
+                        let x = pb.vertex.x + t * cos_a - local_y * sin_a;
+                        let y = pb.vertex.y + t * sin_a + local_y * cos_a;
+                        if x.is_finite() && y.is_finite() {
+                            min_x = min_x.min(x);
+                            min_y = min_y.min(y);
+                            max_x = max_x.max(x);
+                            max_y = max_y.max(y);
+                        }
+                    }
+                    if !min_x.is_finite()
+                        || !min_y.is_finite()
+                        || !max_x.is_finite()
+                        || !max_y.is_finite()
+                    {
+                        continue;
+                    }
+                    (min_x, min_y, max_x, max_y)
+                }
+                GeoObject::Hyperbola(hb) => {
+                    let range = hb.a.max(hb.b) * 3.0;
+                    (
+                        hb.center.x - range,
+                        hb.center.y - range,
+                        hb.center.x + range,
+                        hb.center.y + range,
+                    )
+                }
+                GeoObject::Text(txt) => {
+                    let width = txt.content.len() as f64 * txt.font_size as f64 * 0.6;
+                    let height = txt.font_size as f64;
+                    (
+                        txt.position.x,
+                        txt.position.y - height,
+                        txt.position.x + width,
+                        txt.position.y,
+                    )
+                }
+                GeoObject::ParametricCurve2D(pc) => {
+                    // Sample curve to compute bounding box
+                    let t_min = self.resolve_expr(&pc.t_min_expr, pc.t_min);
+                    let t_max = self.resolve_expr(&pc.t_max_expr, pc.t_max);
+                    let mut min_x = f64::MAX;
+                    let mut min_y = f64::MAX;
+                    let mut max_x = f64::MIN;
+                    let mut max_y = f64::MIN;
+                    let steps = 100;
+                    let dt = (t_max - t_min) / steps as f64;
+                    for i in 0..=steps {
+                        let t = t_min + i as f64 * dt;
+                        if let (Ok(x), Ok(y)) = (
+                            grafito_geometry::expr::evaluate(&pc.expr_x, &[("t".to_string(), t)]),
+                            grafito_geometry::expr::evaluate(&pc.expr_y, &[("t".to_string(), t)]),
+                        ) {
+                            if x.is_finite() && y.is_finite() {
+                                min_x = min_x.min(x);
+                                min_y = min_y.min(y);
+                                max_x = max_x.max(x);
+                                max_y = max_y.max(y);
+                            }
+                        }
+                    }
+                    if min_x > max_x {
+                        continue;
+                    }
+                    (min_x, min_y, max_x, max_y)
+                }
+                GeoObject::PolarCurve(pol) => {
+                    // Sample curve to compute bounding box
+                    let t_min = self.resolve_expr(&pol.t_min_expr, pol.t_min);
+                    let t_max = self.resolve_expr(&pol.t_max_expr, pol.t_max);
+                    let mut min_x = f64::MAX;
+                    let mut min_y = f64::MAX;
+                    let mut max_x = f64::MIN;
+                    let mut max_y = f64::MIN;
+                    let steps = 100;
+                    let dt = (t_max - t_min) / steps as f64;
+                    for i in 0..=steps {
+                        let t = t_min + i as f64 * dt;
+                        if let Ok(r) =
+                            grafito_geometry::expr::evaluate(&pol.expr_r, &[("t".to_string(), t)])
+                        {
+                            if r.is_finite() {
+                                let x = r * t.cos();
+                                let y = r * t.sin();
+                                min_x = min_x.min(x);
+                                min_y = min_y.min(y);
+                                max_x = max_x.max(x);
+                                max_y = max_y.max(y);
+                            }
+                        }
+                    }
+                    if min_x > max_x {
+                        continue;
+                    }
+                    (min_x, min_y, max_x, max_y)
+                }
+                GeoObject::ImplicitCurve(_ic) => {
+                    // Use view bounds as approximation
+                    let view = &self.view;
+                    let x_min = -10.0 / view.scale;
+                    let x_max = 10.0 / view.scale;
+                    let y_min = -10.0 / view.scale;
+                    let y_max = 10.0 / view.scale;
+                    (x_min, y_min, x_max, y_max)
+                }
+                GeoObject::ScatterPlot(sp) => {
+                    if sp.xs.is_empty() || sp.ys.is_empty() {
+                        continue;
+                    }
+                    let mut min_x = f64::MAX;
+                    let mut min_y = f64::MAX;
+                    let mut max_x = f64::MIN;
+                    let mut max_y = f64::MIN;
+                    for (x, y) in sp.xs.iter().zip(sp.ys.iter()) {
+                        min_x = min_x.min(*x);
+                        min_y = min_y.min(*y);
+                        max_x = max_x.max(*x);
+                        max_y = max_y.max(*y);
+                    }
+                    (min_x, min_y, max_x, max_y)
+                }
+                GeoObject::RegressionLine(rl) => {
+                    if rl.xs.is_empty() {
+                        continue;
+                    }
+                    let x_min = rl.xs.iter().cloned().fold(f64::INFINITY, f64::min);
+                    let x_max = rl.xs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    let y1 = rl.slope * x_min + rl.intercept;
+                    let y2 = rl.slope * x_max + rl.intercept;
+                    let y_min = y1.min(y2);
+                    let y_max = y1.max(y2);
+                    (x_min, y_min, x_max, y_max)
+                }
+                GeoObject::Histogram(h) => {
+                    if h.data.is_empty() {
+                        continue;
+                    }
+                    let x_min = h.data.iter().cloned().fold(f64::INFINITY, f64::min);
+                    let x_max = h.data.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    (x_min, 0.0, x_max, h.data.len() as f64)
+                }
+                GeoObject::BarChart(b) => {
+                    if b.data.is_empty() {
+                        continue;
+                    }
+                    let y_min = b.data.iter().cloned().fold(0.0_f64, f64::min);
+                    let y_max = b.data.iter().cloned().fold(0.0_f64, f64::max);
+                    (-0.5, y_min, b.data.len() as f64 - 0.5, y_max)
+                }
+                GeoObject::PieChart(p) => {
+                    if !p.radius.is_finite() || p.radius <= 0.0 {
+                        continue;
+                    }
+                    let r = p.radius.abs();
+                    (
+                        p.center.x - r,
+                        p.center.y - r,
+                        p.center.x + r,
+                        p.center.y + r,
+                    )
+                }
+                GeoObject::BoxPlot(bp) => {
+                    if bp.data.is_empty() {
+                        continue;
+                    }
+                    let y_min = bp.data.iter().cloned().fold(f64::INFINITY, f64::min);
+                    let y_max = bp.data.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    let half_w = bp.width_box * 0.5;
+                    (bp.position - half_w, y_min, bp.position + half_w, y_max)
+                }
+                GeoObject::Fractal2D(fr) => (fr.x_min, fr.y_min, fr.x_max, fr.y_max),
+                GeoObject::VectorField2D(_vf) => {
+                    // Use view bounds as approximation
+                    let view = &self.view;
+                    let x_min = -10.0 / view.scale;
+                    let x_max = 10.0 / view.scale;
+                    let y_min = -10.0 / view.scale;
+                    let y_max = 10.0 / view.scale;
+                    (x_min, y_min, x_max, y_max)
+                }
+                GeoObject::ComplexGrid(cg) => (cg.x_min, cg.y_min, cg.x_max, cg.y_max),
+                GeoObject::ComplexMapping(_) => {
+                    // ComplexMapping doesn't have its own bounds, skip
+                    continue;
+                }
+                // Las tablas son fuentes de análisis, no geometría seleccionable.
+                // Las listas igual: sin representación espacial.
+                GeoObject::DataTable(_) | GeoObject::List(_) => continue,
+                GeoObject::PhasePortrait(pp) => (pp.x_min, pp.y_min, pp.x_max, pp.y_max),
+                GeoObject::Transformed(_) => (0.0, 0.0, 0.0, 0.0),
+                GeoObject::ComplexIntegral(_) => (0.0, 0.0, 0.0, 0.0),
+                GeoObject::Pencil(p) => {
+                    if p.points.is_empty() {
+                        continue;
+                    }
+                    let mut min_x = f64::INFINITY;
+                    let mut min_y = f64::INFINITY;
+                    let mut max_x = f64::NEG_INFINITY;
+                    let mut max_y = f64::NEG_INFINITY;
+                    for pt in &p.points {
+                        if pt.x < min_x {
+                            min_x = pt.x;
+                        }
+                        if pt.x > max_x {
+                            max_x = pt.x;
+                        }
+                        if pt.y < min_y {
+                            min_y = pt.y;
+                        }
+                        if pt.y > max_y {
+                            max_y = pt.y;
+                        }
+                    }
+                    (min_x, min_y, max_x, max_y)
+                }
+                GeoObject::Arc(arc) => {
+                    let r = arc.radius;
+                    (
+                        arc.center.x - r,
+                        arc.center.y - r,
+                        arc.center.x + r,
+                        arc.center.y + r,
+                    )
+                }
+                GeoObject::Sector(sector) => {
+                    let r = sector.radius;
+                    (
+                        sector.center.x - r,
+                        sector.center.y - r,
+                        sector.center.x + r,
+                        sector.center.y + r,
+                    )
+                }
+                GeoObject::BezierCurve(bez) => {
+                    if bez.control_points.is_empty() {
+                        continue;
+                    }
+                    let mut min_x = f64::INFINITY;
+                    let mut min_y = f64::INFINITY;
+                    let mut max_x = f64::NEG_INFINITY;
+                    let mut max_y = f64::NEG_INFINITY;
+                    for pt in &bez.control_points {
+                        min_x = min_x.min(pt.x);
+                        min_y = min_y.min(pt.y);
+                        max_x = max_x.max(pt.x);
+                        max_y = max_y.max(pt.y);
+                    }
+                    (min_x, min_y, max_x, max_y)
+                }
+                GeoObject::Spline(spline) => {
+                    if spline.points.is_empty() {
+                        continue;
+                    }
+                    let mut min_x = f64::INFINITY;
+                    let mut min_y = f64::INFINITY;
+                    let mut max_x = f64::NEG_INFINITY;
+                    let mut max_y = f64::NEG_INFINITY;
+                    for pt in &spline.points {
+                        min_x = min_x.min(pt.x);
+                        min_y = min_y.min(pt.y);
+                        max_x = max_x.max(pt.x);
+                        max_y = max_y.max(pt.y);
+                    }
+                    (min_x, min_y, max_x, max_y)
+                }
+                // 3D objects are not indexed in 2D spatial index
+                GeoObject::Point3D(_)
+                | GeoObject::Segment3D(_)
+                | GeoObject::Plane3D(_)
+                | GeoObject::Line3D(_)
+                | GeoObject::Sphere3D(_)
+                | GeoObject::Cube3D(_)
+                | GeoObject::Tetrahedron3D(_)
+                | GeoObject::Pyramid3D(_)
+                | GeoObject::Cone3D(_)
+                | GeoObject::Cylinder3D(_)
+                | GeoObject::Platonic3D(_)
+                | GeoObject::InfiniteCone3D(_)
+                | GeoObject::InfiniteCylinder3D(_)
+                | GeoObject::Torus3D(_)
+                | GeoObject::MoebiusStrip(_)
+                | GeoObject::Surface3D(_)
+                | GeoObject::Prism3D(_)
+                | GeoObject::Quadric3D(_)
+                | GeoObject::ImplicitSurface3D(_)
+                | GeoObject::ParametricCurve3D(_)
+                | GeoObject::Attractor3D(_)
+                | GeoObject::RegularPolychoron4D(_)
+                | GeoObject::RegularPolytopeND(_)
+                | GeoObject::HyperSurface4D(_)
+                | GeoObject::VectorField3D(_) => {
+                    continue;
+                }
+            };
+            items.push((*id, min_x, min_y, max_x, max_y));
+        }
+        self.spatial.rebuild_with_unbounded(items, unbounded);
+        self.spatial_dirty = false;
+        self.spatial_variables_hash = self.spatial_variables_hash();
+    }
+
+    pub fn clear(&mut self) {
+        self.bump_version();
+        self.objects.clear();
+        self.selection.clear();
+        self.next_label_number.clear();
+        self.variables.clear();
+        self.variable_meta.clear();
+        self.spreadsheet.clear();
+        self.cas_worksheet.clear();
+        self.spreadsheet_variables.clear();
+        self.spreadsheet_coordinate_points.clear();
+        self.live_sequences.clear();
+        self.spatial = crate::spatial::SpatialIndex::new();
+        self.spatial_dirty = true;
+        self.constraints = ConstraintGraph::new();
+        self.last_solution.clear();
+        self.layers.clear();
+    }
+
+    pub fn resolve_expr(&self, expr: &Option<String>, fallback: f64) -> f64 {
+        match expr {
+            Some(e) => {
+                let vars = {
+                    let mut cache = self.cached_vars_list.lock().unwrap_or_else(|p| {
+                        log::warn!("cache lock envenenado; recuperando estado parcial");
+                        p.into_inner()
+                    });
+                    if let Some((ver, cached)) = &*cache {
+                        if *ver == self.version {
+                            cached.clone()
+                        } else {
+                            let new_vars = std::sync::Arc::new(
+                                self.variables
+                                    .iter()
+                                    .map(|(k, v)| (k.clone(), *v))
+                                    .collect::<Vec<_>>(),
+                            );
+                            *cache = Some((self.version, new_vars.clone()));
+                            new_vars
+                        }
+                    } else {
+                        let new_vars = std::sync::Arc::new(
+                            self.variables
+                                .iter()
+                                .map(|(k, v)| (k.clone(), *v))
+                                .collect::<Vec<_>>(),
+                        );
+                        *cache = Some((self.version, new_vars.clone()));
+                        new_vars
+                    }
+                };
+                match evaluate_cached(e, &vars) {
+                    Ok(v) if v.is_finite() => v,
+                    _ => fallback,
+                }
+            }
+            None => fallback,
+        }
+    }
+
+    fn recompute_bound_parameters_with_changes(&mut self) -> Vec<ObjectId> {
+        let vars: Vec<(String, f64)> = self
+            .variables
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        let mut changed = Vec::new();
+        for obj in self.objects.values_mut() {
+            match obj {
+                GeoObject::Point(p) => {
+                    let previous = p.position;
+                    if let Some(expr) = &p.x_expr {
+                        if let Ok(x) = evaluate_cached(expr, &vars) {
+                            p.position.x = x;
+                        }
+                    }
+                    if let Some(expr) = &p.y_expr {
+                        if let Ok(y) = evaluate_cached(expr, &vars) {
+                            p.position.y = y;
+                        }
+                    }
+                    if p.position != previous {
+                        changed.push(p.id);
+                    }
+                }
+                GeoObject::Circle(c) => {
+                    let previous = c.radius;
+                    if let Some(expr) = &c.radius_expr {
+                        if let Ok(r) = evaluate_cached(expr, &vars) {
+                            c.radius = r;
+                        }
+                    }
+                    if c.radius != previous {
+                        changed.push(c.id);
+                    }
+                }
+                GeoObject::Function(f) => {
+                    f.invalidate_cache();
+                }
+                _ => {}
+            }
+        }
+        // Bound expressions can move indexed geometry without going through a
+        // mutable object accessor, so invalidate the spatial index explicitly.
+        self.spatial_dirty = true;
+        changed
+    }
+
+    pub fn recompute_bound_parameters(&mut self) {
+        if let Err(error) = self.try_recompute_bound_parameters() {
+            log::warn!("{error}");
+        }
+    }
+
+    fn try_recompute_bound_parameters(&mut self) -> Result<bool, String> {
+        let mut staged = self.detached_clone_for_staging();
+        let changed = staged.recompute_bound_parameters_with_changes();
+        if changed.is_empty() {
+            return Ok(false);
+        }
+        staged.propagate_changed_roots(&changed)?;
+        staged.recompute_live_sequences()?;
+        staged.sync_linked_scatter_plots();
+        crate::validation::validate_document(&staged)?;
+        staged.version = self.version.wrapping_add(1);
+        staged.spatial_dirty = true;
+        *self = staged;
+        Ok(true)
+    }
+
+    fn propagate_changed_roots(&mut self, changed: &[ObjectId]) -> Result<(), String> {
+        if changed.is_empty() {
+            return Ok(());
+        }
+        let order = self.propagation_order(changed);
+        self.re_evaluate_constraints_in_place(&order)
+    }
+
+    fn commit_variable_mutation<F>(&mut self, mutate: F) -> Result<(), String>
+    where
+        F: FnOnce(&mut Self),
+    {
+        let mut staged = self.detached_clone_for_staging();
+        mutate(&mut staged);
+        // `recompute_spreadsheet_variables` ya incluye secuencias vivas y sync
+        // de gráficos vinculados (F3b).
+        staged.recompute_spreadsheet_variables()?;
+        crate::validation::validate_document(&staged)?;
+        staged.version = self.version.wrapping_add(1);
+        staged.spatial_dirty = true;
+        *self = staged;
+        Ok(())
+    }
+
+    /// Actualiza una variable y, si mueve geometría ligada, propaga y captura
+    /// el estado final de manera atómica.
+    pub fn try_set_variable(&mut self, name: String, value: f64) -> Result<(), String> {
+        if !value.is_finite() {
+            return Err("Variable value must be finite".to_string());
+        }
+        if self.is_spreadsheet_owned_variable(&name) {
+            return Err("Spreadsheet-owned variables must be edited in their cell".to_string());
+        }
+        // Fast-path (FIX5.1): si nada derivado menciona la variable, el
+        // cambio no mueve geometría ni celdas: se muta in place + `touch`
+        // sin clonar el documento ni re-validar/recomputar (el costo del
+        // camino lento es ~1 clon entero + serde + validación por frame de
+        // slider). La validez se preserva: el valor es finito (chequeado
+        // arriba) y ninguna otra guarda de `validate_document` depende del
+        // valor de una variable.
+        if !self.variables.contains_key(&name)
+            && self.variables.len() >= crate::validation::MAX_ARRAY_LENGTH
+        {
+            return Err("Document contains too many variables".to_string());
+        }
+        if self.variable_is_unreferenced(&name) {
+            self.variables.insert(name, value);
+            self.touch();
+            return Ok(());
+        }
+        self.commit_variable_mutation(move |document| {
+            document.variables.insert(name, value);
+        })
+    }
+
+    /// ¿Nada derivado menciona la variable `name`? Revisa expresiones de
+    /// objetos, secuencias vivas, celdas de planilla y hoja CAS. Los guiones
+    /// (`object_scripts`/`on_load`) son event-driven, no estado derivado, y
+    /// no se re-ejecutan al cambiar una variable: no cuentan.
+    fn variable_is_unreferenced(&self, name: &str) -> bool {
+        use crate::object::expr_mentions_var;
+        if self.spreadsheet_variables.contains(name) {
+            return false;
+        }
+        if self
+            .objects
+            .values()
+            .any(|obj| obj.references_variable(name))
+        {
+            return false;
+        }
+        if self.live_sequences.values().any(|binding| {
+            binding.var == name
+                || expr_mentions_var(&binding.expr, name)
+                || expr_mentions_var(&binding.start_expr, name)
+                || expr_mentions_var(&binding.end_expr, name)
+        }) {
+            return false;
+        }
+        if self
+            .spreadsheet
+            .iter()
+            .flatten()
+            .any(|cell| expr_mentions_var(cell, name))
+        {
+            return false;
+        }
+        if self
+            .cas_worksheet
+            .iter()
+            .any(|entry| expr_mentions_var(&entry.input, name))
+        {
+            return false;
+        }
+        true
+    }
+
+    /// Reemplaza los metadatos de una variable existente sólo cuando el
+    /// documento completo sigue siendo válido. El candidato se valida sobre
+    /// una copia aislada, por lo que los rechazos no alteran el estado vivo ni
+    /// sus cachés de ejecución.
+    pub fn try_replace_variable_meta_with_previous(
+        &mut self,
+        name: &str,
+        candidate: VariableMeta,
+    ) -> Result<Option<Self>, String> {
+        if self.is_spreadsheet_owned_variable(name) {
+            return Err("Spreadsheet-owned variables must be edited in their cell".to_string());
+        }
+        if !self.variables.contains_key(name) {
+            return Ok(None);
+        }
+        if self.variable_meta.get(name) == Some(&candidate) {
+            return Ok(None);
+        }
+
+        let mut staged = self.detached_clone_for_staging();
+        staged.variable_meta.insert(name.to_string(), candidate);
+        crate::validation::validate_document(&staged)?;
+        staged.version = self.version.wrapping_add(1);
+        staged.spatial_dirty = true;
+        Ok(Some(std::mem::replace(self, staged)))
+    }
+
+    /// Atajo legacy que nunca paniquea: delega en [`Self::try_set_variable`]
+    /// y registra el rechazo con `log::warn`.
+    ///
+    /// Path recomendado para código nuevo (scripts, sliders, comandos):
+    /// [`Self::try_set_variable`], cuyo `Err` hay que propagar o mostrar en
+    /// la UI en vez de ignorarlo en silencio.
+    pub fn set_variable(&mut self, name: String, value: f64) {
+        if let Err(error) = self.try_set_variable(name, value) {
+            log::warn!("Variable update rejected: {error}");
+        }
+    }
+
+    /// Configura una variable escalar para animarse de forma local y determinista.
+    ///
+    /// Si la variable todavía no existe, comienza en cero cuando el intervalo lo
+    /// contiene; de lo contrario comienza en el extremo mínimo. La operación se
+    /// valida antes de modificar el documento para que un rango inválido no deje
+    /// metadatos huérfanos.
+    pub fn configure_variable_animation(
+        &mut self,
+        name: &str,
+        min: f64,
+        max: f64,
+        speed: f64,
+        mode: AnimationMode,
+    ) -> Result<(), String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("Animation variable name must not be empty".into());
+        }
+        if self.is_spreadsheet_owned_variable(name) {
+            return Err("Spreadsheet-owned variables must be edited in their cell".into());
+        }
+        if !min.is_finite() || !max.is_finite() || !speed.is_finite() {
+            return Err("Animation bounds and speed must be finite".into());
+        }
+        if min >= max {
+            return Err("Animation minimum must be smaller than its maximum".into());
+        }
+
+        let span = max - min;
+        let fallback_step = (span / 100.0).max(f64::MIN_POSITIVE);
+        let current = self
+            .variables
+            .get(name)
+            .copied()
+            .filter(|value| value.is_finite())
+            .unwrap_or_else(|| if (min..=max).contains(&0.0) { 0.0 } else { min })
+            .clamp(min, max);
+        let previous = self.variable_meta.get(name).cloned();
+        let meta = VariableMeta {
+            position: previous
+                .as_ref()
+                .map(|meta| meta.position)
+                .unwrap_or_else(|| Point2::new(0.0, 0.0)),
+            min,
+            max,
+            step: previous
+                .as_ref()
+                .map(|meta| meta.step)
+                .filter(|step| step.is_finite() && *step > 0.0)
+                .unwrap_or(fallback_step),
+            visible: match previous.as_ref() {
+                Some(meta) => meta.visible,
+                None => true,
+            },
+            animating: true,
+            animation_speed: speed,
+            animation_mode: mode,
+        };
+
+        self.commit_variable_mutation(move |document| {
+            document.variables.insert(name.to_string(), current);
+            document.variable_meta.insert(name.to_string(), meta);
+        })
+    }
+
+    /// Avanza todas las variables animadas un intervalo de tiempo acotado por el llamador.
+    ///
+    /// La actualización agrupa todas las variables en una sola revisión e
+    /// invalidación de caché, evitando que una escena con varios parámetros se
+    /// recalcule una vez por variable y por frame.
+    pub fn advance_variable_animations(&mut self, delta_seconds: f64) -> bool {
+        if !delta_seconds.is_finite() || delta_seconds <= 0.0 {
+            return false;
+        }
+
+        let mut changes = Vec::new();
+        for (name, meta) in &self.variable_meta {
+            if self.is_spreadsheet_owned_variable(name)
+                || !meta.animating
+                || meta.animation_speed == 0.0
+                || !meta.animation_speed.is_finite()
+                || !meta.min.is_finite()
+                || !meta.max.is_finite()
+                || meta.min >= meta.max
+            {
+                continue;
+            }
+            let Some(current) = self
+                .variables
+                .get(name)
+                .copied()
+                .filter(|value| value.is_finite())
+            else {
+                continue;
+            };
+            let travel = meta.animation_speed * delta_seconds;
+            if !travel.is_finite() {
+                continue;
+            }
+
+            let span = meta.max - meta.min;
+            let raw = (current.clamp(meta.min, meta.max) - meta.min) + travel;
+            let (next_value, next_speed) = match meta.animation_mode {
+                AnimationMode::Loop => (meta.min + raw.rem_euclid(span), meta.animation_speed),
+                AnimationMode::PingPong => {
+                    // Conserva la semántica histórica de los sliders: el frame
+                    // que alcanza un límite se fija allí y cambia de dirección.
+                    if raw >= span {
+                        (meta.max, -meta.animation_speed.abs())
+                    } else if raw <= 0.0 {
+                        (meta.min, meta.animation_speed.abs())
+                    } else {
+                        (meta.min + raw, meta.animation_speed)
+                    }
+                }
+            };
+            if next_value != current || next_speed != meta.animation_speed {
+                changes.push((name.clone(), next_value, next_speed));
+            }
+        }
+
+        if changes.is_empty() {
+            return false;
+        }
+        let mut staged = self.detached_clone_for_staging();
+        for (name, value, speed) in changes {
+            staged.variables.insert(name.clone(), value);
+            if let Some(meta) = staged.variable_meta.get_mut(&name) {
+                meta.animation_speed = speed;
+            }
+        }
+        if let Err(error) = staged.recompute_spreadsheet_variables() {
+            log::warn!("Animation update rejected: {error}");
+            return false;
+        }
+        if let Err(error) = crate::validation::validate_document(&staged) {
+            log::warn!("Animation update rejected: {error}");
+            return false;
+        }
+        staged.version = self.version.wrapping_add(1);
+        staged.spatial_dirty = true;
+        *self = staged;
+        true
+    }
+
+    pub fn remove_variable(&mut self, name: &str) {
+        let name = name.to_string();
+        if let Err(error) = self.commit_variable_mutation(move |document| {
+            document.variables.remove(&name);
+            document.variable_meta.remove(&name);
+        }) {
+            log::warn!("Variable removal rejected: {error}");
+        }
+    }
+
+    pub fn get_variable(&self, name: &str) -> Option<f64> {
+        self.variables.get(name).copied()
+    }
+
+    pub fn variables(&self) -> &VarMap {
+        &self.variables
+    }
+
+    /// Vista ordenada determinista de `variables` (puente F4 `VarMap`).
+    ///
+    /// Hoy `variables` ya es `VarMap`: retorna un clon para los call-sites que
+    /// necesitan snapshot propio (hash, baseline, export). Puro, sin mutar.
+    pub fn sorted_variables(&self) -> VarMap {
+        self.variables
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect()
+    }
+
+    /// Indica si el valor de una variable es derivado de una celda de spreadsheet.
+    pub fn is_spreadsheet_owned_variable(&self, name: &str) -> bool {
+        let Some((row, column)) = Self::spreadsheet_coordinate_cell_indices(name) else {
+            return false;
+        };
+        self.spreadsheet
+            .get(row)
+            .and_then(|cells| cells.get(column))
+            .is_some_and(|value| !value.trim().is_empty())
+    }
+
+    /// Devuelve los metadatos inmutables de una variable, si fueron configurados.
+    pub fn variable_meta(&self, name: &str) -> Option<&VariableMeta> {
+        self.variable_meta.get(name)
+    }
+
+    pub fn variable_metadata(&self) -> &VarMetaMap {
+        &self.variable_meta
+    }
+
+    /// ── F2c · ValueTracker → `LiveParam` ───────────────────────────────
+    /// Vista honesta sobre `variables` + `variable_meta`, sin estado nuevo.
+    /// El slider del panel y la animación paramétrica `p` leen/escriben por
+    /// acá: escribir re-evalúa dependientes vía `try_set_variable`
+    /// (recomputa spreadsheet + secuencias vivas, valida, sube `version`;
+    /// las funciones se re-muestrean por clave de caché con hash de
+    /// variables en `function_sampling::samples_or_compute`).
+    /// Valida un nombre de `LiveParam`: 1..=256, ASCII letra/`_` inicial y
+    /// resto alfanumérico/`_` (igual que `is_valid_live_var`).
+    fn validate_live_param_name(name: &str) -> Result<String, String> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err("Parámetro vivo: el nombre no puede estar vacío".to_string());
+        }
+        if trimmed.len() > MAX_LIVE_PARAM_NAME_LEN {
+            return Err(format!(
+                "Parámetro vivo: el nombre supera {MAX_LIVE_PARAM_NAME_LEN} bytes"
+            ));
+        }
+        if !Self::is_valid_live_var(trimmed) {
+            return Err(format!(
+                "Parámetro vivo: '{trimmed}' no es un identificador válido (letra o _ + letras/dígitos/_)"
+            ));
+        }
+        Ok(trimmed.to_string())
+    }
+
+    /// Lee el parámetro vivo `name`, si la variable existe y es finita.
+    /// Sin meta → fallback `LIVE_PARAM_FALLBACK_MIN..=MAX` (sin mutar).
+    /// `None` si no existe, es no-finita o su meta es inválida.
+    pub fn live_param(&self, name: &str) -> Option<LiveParam> {
+        let key = name.trim();
+        if key.is_empty() {
+            return None;
+        }
+        let value = self.variables.get(key).copied()?;
+        if !value.is_finite() {
+            return None;
+        }
+        let (min, max) = match self.variable_meta.get(key) {
+            Some(meta) => {
+                if !meta.min.is_finite() || !meta.max.is_finite() || meta.min >= meta.max {
+                    return None;
+                }
+                (meta.min, meta.max)
+            }
+            None => (LIVE_PARAM_FALLBACK_MIN, LIVE_PARAM_FALLBACK_MAX),
+        };
+        if !value.is_finite() {
+            return None;
+        }
+        let clamped = value.clamp(min, max);
+        Some(LiveParam {
+            name: key.to_string(),
+            min,
+            max,
+            value: clamped,
+        })
+    }
+
+    /// Valor del parámetro vivo para la animación paramétrica.
+    /// Lee `name` si existe y es finito; si no, devuelve `fallback`
+    /// (finito o 0.0). Puro, sin `unwrap`, sin mutar. La animación `p`
+    /// usa `live_param_value("p", p0)` para no inventar valores.
+    pub fn live_param_value(&self, name: &str, fallback: f64) -> f64 {
+        let safe_fallback = if fallback.is_finite() { fallback } else { 0.0 };
+        let key = name.trim();
+        if key.is_empty() {
+            return safe_fallback;
+        }
+        self.variables
+            .get(key)
+            .copied()
+            .filter(|v| v.is_finite())
+            .map(|v| match self.variable_meta.get(key) {
+                Some(meta)
+                    if meta.min.is_finite() && meta.max.is_finite() && meta.min < meta.max =>
+                {
+                    v.clamp(meta.min, meta.max)
+                }
+                _ => v,
+            })
+            .unwrap_or(safe_fallback)
+    }
+
+    /// Escribe el valor del parámetro vivo (slider del panel).
+    /// Delega en `try_set_variable`: valida finitud, rechaza variables de
+    /// spreadsheet, recomputa dependientes y sube `version`. El llamador
+    /// (panel) aporta el undo vía `DeferredPanelSnapshot`.
+    pub fn set_live_param(&mut self, name: &str, value: f64) -> Result<(), String> {
+        let key = Self::validate_live_param_name(name)?;
+        if !value.is_finite() {
+            return Err("Parámetro vivo: el valor debe ser finito".to_string());
+        }
+        if !self.variables.contains_key(&key) {
+            return Err(format!(
+                "Parámetro vivo: '{key}' no existe (crealo primero)"
+            ));
+        }
+        // Clampea a la meta si es válida, para que el slider nunca saque el
+        // valor de rango; sin meta válida, escribe tal cual (finito).
+        let clamped = match self.variable_meta.get(&key) {
+            Some(meta) if meta.min.is_finite() && meta.max.is_finite() && meta.min < meta.max => {
+                value.clamp(meta.min, meta.max)
+            }
+            _ => value,
+        };
+        self.try_set_variable(key, clamped)
+    }
+
+    /// Crea el parámetro vivo si falta (botón "Crear parámetro p" del panel).
+    /// Valida nombre/rango finitos con `min < max`, valor finito clampea­do al
+    /// rango; registra `VariableMeta` visible con `step = span/100` y conserva
+    /// `position`/`animating` previos si existían. Todo en una sola mutación
+    /// validada (`commit_variable_mutation`): dependientes re-evaluados.
+    pub fn ensure_live_param(
+        &mut self,
+        name: &str,
+        min: f64,
+        max: f64,
+        value: f64,
+    ) -> Result<LiveParam, String> {
+        let key = Self::validate_live_param_name(name)?;
+        if !min.is_finite() || !max.is_finite() || !value.is_finite() {
+            return Err("Parámetro vivo: min/max/valor deben ser finitos".to_string());
+        }
+        if min >= max {
+            return Err("Parámetro vivo: el mínimo debe ser menor que el máximo".to_string());
+        }
+        if self.is_spreadsheet_owned_variable(&key) {
+            return Err("Spreadsheet-owned variables must be edited in their cell".to_string());
+        }
+        let clamped = value.clamp(min, max);
+        let span = max - min;
+        let fallback_step = (span / 100.0).max(f64::MIN_POSITIVE);
+        let previous = self.variable_meta.get(&key).cloned();
+        let meta = VariableMeta {
+            position: previous
+                .as_ref()
+                .map(|meta| meta.position)
+                .unwrap_or_else(|| Point2::new(0.0, 0.0)),
+            min,
+            max,
+            step: previous
+                .as_ref()
+                .map(|meta| meta.step)
+                .filter(|step| step.is_finite() && *step > 0.0)
+                .unwrap_or(fallback_step),
+            visible: previous.as_ref().map(|meta| meta.visible).unwrap_or(true),
+            animating: previous
+                .as_ref()
+                .map(|meta| meta.animating)
+                .unwrap_or(false),
+            animation_speed: previous
+                .as_ref()
+                .map(|meta| meta.animation_speed)
+                .filter(|speed| speed.is_finite())
+                .unwrap_or(1.0),
+            animation_mode: previous
+                .as_ref()
+                .map(|meta| meta.animation_mode)
+                .unwrap_or(AnimationMode::PingPong),
+        };
+        let key_for_insert = key.clone();
+        let key_for_meta = key.clone();
+        let meta_clone = meta;
+        self.commit_variable_mutation(move |document| {
+            document.variables.insert(key_for_insert, clamped);
+            document.variable_meta.insert(key_for_meta, meta_clone);
+        })?;
+        Ok(LiveParam {
+            name: key,
+            min,
+            max,
+            value: clamped,
+        })
+    }
+
+    /// Alterna el plano numerado 2D (toggle del panel Vista). Solo vista.
+    pub fn set_number_plane_labels(&mut self, visible: bool) {
+        self.number_plane_labels = visible;
+    }
+
+    /// Máximo de celdas CAS retenidas en un documento local.
+    pub const MAX_CAS_WORKSHEET_CELLS: usize = 200;
+    /// Máximo de bytes para la entrada de una celda CAS persistida.
+    pub const MAX_CAS_WORKSHEET_INPUT_BYTES: usize = 4_096;
+    /// Máximo de bytes para el resultado de una celda CAS persistida.
+    pub const MAX_CAS_WORKSHEET_OUTPUT_BYTES: usize = 8_192;
+    /// Máximo agregado de bytes de entrada y resultado en toda la hoja CAS.
+    pub const MAX_CAS_WORKSHEET_BYTES: usize = 256_000;
+
+    /// Devuelve las celdas CAS locales en orden de envío.
+    pub fn cas_worksheet(&self) -> &[CasWorksheetEntry] {
+        &self.cas_worksheet
+    }
+
+    /// Verifica si una nueva entrada podría reservar una celda CAS antes de
+    /// ejecutar trabajo simbólico potencialmente costoso.
+    pub fn validate_cas_worksheet_input(&self, input: &str) -> Result<(), String> {
+        self.validate_cas_worksheet_input_text(input)?;
+        if self.cas_worksheet.len() >= Self::MAX_CAS_WORKSHEET_CELLS {
+            return Err(format!(
+                "CAS worksheet contains the maximum {} cells",
+                Self::MAX_CAS_WORKSHEET_CELLS
+            ));
+        }
+
+        let minimum_cell_bytes = input
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| "CAS worksheet cell size overflow".to_string())?;
+        if self
+            .cas_worksheet_bytes()?
+            .checked_add(minimum_cell_bytes)
+            .is_none_or(|total| total > Self::MAX_CAS_WORKSHEET_BYTES)
+        {
+            return Err(format!(
+                "CAS worksheet exceeds the {} byte limit",
+                Self::MAX_CAS_WORKSHEET_BYTES
+            ));
+        }
+        Ok(())
+    }
+
+    /// Añade una celda CAS histórica después de aplicar límites de memoria.
+    pub fn try_append_cas_worksheet_cell(
+        &mut self,
+        input: String,
+        output: String,
+        status: CasWorksheetStatus,
+    ) -> Result<(), String> {
+        self.validate_cas_worksheet_input(&input)?;
+        self.validate_cas_worksheet_output(&output)?;
+
+        let entry_bytes = input
+            .len()
+            .checked_add(output.len())
+            .ok_or_else(|| "CAS worksheet cell size overflow".to_string())?;
+        let total_bytes = self.cas_worksheet_bytes()?;
+        if total_bytes
+            .checked_add(entry_bytes)
+            .is_none_or(|total| total > Self::MAX_CAS_WORKSHEET_BYTES)
+        {
+            return Err(format!(
+                "CAS worksheet exceeds the {} byte limit",
+                Self::MAX_CAS_WORKSHEET_BYTES
+            ));
+        }
+
+        self.cas_worksheet.push(CasWorksheetEntry {
+            input,
+            output,
+            status,
+        });
+        if let Err(error) = crate::persistence::serialize_document(self) {
+            self.cas_worksheet.pop();
+            return Err(error.to_string());
+        }
+        self.bump_version();
+        Ok(())
+    }
+
+    /// Elimina todas las celdas CAS y devuelve si había contenido persistido.
+    pub fn clear_cas_worksheet(&mut self) -> bool {
+        if self.cas_worksheet.is_empty() {
+            return false;
+        }
+        self.cas_worksheet.clear();
+        self.bump_version();
+        true
+    }
+
+    pub(crate) fn validate_cas_worksheet(&self) -> Result<(), String> {
+        if self.cas_worksheet.len() > Self::MAX_CAS_WORKSHEET_CELLS {
+            return Err(format!(
+                "CAS worksheet contains {} cells, maximum is {}",
+                self.cas_worksheet.len(),
+                Self::MAX_CAS_WORKSHEET_CELLS
+            ));
+        }
+
+        for entry in &self.cas_worksheet {
+            self.validate_cas_worksheet_entry(&entry.input, &entry.output)?;
+        }
+        if self.cas_worksheet_bytes()? > Self::MAX_CAS_WORKSHEET_BYTES {
+            return Err(format!(
+                "CAS worksheet exceeds the {} byte limit",
+                Self::MAX_CAS_WORKSHEET_BYTES
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_cas_worksheet_entry(&self, input: &str, output: &str) -> Result<(), String> {
+        self.validate_cas_worksheet_input_text(input)?;
+        self.validate_cas_worksheet_output(output)
+    }
+
+    fn validate_cas_worksheet_input_text(&self, input: &str) -> Result<(), String> {
+        if input.trim().is_empty() {
+            return Err("CAS worksheet input cannot be empty".to_string());
+        }
+        if input.len() > Self::MAX_CAS_WORKSHEET_INPUT_BYTES {
+            return Err(format!(
+                "CAS worksheet input exceeds the {} byte limit",
+                Self::MAX_CAS_WORKSHEET_INPUT_BYTES
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_cas_worksheet_output(&self, output: &str) -> Result<(), String> {
+        if output.is_empty() {
+            return Err("CAS worksheet output cannot be empty".to_string());
+        }
+        if output.len() > Self::MAX_CAS_WORKSHEET_OUTPUT_BYTES {
+            return Err(format!(
+                "CAS worksheet output exceeds the {} byte limit",
+                Self::MAX_CAS_WORKSHEET_OUTPUT_BYTES
+            ));
+        }
+        Ok(())
+    }
+
+    fn cas_worksheet_bytes(&self) -> Result<usize, String> {
+        self.cas_worksheet
+            .iter()
+            .try_fold(0usize, |total, entry| {
+                total
+                    .checked_add(entry.input.len())
+                    .and_then(|total| total.checked_add(entry.output.len()))
+            })
+            .ok_or_else(|| "CAS worksheet size overflow".to_string())
+    }
+
+    pub fn get_spreadsheet_cell(&self, row: usize, col: usize) -> String {
+        if row < self.spreadsheet.len() && col < self.spreadsheet[row].len() {
+            self.spreadsheet[row][col].clone()
+        } else {
+            String::new()
+        }
+    }
+
+    // A fully populated sheet must fit the 200,000-element raw JSON structural
+    // gate, the 1,000,000-node gate, and the 10 MiB serialized document cap.
+    pub const MAX_SPREADSHEET_ROWS: usize = 400;
+    pub const MAX_SPREADSHEET_COLS: usize = 400;
+    pub const MAX_SPREADSHEET_RECOMPUTE_CELLS: usize = 10_000;
+
+    fn spreadsheet_cell_label(row: usize, col: usize) -> String {
+        let mut column = col;
+        let mut letters = String::new();
+        loop {
+            letters.push(char::from(b'A' + (column % 26) as u8));
+            if column < 26 {
+                break;
+            }
+            column = column / 26 - 1;
+        }
+        format!("{}{}", letters.chars().rev().collect::<String>(), row + 1)
+    }
+
+    fn spreadsheet_expression_references(expression: &str) -> HashSet<String> {
+        let bytes = expression.as_bytes();
+        let mut references = HashSet::new();
+        let mut index = 0;
+
+        while index < bytes.len() {
+            let starts_identifier = bytes[index].is_ascii_uppercase()
+                && (index == 0
+                    || (!bytes[index - 1].is_ascii_alphanumeric() && bytes[index - 1] != b'_'));
+            if !starts_identifier {
+                index += 1;
+                continue;
+            }
+
+            let start = index;
+            while index < bytes.len() && bytes[index].is_ascii_uppercase() {
+                index += 1;
+            }
+            let letters_end = index;
+            while index < bytes.len() && bytes[index].is_ascii_digit() {
+                index += 1;
+            }
+            if letters_end == index
+                || (index < bytes.len()
+                    && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_'))
+            {
+                continue;
+            }
+
+            let candidate = &expression[start..index];
+            if Self::spreadsheet_coordinate_cell_indices(candidate).is_some() {
+                references.insert(candidate.to_string());
+            }
+        }
+
+        references
+    }
+
+    /// Foto de coordenadas de puntos por etiqueta para la hoja vinculada (F3b).
+    /// Excluye los puntos generados por celdas-coordenada (son salidas, no
+    /// entradas: leerlos como entrada crearía un ciclo rancio) y las etiquetas
+    /// ambiguas o no finitas (honesto: no se inventa ningún valor).
+    fn spreadsheet_point_scalars(&self) -> HashMap<String, (f64, f64)> {
+        let mut scalars: HashMap<String, (f64, f64)> = HashMap::new();
+        let mut ambiguous: HashSet<String> = HashSet::new();
+        for object in self.objects.values() {
+            let GeoObject::Point(point) = object else {
+                continue;
+            };
+            if point.label.trim().is_empty() || ambiguous.contains(&point.label) {
+                continue;
+            }
+            if !point.position.x.is_finite() || !point.position.y.is_finite() {
+                continue;
+            }
+            if self
+                .spreadsheet_coordinate_points
+                .contains_key(&point.label)
+            {
+                continue;
+            }
+            if scalars.contains_key(&point.label) {
+                scalars.remove(&point.label);
+                ambiguous.insert(point.label.clone());
+                continue;
+            }
+            scalars.insert(point.label.clone(), (point.position.x, point.position.y));
+        }
+        scalars
+    }
+
+    /// Expande `x(Etiqueta)` / `y(Etiqueta)` (mayúsculas incluidas, espacios
+    /// opcionales) a literales de ida y vuelta. Sin `unwrap`, sin regex, sin
+    /// dependencias nuevas. Si la expresión supera `MAX_EXPR_LENGTH` o el
+    /// resultado lo superaría, devuelve la entrada intacta para que `evaluate`
+    /// la rechace con error honesto. Las etiquetas desconocidas se dejan
+    /// intactas (la celda queda sin resolver, no se inventa un 0).
+    fn expand_spreadsheet_object_refs(
+        expression: &str,
+        scalars: &HashMap<String, (f64, f64)>,
+    ) -> String {
+        if expression.len() > crate::validation::MAX_EXPR_LENGTH || scalars.is_empty() {
+            return expression.to_string();
+        }
+        if !expression.bytes().any(|byte| byte == b'(') {
+            return expression.to_string();
+        }
+        let chars: Vec<char> = expression.chars().collect();
+        let mut out = String::with_capacity(expression.len());
+        let mut index = 0;
+        while index < chars.len() {
+            let current = chars[index];
+            let is_axis = current == 'x' || current == 'X' || current == 'y' || current == 'Y';
+            let prev_ok = if index == 0 {
+                true
+            } else {
+                let prev = chars[index - 1];
+                !(prev.is_ascii_alphanumeric() || prev == '_')
+            };
+            if is_axis && prev_ok {
+                let mut cursor = index + 1;
+                while cursor < chars.len() && (chars[cursor] == ' ' || chars[cursor] == '\t') {
+                    cursor += 1;
+                }
+                if cursor < chars.len() && chars[cursor] == '(' {
+                    cursor += 1;
+                    while cursor < chars.len() && (chars[cursor] == ' ' || chars[cursor] == '\t') {
+                        cursor += 1;
+                    }
+                    let label_start = cursor;
+                    let is_label_start = cursor < chars.len()
+                        && (chars[cursor].is_ascii_alphabetic() || chars[cursor] == '_');
+                    if is_label_start {
+                        cursor += 1;
+                        while cursor < chars.len()
+                            && (chars[cursor].is_ascii_alphanumeric() || chars[cursor] == '_')
+                        {
+                            cursor += 1;
+                        }
+                        let label_end = cursor;
+                        while cursor < chars.len()
+                            && (chars[cursor] == ' ' || chars[cursor] == '\t')
+                        {
+                            cursor += 1;
+                        }
+                        if cursor < chars.len() && chars[cursor] == ')' {
+                            let label: String = chars[label_start..label_end].iter().collect();
+                            if let Some((px, py)) = scalars.get(&label) {
+                                let value = if current == 'x' || current == 'X' {
+                                    *px
+                                } else {
+                                    *py
+                                };
+                                if value.is_finite() {
+                                    out.push_str(&format!("{value:?}"));
+                                    index = cursor + 1;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            out.push(current);
+            index += 1;
+        }
+        if out.len() > crate::validation::MAX_EXPR_LENGTH {
+            return expression.to_string();
+        }
+        out
+    }
+
+    /// Parsea `(x, y)` literal o con componentes como fórmulas de hoja
+    /// (`A1+1`, `x(A)`, `=B2*2`). `vars` son las variables ya resueltas
+    /// (celdas previas + documento) y `scalars` la foto de puntos. Devuelve
+    /// `None` honesto si algo no es finito o no evalúa (la celda queda sin
+    /// punto, la planilla sigue viva).
+    fn parse_spreadsheet_coordinate_with_context(
+        value: &str,
+        vars: &[(String, f64)],
+        scalars: &HashMap<String, (f64, f64)>,
+    ) -> Option<Point2> {
+        if let Some(literal) = Self::parse_spreadsheet_coordinate(value) {
+            return Some(literal);
+        }
+        let trimmed = value.trim();
+        if trimmed.is_empty() || !trimmed.contains(',') {
+            return None;
+        }
+        let inner = trimmed
+            .strip_prefix('(')
+            .and_then(|rest| rest.strip_suffix(')'))
+            .unwrap_or(trimmed);
+        let mut parts = inner.splitn(2, ',');
+        let left = parts.next()?.trim();
+        let right = parts.next()?.trim();
+        if left.is_empty() || right.is_empty() || left.contains(',') || right.contains(',') {
+            return None;
+        }
+        if left.len() > crate::validation::MAX_EXPR_LENGTH
+            || right.len() > crate::validation::MAX_EXPR_LENGTH
+        {
+            return None;
+        }
+        let eval_part = |part: &str| -> Option<f64> {
+            let expr = part.strip_prefix('=').unwrap_or(part).trim();
+            if expr.is_empty() {
+                return None;
+            }
+            let expanded = Self::expand_spreadsheet_object_refs(expr, scalars);
+            grafito_geometry::expr::evaluate(&expanded, vars)
+                .ok()
+                .filter(|v| v.is_finite())
+        };
+        let x = eval_part(left)?;
+        let y = eval_part(right)?;
+        Some(Point2::new(x, y))
+    }
+
+    /// Reconcilia TODAS las celdas con pinta de coordenada (contienen `,`)
+    /// contra sus puntos generados, usando variables frescas + foto de puntos.
+    /// Crea/actualiza/borra sin voltear la hoja: las colisiones de etiqueta con
+    /// objetos de usuario se saltean (la fuente se conserva, sin punto) y solo
+    /// el tope de objetos o una fuente inválida interna devuelve `Err`.
+    /// Acotado por `MAX_SPREADSHEET_RECOMPUTE_CELLS`. Devuelve los puntos
+    /// tocados para propagar.
+    fn reconcile_all_spreadsheet_coordinates(
+        &mut self,
+        vars: &[(String, f64)],
+        scalars: &HashMap<String, (f64, f64)>,
+    ) -> Result<Vec<ObjectId>, String> {
+        let mut candidates: Vec<(String, String)> = Vec::new();
+        let mut scanned = 0usize;
+        for (row, cells) in self.spreadsheet.iter().enumerate() {
+            for (col, value) in cells.iter().enumerate() {
+                if value.trim().is_empty() || !value.contains(',') {
+                    continue;
+                }
+                if scanned >= Self::MAX_SPREADSHEET_RECOMPUTE_CELLS {
+                    break;
+                }
+                scanned += 1;
+                candidates.push((Self::spreadsheet_cell_label(row, col), value.clone()));
+            }
+            if scanned >= Self::MAX_SPREADSHEET_RECOMPUTE_CELLS {
+                break;
+            }
+        }
+        let mut parsed: HashMap<String, Point2> = HashMap::new();
+        for (label, value) in &candidates {
+            if let Some(position) =
+                Self::parse_spreadsheet_coordinate_with_context(value, vars, scalars)
+            {
+                parsed.insert(label.clone(), position);
+            }
+        }
+        let mut changed: Vec<ObjectId> = Vec::new();
+        let mut changed_ids: HashSet<ObjectId> = HashSet::new();
+        let owned: Vec<(String, ObjectId)> = self
+            .spreadsheet_coordinate_points
+            .iter()
+            .map(|(cell, id)| (cell.clone(), *id))
+            .collect();
+        for (label, position) in &parsed {
+            if self.objects.len() >= crate::validation::MAX_OBJECT_COUNT
+                && self.spreadsheet_coordinate_point(label).is_none()
+            {
+                return Err(format!(
+                    "Document reached the maximum of {} objects",
+                    crate::validation::MAX_OBJECT_COUNT
+                ));
+            }
+            if self
+                .objects
+                .values()
+                .any(|existing| existing.label() == label)
+                && self.spreadsheet_coordinate_point(label).is_none()
+            {
+                continue;
+            }
+            if let Some(id) = self.spreadsheet_coordinate_point(label) {
+                if !self.constraints.is_free(&id) {
+                    continue;
+                }
+                let Some(GeoObject::Point(point)) = self.objects.get_mut(&id) else {
+                    continue;
+                };
+                if point.position != *position {
+                    point.position = *position;
+                    self.spatial_dirty = true;
+                    if changed_ids.insert(id) {
+                        changed.push(id);
+                    }
+                }
+            } else {
+                let id = self.try_add_object(GeoObject::Point(
+                    PointObj::new(*position).with_label(label.clone()),
+                ))?;
+                self.set_spreadsheet_coordinate_point(label.clone(), id);
+                if changed_ids.insert(id) {
+                    changed.push(id);
+                }
+            }
+        }
+        for (label, id) in owned {
+            if parsed.contains_key(&label) {
+                continue;
+            }
+            // Solo borra si hay fuente no vacía que ya no es coordenada; los
+            // dueños legacy sin fuente se conservan (contrato de carga).
+            let Some((row, col)) = Self::spreadsheet_coordinate_cell_indices(&label) else {
+                continue;
+            };
+            let has_source = self
+                .spreadsheet
+                .get(row)
+                .and_then(|cells| cells.get(col))
+                .is_some_and(|value| !value.trim().is_empty());
+            if has_source {
+                let _ = self.remove_object(id);
+            }
+        }
+        Ok(changed)
+    }
+
+    /// Sincroniza cada `ScatterPlot.source_data` desde su `DataTable` fuente.
+    /// Si la tabla falta o los largos difieren de forma interna, el gráfico
+    /// queda intacto (honesto, no inventa puntos). Sin `unwrap`, sin I/O.
+    fn sync_linked_scatter_plots(&mut self) {
+        let links: Vec<(ObjectId, ObjectId)> = self
+            .objects
+            .values()
+            .filter_map(|object| match object {
+                GeoObject::ScatterPlot(scatter) => {
+                    scatter.source_data.map(|table_id| (scatter.id, table_id))
+                }
+                _ => None,
+            })
+            .collect();
+        if links.is_empty() {
+            return;
+        }
+        let mut touched = false;
+        for (scatter_id, table_id) in links {
+            let Some(GeoObject::DataTable(table)) = self.objects.get(&table_id) else {
+                continue;
+            };
+            if table.xs.len() != table.ys.len() {
+                continue;
+            }
+            let (xs, ys) = (table.xs.clone(), table.ys.clone());
+            let Some(GeoObject::ScatterPlot(scatter)) = self.objects.get_mut(&scatter_id) else {
+                continue;
+            };
+            if scatter.xs != xs || scatter.ys != ys {
+                scatter.xs = xs;
+                scatter.ys = ys;
+                touched = true;
+            }
+        }
+        if touched {
+            self.spatial_dirty = true;
+            self.bump_version();
+        }
+    }
+
+    fn spreadsheet_coordinate_cell_indices(cell: &str) -> Option<(usize, usize)> {
+        let letter_count = cell.bytes().take_while(u8::is_ascii_uppercase).count();
+        if letter_count == 0 || letter_count == cell.len() {
+            return None;
+        }
+        let (letters, row_text) = cell.split_at(letter_count);
+        if row_text.starts_with('0') {
+            return None;
+        }
+        let row = row_text.parse::<usize>().ok()?.checked_sub(1)?;
+        if row >= Self::MAX_SPREADSHEET_ROWS {
+            return None;
+        }
+        let mut column = 0usize;
+        for letter in letters.bytes() {
+            column = column
+                .checked_mul(26)?
+                .checked_add((letter - b'A' + 1) as usize)?;
+        }
+        let column = column.checked_sub(1)?;
+        if column >= Self::MAX_SPREADSHEET_COLS {
+            return None;
+        }
+        let mut canonical_column = column;
+        let mut canonical_letters = String::new();
+        loop {
+            canonical_letters.push(char::from(b'A' + (canonical_column % 26) as u8));
+            if canonical_column < 26 {
+                break;
+            }
+            canonical_column = canonical_column / 26 - 1;
+        }
+        let canonical = format!(
+            "{}{}",
+            canonical_letters.chars().rev().collect::<String>(),
+            row + 1
+        );
+        (canonical == cell).then_some((row, column))
+    }
+
+    fn is_valid_spreadsheet_coordinate_owner(&self, cell: &str, point_id: ObjectId) -> bool {
+        Self::spreadsheet_coordinate_cell_indices(cell).is_some()
+            && self.constraints.is_free(&point_id)
+            && matches!(
+                self.objects.get(&point_id),
+                Some(GeoObject::Point(point)) if point.label == cell
+            )
+    }
+
+    /// Returns the exact point generated for a coordinate cell, dropping stale
+    /// ownership left by malformed or legacy persisted data.
+    pub fn spreadsheet_coordinate_point(&mut self, cell: &str) -> Option<ObjectId> {
+        let point_id = self.spreadsheet_coordinate_points.get(cell).copied()?;
+        if self.is_valid_spreadsheet_coordinate_owner(cell, point_id) {
+            Some(point_id)
+        } else {
+            self.spreadsheet_coordinate_points.remove(cell);
+            None
+        }
+    }
+
+    /// Records that `point_id` was generated by the spreadsheet coordinate cell.
+    pub fn set_spreadsheet_coordinate_point(&mut self, cell: String, point_id: ObjectId) {
+        if self.is_valid_spreadsheet_coordinate_owner(&cell, point_id) {
+            self.spreadsheet_coordinate_points
+                .retain(|existing_cell, existing_id| {
+                    existing_cell == &cell || *existing_id != point_id
+                });
+            self.spreadsheet_coordinate_points.insert(cell, point_id);
+        }
+    }
+
+    /// Drops coordinate-cell ownership entries whose points are absent or are
+    /// no longer points. This keeps old or manually edited files safe to load.
+    pub fn prune_spreadsheet_coordinate_points(&mut self) {
+        let mut mappings: Vec<(String, ObjectId)> = self
+            .spreadsheet_coordinate_points
+            .iter()
+            .map(|(cell, point_id)| (cell.clone(), *point_id))
+            .collect();
+        mappings.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        let mut owned_points = HashSet::new();
+        self.spreadsheet_coordinate_points.clear();
+        for (cell, point_id) in mappings {
+            if self.is_valid_spreadsheet_coordinate_owner(&cell, point_id)
+                && owned_points.insert(point_id)
+            {
+                self.spreadsheet_coordinate_points.insert(cell, point_id);
+            }
+        }
+    }
+
+    /// Reconciles persisted coordinate-owned points from their present cell
+    /// sources. Source-less legacy owners remain intact because no cell source
+    /// exists to authoritatively replace them.
+    pub(crate) fn reconcile_spreadsheet_coordinate_points_from_sources(
+        &mut self,
+    ) -> Result<(), String> {
+        self.prune_spreadsheet_coordinate_points();
+        let cells: Vec<String> = self.spreadsheet_coordinate_points.keys().cloned().collect();
+        let mut changed_points = Vec::new();
+        let mut changed_point_ids = HashSet::new();
+
+        for cell in cells {
+            let Some((row, column)) = Self::spreadsheet_coordinate_cell_indices(&cell) else {
+                continue;
+            };
+            let Some(value) = self
+                .spreadsheet
+                .get(row)
+                .and_then(|cells| cells.get(column))
+                .filter(|value| !value.trim().is_empty())
+                .cloned()
+            else {
+                continue;
+            };
+            self.reconcile_spreadsheet_coordinate_point_in_place(
+                &cell,
+                &value,
+                &mut changed_points,
+                &mut changed_point_ids,
+            )?;
+        }
+
+        self.propagate_changed_roots(&changed_points)
+    }
+
+    /// Validate persisted spreadsheet ownership before it is allowed to claim a
+    /// point as a coordinate-cell generated object.
+    pub(crate) fn validate_spreadsheet_coordinate_points(&self) -> Result<(), String> {
+        let mut owned_points = HashSet::new();
+        for (cell, point_id) in &self.spreadsheet_coordinate_points {
+            let Some((row, column)) = Self::spreadsheet_coordinate_cell_indices(cell) else {
+                return Err(format!(
+                    "Spreadsheet coordinate owner key '{cell}' is invalid"
+                ));
+            };
+            let Some(GeoObject::Point(point)) = self.objects.get(point_id) else {
+                return Err(format!(
+                    "Spreadsheet coordinate owner '{cell}' is not a point"
+                ));
+            };
+            if point.label != *cell {
+                return Err(format!(
+                    "Spreadsheet coordinate owner '{cell}' does not match point label '{}',",
+                    point.label
+                ));
+            }
+            if !self.constraints.is_free(point_id) {
+                return Err(format!(
+                    "Spreadsheet coordinate owner '{cell}' must reference a free point"
+                ));
+            }
+            if let Some(source) = self
+                .spreadsheet
+                .get(row)
+                .and_then(|cells| cells.get(column))
+                .filter(|source| !source.trim().is_empty())
+            {
+                // F3b: la fuente puede ser literal o fórmula (`(A1, y(A))`).
+                let vars: Vec<(String, f64)> = self
+                    .variables
+                    .iter()
+                    .map(|(name, value)| (name.clone(), *value))
+                    .collect();
+                let scalars = self.spreadsheet_point_scalars();
+                let Some(position) =
+                    Self::parse_spreadsheet_coordinate_with_context(source, &vars, &scalars)
+                else {
+                    return Err(format!(
+                        "Spreadsheet coordinate owner '{cell}' has no coordinate cell source"
+                    ));
+                };
+                if point.position != position {
+                    return Err(format!(
+                        "Spreadsheet coordinate owner '{cell}' does not match its cell source"
+                    ));
+                }
+            }
+            if !owned_points.insert(*point_id) {
+                return Err(format!(
+                    "Spreadsheet point {point_id} has multiple owner cells"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn set_spreadsheet_cell(
+        &mut self,
+        row: usize,
+        col: usize,
+        value: String,
+    ) -> Result<(), String> {
+        let clears_coordinate_owner = value.trim().is_empty();
+        let edits = [(row, col, value)];
+        Self::validate_spreadsheet_cell_edit_batch(&edits)?;
+        let label = Self::spreadsheet_cell_label(row, col);
+        self.set_spreadsheet_cell_sources_in_place(&edits);
+        if clears_coordinate_owner {
+            if let Some(point_id) = self.spreadsheet_coordinate_point(&label) {
+                let _ = self.remove_object(point_id);
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns whether an editor may commit a cell value immediately. Partial
+    /// coordinate text remains local while an existing coordinate cell owns a
+    /// generated point, matching the spreadsheet's interactive edit contract.
+    fn spreadsheet_cell_edit_is_committable(
+        &mut self,
+        row: usize,
+        column: usize,
+        value: &str,
+    ) -> bool {
+        let label = Self::spreadsheet_cell_label(row, column);
+        let owns_coordinate_point = self.spreadsheet_coordinate_point(&label).is_some();
+        if !owns_coordinate_point || !value.trim_start().starts_with('(') {
+            return true;
+        }
+        if Self::parse_spreadsheet_coordinate(value).is_some() {
+            return true;
+        }
+        // F3b: una coordenada con fórmulas también es commiteable si resuelve
+        // con las variables actuales (si no, sigue como borrador local).
+        let vars: Vec<(String, f64)> = self
+            .variables
+            .iter()
+            .map(|(name, val)| (name.clone(), *val))
+            .collect();
+        let scalars = self.spreadsheet_point_scalars();
+        Self::parse_spreadsheet_coordinate_with_context(value, &vars, &scalars).is_some()
+    }
+
+    /// Stages sorted spreadsheet source changes on one detached document.
+    /// Coordinate-owned points, spreadsheet variables, metadata, and document
+    /// validation are reconciled only after every source reflects its final
+    /// value, so rejected batches leave `self` entirely unchanged.
+    pub fn stage_spreadsheet_cell_edits(
+        &self,
+        edits: &[(usize, usize, String)],
+    ) -> Result<Self, String> {
+        Self::validate_spreadsheet_cell_edit_batch(edits)?;
+        if edits.is_empty() {
+            return Ok(self.detached_clone_for_staging());
+        }
+
+        let mut staged = self.detached_clone_for_staging();
+        for (row, column, value) in edits {
+            if !staged.spreadsheet_cell_edit_is_committable(*row, *column, value) {
+                let label = Self::spreadsheet_cell_label(*row, *column);
+                return Err(format!(
+                    "Celda {label}: el borrador está incompleto o no es válido"
+                ));
+            }
+        }
+
+        staged.set_spreadsheet_cell_sources_in_place(edits);
+        let mut changed_points = Vec::new();
+        let mut changed_point_ids = HashSet::new();
+        for (row, column, value) in edits {
+            let label = Self::spreadsheet_cell_label(*row, *column);
+            staged.reconcile_spreadsheet_coordinate_point_in_place(
+                &label,
+                value,
+                &mut changed_points,
+                &mut changed_point_ids,
+            )?;
+        }
+        for point_id in staged.recompute_spreadsheet_variables_with_bound_changes()? {
+            if changed_point_ids.insert(point_id) {
+                changed_points.push(point_id);
+            }
+        }
+        staged.propagate_changed_roots(&changed_points)?;
+        // Re-evalúa secuencias vivas cuyo rango o expresión dependa de variables cambiadas.
+        staged.recompute_live_sequences()?;
+        staged.sync_linked_scatter_plots();
+        crate::validation::validate_document(&staged)?;
+        staged.version = self.version.wrapping_add(1);
+        staged.spatial_dirty = true;
+        Ok(staged)
+    }
+
+    /// Escritura sin validar, solo para tests (simula JSON editado a mano).
+    #[cfg(test)]
+    pub(crate) fn layers_mut_for_test(&mut self, id: ObjectId, layer: u32) {
+        self.layers.insert(id, layer);
+    }
+
+    /// Helper análogo a FillColumn pero por fila: rellena `row` en columnas [start_col..=end_col].
+    pub fn stage_fill_row(
+        &self,
+        row: usize,
+        start_col: usize,
+        end_col: usize,
+        value: &str,
+    ) -> Result<Self, String> {
+        if row >= Self::MAX_SPREADSHEET_ROWS {
+            return Err(format!(
+                "FillRow: fila {} excede máximo {}",
+                row + 1,
+                Self::MAX_SPREADSHEET_ROWS
+            ));
+        }
+        if start_col > end_col {
+            return Err("FillRow: inicio debe ser <= fin".to_string());
+        }
+        if end_col >= Self::MAX_SPREADSHEET_COLS {
+            return Err(format!(
+                "FillRow: columna {} excede máximo {}",
+                end_col + 1,
+                Self::MAX_SPREADSHEET_COLS
+            ));
+        }
+        let count = end_col
+            .checked_sub(start_col)
+            .and_then(|d| d.checked_add(1))
+            .ok_or_else(|| "rango FillRow desborda".to_string())?;
+        if count > Self::MAX_SPREADSHEET_RECOMPUTE_CELLS {
+            return Err(format!(
+                "FillRow: {} celdas excede máximo {}",
+                count,
+                Self::MAX_SPREADSHEET_RECOMPUTE_CELLS
+            ));
+        }
+        if value.len() > crate::validation::MAX_STRING_LENGTH {
+            return Err("valor FillRow excede longitud máxima".to_string());
+        }
+        let mut edits: Vec<(usize, usize, String)> = Vec::with_capacity(count);
+        for col in start_col..=end_col {
+            edits.push((row, col, value.to_string()));
+        }
+        edits.sort_unstable_by_key(|(r, c, _)| (*r, *c));
+        self.stage_spreadsheet_cell_edits(&edits)
+    }
+
+    /// Registra una secuencia viva que depende de variables y se re-evalúa en cada cambio.
+    ///
+    /// Crea un `LiveSequenceBinding` asociado a `target` (debe ser un `DataTable`).
+    /// Usa `variable_meta` binding para la variable de iteración: registra dependencia
+    /// y permite animación/actualización vía `commit_variable_mutation`.
+    pub fn try_add_live_sequence(
+        &mut self,
+        target: ObjectId,
+        binding: LiveSequenceBinding,
+    ) -> Result<(), String> {
+        if self.live_sequences.len() >= MAX_LIVE_SEQUENCES {
+            return Err(format!(
+                "máximo de secuencias vivas {} alcanzado",
+                MAX_LIVE_SEQUENCES
+            ));
+        }
+        if binding.expr.trim().is_empty()
+            || binding.var.trim().is_empty()
+            || binding.start_expr.trim().is_empty()
+            || binding.end_expr.trim().is_empty()
+        {
+            return Err("LiveSequence: campos vacíos".to_string());
+        }
+        if binding.expr.len() > crate::validation::MAX_EXPR_LENGTH
+            || binding.start_expr.len() > crate::validation::MAX_EXPR_LENGTH
+            || binding.end_expr.len() > crate::validation::MAX_EXPR_LENGTH
+        {
+            return Err("LiveSequence: expresión excede longitud máxima".to_string());
+        }
+        if !Self::is_valid_live_var(&binding.var) {
+            return Err("LiveSequence: variable local inválida".to_string());
+        }
+        // Valida que target exista y sea DataTable.
+        match self.get_object(target) {
+            Some(GeoObject::DataTable(_)) => {}
+            _ => return Err("LiveSequence: target debe ser DataTable".to_string()),
+        }
+        // Registra binding de variable_meta para la variable de iteración si no existe,
+        // permitiendo que la secuencia se re-evalúe al animar/actualizar variables.
+        if !self.variables.contains_key(&binding.var) {
+            // Crea variable local con valor inicial 0 para que la meta tenga dónde anclarse.
+            self.variables.insert(binding.var.clone(), 0.0);
+        }
+        if !self.variable_meta.contains_key(&binding.var) {
+            let meta = VariableMeta {
+                position: Point2::new(0.0, 0.0),
+                min: -1e6,
+                max: 1e6,
+                step: 1.0,
+                visible: false,
+                animating: false,
+                animation_speed: 1.0,
+                animation_mode: AnimationMode::PingPong,
+            };
+            self.variable_meta.insert(binding.var.clone(), meta);
+        }
+        self.live_sequences.insert(target, binding);
+        self.bump_version();
+        self.spatial_dirty = true;
+        Ok(())
+    }
+
+    /// Re-evalúa todas las secuencias vivas tras un cambio de variables.
+    pub fn recompute_live_sequences(&mut self) -> Result<(), String> {
+        if self.live_sequences.is_empty() {
+            self.sync_linked_scatter_plots();
+            return Ok(());
+        }
+        // Snapshot de bindings para evitar borrow conflicts.
+        let bindings: Vec<(ObjectId, LiveSequenceBinding)> = self
+            .live_sequences
+            .iter()
+            .map(|(id, binding)| (*id, binding.clone()))
+            .collect();
+        for (target, binding) in bindings {
+            // Evalúa start/end con las variables actuales.
+            let start = self.resolve_live_expr(&binding.start_expr)?;
+            let end = self.resolve_live_expr(&binding.end_expr)?;
+            let start_i = start.round() as i64;
+            let end_i = end.round() as i64;
+            if !start.is_finite()
+                || !end.is_finite()
+                || (start - start.round()).abs() > 1e-9
+                || (end - end.round()).abs() > 1e-9
+            {
+                return Err(format!(
+                    "LiveSequence {target}: start/end deben ser enteros finitos"
+                ));
+            }
+            // R2-V5: `checked` + deadline (sin wrap ni hang).
+            // `end - start` con `checked_sub` (i64::MIN/MAX no wrappea),
+            // `unsigned_abs` + `checked_add(1)` + `try_from` a `usize`.
+            let diff = end_i
+                .checked_sub(start_i)
+                .ok_or_else(|| format!("LiveSequence {target}: rango con overflow"))?;
+            let len_u64 = diff
+                .unsigned_abs()
+                .checked_add(1)
+                .ok_or_else(|| format!("LiveSequence {target}: longitud con overflow"))?;
+            let len = usize::try_from(len_u64)
+                .map_err(|_| format!("LiveSequence {target}: longitud con overflow"))?;
+            if len > MAX_LIVE_SEQUENCE_LENGTH {
+                return Err(format!(
+                    "LiveSequence {target}: longitud {len} excede máximo {MAX_LIVE_SEQUENCE_LENGTH}"
+                ));
+            }
+            if len > crate::validation::MAX_ARRAY_LENGTH {
+                return Err(format!(
+                    "LiveSequence {target}: longitud {len} excede MAX_ARRAY_LENGTH"
+                ));
+            }
+            // Genera nueva serie (R2-V5: `try_reserve` + deadline 1s).
+            let mut xs: Vec<f64> = Vec::new();
+            xs.try_reserve(len)
+                .map_err(|_| format!("LiveSequence {target}: sin memoria para {len} puntos"))?;
+            let mut ys: Vec<f64> = Vec::new();
+            ys.try_reserve(len)
+                .map_err(|_| format!("LiveSequence {target}: sin memoria para {len} puntos"))?;
+            let deadline = std::time::Instant::now()
+                .checked_add(std::time::Duration::from_millis(MAX_LIVE_SEQUENCE_EVAL_MS))
+                .ok_or_else(|| format!("LiveSequence {target}: deadline con overflow"))?;
+            let step: i64 = if end_i >= start_i { 1 } else { -1 };
+            let mut current = start_i;
+            loop {
+                if std::time::Instant::now() > deadline {
+                    return Err(format!(
+                        "LiveSequence {target}: tiempo excedido (>{MAX_LIVE_SEQUENCE_EVAL_MS} ms)"
+                    ));
+                }
+                let mut mapping: Vec<(String, f64)> = self
+                    .variables
+                    .iter()
+                    .map(|(k, v)| (k.clone(), *v))
+                    .collect();
+                mapping.push((binding.var.clone(), current as f64));
+                let value = grafito_geometry::expr::evaluate(&binding.expr, &mapping)
+                    .map_err(|error| format!("LiveSequence {target} eval: {error}"))?;
+                if !value.is_finite() {
+                    return Err(format!(
+                        "LiveSequence {target}: evaluación no finita en {}={current}",
+                        binding.var
+                    ));
+                }
+                xs.push(current as f64);
+                ys.push(value);
+                if current == end_i {
+                    break;
+                }
+                current = current
+                    .checked_add(step)
+                    .ok_or_else(|| format!("LiveSequence {target}: paso con overflow"))?;
+            }
+            // Actualiza el DataTable asociado.
+            if let Some(GeoObject::DataTable(table)) = self.objects.get_mut(&target) {
+                table.xs = xs;
+                table.ys = ys;
+            }
+        }
+        // F3b: las tablas vivas alimentan gráficos enlazados.
+        self.sync_linked_scatter_plots();
+        Ok(())
+    }
+
+    fn resolve_live_expr(&self, expr: &str) -> Result<f64, String> {
+        let trimmed = expr.trim();
+        if trimmed.is_empty() {
+            return Err("expresión vacía".to_string());
+        }
+        // Intenta parsear como número literal rápido.
+        if let Ok(value) = trimmed.parse::<f64>() {
+            if value.is_finite() {
+                return Ok(value);
+            }
+        }
+        let vars: Vec<(String, f64)> = self
+            .variables
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        grafito_geometry::expr::evaluate(trimmed, &vars)
+            .map_err(|error| format!("no se pudo evaluar '{trimmed}': {error}"))
+    }
+
+    fn is_valid_live_var(name: &str) -> bool {
+        let mut chars = name.chars();
+        chars
+            .next()
+            .is_some_and(|first| first.is_alphabetic() || first == '_')
+            && chars.all(|ch| ch.is_alphanumeric() || ch == '_')
+    }
+
+    /// Tope de bytes por lote de celdas (4 MiB): con valores de hasta
+    /// `MAX_STRING_LENGTH` un lote al tope de celdas ya no puede acercarse al
+    /// techo teórico de 1.6 GB de una sola vez.
+    pub const MAX_SPREADSHEET_BATCH_BYTES: usize = 4_000_000;
+
+    fn validate_spreadsheet_cell_edit_batch(
+        edits: &[(usize, usize, String)],
+    ) -> Result<(), String> {
+        let maximum_cells = Self::MAX_SPREADSHEET_ROWS * Self::MAX_SPREADSHEET_COLS;
+        if edits.len() > maximum_cells {
+            return Err(format!(
+                "Spreadsheet batch exceeds the maximum of {maximum_cells} cells"
+            ));
+        }
+
+        let mut previous = None;
+        let mut total_bytes = 0usize;
+        for (row, column, value) in edits {
+            if *row >= Self::MAX_SPREADSHEET_ROWS {
+                return Err(format!(
+                    "row {} exceeds maximum {}",
+                    row,
+                    Self::MAX_SPREADSHEET_ROWS
+                ));
+            }
+            if *column >= Self::MAX_SPREADSHEET_COLS {
+                return Err(format!(
+                    "col {} exceeds maximum {}",
+                    column,
+                    Self::MAX_SPREADSHEET_COLS
+                ));
+            }
+            if previous.is_some_and(|previous| previous >= (*row, *column)) {
+                return Err("Spreadsheet batch cells must be strictly sorted and unique".into());
+            }
+            previous = Some((*row, *column));
+            // Sin tope por valor, una sola celda podía traer cientos de MB.
+            // El tope por valor usa el mismo `MAX_STRING_LENGTH` de la carga.
+            if value.len() > crate::validation::MAX_STRING_LENGTH {
+                return Err(format!(
+                    "cell value exceeds maximum {} bytes",
+                    crate::validation::MAX_STRING_LENGTH
+                ));
+            }
+            total_bytes = total_bytes.saturating_add(value.len());
+            if total_bytes > Self::MAX_SPREADSHEET_BATCH_BYTES {
+                return Err(format!(
+                    "Spreadsheet batch exceeds the maximum of {} bytes",
+                    Self::MAX_SPREADSHEET_BATCH_BYTES
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn set_spreadsheet_cell_sources_in_place(&mut self, edits: &[(usize, usize, String)]) {
+        let Some(max_row) = edits.last().map(|(row, _, _)| *row) else {
+            log::warn!("set_spreadsheet_cell_sources_in_place called with empty batch");
+            debug_assert!(false, "non-empty spreadsheet edit batch required");
+            return;
+        };
+        if self.spreadsheet.len() <= max_row {
+            self.spreadsheet.resize_with(max_row + 1, Vec::new);
+        }
+        for (row, column, value) in edits {
+            let cells = &mut self.spreadsheet[*row];
+            if cells.len() <= *column {
+                cells.resize(*column + 1, String::new());
+            }
+            cells[*column] = value.clone();
+        }
+        self.bump_version();
+    }
+
+    fn parse_spreadsheet_coordinate(value: &str) -> Option<Point2> {
+        let value = value.trim();
+        let value = value
+            .strip_prefix('(')
+            .and_then(|value| value.strip_suffix(')'))
+            .unwrap_or(value);
+        let mut coordinates = value.split(',').map(str::trim);
+        let x = coordinates.next()?.parse::<f64>().ok()?;
+        let y = coordinates.next()?.parse::<f64>().ok()?;
+        if coordinates.next().is_some() || !x.is_finite() || !y.is_finite() {
+            return None;
+        }
+        Some(Point2::new(x, y))
+    }
+
+    fn reconcile_spreadsheet_coordinate_point_in_place(
+        &mut self,
+        label: &str,
+        cell_value: &str,
+        changed_points: &mut Vec<ObjectId>,
+        changed_point_ids: &mut HashSet<ObjectId>,
+    ) -> Result<(), String> {
+        // F3b: literal primero (rápido), si no, fórmula con variables frescas.
+        let position = Self::parse_spreadsheet_coordinate(cell_value).or_else(|| {
+            let vars: Vec<(String, f64)> = self
+                .variables
+                .iter()
+                .map(|(name, val)| (name.clone(), *val))
+                .collect();
+            let scalars = self.spreadsheet_point_scalars();
+            Self::parse_spreadsheet_coordinate_with_context(cell_value, &vars, &scalars)
+        });
+        if let Some(position) = position {
+            if let Some(id) = self.spreadsheet_coordinate_point(label) {
+                if self.constraints.is_free(&id) {
+                    let Some(GeoObject::Point(point)) = self.objects.get_mut(&id) else {
+                        return Ok(());
+                    };
+                    if point.position != position {
+                        point.position = position;
+                        self.spatial_dirty = true;
+                        if changed_point_ids.insert(id) {
+                            changed_points.push(id);
+                        }
+                    }
+                }
+            } else {
+                let id = self
+                    .try_add_object(GeoObject::Point(PointObj::new(position).with_label(label)))?;
+                self.set_spreadsheet_coordinate_point(label.to_string(), id);
+            }
+        } else if let Some(id) = self.spreadsheet_coordinate_point(label) {
+            let _ = self.remove_object(id);
+        }
+        Ok(())
+    }
+
+    pub fn eval_spreadsheet_cell(&self, row: usize, col: usize) -> Option<f64> {
+        if row >= self.spreadsheet.len() || col >= self.spreadsheet[row].len() {
+            return None;
+        }
+        let expr = self.spreadsheet[row][col].trim();
+        if expr.is_empty() {
+            return None;
+        }
+        // Hoja vinculada: acepta `=A1+1` y `x(A)` como el recompute (F3b).
+        let expr = expr.strip_prefix('=').unwrap_or(expr).trim();
+        if expr.is_empty() {
+            return None;
+        }
+        // Las celdas-coordenada `(x, y)` no son escalares: honesto `None`.
+        if expr.contains(',')
+            && Self::parse_spreadsheet_coordinate(&self.spreadsheet[row][col]).is_some()
+        {
+            return None;
+        }
+        let scalars = self.spreadsheet_point_scalars();
+        let expanded = Self::expand_spreadsheet_object_refs(expr, &scalars);
+        // Si es coordenada con fórmulas, tampoco es escalar.
+        if expanded.contains(',') {
+            let vars: Vec<(String, f64)> = self
+                .variables
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect();
+            if Self::parse_spreadsheet_coordinate_with_context(
+                &self.spreadsheet[row][col],
+                &vars,
+                &scalars,
+            )
+            .is_some()
+            {
+                return None;
+            }
+        }
+        grafito_geometry::expr::evaluate(
+            &expanded,
+            &self
+                .variables
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect::<Vec<_>>(),
+        )
+        .ok()
+        .filter(|value| value.is_finite())
+    }
+
+    /// Recomputes the scalar variables owned by spreadsheet cells. A
+    /// topological traversal resolves every acyclic dependency once, while
+    /// cycles and invalid formulas remain unresolved without retaining stale
+    /// values. F3b: expande `x(A)`/`y(A)` desde la foto de puntos, reconcilia
+    /// coordenadas con fórmulas y sincroniza `ScatterPlot` vinculados.
+    pub fn recompute_spreadsheet_variables(&mut self) -> Result<(), String> {
+        let changed = self.recompute_spreadsheet_variables_with_bound_changes()?;
+        self.propagate_changed_roots(&changed)?;
+        self.recompute_live_sequences()?;
+        // `recompute_live_sequences` vuelve temprano sin sync si no hay
+        // secuencias: el sync explícito cubre ese caso (F3b).
+        self.sync_linked_scatter_plots();
+        Ok(())
+    }
+
+    fn recompute_spreadsheet_variables_with_bound_changes(
+        &mut self,
+    ) -> Result<Vec<ObjectId>, String> {
+        let mut cells = Vec::new();
+        for (row, values) in self.spreadsheet.iter().enumerate() {
+            for (col, value) in values.iter().enumerate() {
+                if value.trim().is_empty() {
+                    continue;
+                }
+                if cells.len() == Self::MAX_SPREADSHEET_RECOMPUTE_CELLS {
+                    for name in std::mem::take(&mut self.spreadsheet_variables) {
+                        self.variables.remove(&name);
+                    }
+                    self.variable_meta
+                        .retain(|name, _| self.variables.contains_key(name));
+                    let _ = self.recompute_bound_parameters_with_changes();
+                    self.bump_version();
+                    return Err(format!(
+                        "Spreadsheet exceeds the {} cell recomputation limit",
+                        Self::MAX_SPREADSHEET_RECOMPUTE_CELLS
+                    ));
+                }
+                cells.push((Self::spreadsheet_cell_label(row, col), value.clone()));
+            }
+        }
+
+        let cell_indices: HashMap<String, usize> = cells
+            .iter()
+            .enumerate()
+            .map(|(index, (label, _))| (label.clone(), index))
+            .collect();
+        for name in std::mem::take(&mut self.spreadsheet_variables) {
+            self.variables.remove(&name);
+        }
+        for (label, _) in &cells {
+            self.variables.remove(label);
+        }
+
+        // R2-V4: cap dura + `try_reserve` (OOM honesto, jamás panic).
+        // `cells.len()` ya viene acotado por `MAX_SPREADSHEET_RECOMPUTE_CELLS`
+        // en el escaneo, pero se re-chequea acá para prueba explícita.
+        if cells.len() > Self::MAX_SPREADSHEET_RECOMPUTE_CELLS {
+            return Err(format!(
+                "Spreadsheet exceeds the {} cell recomputation limit",
+                Self::MAX_SPREADSHEET_RECOMPUTE_CELLS
+            ));
+        }
+        let mut dependency_counts: Vec<usize> = Vec::new();
+        dependency_counts
+            .try_reserve(cells.len())
+            .map_err(|_| format!("Spreadsheet sin memoria para {} celdas", cells.len()))?;
+        dependency_counts.resize(cells.len(), 0);
+        let mut dependents: Vec<Vec<usize>> = Vec::new();
+        dependents
+            .try_reserve(cells.len())
+            .map_err(|_| format!("Spreadsheet sin memoria para {} celdas", cells.len()))?;
+        dependents.resize_with(cells.len(), Vec::new);
+        for (index, (_, expression)) in cells.iter().enumerate() {
+            let expr_for_deps = expression
+                .trim()
+                .strip_prefix('=')
+                .unwrap_or(expression.trim());
+            for dependency in Self::spreadsheet_expression_references(expr_for_deps) {
+                if let Some(&dependency_index) = cell_indices.get(&dependency) {
+                    dependency_counts[index] += 1;
+                    dependents[dependency_index].push(index);
+                }
+            }
+        }
+
+        let mut variables: Vec<(String, f64)> = self
+            .variables
+            .iter()
+            .map(|(name, value)| (name.clone(), *value))
+            .collect();
+        let mut variable_indices: HashMap<String, usize> = variables
+            .iter()
+            .enumerate()
+            .map(|(index, (name, _))| (name.clone(), index))
+            .collect();
+        let mut ready: VecDeque<usize> = dependency_counts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, count)| (*count == 0).then_some(index))
+            .collect();
+        let mut resolved = BTreeSet::new();
+        // F3b: foto de puntos para `x(A)`/`y(A)` (entradas, no salidas).
+        let scalars = self.spreadsheet_point_scalars();
+        while let Some(index) = ready.pop_front() {
+            let (label, expression) = &cells[index];
+            // Hoja vinculada GeoGebra-like: soporta "=A1+B1" además de "A1+B1"
+            let expr_trimmed = expression.trim();
+            let expr_for_eval = if let Some(stripped) = expr_trimmed.strip_prefix('=') {
+                stripped.trim()
+            } else {
+                expr_trimmed
+            };
+            if expr_for_eval.is_empty() {
+                continue;
+            }
+            // Las celdas-coordenada no son escalares: se reconcilian aparte.
+            if expr_for_eval.contains(',') {
+                let vars_now: Vec<(String, f64)> = variables.clone();
+                if Self::parse_spreadsheet_coordinate_with_context(expression, &vars_now, &scalars)
+                    .is_some()
+                {
+                    continue;
+                }
+            }
+            let expanded = Self::expand_spreadsheet_object_refs(expr_for_eval, &scalars);
+            let Ok(value) = grafito_geometry::expr::evaluate(&expanded, &variables) else {
+                continue;
+            };
+            if !value.is_finite() {
+                continue;
+            }
+
+            self.variables.insert(label.clone(), value);
+            if let Some(&variable_index) = variable_indices.get(label) {
+                variables[variable_index].1 = value;
+            } else {
+                let variable_index = variables.len();
+                variables.push((label.clone(), value));
+                variable_indices.insert(label.clone(), variable_index);
+            }
+            resolved.insert(label.clone());
+            for &dependent in &dependents[index] {
+                dependency_counts[dependent] -= 1;
+                if dependency_counts[dependent] == 0 {
+                    ready.push_back(dependent);
+                }
+            }
+        }
+
+        self.spreadsheet_variables = resolved;
+        self.variable_meta
+            .retain(|name, _| self.variables.contains_key(name));
+        let mut changed = self.recompute_bound_parameters_with_changes();
+        // F3b: coordenadas con fórmulas (`(A1, y(A))`) usan las variables
+        // frescas; los puntos tocados también se propagan.
+        let vars_for_coords: Vec<(String, f64)> = self
+            .variables
+            .iter()
+            .map(|(name, value)| (name.clone(), *value))
+            .collect();
+        let mut seen: HashSet<ObjectId> = changed.iter().copied().collect();
+        for point_id in self.reconcile_all_spreadsheet_coordinates(&vars_for_coords, &scalars)? {
+            if seen.insert(point_id) {
+                changed.push(point_id);
+            }
+        }
+        self.bump_version();
+        Ok(changed)
+    }
+
+    pub fn spreadsheet_dim(&self) -> (usize, usize) {
+        // Count only rows/cols that have actual non-empty content
+        let mut max_row = 0_usize;
+        let mut max_col = 0_usize;
+        for (r, row) in self.spreadsheet.iter().enumerate() {
+            for (c, cell) in row.iter().enumerate() {
+                if !cell.is_empty() {
+                    max_row = max_row.max(r + 1);
+                    max_col = max_col.max(c + 1);
+                }
+            }
+        }
+        // At least 3×3, plus 1 extra for expansion without rendering cells
+        // that the bounded setter must reject.
+        (
+            max_row
+                .max(3)
+                .saturating_add(1)
+                .min(Self::MAX_SPREADSHEET_ROWS),
+            max_col
+                .max(3)
+                .saturating_add(1)
+                .min(Self::MAX_SPREADSHEET_COLS),
+        )
+    }
+
+    pub fn object_count(&self) -> usize {
+        self.objects.len()
+    }
+
+    /// Estimación de memoria/peso serializado del documento.
+    ///
+    /// Antes: `object_count * 200 KiB` como cota conservadora. Con 5000 puntos
+    /// resultaba en ~1 GiB (`5000*200KiB`) y fuerzas al undo a evictar a 1
+    /// entrada aunque `MAX_UNDO_BYTES` sea 50 MiB. Ahora se usan pesos por
+    /// variante (Point ~200B, Function ~1 KiB, implicit heavy 8 KiB, etc.) y
+    /// se mantiene un fallback legacy de `4 KiB/objeto` para no subestimar.
+    /// Se toma `max(pesos, 4KiB*count, json_len, 8KiB)` para que documentos
+    /// pequeños con mucho texto (variables/spreadsheet/whiteboard) no queden
+    /// por debajo del coste real de serialización.
+    ///
+    /// Usa `checked_mul`/`checked_add` con `CoreError::LimitExceeded` en lugar
+    /// de `saturating_mul` para detectar overflow (ver `validation::MAX`).
+    ///
+    /// Útil para presupuestar undo (`MAX_UNDO_BYTES 50 MiB`): evita
+    /// 50 entradas × 10 MiB = 500 MiB en iGPU/low-RAM y evita evicción
+    /// prematura a 1 entrada en docs de 5000 puntos.
+    #[allow(clippy::manual_saturating_arithmetic)]
+    fn estimated_bytes_uncached(&self) -> usize {
+        const MIN_BYTES: usize = 8 * 1024;
+        const LEGACY_BYTES_PER_OBJECT: usize = 4 * 1024;
+
+        // Suma de pesos por variante; usa `checked_add` para evitar overflow silencioso.
+        let mut per_object_weight: usize = 0;
+        let mut overflowed = false;
+        for obj in self.objects.values() {
+            let w = Self::object_weight(obj);
+            match per_object_weight.checked_add(w) {
+                Some(next) => per_object_weight = next,
+                None => {
+                    overflowed = true;
+                    break;
+                }
+            }
+        }
+        if overflowed {
+            // Overflow de suma → tratar como recurso excedido (CoreError) y saturar a MAX.
+            let _ = CoreError::LimitExceeded {
+                what: "Document::estimated_bytes per_object_weight overflow".into(),
+                provided: self.object_count(),
+                maximum: usize::MAX,
+            };
+            per_object_weight = usize::MAX;
+        }
+
+        // Fallback legacy 4 KiB/objeto con checked_mul (reemplaza saturating_mul previo).
+        let legacy_by_objects = match self.object_count().checked_mul(LEGACY_BYTES_PER_OBJECT) {
+            Some(v) => v,
+            None => {
+                let _ = CoreError::LimitExceeded {
+                    what: "Document::estimated_bytes legacy_by_objects overflow".into(),
+                    provided: self.object_count(),
+                    maximum: usize::MAX / LEGACY_BYTES_PER_OBJECT.max(1),
+                };
+                usize::MAX
+            }
+        };
+
+        let by_objects = per_object_weight.max(legacy_by_objects).max(MIN_BYTES);
+        let by_json = match serde_json::to_vec(self) {
+            Ok(bytes) => bytes.len(),
+            Err(_) => by_objects,
+        };
+        // El índice espacial (`#[serde(skip)]`, R-tree) se clona con cada
+        // snapshot pero el JSON no lo pesa: sumarlo acá cierra el hueco del
+        // presupuesto (nodo R-tree + `ObjectId` ≈ 128 B, conservador).
+        let by_spatial = self.spatial.len().checked_mul(128).unwrap_or(usize::MAX);
+        // Los trails (`#[serde(skip)]`, hasta 512 puntos × 16 B por objeto)
+        // tampoco los pesa el JSON y también viajan en cada snapshot: peor
+        // caso 5000 × 8 KiB = 40 MiB fuera de presupuesto si no se cuentan.
+        let by_trails = self
+            .trails
+            .len()
+            .checked_mul(MAX_TRAIL_POINTS)
+            .and_then(|n| n.checked_mul(16))
+            .unwrap_or(usize::MAX);
+        by_objects
+            .max(by_json)
+            .max(by_spatial)
+            .max(by_trails)
+            .max(MIN_BYTES)
+    }
+
+    /// Peso estimado con memo por `version`: la primera llamada tras un
+    /// commit serializa una vez; las siguientes (evicciones, undo/redo,
+    /// contadores) reutilizan el valor sin re-serializar.
+    pub fn estimated_bytes(&self) -> usize {
+        if let Ok(guard) = self.estimated_bytes_cache.lock() {
+            if let Some((version, bytes)) = *guard {
+                if version == self.version {
+                    return bytes;
+                }
+            }
+        }
+        let bytes = self.estimated_bytes_uncached();
+        if let Ok(mut guard) = self.estimated_bytes_cache.lock() {
+            *guard = Some((self.version, bytes));
+        }
+        bytes
+    }
+
+    /// Partes cacheadas del contexto del asistente, si la versión coincide:
+    /// `(etiqueta, tipo, huella)` por objeto visible + variables. `None`
+    /// tras cualquier commit (la versión bumpea). Lo usa `document_context`
+    /// (crate `command`) para no re-serializar en cada envío.
+    pub fn cached_context_parts(&self) -> Option<ContextParts> {
+        let guard = self.context_parts_cache.lock().ok()?;
+        let (version, parts) = guard.as_ref()?;
+        (*version == self.version).then(|| parts.clone())
+    }
+
+    /// Guarda las partes del contexto para la versión actual.
+    pub fn store_context_parts(&self, parts: ContextParts) {
+        if let Ok(mut guard) = self.context_parts_cache.lock() {
+            *guard = Some((self.version, parts));
+        }
+    }
+
+    /// Peso estimado por variante para `estimated_bytes`. Valores conservadores
+    /// pero mucho menores que 200 KiB: Point 200B, Function 1 KiB, implicit 8 KiB.
+    #[allow(clippy::manual_saturating_arithmetic)]
+    fn object_weight(obj: &GeoObject) -> usize {
+        match obj {
+            GeoObject::Point(_) => 256,
+            GeoObject::Line(_) => 320,
+            GeoObject::Circle(_) => 320,
+            GeoObject::Polygon(o) => 128usize
+                .checked_add(o.vertices.len().checked_mul(32).unwrap_or(usize::MAX))
+                .unwrap_or(usize::MAX)
+                .checked_add(o.x_exprs.len().checked_mul(64).unwrap_or(usize::MAX))
+                .unwrap_or(usize::MAX),
+            GeoObject::Pencil(o) => 128usize
+                .checked_add(o.points.len().checked_mul(16).unwrap_or(usize::MAX))
+                .unwrap_or(usize::MAX),
+            GeoObject::Function(o) => 1024usize.checked_add(o.expr.len()).unwrap_or(usize::MAX),
+            GeoObject::Text(o) => 256usize.checked_add(o.content.len()).unwrap_or(usize::MAX),
+            GeoObject::Ellipse(_) => 320,
+            GeoObject::Parabola(_) => 320,
+            GeoObject::Hyperbola(_) => 320,
+            GeoObject::Arc(_) => 320,
+            GeoObject::Sector(_) => 320,
+            GeoObject::BezierCurve(o) => 128usize
+                .checked_add(o.control_points.len().checked_mul(16).unwrap_or(usize::MAX))
+                .unwrap_or(usize::MAX),
+            GeoObject::Spline(o) => 128usize
+                .checked_add(o.points.len().checked_mul(16).unwrap_or(usize::MAX))
+                .unwrap_or(usize::MAX),
+            GeoObject::Polyline(o) => 128usize
+                .checked_add(o.points.len().checked_mul(16).unwrap_or(usize::MAX))
+                .unwrap_or(usize::MAX),
+            GeoObject::Point3D(_) => 256,
+            GeoObject::Segment3D(_) => 320,
+            GeoObject::Plane3D(_) => 320,
+            GeoObject::Line3D(_) => 320,
+            GeoObject::Sphere3D(_) => 320,
+            GeoObject::Cube3D(_) => 320,
+            GeoObject::Tetrahedron3D(_) => 320,
+            GeoObject::Pyramid3D(_) => 380,
+            GeoObject::Cone3D(_) => 380,
+            GeoObject::Cylinder3D(_) => 380,
+            GeoObject::Platonic3D(_) => 360,
+            GeoObject::InfiniteCone3D(_) => 320,
+            GeoObject::InfiniteCylinder3D(_) => 320,
+            GeoObject::Torus3D(_) => 380,
+            GeoObject::MoebiusStrip(_) => 512,
+            GeoObject::Surface3D(_) => 2048,
+            GeoObject::Prism3D(o) => 256usize
+                .checked_add(o.base_vertices.len().checked_mul(16).unwrap_or(usize::MAX))
+                .unwrap_or(usize::MAX),
+            GeoObject::Quadric3D(_) => 512,
+            GeoObject::ImplicitSurface3D(o) => {
+                2048usize.checked_add(o.expr.len()).unwrap_or(usize::MAX)
+            }
+            GeoObject::ParametricCurve2D(o) => 1024usize
+                .checked_add(o.expr_x.len())
+                .unwrap_or(usize::MAX)
+                .checked_add(o.expr_y.len())
+                .unwrap_or(usize::MAX),
+            GeoObject::ParametricCurve3D(o) => 1024usize
+                .checked_add(o.expr_x.len())
+                .unwrap_or(usize::MAX)
+                .checked_add(o.expr_y.len())
+                .unwrap_or(usize::MAX)
+                .checked_add(o.expr_z.len())
+                .unwrap_or(usize::MAX),
+            GeoObject::PolarCurve(o) => 1024usize.checked_add(o.expr_r.len()).unwrap_or(usize::MAX),
+            GeoObject::VectorField2D(o) => 1024usize
+                .checked_add(o.expr_u.len())
+                .unwrap_or(usize::MAX)
+                .checked_add(o.expr_v.len())
+                .unwrap_or(usize::MAX),
+            GeoObject::VectorField3D(o) => 2048usize
+                .checked_add(o.expr_u.len())
+                .unwrap_or(usize::MAX)
+                .checked_add(o.expr_v.len())
+                .unwrap_or(usize::MAX)
+                .checked_add(o.expr_w.len())
+                .unwrap_or(usize::MAX),
+            GeoObject::ComplexGrid(o) => 2048usize.checked_add(o.expr.len()).unwrap_or(usize::MAX),
+            GeoObject::ComplexMapping(o) => {
+                1024usize.checked_add(o.expr.len()).unwrap_or(usize::MAX)
+            }
+            GeoObject::ComplexIntegral(o) => {
+                1024usize.checked_add(o.expr.len()).unwrap_or(usize::MAX)
+            }
+            GeoObject::ImplicitCurve(o) => {
+                let base = 8192usize;
+                let extra = o
+                    .contour_levels
+                    .as_ref()
+                    .map(|levels| levels.len().checked_mul(128).unwrap_or(0))
+                    .unwrap_or(0);
+                base.checked_add(extra)
+                    .unwrap_or(usize::MAX)
+                    .checked_add(o.expr_lhs.len())
+                    .unwrap_or(usize::MAX)
+                    .checked_add(o.expr_rhs.len())
+                    .unwrap_or(usize::MAX)
+            }
+            GeoObject::Attractor3D(_) => 4096,
+            GeoObject::Fractal2D(_) => 4096,
+            GeoObject::RegularPolychoron4D(_) => 1024,
+            GeoObject::RegularPolytopeND(o) => 512usize
+                .checked_add(o.rotation_angles.len().checked_mul(8).unwrap_or(usize::MAX))
+                .unwrap_or(usize::MAX),
+            GeoObject::HyperSurface4D(_) => 2048,
+            GeoObject::PhasePortrait(o) => 1024usize
+                .checked_add(o.expr_dx.len())
+                .unwrap_or(usize::MAX)
+                .checked_add(o.expr_dy.len())
+                .unwrap_or(usize::MAX),
+            GeoObject::Histogram(o) => 256usize
+                .checked_add(o.data.len().checked_mul(8).unwrap_or(usize::MAX))
+                .unwrap_or(usize::MAX),
+            GeoObject::BarChart(o) => 256usize
+                .checked_add(o.data.len().checked_mul(8).unwrap_or(usize::MAX))
+                .unwrap_or(usize::MAX),
+            GeoObject::PieChart(o) => 256usize
+                .checked_add(o.data.len().checked_mul(8).unwrap_or(usize::MAX))
+                .unwrap_or(usize::MAX),
+            GeoObject::ScatterPlot(o) => 256usize
+                .checked_add(o.xs.len().checked_mul(16).unwrap_or(usize::MAX))
+                .unwrap_or(usize::MAX),
+            GeoObject::BoxPlot(o) => 256usize
+                .checked_add(o.data.len().checked_mul(8).unwrap_or(usize::MAX))
+                .unwrap_or(usize::MAX),
+            GeoObject::RegressionLine(o) => 256usize
+                .checked_add(o.xs.len().checked_mul(16).unwrap_or(usize::MAX))
+                .unwrap_or(usize::MAX),
+            GeoObject::DataTable(o) => 256usize
+                .checked_add(o.xs.len().checked_mul(16).unwrap_or(usize::MAX))
+                .unwrap_or(usize::MAX),
+            GeoObject::List(o) => 256usize
+                .checked_add(o.items.len().checked_mul(32).unwrap_or(usize::MAX))
+                .unwrap_or(usize::MAX),
+            GeoObject::Transformed(o) => 1024usize
+                .checked_add(o.complex_expr.len())
+                .unwrap_or(usize::MAX)
+                .checked_add(Self::object_weight(&o.inner))
+                .unwrap_or(usize::MAX),
+        }
+    }
+}
+
+fn distance_point_to_polygon(p: Point2, vertices: &[Point2]) -> f64 {
+    if vertices.len() < 2 {
+        return f64::INFINITY;
+    }
+    let mut min_dist = f64::INFINITY;
+    for i in 0..vertices.len() {
+        let a = vertices[i];
+        let b = vertices[(i + 1) % vertices.len()];
+        let d = distance_point_to_segment(p, a, b);
+        if d < min_dist {
+            min_dist = d;
+        }
+    }
+    min_dist
+}
+
+fn project_point_to_line(p: Point2, a: Point2, b: Point2) -> Point2 {
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    let len2 = dx * dx + dy * dy;
+    if len2 < 1e-12 {
+        return a;
+    }
+    let t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / len2;
+    Point2::new(a.x + t * dx, a.y + t * dy)
+}
+
+fn project_point_to_segment(p: Point2, a: Point2, b: Point2) -> Point2 {
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    let len2 = dx * dx + dy * dy;
+    if len2 < 1e-12 {
+        return a;
+    }
+    let t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / len2;
+    let t = t.clamp(0.0, 1.0);
+    Point2::new(a.x + t * dx, a.y + t * dy)
+}
+
+fn project_point_to_circle(p: Point2, center: Point2, radius: f64) -> Point2 {
+    let dx = p.x - center.x;
+    let dy = p.y - center.y;
+    let d = (dx * dx + dy * dy).sqrt();
+    if d < 1e-12 {
+        return Point2::new(center.x + radius, center.y);
+    }
+    Point2::new(center.x + radius * dx / d, center.y + radius * dy / d)
+}
+
+fn project_point_to_polygon_edges(p: Point2, vertices: &[Point2]) -> Point2 {
+    if vertices.len() < 2 {
+        return p;
+    }
+    let mut best = vertices[0];
+    let mut best_dist = f64::INFINITY;
+    for i in 0..vertices.len() {
+        let a = vertices[i];
+        let b = vertices[(i + 1) % vertices.len()];
+        let proj = project_point_to_segment(p, a, b);
+        let d = proj.distance(&p);
+        if d < best_dist {
+            best_dist = d;
+            best = proj;
+        }
+    }
+    best
+}
+
+fn circle_from_three_points(a: Point2, b: Point2, c: Point2) -> Option<(Point2, f64)> {
+    let d = 2.0 * (a.x * (b.y - c.y) + b.x * (c.y - a.y) + c.x * (a.y - b.y));
+    if d.abs() < 1e-12 {
+        return None;
+    }
+    let a2 = a.x * a.x + a.y * a.y;
+    let b2 = b.x * b.x + b.y * b.y;
+    let c2 = c.x * c.x + c.y * c.y;
+    let ux = (a2 * (b.y - c.y) + b2 * (c.y - a.y) + c2 * (a.y - b.y)) / d;
+    let uy = (a2 * (c.x - b.x) + b2 * (a.x - c.x) + c2 * (b.x - a.x)) / d;
+    let center = Point2::new(ux, uy);
+    let radius = center.distance(&a);
+    Some((center, radius))
+}
+
+fn conic_from_five_points(points: &[Point2]) -> Option<GeoObject> {
+    // Build the 5x6 homogeneous system for the conic coefficients
+    // [A, B, C, D, E, F] such that A*x^2 + B*x*y + C*y^2 + D*x + E*y + F = 0.
+    let mut rows = Vec::with_capacity(5);
+    for p in points {
+        rows.push(vec![p.x * p.x, p.x * p.y, p.y * p.y, p.x, p.y, 1.0]);
+    }
+    let m = Matrix::from_rows(rows)?;
+
+    // Try fixing each coefficient to 1 and solving the resulting 5x5 system.
+    let mut coeffs: Option<[f64; 6]> = None;
+    for fixed in 0..6 {
+        let mut a_rows = Vec::with_capacity(5);
+        let mut b_rows = Vec::with_capacity(5);
+        for r in 0..5 {
+            let mut a_row = Vec::with_capacity(5);
+            let b_val = -m.get(r, fixed);
+            for c in 0..6 {
+                if c == fixed {
+                    continue;
+                }
+                a_row.push(m.get(r, c));
+            }
+            a_rows.push(a_row);
+            b_rows.push(vec![b_val]);
+        }
+        let a_mat = Matrix::from_rows(a_rows)?;
+        let b_mat = Matrix::from_rows(b_rows)?;
+        if let Some(sol) = solve_linear_system(&a_mat, &b_mat) {
+            let mut coeffs_local = [0.0; 6];
+            let mut idx = 0;
+            for (i, coeff) in coeffs_local.iter_mut().enumerate() {
+                if i == fixed {
+                    *coeff = 1.0;
+                } else {
+                    *coeff = sol.get(idx, 0);
+                    idx += 1;
+                }
+            }
+            // Verify the solution fits the points.
+            let max_residual = points
+                .iter()
+                .zip(m.data.chunks(6))
+                .map(|(_p, row)| {
+                    let v = row
+                        .iter()
+                        .zip(coeffs_local.iter())
+                        .map(|(a, b)| a * b)
+                        .sum::<f64>();
+                    v.abs()
+                })
+                .fold(0.0f64, f64::max);
+            if max_residual < 1e-6 {
+                coeffs = Some(coeffs_local);
+                break;
+            }
+        }
+    }
+
+    let [a, b, c, d, e, f] = coeffs?;
+
+    // Discriminant: B^2 - 4AC.
+    let discriminant = b * b - 4.0 * a * c;
+
+    // Center of the conic (valid for ellipse/hyperbola).
+    let q = Matrix::from_rows(vec![vec![a, b * 0.5], vec![b * 0.5, c]])?;
+    let q_inv = q.inverse()?;
+    let center = Point2::new(
+        -0.5 * (q_inv.get(0, 0) * d + q_inv.get(0, 1) * e),
+        -0.5 * (q_inv.get(1, 0) * d + q_inv.get(1, 1) * e),
+    );
+
+    // Evaluate the constant term at the center.
+    let f_prime = a * center.x * center.x
+        + b * center.x * center.y
+        + c * center.y * center.y
+        + d * center.x
+        + e * center.y
+        + f;
+
+    // Eigen-decomposition of Q.
+    let trace = a + c;
+    let diff = a - c;
+    let gap = (diff * diff + b * b).sqrt();
+    let lambda1 = 0.5 * (trace + gap);
+    let lambda2 = 0.5 * (trace - gap);
+
+    let angle = if gap < 1e-12 {
+        // A circular ellipse has an isotropic quadratic form. Its orientation
+        // is arbitrary, so choose the canonical zero angle instead of
+        // rejecting the otherwise valid fit for lack of an eigenvector.
+        0.0
+    } else {
+        // Eigenvector for lambda1.
+        let mut ev_x = lambda1 - c;
+        let mut ev_y = b * 0.5;
+        let mut ev_norm = (ev_x * ev_x + ev_y * ev_y).sqrt();
+        if ev_norm < 1e-12 {
+            ev_x = b * 0.5;
+            ev_y = lambda1 - a;
+            ev_norm = (ev_x * ev_x + ev_y * ev_y).sqrt();
+        }
+        if ev_norm < 1e-12 {
+            return None;
+        }
+        ev_y.atan2(ev_x)
+    };
+
+    if discriminant < -1e-12 {
+        // Ellipse.
+        let denom1 = -f_prime / lambda1;
+        let denom2 = -f_prime / lambda2;
+        if denom1 > 1e-12 && denom2 > 1e-12 {
+            return Some(GeoObject::Ellipse(EllipseObj {
+                id: ObjectId::new(),
+                label: String::new(),
+                center,
+                rx: denom1.sqrt(),
+                ry: denom2.sqrt(),
+                angle,
+                color: Color::BLACK,
+                visible: true,
+                width: 2.0,
+                fill_color: Some(Color::new(0.2, 0.5, 0.9, 0.15)),
+                line_style: crate::LineStyle::default(),
+            }));
+        }
+    } else if discriminant > 1e-12 {
+        // Hyperbola.
+        let denom1 = -f_prime / lambda1;
+        let denom2 = -f_prime / lambda2;
+        if denom1 * denom2 < -1e-12 {
+            // One denominator positive, one negative.
+            let (a_axis, b_axis, transverse_is_lambda1) = if denom1 > 0.0 {
+                (denom1.sqrt(), (-denom2).sqrt(), true)
+            } else {
+                (denom2.sqrt(), (-denom1).sqrt(), false)
+            };
+            // Angle of the transverse axis.
+            let transverse_angle = if transverse_is_lambda1 {
+                angle
+            } else {
+                angle + std::f64::consts::FRAC_PI_2
+            };
+            return Some(GeoObject::Hyperbola(HyperbolaObj {
+                id: ObjectId::new(),
+                label: String::new(),
+                center,
+                a: a_axis,
+                b: b_axis,
+                horizontal: true,
+                angle: transverse_angle,
+                color: Color::RED,
+                visible: true,
+                width: 2.0,
+                line_style: crate::LineStyle::default(),
+            }));
+        }
+    }
+
+    None
+}
+
+fn doc_intersect(obj_a: &GeoObject, obj_b: &GeoObject) -> Vec<Point2> {
+    use grafito_geometry::intersections::{self, IntersectionResult};
+
+    match (obj_a, obj_b) {
+        (GeoObject::Line(a), GeoObject::Line(b)) => {
+            match intersections::line_line(a.start, a.end, b.start, b.end) {
+                IntersectionResult::One(p) => {
+                    let t_a = a.param_at_point(p);
+                    let t_b = b.param_at_point(p);
+                    if a.kind_contains_t(t_a) && b.kind_contains_t(t_b) {
+                        vec![p]
+                    } else {
+                        vec![]
+                    }
+                }
+                _ => vec![],
+            }
+        }
+        (GeoObject::Line(l), GeoObject::Circle(c)) | (GeoObject::Circle(c), GeoObject::Line(l)) => {
+            match intersections::line_circle(l.start, l.end, c.center, c.radius) {
+                IntersectionResult::One(p) => {
+                    if l.kind_contains_t(l.param_at_point(p)) {
+                        vec![p]
+                    } else {
+                        vec![]
+                    }
+                }
+                IntersectionResult::Two(p1, p2) => {
+                    let mut pts = Vec::new();
+                    for p in [p1, p2] {
+                        if l.kind_contains_t(l.param_at_point(p)) {
+                            pts.push(p);
+                        }
+                    }
+                    pts
+                }
+                _ => vec![],
+            }
+        }
+        (GeoObject::Circle(c1), GeoObject::Circle(c2)) => {
+            match intersections::circle_circle(c1.center, c1.radius, c2.center, c2.radius) {
+                IntersectionResult::One(p) => vec![p],
+                IntersectionResult::Two(p1, p2) => vec![p1, p2],
+                _ => vec![],
+            }
+        }
+        (GeoObject::Line(l), GeoObject::Function(f))
+        | (GeoObject::Function(f), GeoObject::Line(l)) => {
+            let dx = l.end.x - l.start.x;
+            if dx.abs() < 1e-12 {
+                return grafito_geometry::expr::eval_function(&f.expr, l.start.x)
+                    .ok()
+                    .filter(|y| y.is_finite())
+                    .map(|y| Point2::new(l.start.x, y))
+                    .filter(|point| l.kind_contains_t(l.param_at_point(*point)))
+                    .into_iter()
+                    .collect();
+            }
+
+            let slope = (l.end.y - l.start.y) / dx;
+            let intercept = l.start.y - slope * l.start.x;
+            let x_min = f.domain_min.unwrap_or(-10.0);
+            let x_max = f.domain_max.unwrap_or(10.0);
+            intersections::function_line(&f.expr, slope, intercept, x_min, x_max)
+                .into_iter()
+                .filter(|p| l.kind_contains_t(l.param_at_point(*p)))
+                .collect()
+        }
+        _ => vec![],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::CircleObj;
+    use crate::FunctionObj;
+    use crate::{LineKind, LineObj};
+
+    #[test]
+    fn new_document_is_empty() {
+        let doc = Document::new();
+        assert_eq!(doc.object_count(), 0);
+        assert!(doc.objects_iter().next().is_none());
+        assert_eq!(doc.constraints.constraint_count(), 0);
+    }
+
+    #[test]
+    fn estimated_bytes_memo_versiones_y_no_queda_viejo() {
+        // Invariante del memo (Ola 2 B3): toda mutación bumpea `version`;
+        // repetir la lectura no re-serializa (mismo valor) y mutar invalida.
+        let mut doc = Document::new();
+        let v0 = doc.version;
+        let base = doc.estimated_bytes();
+        assert_eq!(doc.estimated_bytes(), base);
+        for i in 0..30 {
+            doc.add_object(GeoObject::Function(FunctionObj::new(format!(
+                "x^{}",
+                i + 2
+            ))));
+        }
+        assert_ne!(doc.version, v0, "mutar debe bumpear versión");
+        let grown = doc.estimated_bytes();
+        assert!(grown > base, "30 funciones deben pesar más que vacío");
+        assert_eq!(doc.estimated_bytes(), grown);
+        // Roundtrip serde: caché fresca, mismo peso.
+        let json = serde_json::to_string(&doc).expect("serializa");
+        let back: Document = serde_json::from_str(&json).expect("deserializa");
+        assert_eq!(back.estimated_bytes(), grown);
+    }
+
+    #[test]
+    fn get_object_mut_sin_mutacion_no_quema_memos() {
+        // FIX 2: el préstamo mutable no bumpea `version`; el memo de
+        // `estimated_bytes` hace hit tras un préstamo sin escritura.
+        use crate::PointObj;
+        use grafito_geometry::Point2;
+        let mut doc = Document::new();
+        let id = doc
+            .try_add_object(GeoObject::Point(PointObj::new(Point2::new(1.0, 2.0))))
+            .expect("punto válido");
+        let v0 = doc.version;
+        let base = doc.estimated_bytes();
+        assert_eq!(doc.estimated_bytes(), base);
+        {
+            let _prestamo = doc.get_object_mut(id);
+        }
+        assert_eq!(
+            doc.version, v0,
+            "préstamo sin mutación no debe bumpear versión"
+        );
+        assert_eq!(doc.estimated_bytes(), base, "el memo debe hacer hit");
+        // `touch()` explícito tras mutar sí invalida.
+        if let Some(GeoObject::Point(p)) = doc.get_object_mut(id) {
+            p.position = Point2::new(3.0, 4.0);
+        }
+        doc.touch();
+        assert_ne!(doc.version, v0, "mutar + touch debe bumpear");
+    }
+
+    #[test]
+    fn set_field_value_desync_da_error_honesto() {
+        // FIX 3: var_map para Point sobre un objeto reemplazado por Circle
+        // → `Err` con tipo incompatible, no escritura silenciosa ni `0.0`.
+        use crate::PointObj;
+        use grafito_geometry::Point2;
+        let mut doc = Document::new();
+        let id = doc
+            .try_add_object(GeoObject::Point(PointObj::new(Point2::new(1.0, 2.0))))
+            .expect("punto válido");
+        let var_map = vec![(id, ObjField::PointX)];
+        assert_eq!(doc.solver_field(id, ObjField::PointX), Ok(1.0));
+        let mut circle = CircleObj::new(Point2::new(0.0, 0.0), 1.0);
+        circle.id = id;
+        let circle = GeoObject::Circle(circle);
+        assert!(doc
+            .try_replace_object(id, circle)
+            .expect("reemplazo válido"));
+        let err = doc.solver_field(id, ObjField::PointX).unwrap_err();
+        assert!(
+            err.contains("incompatible"),
+            "debe citar incompatibilidad, fue: {err}"
+        );
+        assert!(
+            doc.set_field_value(id, ObjField::PointX, 9.0).is_err(),
+            "escribir campo de otro tipo debe fallar"
+        );
+        assert!(
+            doc.write_solver_variables(&var_map, &[9.0]).is_err(),
+            "el solver debe propagar el desync, no escribir al vacío"
+        );
+    }
+
+    #[test]
+    fn try_set_variable_no_referenciada_mutacion_in_place() {
+        // FIX 5.1: variable que nada menciona → in place + bump, sin
+        // clonar; el documento sigue válido y la geometría intacta.
+        use crate::PointObj;
+        use grafito_geometry::Point2;
+        let mut doc = Document::new();
+        let id = doc
+            .try_add_object(GeoObject::Point(PointObj::new(Point2::new(1.0, 2.0))))
+            .expect("punto válido");
+        doc.try_set_variable("k".to_string(), 1.0)
+            .expect("alta rápida");
+        let v0 = doc.version;
+        doc.try_set_variable("k".to_string(), 2.0)
+            .expect("fast-path");
+        assert_eq!(doc.get_variable("k"), Some(2.0));
+        assert_ne!(doc.version, v0, "el fast-path debe bumpear versión");
+        assert!(crate::validation::validate_document(&doc).is_ok());
+        let pos = doc.point_position(id).expect("punto");
+        assert_eq!(pos, Point2::new(1.0, 2.0), "geometría intacta");
+    }
+
+    #[test]
+    fn try_set_variable_referenciada_va_por_camino_lento() {
+        // FIX 5.1: variable mencionada por una fórmula viva → camino lento
+        // con re-evaluación (el punto ligado se mueve).
+        use crate::PointObj;
+        use grafito_geometry::Point2;
+        let mut doc = Document::new();
+        let mut point = PointObj::new(Point2::new(0.0, 0.0));
+        point.x_expr = Some("k".to_string());
+        let id = doc
+            .try_add_object(GeoObject::Point(point))
+            .expect("punto válido");
+        assert!(!doc.variable_is_unreferenced("k"));
+        doc.try_set_variable("k".to_string(), 5.0)
+            .expect("slow-path");
+        assert_eq!(doc.get_variable("k"), Some(5.0));
+        let pos = doc.point_position(id).expect("punto");
+        assert!(
+            (pos.x - 5.0).abs() < 1e-9,
+            "el punto ligado debe seguir a k, x={}",
+            pos.x
+        );
+    }
+
+    #[test]
+    fn sorted_variables_es_vista_ordenada_sin_mutar() {
+        let mut doc = Document::new();
+        doc.try_set_variable("z".to_string(), 3.0).expect("set z");
+        doc.try_set_variable("a".to_string(), 1.0).expect("set a");
+        doc.try_set_variable("m".to_string(), 2.0).expect("set m");
+        let sorted = doc.sorted_variables();
+        let keys: Vec<String> = sorted.keys().cloned().collect();
+        assert_eq!(
+            keys,
+            ["a".to_string(), "m".to_string(), "z".to_string()],
+            "VarMap itera ordenado"
+        );
+        assert_eq!(sorted["a"], 1.0);
+        // Sin mutar: el mapa vivo sigue intacto.
+        assert_eq!(doc.get_variable("z"), Some(3.0));
+    }
+
+    #[test]
+    fn label_counters_btreemap_roundtrip_json() {
+        let mut doc = Document::new();
+        let _ = doc.try_add_object(crate::GeoObject::Point(crate::PointObj::new(
+            grafito_geometry::Point2::new(1.0, 2.0),
+        )));
+        let json = serde_json::to_value(&doc).expect("serialize");
+        let back: Document = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(
+            back.next_label_number, doc.next_label_number,
+            "contadores BTreeMap sobreviven roundtrip"
+        );
+    }
+
+    #[test]
+    fn screen_size_updates_mark_spatial_state_only_when_dimensions_change() {
+        let mut document = Document::new();
+        document.spatial_dirty = false;
+        let initial_size = document.view().screen_size;
+
+        assert!(!document.set_screen_size(initial_size.x, initial_size.y));
+        assert!(!document.spatial_dirty);
+
+        assert!(document.set_screen_size(initial_size.x + 1.0, initial_size.y));
+        assert!(document.spatial_dirty);
+
+        document.spatial_dirty = false;
+        assert!(!document
+            .set_screen_size(document.view().screen_size.x, document.view().screen_size.y,));
+        assert!(!document.spatial_dirty);
+    }
+
+    #[test]
+    fn add_point_stores_object() {
+        let mut doc = Document::new();
+        let id = doc.add_point(Point2::new(1.5, -2.0));
+        assert_eq!(doc.object_count(), 1);
+        assert!(doc.get_object(id).is_some());
+        let pos = doc.point_position(id).unwrap();
+        assert!((pos.x - 1.5).abs() < 1e-12);
+        assert!((pos.y + 2.0).abs() < 1e-12);
+        // A user-created point is registered as free.
+        assert!(doc.constraints.is_free(&id));
+    }
+
+    #[test]
+    fn spreadsheet_dimensions_do_not_offer_cells_beyond_the_persisted_limit() {
+        let mut doc = Document::new();
+        doc.set_spreadsheet_cell(
+            Document::MAX_SPREADSHEET_ROWS - 1,
+            Document::MAX_SPREADSHEET_COLS - 1,
+            "1".to_string(),
+        )
+        .expect("boundary cell is valid");
+
+        assert_eq!(
+            doc.spreadsheet_dim(),
+            (
+                Document::MAX_SPREADSHEET_ROWS,
+                Document::MAX_SPREADSHEET_COLS
+            )
+        );
+    }
+
+    #[test]
+    fn constructed_intersection_evaluates_vertical_lines_at_their_x_coordinate() {
+        let line = GeoObject::Line(LineObj::new_with_kind(
+            Point2::new(2.0, 1.0),
+            Point2::new(2.0, 3.0),
+            LineKind::Segment,
+        ));
+        let function = GeoObject::Function(FunctionObj::new("x".to_string()));
+
+        assert_eq!(doc_intersect(&line, &function), vec![Point2::new(2.0, 2.0)]);
+    }
+
+    #[test]
+    fn remove_object_by_id_drops_it() {
+        let mut doc = Document::new();
+        let id = doc.add_point(Point2::new(0.0, 0.0));
+        assert_eq!(doc.object_count(), 1);
+        let removed = doc.remove_object(id);
+        assert!(removed.is_some());
+        assert!(doc.get_object(id).is_none());
+        assert_eq!(doc.object_count(), 0);
+        // Removing a non-existent id returns None and is a no-op.
+        assert!(doc.remove_object(id).is_none());
+    }
+
+    #[test]
+    fn set_variable_recomputes_bound_point() {
+        let mut doc = Document::new();
+        // Create a point whose coordinates are bound to document variables.
+        let mut p = PointObj::new(Point2::new(0.0, 0.0));
+        p.x_expr = Some("a".to_string());
+        p.y_expr = Some("b * 2".to_string());
+        let id = doc.add_object(GeoObject::Point(p));
+
+        // Before setting variables, the fallback (0.0) is used.
+        let pos0 = doc.point_position(id).unwrap();
+        assert!((pos0.x).abs() < 1e-9 && (pos0.y).abs() < 1e-9);
+
+        doc.set_variable("a".to_string(), 3.0);
+        doc.set_variable("b".to_string(), 5.0);
+
+        let pos = doc.point_position(id).unwrap();
+        assert!((pos.x - 3.0).abs() < 1e-9, "x should be a=3, got {}", pos.x);
+        assert!(
+            (pos.y - 10.0).abs() < 1e-9,
+            "y should be b*2=10, got {}",
+            pos.y
+        );
+        assert_eq!(doc.get_variable("a"), Some(3.0));
+    }
+
+    #[test]
+    fn json_roundtrip_preserves_objects_and_variables() {
+        let mut doc = Document::new();
+        let a = doc.add_point(Point2::new(0.0, 0.0));
+        let b = doc.add_point(Point2::new(4.0, 0.0));
+        let circle = doc.add_object(GeoObject::Circle(CircleObj::new(
+            Point2::new(2.0, 1.0),
+            1.5,
+        )));
+        doc.set_variable("r".to_string(), 1.5);
+        let (_mid, _) = doc.add_constructed_object(
+            GeoObject::Point(PointObj::new(Point2::new(0.0, 0.0)).with_label("M")),
+            "Midpoint",
+            &[a, b],
+        );
+        let n_before = doc.object_count();
+        let c_before = doc.constraints.constraint_count();
+
+        let json = serde_json::to_string(&doc).expect("serialize");
+        let doc2: Document = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(doc2.object_count(), n_before);
+        assert_eq!(doc2.constraints.constraint_count(), c_before);
+        assert!(doc2.get_object(a).is_some());
+        assert!(doc2.get_object(b).is_some());
+        assert!(doc2.get_object(circle).is_some());
+        if let GeoObject::Circle(c) = doc2.get_object(circle).unwrap() {
+            assert!((c.radius - 1.5).abs() < 1e-9);
+        } else {
+            panic!("expected circle after roundtrip");
+        }
+        // Variables survive the round-trip.
+        assert_eq!(doc2.get_variable("r"), Some(1.5));
+    }
+
+    #[test]
+    fn old_function_json_without_integral_fields_deserializes() {
+        let mut doc = Document::new();
+        doc.add_object(GeoObject::Function(FunctionObj::new("x^2")));
+        let mut value = serde_json::to_value(&doc).expect("serialize value");
+
+        fn strip_integral_fields(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    map.remove("is_integral");
+                    map.remove("integral_var");
+                    map.remove("integral_lower");
+                    for child in map.values_mut() {
+                        strip_integral_fields(child);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for child in items {
+                        strip_integral_fields(child);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        strip_integral_fields(&mut value);
+        let loaded: Document = serde_json::from_value(value).expect("old document should load");
+        let function = loaded.objects_iter().find_map(|(_, obj)| match obj {
+            GeoObject::Function(f) => Some(f),
+            _ => None,
+        });
+        let function = function.expect("function should exist");
+        assert!(!function.is_integral);
+        assert_eq!(function.integral_var, "x");
+        assert_eq!(function.integral_lower, 0.0);
+    }
+
+    #[test]
+    fn re_evaluate_constraints_midpoint() {
+        let mut doc = Document::new();
+        let a = doc.add_point(Point2::new(0.0, 0.0));
+        let b = doc.add_point(Point2::new(4.0, 0.0));
+        let (mid, _) = doc.add_constructed_object(
+            GeoObject::Point(PointObj::new(Point2::new(0.0, 0.0)).with_label("M")),
+            "Midpoint",
+            &[a, b],
+        );
+
+        // Initial evaluation: midpoint of (0,0) and (4,0) is (2,0).
+        let order = doc.propagation_order(&[a, b]);
+        doc.re_evaluate_constraints(&order);
+        if let GeoObject::Point(m) = doc.get_object(mid).unwrap() {
+            assert!((m.position.x - 2.0).abs() < 1e-9);
+            assert!(m.position.y.abs() < 1e-9);
+        } else {
+            panic!("expected midpoint point");
+        }
+
+        // Move a free point and re-evaluate; midpoint must follow.
+        doc.move_point(a, Point2::new(2.0, 0.0));
+        let order = doc.propagation_order(&[a]);
+        doc.re_evaluate_constraints(&order);
+        if let GeoObject::Point(m) = doc.get_object(mid).unwrap() {
+            assert!((m.position.x - 3.0).abs() < 1e-9, "midpoint x after move");
+            assert!(m.position.y.abs() < 1e-9);
+        } else {
+            panic!("expected midpoint point after move");
+        }
+    }
+
+    // ── Frente W-B: geometría dinámica arrastrable ──────────────────────
+    #[test]
+    fn drag_free_point_moves_line_circle_midpoint_and_live_measure() {
+        let mut doc = Document::new();
+        let a = doc
+            .try_add_object(GeoObject::Point(
+                PointObj::new(Point2::new(0.0, 0.0)).with_label("A"),
+            ))
+            .unwrap();
+        let b = doc
+            .try_add_object(GeoObject::Point(
+                PointObj::new(Point2::new(4.0, 0.0)).with_label("B"),
+            ))
+            .unwrap();
+        let (line, _) = doc
+            .try_add_constructed_object_with_params(
+                GeoObject::Line(
+                    LineObj::new_with_kind(
+                        Point2::new(0.0, 0.0),
+                        Point2::new(4.0, 0.0),
+                        LineKind::Line,
+                    )
+                    .with_label("l"),
+                ),
+                "LineByTwoPoints",
+                &[a, b],
+                BTreeMap::from([("kind".to_string(), 0.0)]),
+            )
+            .unwrap();
+        assert_eq!(
+            doc.creator_of(&line).unwrap().name,
+            "LineByTwoPoints",
+            "la recta debe declarar padres en el grafo"
+        );
+        assert_eq!(doc.creator_of(&line).unwrap().inputs, vec![a, b]);
+        let (mid, _) = doc
+            .try_add_constructed_object(
+                GeoObject::Point(PointObj::new(Point2::new(2.0, 0.0)).with_label("M")),
+                "Midpoint",
+                &[a, b],
+            )
+            .unwrap();
+        let (circle, _) = doc
+            .try_add_constructed_object(
+                GeoObject::Circle(CircleObj::new(Point2::new(0.0, 0.0), 4.0)),
+                "CircleByCenterPoint",
+                &[a, b],
+            )
+            .unwrap();
+        let mut text = crate::TextObj::new("4.000", Point2::new(2.0, 0.0));
+        text.label = "m".to_string();
+        let (measure, _) = doc
+            .try_add_constructed_object(GeoObject::Text(text), "MeasureDistance", &[a, b])
+            .unwrap();
+
+        // Un frame de arrastre por el camino real del gesto (input.rs).
+        assert!(doc
+            .try_move_point_and_re_evaluate(a, Point2::new(0.0, 2.0))
+            .unwrap());
+
+        if let GeoObject::Line(moved) = doc.get_object(line).unwrap() {
+            assert_eq!(moved.start, Point2::new(0.0, 2.0));
+            assert_eq!(moved.end, Point2::new(4.0, 0.0));
+            assert_eq!(moved.kind, LineKind::Line);
+        } else {
+            panic!("expected line");
+        }
+        if let GeoObject::Point(moved) = doc.get_object(mid).unwrap() {
+            assert!((moved.position.x - 2.0).abs() < 1e-9);
+            assert!((moved.position.y - 1.0).abs() < 1e-9);
+        } else {
+            panic!("expected midpoint");
+        }
+        if let GeoObject::Circle(moved) = doc.get_object(circle).unwrap() {
+            assert_eq!(moved.center, Point2::new(0.0, 2.0));
+            assert!((moved.radius - 20.0f64.sqrt()).abs() < 1e-9);
+        } else {
+            panic!("expected circle");
+        }
+        if let GeoObject::Text(moved) = doc.get_object(measure).unwrap() {
+            assert_eq!(moved.content, format!("{:.3}", 20.0f64.sqrt()));
+            assert!((moved.position.x - 2.0).abs() < 1e-9);
+            assert!((moved.position.y - 1.0).abs() < 1e-9);
+        } else {
+            panic!("expected measure text");
+        }
+    }
+
+    #[test]
+    fn drag_onto_degenerate_parents_rejects_frame_and_keeps_last_valid() {
+        // A arrastrado exactamente sobre B: la validación constructiva
+        // rechaza el frame (igual que Perpendicular hoy) y el estado vivo
+        // conserva la última geometría válida: congelado honesto con error
+        // visible, jamás escritura silenciosa de basura.
+        let mut doc = Document::new();
+        let a = doc
+            .try_add_object(GeoObject::Point(
+                PointObj::new(Point2::new(0.0, 0.0)).with_label("A"),
+            ))
+            .unwrap();
+        let b = doc
+            .try_add_object(GeoObject::Point(
+                PointObj::new(Point2::new(4.0, 0.0)).with_label("B"),
+            ))
+            .unwrap();
+        let (line, _) = doc
+            .try_add_constructed_object_with_params(
+                GeoObject::Line(
+                    LineObj::new_with_kind(
+                        Point2::new(0.0, 0.0),
+                        Point2::new(4.0, 0.0),
+                        LineKind::Line,
+                    )
+                    .with_label("l"),
+                ),
+                "LineByTwoPoints",
+                &[a, b],
+                BTreeMap::from([("kind".to_string(), 0.0)]),
+            )
+            .unwrap();
+        let (circle, _) = doc
+            .try_add_constructed_object(
+                GeoObject::Circle(CircleObj::new(Point2::new(0.0, 0.0), 4.0)),
+                "CircleByCenterPoint",
+                &[a, b],
+            )
+            .unwrap();
+
+        assert!(doc
+            .try_move_point_and_re_evaluate(a, Point2::new(4.0, 0.0))
+            .unwrap_err()
+            .contains("distintos"));
+        if let GeoObject::Line(frozen) = doc.get_object(line).unwrap() {
+            assert_eq!(frozen.start, Point2::new(0.0, 0.0));
+            assert_eq!(frozen.end, Point2::new(4.0, 0.0));
+        } else {
+            panic!("expected line");
+        }
+        if let GeoObject::Circle(frozen) = doc.get_object(circle).unwrap() {
+            assert_eq!(frozen.center, Point2::new(0.0, 0.0));
+            assert!((frozen.radius - 4.0).abs() < 1e-12);
+        } else {
+            panic!("expected circle");
+        }
+    }
+
+    #[test]
+    fn construction_closing_a_dependency_cycle_is_rejected() {
+        let mut doc = Document::new();
+        let a = doc
+            .try_add_object(GeoObject::Point(
+                PointObj::new(Point2::new(0.0, 0.0)).with_label("A"),
+            ))
+            .unwrap();
+        let b = doc
+            .try_add_object(GeoObject::Point(
+                PointObj::new(Point2::new(4.0, 0.0)).with_label("B"),
+            ))
+            .unwrap();
+        let (m, _) = doc
+            .try_add_constructed_object(
+                GeoObject::Point(PointObj::new(Point2::new(2.0, 0.0)).with_label("M")),
+                "Midpoint",
+                &[a, b],
+            )
+            .unwrap();
+        // Re-envolver A (existente) como derivado de su propio descendiente M
+        // cerraría A → M → A: se rechaza sin mutar el documento.
+        let forged_a = doc.get_object(a).unwrap().clone();
+        let error = doc
+            .try_add_constructed_object(forged_a, "Midpoint", &[m, b])
+            .unwrap_err();
+        assert!(error.contains("ciclo"), "unexpected error: {error}");
+        // Self-loop directo: B derivado de B.
+        let forged_b = doc.get_object(b).unwrap().clone();
+        let error = doc
+            .try_add_constructed_object(forged_b, "Midpoint", &[b, m])
+            .unwrap_err();
+        assert!(error.contains("ciclo"), "unexpected error: {error}");
+        // El documento sigue intacto: A libre, M con su creador.
+        assert!(doc.constraints.is_free(&a));
+        assert_eq!(doc.creator_of(&m).unwrap().name, "Midpoint");
+        assert_eq!(doc.object_count(), 3);
+    }
+
+    #[test]
+    fn drag_liberates_constant_formula_binding_like_geogebra() {
+        // `A = (0, 0)` guarda `x_expr = "0"`: el arrastre redefine el punto
+        // (libera el binding) y los hijos siguen, sin snap-back silencioso.
+        let mut doc = Document::new();
+        let mut a = PointObj::new(Point2::new(0.0, 0.0)).with_label("A");
+        a.x_expr = Some("0".to_string());
+        a.y_expr = Some("0".to_string());
+        let a = doc.try_add_object(GeoObject::Point(a)).unwrap();
+        let b = doc
+            .try_add_object(GeoObject::Point(
+                PointObj::new(Point2::new(4.0, 0.0)).with_label("B"),
+            ))
+            .unwrap();
+        let (mid, _) = doc
+            .try_add_constructed_object(
+                GeoObject::Point(PointObj::new(Point2::new(2.0, 0.0)).with_label("M")),
+                "Midpoint",
+                &[a, b],
+            )
+            .unwrap();
+        assert!(doc
+            .try_move_point_and_re_evaluate(a, Point2::new(0.0, 3.0))
+            .unwrap());
+        if let GeoObject::Point(moved) = doc.get_object(a).unwrap() {
+            assert_eq!(moved.position, Point2::new(0.0, 3.0));
+            assert!(moved.x_expr.is_none() && moved.y_expr.is_none());
+        } else {
+            panic!("expected point");
+        }
+        if let GeoObject::Point(moved) = doc.get_object(mid).unwrap() {
+            assert!((moved.position.x - 2.0).abs() < 1e-9);
+            assert!((moved.position.y - 1.5).abs() < 1e-9);
+        } else {
+            panic!("expected midpoint");
+        }
+    }
+
+    #[test]
+    fn drag_rejects_live_formula_binding_with_honest_error() {
+        // `x_expr = "t"` con variable `t`: el punto lo maneja la variable,
+        // el gesto se rechaza con error visible (antes: snap-back silencioso).
+        let mut doc = Document::new();
+        doc.try_set_variable("t".to_string(), 1.0).unwrap();
+        let mut p = PointObj::new(Point2::new(1.0, 0.0)).with_label("P");
+        p.x_expr = Some("t".to_string());
+        let p = doc.try_add_object(GeoObject::Point(p)).unwrap();
+        let error = doc
+            .try_move_point_and_re_evaluate(p, Point2::new(9.0, 0.0))
+            .unwrap_err();
+        assert!(error.contains("fórmula viva"), "unexpected error: {error}");
+        assert_eq!(doc.point_position(p), Some(Point2::new(1.0, 0.0)));
+    }
+
+    #[test]
+    fn drag_rejects_propagation_chains_deeper_than_budget() {
+        let mut doc = Document::new();
+        let first = doc
+            .try_add_object(GeoObject::Point(
+                PointObj::new(Point2::new(0.0, 0.0)).with_label("P0"),
+            ))
+            .unwrap();
+        // Cadena Translate de 70 eslabones (> MAX_DRAG_PROPAGATION_DEPTH = 64).
+        // Inserción directa al grafo: el camino productivo siempre valida.
+        let mut prev = first;
+        for _ in 1..=70 {
+            let next = doc
+                .try_add_object(GeoObject::Point(PointObj::new(Point2::new(0.0, 0.0))))
+                .unwrap();
+            doc.constraints
+                .try_add_constraint(
+                    "Translate",
+                    vec![prev],
+                    vec![next],
+                    BTreeMap::from([("dx".to_string(), 1.0), ("dy".to_string(), 0.0)]),
+                )
+                .unwrap();
+            prev = next;
+        }
+        let error = doc
+            .try_move_point_and_re_evaluate(first, Point2::new(5.0, 0.0))
+            .unwrap_err();
+        assert!(error.contains("profundidad"), "unexpected error: {error}");
+        // Fail-closed: el estado vivo queda intacto.
+        assert_eq!(doc.point_position(first), Some(Point2::new(0.0, 0.0)));
+    }
+
+    #[test]
+    fn drag_rejects_frames_beyond_reevaluation_budget() {
+        let mut doc = Document::new();
+        let a = doc
+            .try_add_object(GeoObject::Point(
+                PointObj::new(Point2::new(0.0, 0.0)).with_label("A"),
+            ))
+            .unwrap();
+        let b = doc
+            .try_add_object(GeoObject::Point(
+                PointObj::new(Point2::new(4.0, 0.0)).with_label("B"),
+            ))
+            .unwrap();
+        for _ in 0..(MAX_DRAG_REEVALS_PER_FRAME + 10) {
+            let m = doc
+                .try_add_object(GeoObject::Point(PointObj::new(Point2::new(0.0, 0.0))))
+                .unwrap();
+            doc.constraints
+                .try_add_constraint("Midpoint", vec![a, b], vec![m], BTreeMap::new())
+                .unwrap();
+        }
+        let error = doc
+            .try_move_point_and_re_evaluate(a, Point2::new(1.0, 0.0))
+            .unwrap_err();
+        assert!(error.contains("Arrastre"), "unexpected error: {error}");
+        assert_eq!(doc.point_position(a), Some(Point2::new(0.0, 0.0)));
+    }
+
+    #[test]
+    fn whiteboard_book_roundtrip_32_pages() {
+        let mut doc = Document::new();
+        let mut pages = Vec::new();
+        for index in 0..MAX_WHITEBOARD_PAGES {
+            let mut page = WhiteboardPageData::blank(&format!("Hoja {}", index + 1));
+            page.doc.add(grafito_whiteboard::WhiteboardElement::Text {
+                at: (index as f64, 0.0),
+                text: format!("contenido {index}"),
+                size: 14.0,
+            });
+            page.pan = (index as f64, -(index as f64));
+            page.zoom = 1.0 + index as f64 * 0.01;
+            pages.push(page);
+        }
+        doc.set_whiteboard_book(pages, MAX_WHITEBOARD_PAGES - 1)
+            .expect("libro válido de 32 hojas");
+        assert_eq!(doc.whiteboard_book_len(), MAX_WHITEBOARD_PAGES);
+        assert_eq!(doc.whiteboard_book_current(), MAX_WHITEBOARD_PAGES - 1);
+        // El espejo sigue a la hoja actual (export/validación intactos).
+        assert_eq!(doc.whiteboard.len(), 1);
+        let json = serde_json::to_string(&doc).expect("serializa");
+        let loaded: Document = serde_json::from_str(&json).expect("deserializa");
+        assert_eq!(loaded.whiteboard_pages.len(), MAX_WHITEBOARD_PAGES);
+        assert_eq!(loaded.whiteboard_current, MAX_WHITEBOARD_PAGES - 1);
+        assert_eq!(loaded.whiteboard.len(), 1);
+        match &loaded.whiteboard_pages[MAX_WHITEBOARD_PAGES - 1]
+            .doc
+            .elements()[0]
+        {
+            grafito_whiteboard::WhiteboardElement::Text { text, .. } => {
+                assert_eq!(text, "contenido 31");
+            }
+            other => panic!("hoja 32 inesperada: {other:?}"),
+        }
+        assert!((loaded.whiteboard_pages[5].pan.0 - 5.0).abs() < 1e-12);
+        assert!((loaded.whiteboard_pages[5].zoom - 1.05).abs() < 1e-12);
+    }
+
+    #[test]
+    fn whiteboard_book_migrates_legacy_single_page_json() {
+        let mut doc = Document::new();
+        doc.whiteboard
+            .add(grafito_whiteboard::WhiteboardElement::Text {
+                at: (1.0, 2.0),
+                text: "legado".to_string(),
+                size: 14.0,
+            });
+        // Simula JSON viejo: con `whiteboard` pero sin libro ni índice.
+        let mut value = serde_json::to_value(&doc).expect("a valor JSON");
+        let object = value.as_object_mut().expect("objeto JSON");
+        object.remove("whiteboard_pages");
+        object.remove("whiteboard_current");
+        let mut loaded: Document = serde_json::from_value(value).expect("carga legado");
+        assert!(loaded.whiteboard_pages.is_empty());
+        assert_eq!(loaded.whiteboard.len(), 1);
+        loaded.ensure_whiteboard_book_migrated();
+        assert_eq!(loaded.whiteboard_pages.len(), 1);
+        assert_eq!(loaded.whiteboard_current, 0);
+        assert_eq!(loaded.whiteboard_book_len(), 1);
+        assert_eq!(loaded.whiteboard.len(), 1);
+        // Roundtrip: el nuevo formato persiste el Vec y se reutiliza tal cual.
+        let json = serde_json::to_string(&loaded).expect("serializa migrado");
+        assert!(json.contains("whiteboard_pages"));
+        let reloaded: Document = serde_json::from_str(&json).expect("deserializa migrado");
+        assert_eq!(reloaded.whiteboard_pages.len(), 1);
+        assert_eq!(reloaded.whiteboard.len(), 1);
+        match &reloaded.whiteboard_pages[0].doc.elements()[0] {
+            grafito_whiteboard::WhiteboardElement::Text { text, .. } => {
+                assert_eq!(text, "legado");
+            }
+            other => panic!("hoja migrada inesperada: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn whiteboard_book_deserialize_caps_pages_and_elements() {
+        // Libro sobredimensionado a mano (40 hojas × (1 trazo largo + 600
+        // rectángulos) + título largo + zoom absurdo): la carga lo acota sin
+        // panic ni error. Nota: NaN/Inf no sobreviven a JSON (`serde_json`
+        // los escribe como `null`), así que aquí van valores finitos fuera
+        // de cota; los no finitos se sanean en memoria vía
+        // `set_whiteboard_book` / `ensure_whiteboard_book_migrated`.
+        let mut doc = Document::new();
+        let mut pages = Vec::new();
+        for index in 0..MAX_WHITEBOARD_PAGES + 8 {
+            let mut page = WhiteboardPageData {
+                title: format!("Hoja {index} {}", "t".repeat(100)),
+                doc: grafito_whiteboard::WhiteboardDoc::new(),
+                pan: (1e300, 1.0),
+                zoom: 1e300,
+            };
+            page.doc.add(grafito_whiteboard::WhiteboardElement::Stroke {
+                points: vec![(0.0, 0.0); MAX_WHITEBOARD_POINTS_PER_STROKE + 100],
+                color: (0, 0, 0),
+                width: 2.0,
+            });
+            for _ in 0..MAX_WHITEBOARD_ELEMENTS_PER_PAGE + 100 {
+                page.doc
+                    .add(grafito_whiteboard::WhiteboardElement::Rectangle {
+                        min: (0.0, 0.0),
+                        max: (1.0, 1.0),
+                        fill: None,
+                    });
+            }
+            pages.push(page);
+        }
+        // Asignación directa (sin `set_whiteboard_book`, que rechazaría):
+        // simula JSON externo fuera de cotas.
+        doc.whiteboard_pages = pages;
+        doc.whiteboard_current = 999;
+        let value = serde_json::to_value(&doc).expect("a valor JSON");
+        let loaded: Document = serde_json::from_value(value).expect("carga acotada");
+        assert_eq!(loaded.whiteboard_pages.len(), MAX_WHITEBOARD_PAGES);
+        assert!(
+            loaded
+                .whiteboard_pages
+                .iter()
+                .all(|page| page.doc.len() <= MAX_WHITEBOARD_ELEMENTS_PER_PAGE),
+            "cada hoja queda en ≤500 elementos"
+        );
+        assert!(
+            loaded.whiteboard_pages[0].title.chars().count() <= MAX_WHITEBOARD_PAGE_TITLE_CHARS,
+            "título truncado a 64 caracteres"
+        );
+        // El trazo largo (primer elemento) se capa a 4096 puntos.
+        match &loaded.whiteboard_pages[0].doc.elements()[0] {
+            grafito_whiteboard::WhiteboardElement::Stroke { points, .. } => {
+                assert_eq!(points.len(), MAX_WHITEBOARD_POINTS_PER_STROKE);
+            }
+            other => panic!("trazo esperado, fue: {other:?}"),
+        }
+        // Zoom absurdo pero finito se recorta a 1e6.
+        assert!((loaded.whiteboard_pages[0].zoom - WHITEBOARD_PAGE_ZOOM_MAX).abs() < 1e-6);
+        // `whiteboard_current` absurdo se recorta al rango válido al migrar.
+        let mut migrated = loaded;
+        migrated.ensure_whiteboard_book_migrated();
+        assert_eq!(migrated.whiteboard_current, MAX_WHITEBOARD_PAGES - 1);
+    }
+
+    #[test]
+    fn whiteboard_book_deserialize_skips_corrupt_page_keeps_book() {
+        // Una hoja corrupta (`null` donde iba contenido, como deja un NaN
+        // serializado) se omite sin tumbar el libro ni fallar la carga.
+        let mut doc = Document::new();
+        doc.set_whiteboard_book(
+            vec![
+                WhiteboardPageData::blank("Hoja 1"),
+                WhiteboardPageData::blank("Hoja 2"),
+            ],
+            1,
+        )
+        .expect("libro válido");
+        let mut value = serde_json::to_value(&doc).expect("a valor JSON");
+        let pages = value
+            .get_mut("whiteboard_pages")
+            .expect("libro serializado")
+            .as_array_mut()
+            .expect("arreglo de hojas");
+        pages.insert(
+            0,
+            serde_json::json!({"title": null, "doc": null, "pan": null, "zoom": null}),
+        );
+        let loaded: Document = serde_json::from_value(value).expect("carga tolerante");
+        assert_eq!(loaded.whiteboard_pages.len(), 2);
+        assert_eq!(loaded.whiteboard_pages[0].title, "Hoja 1");
+        assert_eq!(loaded.whiteboard_pages[1].title, "Hoja 2");
+    }
+
+    #[test]
+    fn whiteboard_pages_to_svg_renders_one_file_per_page() {
+        let mut first = WhiteboardPageData::blank("Hoja 1");
+        first
+            .doc
+            .add(grafito_whiteboard::WhiteboardElement::Rectangle {
+                min: (0.0, 0.0),
+                max: (10.0, 5.0),
+                fill: None,
+            });
+        let mut second = WhiteboardPageData::blank("Hoja 2");
+        second.doc.add(grafito_whiteboard::WhiteboardElement::Text {
+            at: (1.0, 2.0),
+            text: "a<b>&c".to_string(),
+            size: 14.0,
+        });
+        let pages = whiteboard_pages_to_svg(&[first, second], 800, 600);
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].0, "Hoja 1");
+        assert!(pages[0].1.contains("<svg") && pages[0].1.contains("<rect"));
+        // Texto con XML se escapa y los lados se acotan a 64..=4096.
+        assert!(pages[1].1.contains("a&lt;b&gt;&amp;c"));
+        let clamped = whiteboard_pages_to_svg(&[WhiteboardPageData::blank("H")], 10_000, 10);
+        assert!(clamped[0].1.contains("width=\"4096\""));
+        assert!(clamped[0].1.contains("height=\"64\""));
+    }
+
+    #[test]
+    fn whiteboard_book_rejects_empty_and_oversized_on_write() {
+        let mut doc = Document::new();
+        let error = doc
+            .set_whiteboard_book(Vec::new(), 0)
+            .expect_err("libro vacío debe rechazarse");
+        assert!(error.contains("al menos una hoja"), "fue: {error}");
+        let pages: Vec<WhiteboardPageData> = (0..MAX_WHITEBOARD_PAGES + 1)
+            .map(|index| WhiteboardPageData::blank(&format!("H{index}")))
+            .collect();
+        let error = doc
+            .set_whiteboard_book(pages, 0)
+            .expect_err("33 hojas deben rechazarse");
+        assert!(error.contains("32"), "fue: {error}");
+        assert!(doc.whiteboard_pages.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod trace_tests {
+    use super::*;
+    use crate::PointObj;
+
+    fn point_doc(label: &str, x: f64, y: f64) -> (Document, ObjectId) {
+        let mut doc = Document::new();
+        let id = doc
+            .try_add_object(GeoObject::Point(
+                PointObj::new(Point2::new(x, y)).with_label(label),
+            ))
+            .expect("punto");
+        (doc, id)
+    }
+
+    #[test]
+    fn trace_toggle_persists_and_clears_trail() {
+        let (mut doc, id) = point_doc("A", 1.0, 2.0);
+        assert!(!doc.is_trace(id));
+        assert!(doc.set_trace(id, true));
+        assert!(doc.is_trace(id));
+        assert!(doc.push_trail_sample(id, Point2::new(1.0, 2.0)));
+        assert_eq!(doc.trail_points(id).len(), 1);
+        assert!(doc.set_trace(id, false));
+        assert!(!doc.is_trace(id));
+        assert!(doc.trail_points(id).is_empty());
+    }
+
+    #[test]
+    fn trace_rejects_unknown_and_filters_nonfinite() {
+        let (mut doc, id) = point_doc("A", 0.0, 0.0);
+        assert!(!doc.set_trace(ObjectId::new(), true));
+        assert!(!doc.push_trail_sample(id, Point2::new(0.0, 0.0)));
+        assert!(!doc.push_trail_sample(id, Point2::new(f64::NAN, f64::INFINITY)));
+        assert!(doc.trail_points(id).is_empty());
+    }
+
+    #[test]
+    fn trail_fifo_caps_at_512_and_survives_serde() {
+        let (mut doc, id) = point_doc("A", 0.0, 0.0);
+        assert!(doc.set_trace(id, true));
+        for i in 0..(MAX_TRAIL_POINTS + 10) {
+            let x = i as f64;
+            assert!(doc.push_trail_sample(id, Point2::new(x, 0.0)));
+        }
+        let pts = doc.trail_points(id);
+        assert_eq!(pts.len(), MAX_TRAIL_POINTS);
+        assert!((pts[0].x - 10.0).abs() < 1e-12);
+        let json = serde_json::to_string(&doc).expect("serializa");
+        assert!(json.contains("trace_enabled"));
+        assert!(!json.contains("\"trails\""));
+        let back: Document = serde_json::from_str(&json).expect("deserializa");
+        assert!(back.is_trace(id));
+        assert!(back.trail_points(id).is_empty());
+    }
+
+    #[test]
+    fn trace_entries_dropped_with_object() {
+        let (mut doc, id) = point_doc("A", 0.0, 0.0);
+        assert!(doc.set_trace(id, true));
+        assert!(doc.push_trail_sample(id, Point2::new(0.0, 0.0)));
+        assert!(doc.remove_object(id).is_some());
+        assert!(!doc.is_trace(id));
+        assert!(doc.trail_points(id).is_empty());
+    }
+
+    #[test]
+    fn trail_buffer_unit() {
+        let mut buf = TrailBuffer::new();
+        assert!(buf.is_empty());
+        assert!(!buf.push(Point2::new(f64::NAN, 0.0)));
+        assert!(buf.push(Point2::new(1.0, 2.0)));
+        assert_eq!(buf.len(), 1);
+        buf.clear();
+        assert!(buf.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod live_param_tests {
+    use super::*;
+
+    #[test]
+    fn ensure_crea_p_y_slider_lo_lee() {
+        let mut doc = Document::new();
+        assert!(doc.live_param("p").is_none());
+        let live = doc.ensure_live_param("p", -5.0, 5.0, 0.0).expect("crea p");
+        assert_eq!(live.name, "p");
+        assert_eq!((live.min, live.max, live.value), (-5.0, 5.0, 0.0));
+        let read = doc.live_param("p").expect("slider lo lee");
+        assert_eq!(read.value, 0.0);
+        // La animación lo lee si existe, con fallback si no.
+        assert_eq!(doc.live_param_value("p", 99.0), 0.0);
+        assert_eq!(doc.live_param_value("ausente", 99.0), 99.0);
+    }
+
+    #[test]
+    fn set_revalua_dependientes_y_version_sube() {
+        let mut doc = Document::new();
+        doc.ensure_live_param("p", -2.0, 2.0, 0.0).expect("crea p");
+        let before = doc.version;
+        doc.set_live_param("p", 1.5).expect("mueve slider");
+        assert_eq!(doc.live_param("p").expect("lee").value, 1.5);
+        assert!(doc.version.wrapping_sub(before) >= 1);
+        // Clampea al rango en vez de rechazar (slider honesto).
+        doc.set_live_param("p", 99.0).expect("clampea");
+        assert_eq!(doc.live_param("p").expect("lee").value, 2.0);
+    }
+
+    #[test]
+    fn ensure_rechaza_rangos_y_nombres_sin_mutar() {
+        let mut doc = Document::new();
+        assert!(doc.ensure_live_param("", -1.0, 1.0, 0.0).is_err());
+        assert!(doc.ensure_live_param("9mal", -1.0, 1.0, 0.0).is_err());
+        assert!(doc.ensure_live_param("p", 2.0, -2.0, 0.0).is_err());
+        assert!(doc.ensure_live_param("p", f64::NAN, 1.0, 0.0).is_err());
+        assert!(doc.live_param("p").is_none(), "rechazo no deja rastro");
+        doc.ensure_live_param("p", -1.0, 1.0, 0.0).expect("crea");
+        assert!(doc.set_live_param("p", f64::INFINITY).is_err());
+        assert!(doc.set_live_param("ausente", 1.0).is_err());
+    }
+
+    #[test]
+    fn variable_sin_meta_usa_fallback_sin_mutar() {
+        let mut doc = Document::new();
+        doc.try_set_variable("q".to_string(), 3.0)
+            .expect("variable suelta");
+        let live = doc.live_param("q").expect("fallback");
+        assert_eq!(
+            (live.min, live.max),
+            (LIVE_PARAM_FALLBACK_MIN, LIVE_PARAM_FALLBACK_MAX)
+        );
+        assert_eq!(live.value, 3.0);
+        assert!(doc.variable_meta("q").is_none(), "lectura no muta");
+    }
+
+    #[test]
+    fn f3b_celda_con_referencia_a_objeto_se_recomputa_al_mover_fuente() {
+        let mut doc = Document::new();
+        let point_id = doc
+            .try_add_object(GeoObject::Point(
+                PointObj::new(Point2::new(1.0, 2.0)).with_label("A"),
+            ))
+            .expect("punto A");
+        doc.set_spreadsheet_cell(0, 0, "1".to_string()).expect("A1");
+        doc.set_spreadsheet_cell(0, 1, "=A1*3".to_string())
+            .expect("B1");
+        doc.set_spreadsheet_cell(0, 2, "=x(A)+10".to_string())
+            .expect("C1");
+        doc.recompute_spreadsheet_variables()
+            .expect("recompute inicial");
+        assert_eq!(doc.get_variable("B1"), Some(3.0));
+        assert_eq!(doc.get_variable("C1"), Some(11.0));
+        // Cambia la fuente escalar: la dependiente se recomputa.
+        let staged = doc
+            .stage_spreadsheet_cell_edits(&[(0, 0, "4".to_string())])
+            .expect("edita A1");
+        doc = staged;
+        assert_eq!(doc.get_variable("A1"), Some(4.0));
+        assert_eq!(doc.get_variable("B1"), Some(12.0));
+        // Mueve el punto fuente: la celda con `x(A)` se recomputa.
+        doc.try_update_point_and_re_evaluate(point_id, |point| {
+            point.position = Point2::new(5.0, 2.0);
+            Ok(())
+        })
+        .expect("mueve A");
+        assert_eq!(doc.get_variable("C1"), Some(15.0));
+        // Fórmula rota: no voltea la hoja, solo queda sin resolver.
+        let staged = doc
+            .stage_spreadsheet_cell_edits(&[(0, 3, "=ZZZ_NO_EXISTE+(".to_string())])
+            .expect("fuente rota se conserva");
+        doc = staged;
+        assert!(doc.get_variable("D1").is_none(), "rota no resuelve");
+        assert_eq!(doc.get_variable("B1"), Some(12.0), "sanas intactas");
+        assert_eq!(doc.get_variable("C1"), Some(15.0), "objeto-ref intacta");
+    }
+
+    #[test]
+    fn f3b_coordenada_con_formula_y_grafico_vinculado_se_actualizan() {
+        use crate::{DataTableObj, ScatterPlotObj};
+        let mut doc = Document::new();
+        doc.set_spreadsheet_cell(0, 0, "2".to_string()).expect("A1");
+        doc.set_spreadsheet_cell(0, 1, "3".to_string()).expect("B1");
+        // C1 es coordenada con fórmula sobre otras celdas.
+        let staged = doc
+            .stage_spreadsheet_cell_edits(&[(0, 2, "(A1+1, B1*2)".to_string())])
+            .expect("C1 coordenada");
+        doc = staged;
+        let owned = doc.spreadsheet_coordinate_point("C1").expect("punto C1");
+        let position = doc.point_position(owned).expect("posición C1");
+        assert!((position.x - 3.0).abs() < 1e-9, "x = {position:?}");
+        assert!((position.y - 6.0).abs() < 1e-9, "y = {position:?}");
+        // Cambia la fuente: el punto generado se actualiza.
+        let staged = doc
+            .stage_spreadsheet_cell_edits(&[(0, 0, "10".to_string())])
+            .expect("edita A1");
+        doc = staged;
+        let renewed = doc.spreadsheet_coordinate_point("C1").expect("sigue C1");
+        let position = doc.point_position(renewed).expect("nueva posición");
+        assert!(
+            (position.x - 11.0).abs() < 1e-9,
+            "x tras fuente = {position:?}"
+        );
+        // Gráfico vinculado: el Scatter sigue a su DataTable vía live.
+        let table = DataTableObj::new("x", "y", vec![0.0, 1.0], vec![0.0, 1.0]).with_label("t");
+        let table_id = doc
+            .try_add_object(GeoObject::DataTable(table))
+            .expect("tabla");
+        let scatter = ScatterPlotObj::new(vec![0.0, 1.0], vec![0.0, 1.0]).linked_to(table_id);
+        let scatter_id = doc
+            .try_add_object(GeoObject::ScatterPlot(scatter))
+            .expect("scatter");
+        doc.try_add_live_sequence(
+            table_id,
+            LiveSequenceBinding {
+                expr: "k*k".to_string(),
+                var: "k".to_string(),
+                start_expr: "0".to_string(),
+                end_expr: "3".to_string(),
+            },
+        )
+        .expect("secuencia viva");
+        doc.recompute_live_sequences().expect("live");
+        let (table_xs, table_ys) = match doc.get_object(table_id).expect("tabla existe") {
+            GeoObject::DataTable(table) => (table.xs.clone(), table.ys.clone()),
+            _ => panic!("tabla esperada"),
+        };
+        assert_eq!(table_xs, vec![0.0, 1.0, 2.0, 3.0]);
+        assert_eq!(table_ys, vec![0.0, 1.0, 4.0, 9.0]);
+        match doc.get_object(scatter_id).expect("scatter existe") {
+            GeoObject::ScatterPlot(scatter) => {
+                assert_eq!(scatter.xs, table_xs, "scatter sigue xs");
+                assert_eq!(scatter.ys, table_ys, "scatter sigue ys");
+            }
+            _ => panic!("scatter esperado"),
+        }
+    }
+
+    #[test]
+    fn f3b_presupuestos_spreadsheet_siguen_enforced() {
+        assert_eq!(Document::MAX_SPREADSHEET_ROWS, 400);
+        assert_eq!(Document::MAX_SPREADSHEET_COLS, 400);
+        assert_eq!(Document::MAX_SPREADSHEET_RECOMPUTE_CELLS, 10_000);
+        let mut doc = Document::new();
+        assert!(doc
+            .set_spreadsheet_cell(Document::MAX_SPREADSHEET_ROWS, 0, "1".to_string())
+            .is_err());
+        assert!(doc
+            .set_spreadsheet_cell(0, Document::MAX_SPREADSHEET_COLS, "1".to_string())
+            .is_err());
+    }
+
+    #[test]
+    fn q2_try_set_layer_with_previous_commits_staged_and_reports_noop() {
+        let mut doc = Document::new();
+        let id = doc.add_object(GeoObject::Point(crate::PointObj::new(
+            grafito_geometry::Point2::new(0.0, 0.0),
+        )));
+        let version = doc.version;
+        // Sin cambio → None sin versionar.
+        assert!(doc
+            .try_set_layer_with_previous(id, 0)
+            .expect("no-op ok")
+            .is_none());
+        assert_eq!(doc.version, version);
+        // Cambio → Some(before) con la capa vieja y versión +1.
+        let before = doc
+            .try_set_layer_with_previous(id, 4)
+            .expect("cambio ok")
+            .expect("previo");
+        assert_eq!(before.layer_of(id), 0);
+        assert_eq!(doc.layer_of(id), 4);
+        assert_eq!(doc.version, version.wrapping_add(1));
+        // Errores honestos sin mutar.
+        assert!(doc.try_set_layer_with_previous(id, 256).is_err());
+        assert!(doc
+            .try_set_layer_with_previous(crate::ObjectId::new(), 1)
+            .is_err());
+        assert_eq!(doc.layer_of(id), 4);
+    }
+
+    // ── Q2: capas reales persistentes ─────────────────────────────────────
+
+    #[test]
+    fn q2_layer_default_is_zero_and_set_roundtrips() {
+        let mut doc = Document::new();
+        let id = doc.add_object(GeoObject::Point(crate::PointObj::new(
+            grafito_geometry::Point2::new(0.0, 0.0),
+        )));
+        assert_eq!(doc.layer_of(id), 0);
+        doc.set_layer(id, 3).expect("capa válida");
+        assert_eq!(doc.layer_of(id), 3);
+        // Capa 0 no se almacena (documento flaco); volver a 0 limpia.
+        doc.set_layer(id, 0).expect("capa 0");
+        assert_eq!(doc.layer_of(id), 0);
+        assert!(doc.layers().is_empty());
+    }
+
+    #[test]
+    fn q2_layer_rejects_missing_object_and_overflow() {
+        let mut doc = Document::new();
+        let missing = crate::ObjectId::new();
+        assert!(doc.set_layer(missing, 1).is_err());
+        assert!(doc.set_layer_clamped(missing, 1).is_err());
+        let id = doc.add_object(GeoObject::Point(crate::PointObj::new(
+            grafito_geometry::Point2::new(0.0, 0.0),
+        )));
+        assert!(doc.set_layer(id, 256).is_err());
+        assert!(doc.set_layer_clamped(id, -1).is_err());
+        // Clamp honesto: 300 → 255 avisando.
+        let (applied, clamped) = doc.set_layer_clamped(id, 300).expect("clamp");
+        assert_eq!(applied, 255);
+        assert!(clamped);
+        assert_eq!(doc.layer_of(id), 255);
+        let (applied, clamped) = doc.set_layer_clamped(id, 7).expect("exacta");
+        assert_eq!((applied, clamped), (7, false));
+    }
+
+    #[test]
+    fn q2_layer_prune_and_remove_keep_table_bounded() {
+        let mut doc = Document::new();
+        let a = doc.add_object(GeoObject::Point(crate::PointObj::new(
+            grafito_geometry::Point2::new(0.0, 0.0),
+        )));
+        let b = doc.add_object(GeoObject::Point(crate::PointObj::new(
+            grafito_geometry::Point2::new(1.0, 1.0),
+        )));
+        doc.set_layer(a, 2).expect("capa");
+        doc.set_layer(b, 2).expect("capa");
+        assert_eq!(doc.used_layers(), vec![(2, 2)]);
+        doc.remove_object(a);
+        assert_eq!(doc.layer_of(a), 0);
+        assert_eq!(doc.used_layers(), vec![(2, 1)]);
+        doc.clear();
+        assert!(doc.layers().is_empty());
+        assert_eq!(doc.used_layers(), vec![]);
+    }
+
+    #[test]
+    fn q2_layers_persist_through_serde_and_legacy_defaults_to_zero() {
+        let mut doc = Document::new();
+        let id = doc.add_object(GeoObject::Point(crate::PointObj::new(
+            grafito_geometry::Point2::new(0.0, 0.0),
+        )));
+        doc.set_layer(id, 5).expect("capa");
+        let json = serde_json::to_string(&doc).expect("serializa");
+        assert!(json.contains("\"layers\""), "layers persiste en JSON");
+        let back: Document = serde_json::from_str(&json).expect("deserializa");
+        assert_eq!(back.layer_of(id), 5);
+        // JSON viejo sin `layers` → todo en capa 0 (orden histórico).
+        let legacy = json.replace("\"layers\"", "\"layers_legacy_ignored\"");
+        let legacy_doc: Document = serde_json::from_str(&legacy).expect("migra");
+        assert_eq!(legacy_doc.layer_of(id), 0);
+    }
+
+    #[test]
+    fn q2_validation_rejects_layer_overflow_from_hand_edited_json() {
+        let mut doc = Document::new();
+        let id = doc.add_object(GeoObject::Point(crate::PointObj::new(
+            grafito_geometry::Point2::new(0.0, 0.0),
+        )));
+        doc.set_layer(id, 9).expect("capa");
+        crate::validation::validate_document(&doc).expect("documento válido");
+        let mut hacked = doc.clone();
+        hacked.layers_mut_for_test(id, 999);
+        assert!(crate::validation::validate_document(&hacked).is_err());
+    }
+
+    #[test]
+    fn r2_v4_10k_celdas_enlazadas_no_panica() {
+        // 10k celdas enlazadas en cadena: cap + `try_reserve`, jamás panic.
+        let mut doc = Document::new();
+        for i in 0..100 {
+            for j in 0..100 {
+                let val = if i == 0 && j == 0 {
+                    "1".to_string()
+                } else if j == 0 {
+                    format!("=A{}", i)
+                } else {
+                    "1".to_string()
+                };
+                // `set_spreadsheet_cell` valida cotas 400x400; 100x100 entra.
+                doc.set_spreadsheet_cell(i, j, val).expect("celda");
+            }
+        }
+        let res = doc.recompute_spreadsheet_variables();
+        let _ = res;
+    }
+
+    #[test]
+    fn r2_v5_len_200k_da_err_acotado() {
+        // `len=200k` excede `MAX_LIVE_SEQUENCE_LENGTH` (10k): `Err`, no OOM.
+        // Además pinnea el presupuesto de deadline en const.
+        assert_eq!(crate::document::MAX_LIVE_SEQUENCE_LENGTH, 10_000);
+        assert_eq!(crate::document::MAX_LIVE_SEQUENCE_EVAL_MS, 1_000);
+        let len_probe = 200_000_usize;
+        assert!(len_probe > crate::document::MAX_LIVE_SEQUENCE_LENGTH);
+        assert!(len_probe <= crate::validation::MAX_ARRAY_LENGTH);
+        let mut doc = Document::new();
+        let table_id = doc
+            .try_add_object(GeoObject::DataTable(crate::DataTableObj::new(
+                "x",
+                "y",
+                vec![0.0, 1.0],
+                vec![0.0, 1.0],
+            )))
+            .expect("tabla");
+        doc.try_add_live_sequence(
+            table_id,
+            LiveSequenceBinding {
+                expr: "k".to_string(),
+                var: "k".to_string(),
+                start_expr: "0".to_string(),
+                end_expr: "200000".to_string(),
+            },
+        )
+        .expect("binding");
+        let err = doc.recompute_live_sequences().expect_err("debe acotar");
+        assert!(err.contains("excede"), "err honesto: {err}");
+    }
+}
+#[cfg(test)]
+mod coverage_sweep_lifecycle {
+    use super::*;
+    use crate::{validation::validate_document, GeoObject, LineObj, PointObj};
+    #[test]
+    fn barrido_documento_crea_remueve_y_valida() {
+        let mut doc = Document::new();
+        let id_p = doc.add_object(GeoObject::Point(PointObj::new(Point2::new(1.0, 2.0))));
+        let id_l = doc.add_object(GeoObject::Line(LineObj::new(
+            Point2::new(0.0, 0.0),
+            Point2::new(3.0, 4.0),
+        )));
+        assert_eq!(doc.objects_iter().count(), 2);
+        assert!(validate_document(&doc).is_ok());
+        assert!(doc.estimated_bytes() > 0);
+        let staged = doc.detached_clone_for_staging();
+        assert_eq!(staged.objects_iter().count(), 2);
+        assert!(doc.remove_object(id_p).is_some());
+        assert_eq!(doc.objects_iter().count(), 1);
+        assert!(validate_document(&doc).is_ok());
+        assert!(doc.remove_object(id_l).is_some());
+        assert_eq!(doc.objects_iter().count(), 0);
+    }
+    #[test]
+    fn barrido_worksheet_input_y_celdas() {
+        let mut doc = Document::new();
+        assert!(doc.validate_cas_worksheet_input("Function[x^2]").is_ok());
+        assert!(doc.validate_cas_worksheet_input("").is_err());
+        assert!(doc
+            .try_append_cas_worksheet_cell(
+                "1+1".to_string(),
+                "2".to_string(),
+                CasWorksheetStatus::Success
+            )
+            .is_ok());
+        assert!(validate_document(&doc).is_ok());
+    }
+}

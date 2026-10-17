@@ -1,0 +1,4206 @@
+//! Herramientas seguras del agente (3 base + 6 pedagógicas = 9).
+//!
+//! Implementación autocontenida dentro de `grafito-agent`: no depende de
+//! `grafito-assistant`, `grafito-pedagogy`, `grafito-geometry` ni `grafito-anim`
+//! para mantener el DAG como hoja y ownership exclusivo en este crate.
+//! Los datos curriculares replican los IDs/títulos reales del `Curriculum`
+//! (`grafito-pedagogy/src/curriculum.rs`) y la lógica determinista
+//! (hash_con_sal, tolerancia 2 %, plantillas nativas) replica el comportamiento
+//! verificado en `grafito-pedagogy` y `grafito-anim/src/protocol.rs`.
+
+use crate::loop_engine::ToolDispatcher;
+use crate::schema::{ToolCall, ToolResult, ToolSchema};
+use serde_json::{json, Value};
+use std::collections::BTreeMap;
+use std::fmt;
+use std::sync::LazyLock;
+
+// ── Constantes ──────────────────────────────────────────────────────────────
+
+/// Límite de bytes por argumento de texto (mitiga DoS).
+pub const MAX_ARG_BYTES: usize = 2_000;
+/// Versión del protocolo de animación que `generate_animation` declara.
+pub const ANIM_PROTOCOL_VERSION: u32 = 1;
+/// Plantillas válidas del motor nativo (R6e: espejo pineado de
+/// `grafito-anim::protocol::CANONICAL_TEMPLATES`, mismo orden, las 69:
+/// 13 base + 52 de dominio + 4 extra).
+///
+/// `grafito-agent` es hoja sin dep a `grafito-anim` (ver encabezado): no
+/// puede delegar el símbolo, así que replica el contrato y lo pinea con
+/// `r6e_mirror_pineado_paridad_protocolo` (typo→`Err`, `""`/`auto` por
+/// concepto, fallback `universal` honesto). Si el protocolo suma una
+/// canónica, este espejo debe actualizarse a la par (el test lo exige).
+pub const KNOWN_TEMPLATES: &[&str] = &[
+    "derivative-slope",
+    "integral-area",
+    "taylor-series",
+    "conformal-map",
+    "pitagoras",
+    "euler",
+    "fourier",
+    "logistic-bifurcation",
+    "gradient-field",
+    "mobius-transform",
+    "universal",
+    "subspace",
+    "fractal",
+    // Ola 52: álgebra lineal (6).
+    "cambio-de-base",
+    "determinante-area",
+    "eigenvectores",
+    "matriz-transformacion",
+    "producto-cruz",
+    "vectores-combinacion-lineal",
+    // Ola 52: análisis I (6).
+    "chain-rule",
+    "epsilon-delta",
+    "improper-integral",
+    "ode-slope-field",
+    "riemann-sums",
+    "taylor-remainder",
+    // Ola 52: análisis II (6).
+    "double-integral",
+    "gradient-descent",
+    "green-stokes",
+    "jacobian",
+    "lagrange-multipliers",
+    "partial-derivatives",
+    // Ola 52: caos (5).
+    "chaos-bifurcacion-barrido",
+    "chaos-julia-morph",
+    "chaos-lorenz",
+    "chaos-mandelbrot-zoom",
+    "chaos-pendulo-doble",
+    // Ola 52: EDO (5).
+    "edo-calor-onda",
+    "edo-campo-direcciones",
+    "edo-convolucion",
+    "edo-fourier-epiciclos",
+    "edo-laplace",
+    // Ola 52: estadística y ML (8).
+    "backprop-flujo",
+    "descenso-gradiente-3d",
+    "distribuciones",
+    "limite-central",
+    "pca-rotacion",
+    "perceptron-mlp",
+    "regresion-lineal",
+    "teorema-bayes",
+    // Ola 52: superficies 3D (6).
+    "sup-campo-vectorial",
+    "sup-interseccion",
+    "sup-onda-3d",
+    "sup-paraboloide-tangente",
+    "sup-silla-descenso",
+    "sup-toro-rotante",
+    // Ola 52: politopos 4D (5).
+    "celda-24",
+    "estereografica",
+    "hipercubo-corte",
+    "simplex-nd",
+    "tesseract-xw",
+    // Ola 52: grafos y redes (5).
+    "bfs-animado",
+    "camino-minimo",
+    "force-directed",
+    "moser-spindle-coloreo",
+    "unit-distance",
+    // Ola extra (3) + Laplace 3D (1) + Trig (1).
+    "matriz-inversa-nucleo",
+    "matriz-no-cuadrada",
+    "producto-punto-dualidad",
+    "sup-laplace-3d",
+    "trig-circulo-unitario",
+];
+const MIN_CANVAS: u64 = 64;
+const MAX_CANVAS: u64 = 4096;
+const DEFAULT_CANVAS: (u32, u32) = (640, 480);
+const MIN_DURATION_MS: u64 = 100;
+const MAX_DURATION_MS: u64 = 30_000;
+/// FPS del plan de animación (paridad diálogo `MediaExportDialog` 1..=60, default 12).
+pub const MIN_ANIM_FPS: u32 = 1;
+pub const MAX_ANIM_FPS: u32 = 60;
+pub const DEFAULT_ANIM_FPS: u32 = 12;
+/// Frames por item del player (paridad `PLAYER_MAX_FRAMES` 48) y total (96).
+pub const PLAYER_ITEM_MAX_FRAMES: usize = 48;
+pub const PLAYER_TOTAL_MAX_FRAMES: usize = 96;
+/// Calidades del plan (espejo UI `MediaExportQuality`: bitrate sugerido).
+pub const KNOWN_QUALITIES: &[&str] = &["baja", "media", "alta"];
+/// Vistas del plan (espejo UI `MediaExportView`).
+pub const KNOWN_VIEWS: &[&str] = &["plana", "orbita"];
+/// Efectos de creación del player (brazos `PlayItem`; `none` = morph histórico).
+pub const KNOWN_EFFECTS: &[&str] = &["create", "write", "fade", "grow", "indicate", "none"];
+/// Formatos de exportación del plan (wire `ExportFormat`: gif/png/mp4/webm).
+pub const KNOWN_EXPORT_FORMATS: &[&str] = &["gif", "png", "mp4", "webm"];
+/// Destinos del tracker (`TrackerMap`: opacidad/escala/centro).
+pub const KNOWN_TRACKER_MAPS: &[&str] = &["opacity", "scale", "center_x", "center_y"];
+
+// ── Error tipado en español ─────────────────────────────────────────────────
+
+/// Error tipado de las herramientas, siempre en español con código claro.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolError {
+    /// Falta un campo obligatorio.
+    FaltaCampo { campo: &'static str },
+    /// Campo presente pero inválido.
+    CampoInvalido { campo: &'static str, motivo: String },
+    /// LO / concepto no encontrado en el currículum.
+    NoEncontrado(String),
+    /// Fallo de evaluación matemática o de dominio.
+    EvaluacionFallida(String),
+    /// Presupuesto excedido (tamaño, rango, etc.).
+    PresupuestoExcedido(String),
+}
+
+impl ToolError {
+    /// Código estable para aserciones y logs.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::FaltaCampo { .. } => "E_FALTA_CAMPO",
+            Self::CampoInvalido { .. } => "E_CAMPO_INVALIDO",
+            Self::NoEncontrado(_) => "E_NO_ENCONTRADO",
+            Self::EvaluacionFallida(_) => "E_EVALUACION",
+            Self::PresupuestoExcedido(_) => "E_PRESUPUESTO",
+        }
+    }
+}
+
+impl fmt::Display for ToolError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::FaltaCampo { campo } => {
+                write!(f, "falta el campo obligatorio '{campo}' ({})", self.code())
+            }
+            Self::CampoInvalido { campo, motivo } => {
+                write!(f, "campo '{campo}' inválido: {motivo} ({})", self.code())
+            }
+            Self::NoEncontrado(detalle) => {
+                write!(f, "no encontrado: {detalle} ({})", self.code())
+            }
+            Self::EvaluacionFallida(detalle) => {
+                write!(f, "evaluación fallida: {detalle} ({})", self.code())
+            }
+            Self::PresupuestoExcedido(detalle) => {
+                write!(f, "presupuesto excedido: {detalle} ({})", self.code())
+            }
+        }
+    }
+}
+
+impl std::error::Error for ToolError {}
+
+fn err_result(call_id: &str, err: ToolError) -> ToolResult {
+    ToolResult::text(call_id, false, err.to_string())
+}
+
+// ── Helpers de argumentos ───────────────────────────────────────────────────
+
+fn string_arg(call: &ToolCall, key: &str) -> Option<String> {
+    call.arguments
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|v| !v.trim().is_empty() && v.len() <= MAX_ARG_BYTES)
+        .map(str::to_owned)
+}
+
+/// Vista prestada de `string_arg` (mismos filtros, sin clonar).
+///
+/// Para búsquedas/parseos que solo necesitan `&str` (niveles, ids, queries
+/// en camino feliz): evita un `String` temporal por argumento y turno.
+fn arg_str<'a>(call: &'a ToolCall, key: &str) -> Option<&'a str> {
+    call.arguments
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|v| !v.trim().is_empty() && v.len() <= MAX_ARG_BYTES)
+}
+
+/// Rechaza cualquier string >2000 bytes (recursivo en objetos/arrays anidados:
+/// `{"a":[{"b":"<5000 bytes>"}]}` también cae, no solo el nivel plano).
+fn reject_oversized_string_args(call: &ToolCall) -> Option<ToolResult> {
+    fn check(call_id: &str, key: &str, value: &Value) -> Option<ToolResult> {
+        match value {
+            Value::String(text) => {
+                if text.len() > MAX_ARG_BYTES {
+                    return Some(ToolResult::text(
+                        call_id,
+                        false,
+                        ToolError::PresupuestoExcedido(format!(
+                            "el argumento '{key}' excede el límite de {MAX_ARG_BYTES} bytes (E_PRESUPUESTO)"
+                        ))
+                        .to_string(),
+                    ));
+                }
+            }
+            Value::Object(map) => {
+                for (nested_key, nested) in map {
+                    if let Some(r) = check(call_id, nested_key, nested) {
+                        return Some(r);
+                    }
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    if let Some(r) = check(call_id, key, item) {
+                        return Some(r);
+                    }
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+    if let Some(map) = call.arguments.as_object() {
+        for (k, v) in map {
+            if let Some(r) = check(&call.id, k, v) {
+                return Some(r);
+            }
+        }
+    }
+    None
+}
+
+// ── Nivel pedagógico ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Level {
+    Primary,
+    Secondary,
+    University,
+    UtmAm1,
+    UtmAm2,
+    UtmAlgebra,
+    UtmProb,
+}
+
+fn parse_level(raw: Option<&str>) -> Level {
+    let Some(text) = raw.map(|s| s.trim().to_lowercase()) else {
+        return Level::Secondary;
+    };
+    match text.as_str() {
+        "primary" | "primaria" | "primario" => Level::Primary,
+        "secondary" | "secundaria" | "secundario" => Level::Secondary,
+        "university" | "universidad" | "universitario" => Level::University,
+        "utn_am1" | "utnam1" | "am1" | "utn am1" => Level::UtmAm1,
+        "utn_am2" | "utnam2" | "am2" | "utn am2" => Level::UtmAm2,
+        "utn_algebra" | "algebra" | "álgebra" => Level::UtmAlgebra,
+        "utn_probabilidad" | "probabilidad" | "prob" | "utn_prob" => Level::UtmProb,
+        _ => Level::Secondary,
+    }
+}
+
+fn level_label(level: Level) -> &'static str {
+    match level {
+        Level::Primary => "Primaria",
+        Level::Secondary => "Secundaria",
+        Level::University => "Universidad",
+        Level::UtmAm1 => "UTN AM1",
+        Level::UtmAm2 => "UTN AM2",
+        Level::UtmAlgebra => "UTN Álgebra",
+        Level::UtmProb => "UTN Probabilidad",
+    }
+}
+
+fn level_difficulty(level: Level) -> &'static str {
+    match level {
+        Level::Primary => "Easy",
+        Level::Secondary => "Medium",
+        _ => "Hard",
+    }
+}
+
+// ── Currículum real (43 LOs, replica curriculum.rs) ─────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+struct Lo {
+    id: &'static str,
+    title: &'static str,
+    description: &'static str,
+    program: Option<&'static str>,
+    level_min: u32,
+    requires: &'static [&'static str],
+    tags: &'static [&'static str],
+    hours: f32,
+}
+
+/// Currículum estático (43 LOs): evita reconstruir un `Vec` por búsqueda.
+///
+/// `all_los()` devolvía `Vec<Lo>` y cada `curriculum_get/find` (hasta 6× por
+/// `suggest_next`) realocaba los 43. El slice estático es la misma tabla.
+static ALL_LOS: &[Lo] = &[
+    // Primaria 5
+    Lo {
+        id: "pri-conteo",
+        title: "Conteo",
+        description: "Conteo, números naturales, orden y comparación",
+        program: None,
+        level_min: 1,
+        requires: &[],
+        tags: &["conteo", "numeros", "orden", "primaria"],
+        hours: 2.0,
+    },
+    Lo {
+        id: "pri-fracc-vis",
+        title: "Fracciones visuales",
+        description: "Fracciones con dibujos, mitad y cuarto, representación pictórica",
+        program: None,
+        level_min: 1,
+        requires: &["pri-conteo"],
+        tags: &["fraccion", "visual", "mitad", "primaria"],
+        hours: 2.5,
+    },
+    Lo {
+        id: "pri-perim-area",
+        title: "Perímetro y área",
+        description: "Perímetro y área de figuras simples, cuadrados y rectángulos",
+        program: None,
+        level_min: 2,
+        requires: &["pri-conteo"],
+        tags: &["perimetro", "area", "geometria", "primaria"],
+        hours: 3.0,
+    },
+    Lo {
+        id: "pri-proporciones",
+        title: "Proporciones simples",
+        description: "Doble, mitad, proporcionalidad simple con ejemplos concretos",
+        program: None,
+        level_min: 2,
+        requires: &["pri-fracc-vis"],
+        tags: &["proporcion", "doble", "mitad", "primaria"],
+        hours: 2.0,
+    },
+    Lo {
+        id: "pri-datos",
+        title: "Datos simples",
+        description: "Tablas, gráficos de barras, promedio simple y recolección de datos",
+        program: None,
+        level_min: 2,
+        requires: &["pri-conteo"],
+        tags: &["datos", "tablas", "barras", "primaria", "estadistica"],
+        hours: 2.0,
+    },
+    // Secundaria 11
+    Lo {
+        id: "sec-fracc",
+        title: "Fracciones",
+        description: "Operaciones con fracciones, simplificación, fracciones equivalentes",
+        program: None,
+        level_min: 4,
+        requires: &["pri-fracc-vis"],
+        tags: &["fraccion", "simplificacion", "equivalente", "secundaria"],
+        hours: 3.0,
+    },
+    Lo {
+        id: "sec-prop",
+        title: "Proporciones",
+        description: "Razones, proporciones, regla de tres, porcentaje",
+        program: None,
+        level_min: 5,
+        requires: &["sec-fracc"],
+        tags: &["proporcion", "razon", "regla de tres", "porcentaje"],
+        hours: 3.0,
+    },
+    Lo {
+        id: "sec-ec",
+        title: "Ecuaciones",
+        description: "Ecuaciones lineales y cuadráticas, sistemas de ecuaciones",
+        program: None,
+        level_min: 6,
+        requires: &["sec-prop"],
+        tags: &["ecuacion", "lineal", "cuadratica", "sistema"],
+        hours: 4.0,
+    },
+    Lo {
+        id: "sec-lineal",
+        title: "Funciones lineales",
+        description: "Recta, pendiente, ordenada al origen, gráfica de función lineal",
+        program: None,
+        level_min: 6,
+        requires: &["sec-ec"],
+        tags: &["funcion", "lineal", "recta", "pendiente", "grafica"],
+        hours: 4.0,
+    },
+    Lo {
+        id: "sec-cuad",
+        title: "Funciones cuadráticas",
+        description: "Parábola, vértice, raíces, discriminante, gráfica cuadrática",
+        program: None,
+        level_min: 7,
+        requires: &["sec-lineal"],
+        tags: &["funcion", "cuadratica", "parabola", "vertice", "raiz"],
+        hours: 4.0,
+    },
+    Lo {
+        id: "sec-pend",
+        title: "Pendiente",
+        description: "Pendiente de recta, tangente intuitiva, inclinación",
+        program: None,
+        level_min: 6,
+        requires: &["sec-lineal"],
+        tags: &["pendiente", "recta", "tangente", "inclinacion"],
+        hours: 2.0,
+    },
+    Lo {
+        id: "sec-area",
+        title: "Área",
+        description: "Área bajo curva, aproximación, área de figuras",
+        program: None,
+        level_min: 6,
+        requires: &["pri-perim-area"],
+        tags: &["area", "curva", "aproximacion", "figura"],
+        hours: 2.5,
+    },
+    Lo {
+        id: "sec-trig",
+        title: "Trigonometría",
+        description: "Seno, coseno, círculo unitario, identidades trigonométricas",
+        program: None,
+        level_min: 7,
+        requires: &["sec-lineal"],
+        tags: &["trigonometria", "seno", "coseno", "circulo", "identidad"],
+        hours: 4.0,
+    },
+    Lo {
+        id: "sec-vect",
+        title: "Vectores intro",
+        description: "Vectores, componentes, suma, noción geométrica",
+        program: None,
+        level_min: 6,
+        requires: &["sec-pend"],
+        tags: &["vector", "componente", "suma", "geometrico"],
+        hours: 3.0,
+    },
+    Lo {
+        id: "sec-prob",
+        title: "Probabilidad básica secundaria",
+        description: "Eventos, probabilidad simple, diagramas, frecuencia",
+        program: None,
+        level_min: 5,
+        requires: &["sec-prop", "pri-datos"],
+        tags: &[
+            "probabilidad",
+            "evento",
+            "diagrama",
+            "frecuencia",
+            "secundaria",
+        ],
+        hours: 3.0,
+    },
+    Lo {
+        id: "sec-pitagoras",
+        title: "Teorema de Pitágoras",
+        description:
+            "Triángulo rectángulo, catetos e hipotenusa, c²=a²+b², demostración y aplicaciones",
+        program: None,
+        level_min: 8,
+        requires: &["sec-area"],
+        tags: &[
+            "pitagoras",
+            "triangulo",
+            "hipotenusa",
+            "cateto",
+            "secundaria",
+            "geometria",
+        ],
+        hours: 3.0,
+    },
+    // AM1 8
+    Lo {
+        id: "am1-func",
+        title: "Funciones",
+        description: "Dominio, imagen, composición, inversa, clasificación",
+        program: Some("UTN AM1"),
+        level_min: 10,
+        requires: &[],
+        tags: &["funcion", "dominio", "imagen", "composicion", "inversa"],
+        hours: 6.0,
+    },
+    Lo {
+        id: "am1-lim",
+        title: "Límites",
+        description: "Límites laterales, indeterminaciones, asintotas, límites infinitos",
+        program: Some("UTN AM1"),
+        level_min: 11,
+        requires: &["am1-func"],
+        tags: &["limite", "asintota", "indeterminacion", "continuidad"],
+        hours: 5.0,
+    },
+    Lo {
+        id: "am1-cont",
+        title: "Continuidad",
+        description: "Continuidad, teorema de Bolzano, clasificación de discontinuidades",
+        program: Some("UTN AM1"),
+        level_min: 11,
+        requires: &["am1-lim"],
+        tags: &["continuidad", "bolzano", "discontinuidad", "limite"],
+        hours: 4.0,
+    },
+    Lo {
+        id: "am1-der",
+        title: "Derivadas",
+        description: "Definición, reglas, recta tangente, extremos, derivada",
+        program: Some("UTN AM1"),
+        level_min: 12,
+        requires: &["am1-cont"],
+        tags: &["derivada", "tangente", "extremos", "reglas"],
+        hours: 7.0,
+    },
+    Lo {
+        id: "am1-der-aplic",
+        title: "Aplicaciones de derivadas",
+        description: "Crecimiento, concavidad, máximos y mínimos, L'Hôpital, optimización",
+        program: Some("UTN AM1"),
+        level_min: 12,
+        requires: &["am1-der"],
+        tags: &[
+            "derivada",
+            "optimizacion",
+            "extremos",
+            "concavidad",
+            "lhopital",
+        ],
+        hours: 6.0,
+    },
+    Lo {
+        id: "am1-int",
+        title: "Integrales",
+        description: "Primitivas, área, Barrow, impropias, integral definida",
+        program: Some("UTN AM1"),
+        level_min: 12,
+        requires: &["am1-der"],
+        tags: &["integral", "primitiva", "barrow", "area", "impropia"],
+        hours: 7.0,
+    },
+    Lo {
+        id: "am1-int-aplic",
+        title: "Aplicaciones de integrales",
+        description: "Área entre curvas, volumen de revolución, longitud de arco",
+        program: Some("UTN AM1"),
+        level_min: 12,
+        requires: &["am1-int"],
+        tags: &["integral", "area", "volumen", "revolucion", "arco"],
+        hours: 5.0,
+    },
+    Lo {
+        id: "am1-sucesiones",
+        title: "Sucesiones",
+        description: "Sucesiones numéricas, convergencia, criterio, límite de sucesión",
+        program: Some("UTN AM1"),
+        level_min: 11,
+        requires: &["am1-lim"],
+        tags: &["sucesion", "convergencia", "limite", "numerica"],
+        hours: 4.0,
+    },
+    // AM2 7
+    Lo {
+        id: "am2-edo",
+        title: "EDO",
+        description: "Variables separables, lineales, aplicaciones, ecuaciones diferenciales",
+        program: Some("UTN AM2"),
+        level_min: 13,
+        requires: &["am1-der", "am1-int"],
+        tags: &["edo", "diferencial", "separable", "lineal"],
+        hours: 8.0,
+    },
+    Lo {
+        id: "am2-series",
+        title: "Series numéricas",
+        description: "Criterios de convergencia, series alternadas, geométricas",
+        program: Some("UTN AM2"),
+        level_min: 13,
+        requires: &["am1-sucesiones"],
+        tags: &["serie", "convergencia", "numerica", "criterio"],
+        hours: 6.0,
+    },
+    Lo {
+        id: "am2-taylor",
+        title: "Taylor y Fourier",
+        description: "Series de Taylor, Fourier, aproximación, convergencia",
+        program: Some("UTN AM2"),
+        level_min: 14,
+        requires: &["am2-series"],
+        tags: &["taylor", "fourier", "serie", "aproximacion"],
+        hours: 6.0,
+    },
+    Lo {
+        id: "am2-multivariable",
+        title: "Cálculo multivariable",
+        description: "Funciones de varias variables, derivadas parciales, gradiente",
+        program: Some("UTN AM2"),
+        level_min: 13,
+        requires: &["am1-der"],
+        tags: &["multivariable", "parcial", "gradiente", "varias variables"],
+        hours: 7.0,
+    },
+    Lo {
+        id: "am2-int-multi",
+        title: "Integrales dobles y triples",
+        description: "Integrales dobles, triples, cambio de variables, Jacobiano",
+        program: Some("UTN AM2"),
+        level_min: 14,
+        requires: &["am2-multivariable"],
+        tags: &[
+            "integral",
+            "doble",
+            "triple",
+            "jacobiano",
+            "cambio variable",
+        ],
+        hours: 7.0,
+    },
+    Lo {
+        id: "am2-campos",
+        title: "Campos vectoriales",
+        description: "Campos vectoriales, rotacional, divergencia, potencial",
+        program: Some("UTN AM2"),
+        level_min: 14,
+        requires: &["am2-multivariable", "alg-vectores"],
+        tags: &[
+            "campo",
+            "vectorial",
+            "rotacional",
+            "divergencia",
+            "gradiente",
+        ],
+        hours: 6.0,
+    },
+    Lo {
+        id: "am2-teoremas",
+        title: "Teoremas integrales",
+        description: "Green, Stokes, Gauss (divergencia), aplicaciones",
+        program: Some("UTN AM2"),
+        level_min: 14,
+        requires: &["am2-campos", "am2-int-multi"],
+        tags: &["green", "stokes", "gauss", "teorema", "integral"],
+        hours: 6.0,
+    },
+    // Álgebra 6
+    Lo {
+        id: "alg-vectores",
+        title: "Vectores",
+        description: "Vectores en R2/R3, producto escalar y vectorial, norma",
+        program: Some("UTN Álgebra"),
+        level_min: 11,
+        requires: &["sec-vect"],
+        tags: &["vector", "escalar", "vectorial", "norma", "r2", "r3"],
+        hours: 5.0,
+    },
+    Lo {
+        id: "alg-rectas-planos",
+        title: "Rectas y planos",
+        description: "Ecuaciones de rectas y planos, posiciones relativas, distancias",
+        program: Some("UTN Álgebra"),
+        level_min: 12,
+        requires: &["alg-vectores"],
+        tags: &["recta", "plano", "ecuacion", "posicion", "distancia"],
+        hours: 5.0,
+    },
+    Lo {
+        id: "alg-matrices",
+        title: "Matrices",
+        description: "Operaciones, rango, sistemas lineales, Gauss-Jordan",
+        program: Some("UTN Álgebra"),
+        level_min: 11,
+        requires: &["sec-ec"],
+        tags: &["matriz", "rango", "sistema", "gauss", "lineal"],
+        hours: 6.0,
+    },
+    Lo {
+        id: "alg-determinantes",
+        title: "Determinantes",
+        description: "Propiedades, cálculo, matriz inversa, regla de Cramer",
+        program: Some("UTN Álgebra"),
+        level_min: 12,
+        requires: &["alg-matrices"],
+        tags: &["determinante", "inversa", "cramer", "matriz"],
+        hours: 4.0,
+    },
+    Lo {
+        id: "alg-conicas",
+        title: "Cónicas",
+        description: "Circunferencia, elipse, parábola, hipérbola, ecuaciones canónicas",
+        program: Some("UTN Álgebra"),
+        level_min: 12,
+        requires: &["alg-rectas-planos"],
+        tags: &[
+            "conica",
+            "elipse",
+            "parabola",
+            "hiperbola",
+            "circunferencia",
+        ],
+        hours: 5.0,
+    },
+    Lo {
+        id: "alg-transformaciones",
+        title: "Transformaciones lineales",
+        description: "Núcleo, imagen, matriz asociada, autovalores y autovectores",
+        program: Some("UTN Álgebra"),
+        level_min: 13,
+        requires: &["alg-matrices", "alg-determinantes"],
+        tags: &["transformacion", "lineal", "nucleo", "imagen", "autovalor"],
+        hours: 6.0,
+    },
+    // Probabilidad 6
+    Lo {
+        id: "prob-basica",
+        title: "Probabilidad básica",
+        description: "Espacio muestral, eventos, probabilidad condicional, Bayes",
+        program: Some("UTN Probabilidad"),
+        level_min: 11,
+        requires: &["sec-prob"],
+        tags: &["probabilidad", "muestral", "bayes", "condicional", "evento"],
+        hours: 5.0,
+    },
+    Lo {
+        id: "prob-var",
+        title: "Variables aleatorias",
+        description: "Variables aleatorias discretas y continuas, esperanza, varianza",
+        program: Some("UTN Probabilidad"),
+        level_min: 12,
+        requires: &["prob-basica"],
+        tags: &["variable", "aleatoria", "esperanza", "varianza", "discreta"],
+        hours: 5.0,
+    },
+    Lo {
+        id: "prob-distribuciones",
+        title: "Distribuciones",
+        description: "Binomial, Poisson, Normal, exponencial, propiedades",
+        program: Some("UTN Probabilidad"),
+        level_min: 12,
+        requires: &["prob-var"],
+        tags: &[
+            "distribucion",
+            "binomial",
+            "poisson",
+            "normal",
+            "exponencial",
+        ],
+        hours: 6.0,
+    },
+    Lo {
+        id: "prob-inferencia",
+        title: "Inferencia estadística",
+        description: "Estimación puntual, intervalos de confianza, test de hipótesis",
+        program: Some("UTN Probabilidad"),
+        level_min: 13,
+        requires: &["prob-distribuciones"],
+        tags: &[
+            "inferencia",
+            "estimacion",
+            "confianza",
+            "hipotesis",
+            "intervalo",
+        ],
+        hours: 6.0,
+    },
+    Lo {
+        id: "prob-regresion",
+        title: "Regresión",
+        description: "Regresión lineal, correlación, mínimos cuadrados, predicción",
+        program: Some("UTN Probabilidad"),
+        level_min: 13,
+        requires: &["prob-distribuciones"],
+        tags: &["regresion", "correlacion", "lineal", "minimos cuadrados"],
+        hours: 5.0,
+    },
+    Lo {
+        id: "prob-muestreo",
+        title: "Muestreo",
+        description: "Técnicas de muestreo, teorema central del límite, distribuciones muestrales",
+        program: Some("UTN Probabilidad"),
+        level_min: 13,
+        requires: &["prob-inferencia"],
+        tags: &["muestreo", "central limite", "muestral", "tecnica"],
+        hours: 4.0,
+    },
+];
+
+fn all_los() -> &'static [Lo] {
+    ALL_LOS
+}
+
+fn curriculum_get(id: &str) -> Option<Lo> {
+    all_los().iter().find(|lo| lo.id == id).cloned()
+}
+
+/// Título/descripción en minúsculas, precomputados una vez.
+///
+/// `curriculum_find` hacía `to_lowercase()` por campo y por LO en cada
+/// búsqueda (43×3 alocaciones + tags). El cache es idéntico (mismo
+/// `to_lowercase`, misma comparación) pero sin alocar por búsqueda.
+static CURRICULUM_LOWER: LazyLock<Vec<(String, String)>> = LazyLock::new(|| {
+    all_los()
+        .iter()
+        .map(|lo| (lo.title.to_lowercase(), lo.description.to_lowercase()))
+        .collect()
+});
+
+fn curriculum_find(concept: &str) -> Vec<Lo> {
+    let q = concept.trim().to_lowercase();
+    if q.is_empty() {
+        return Vec::new();
+    }
+    // `id` y `tags` están pineados en minúsculas: `contains` directo es
+    // idéntico a `to_lowercase().contains` y evita ~200 alocaciones por
+    // búsqueda. Título/descripción usan el cache precomputado.
+    let lowers = &*CURRICULUM_LOWER;
+    let mut scored: Vec<(usize, Lo)> = all_los()
+        .iter()
+        .zip(lowers.iter())
+        .filter_map(|(lo, (title_lower, desc_lower))| {
+            let mut score = 0usize;
+            if title_lower.contains(&q) {
+                score += 1;
+            }
+            if desc_lower.contains(&q) {
+                score += 1;
+            }
+            if lo.id.contains(&q) {
+                score += 1;
+            }
+            score += lo.tags.iter().filter(|t| t.contains(&q)).count();
+            if score > 0 {
+                Some((score, lo.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.title.cmp(b.1.title)));
+    scored.into_iter().map(|(_, lo)| lo).collect()
+}
+
+fn lo_to_json(lo: &Lo) -> Value {
+    json!({
+        "id": lo.id,
+        "title": lo.title,
+        "description": lo.description,
+        "program": lo.program,
+        "level_min": lo.level_min,
+        "requires": lo.requires,
+        "tags": lo.tags,
+        "estimated_hours": lo.hours,
+    })
+}
+
+// ── Ejercicios deterministas (hash_con_sal, replica pedagogy) ───────────────
+
+// Réplica de `grafito-pedagogy::exercise::hash_con_sal`: deriva un `u64`
+// pseudoaleatorio de `(seed, sal)` con avalancha completa (splitmix64).
+// Cada parámetro (`h0`, `h1`, `h2`) usa sal distinta: flujos independientes
+// entre sí y entre semillas consecutivas. La cadena lineal anterior
+// (`h1 = h0*K+C`, `h2 = h1*K`) dejaba `(a, b)` correlacionados y divergía
+// del nativo; la paridad está pineada por
+// `agent_tools_parity_exercise_determinism` (vive en `grafito-assistant`,
+// fuera de este crate): si el nativo cambia sales o finalizador, este
+// espejo debe cambiar a la par.
+const SAL_DORADA: u64 = 0x9E37_79B9_7F4A_7C15;
+
+fn hash_con_sal(seed: u64, sal: u64) -> u64 {
+    let mut z = seed
+        .wrapping_add(sal.wrapping_mul(SAL_DORADA))
+        .wrapping_add(SAL_DORADA);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+struct GeneratedExercise {
+    prompt: String,
+    solution: String,
+    kind: &'static str,
+    validator: String,
+    params: BTreeMap<String, f64>,
+}
+
+fn generate_exercise_inner(lo_id: &str, seed: u64) -> GeneratedExercise {
+    let h0 = hash_con_sal(seed, 0);
+    let h1 = hash_con_sal(seed, 1);
+    let h2 = hash_con_sal(seed, 2);
+    match lo_id {
+        "am1-der" => {
+            let a = 1 + (h0 % 3);
+            let b = 1 + (h1 % 3);
+            let prompt = format!("Deriva f(x)={a}*x^2 + {b}*x en x=1");
+            let solution = (2 * a + b).to_string();
+            let mut params = BTreeMap::new();
+            params.insert("a".to_string(), a as f64);
+            params.insert("b".to_string(), b as f64);
+            GeneratedExercise {
+                prompt,
+                solution,
+                kind: "Symbolic",
+                validator: "NumericTol(0.02)".to_string(),
+                params,
+            }
+        }
+        "am1-int" => {
+            let a = 1 + (h0 % 3);
+            let prompt = format!("Calcula ∫₀¹ {a}*x^2 dx");
+            let val = a as f64 / 3.0;
+            // Paridad nativa: múltiplo de 3 → entero exacto ("1"), si no decimal.
+            let solution = if a.is_multiple_of(3) {
+                (val as i64).to_string()
+            } else {
+                format!("{val}")
+            };
+            let mut params = BTreeMap::new();
+            params.insert("a".to_string(), a as f64);
+            GeneratedExercise {
+                prompt,
+                solution,
+                kind: "Symbolic",
+                validator: "NumericTol(0.02)".to_string(),
+                params,
+            }
+        }
+        "sec-trig" => {
+            let k = seed % 4;
+            let (prompt, solution) = match k {
+                0 => ("¿Cuánto vale sin(0)?".to_string(), "0".to_string()),
+                1 => ("¿Cuánto vale sin(π/2)?".to_string(), "1".to_string()),
+                2 => ("¿Cuánto vale sin(π)?".to_string(), "0".to_string()),
+                _ => ("¿Cuánto vale sin(3·π/2)?".to_string(), "-1".to_string()),
+            };
+            let mut params = BTreeMap::new();
+            params.insert("k".to_string(), k as f64);
+            params.insert(
+                "angle_rad".to_string(),
+                k as f64 * std::f64::consts::FRAC_PI_2,
+            );
+            GeneratedExercise {
+                prompt,
+                solution,
+                kind: "Numeric",
+                validator: "NumericTol(0.02)".to_string(),
+                params,
+            }
+        }
+        _ => {
+            let a = 1 + (h0 % 5);
+            let b = 1 + (h1 % 5);
+            let c = 1 + (h2 % 5);
+            let prompt = format!("Si f(x)={a}*x+{b}, evalúa en x={c}");
+            let solution = (a * c + b).to_string();
+            let mut params = BTreeMap::new();
+            params.insert("a".to_string(), a as f64);
+            params.insert("b".to_string(), b as f64);
+            params.insert("c".to_string(), c as f64);
+            // Paridad nativa: `am1-lim` frasea como límite (mismo a/b/c).
+            let (prompt, kind) = if lo_id == "am1-lim" {
+                (
+                    format!("Si f(x)={a}*x+{b}, ¿cuánto vale lim_{{x→{c}}} f(x)?"),
+                    "Symbolic",
+                )
+            } else if lo_id == "am1-cont" {
+                (prompt, "Symbolic")
+            } else if lo_id.starts_with("sec-") || lo_id.starts_with("am1-") {
+                (prompt, "Numeric")
+            } else {
+                (prompt, "Graphical")
+            };
+            GeneratedExercise {
+                prompt,
+                solution,
+                kind,
+                validator: "NumericTol(0.02)".to_string(),
+                params,
+            }
+        }
+    }
+}
+
+// ── Feedback (bien / parcial / mal, replica pedagogy) ───────────────────────
+
+fn normalize_answer(s: &str) -> String {
+    s.trim()
+        .to_lowercase()
+        .replace(' ', "")
+        .replace(['·', '×'], "*")
+}
+
+fn parse_numeric(raw: &str) -> Option<f64> {
+    let t = raw.trim().to_lowercase().replace(' ', "").replace(',', ".");
+    if t.is_empty() {
+        return None;
+    }
+    let t = if t.contains('=') {
+        t.split('=').next_back().unwrap_or(&t).to_string()
+    } else {
+        t
+    };
+    if t.contains('/') {
+        let parts: Vec<&str> = t.split('/').collect();
+        if parts.len() == 2 {
+            if let (Ok(a), Ok(b)) = (parts[0].parse::<f64>(), parts[1].parse::<f64>()) {
+                if b.abs() > 1e-12 {
+                    return Some(a / b);
+                }
+            }
+        }
+        return None;
+    }
+    if let Ok(v) = t.parse::<f64>() {
+        return Some(v);
+    }
+    if t == "pi" || t == "π" {
+        return Some(std::f64::consts::PI);
+    }
+    None
+}
+
+fn numeric_close(a: f64, b: f64) -> bool {
+    if !a.is_finite() || !b.is_finite() {
+        return false;
+    }
+    let diff = (a - b).abs();
+    if b.abs() < 1e-9 {
+        diff <= 0.02
+    } else {
+        diff <= 0.02 * b.abs()
+    }
+}
+
+fn numeric_close_loose(a: f64, b: f64) -> bool {
+    if !a.is_finite() || !b.is_finite() {
+        return false;
+    }
+    let diff = (a - b).abs();
+    if b.abs() < 1e-9 {
+        diff <= 0.15
+    } else {
+        diff <= 0.15 * b.abs()
+    }
+}
+
+fn is_domain_phrase(s: &str) -> bool {
+    let low = s.to_lowercase();
+    let norm = normalize_answer(s);
+    low.contains("no existe")
+        || norm.contains("noexiste")
+        || norm.contains("infinito")
+        || norm.contains("indeterminado")
+        || low.contains("no está definida")
+        || low.contains("no esta definida")
+}
+
+fn diagnose_misconception(prompt: &str, solution: &str, answer: &str) -> &'static str {
+    let sol_norm = normalize_answer(solution);
+    let ans_norm = normalize_answer(answer);
+    if sol_norm.contains('-') != ans_norm.contains('-') {
+        return "Sign";
+    }
+    if let (Some(sv), Some(av)) = (parse_numeric(solution), parse_numeric(answer)) {
+        if sv != 0.0 && av != 0.0 && sv.signum() != av.signum() {
+            return "Sign";
+        }
+    }
+    if answer.contains('/') && solution.contains('/') {
+        match (parse_numeric(solution), parse_numeric(answer)) {
+            (Some(sv), Some(av)) => {
+                if !numeric_close(av, sv) {
+                    return "Fraction";
+                }
+            }
+            _ => return "Fraction",
+        }
+    }
+    let sol_low = solution.to_lowercase();
+    let ans_low = answer.to_lowercase();
+    let prompt_low = prompt.to_lowercase();
+    if prompt_low.contains('(') && prompt_low.contains('+') {
+        return "Distributive";
+    }
+    if ans_norm.contains('+')
+        && ans_norm.contains('*')
+        && !ans_norm.contains('(')
+        && sol_norm.contains('(')
+    {
+        return "Distributive";
+    }
+    let sol_trig = sol_low.contains("cos") || sol_low.contains("sin");
+    let ans_trig = ans_low.contains("cos") || ans_low.contains("sin");
+    if sol_trig && !ans_trig {
+        return "ChainRule";
+    }
+    if is_domain_phrase(answer) != is_domain_phrase(solution) {
+        return "Domain";
+    }
+    let notation = (sol_low.contains('^')
+        && !ans_low.contains('^')
+        && !ans_low.contains("**")
+        && !ans_low.contains('²'))
+        || (!sol_low.contains('^') && ans_low.contains('^'))
+        || (sol_low.contains("sin") && ans_low.contains("sen"))
+        || (sol_low.contains("√") && ans_low.contains("sqrt"))
+        || (sol_low.contains("sqrt") && ans_low.contains('√'));
+    if notation {
+        return "Notation";
+    }
+    if sol_low.contains("x^2") && ans_low == "x2" {
+        return "Notation";
+    }
+    "Concept"
+}
+
+fn misconception_feedback(misconception: &str, solution: &str) -> (String, String) {
+    match misconception {
+        "Sign" => (
+            "Revisá el signo: ¿es positivo o negativo? Cuidado con los menos al distribuir.".to_string(),
+            "Repasá am1-der (reglas de signos) y sec-ec.".to_string(),
+        ),
+        "Fraction" => (
+            "Revisá fracciones: no se suman numeradores y denominadores por separado. Buscá común denominador.".to_string(),
+            "Repasá sec-fracc (operaciones con fracciones).".to_string(),
+        ),
+        "Distributive" => (
+            "Revisá la propiedad distributiva: (a+b)·c = a·c + b·c, no a + b·c.".to_string(),
+            "Repasá sec-prop (propiedad distributiva).".to_string(),
+        ),
+        "ChainRule" => (
+            "Revisá la regla de la cadena: deriva afuera y adentro.".to_string(),
+            "Repasá am1-der (regla de la cadena).".to_string(),
+        ),
+        "Domain" => (
+            "Revisá el dominio: ¿la función está definida ahí? ¿existe el límite?".to_string(),
+            "Repasá am1-func (dominio) y am1-lim.".to_string(),
+        ),
+        "Notation" => (
+            "Revisá la notación: usá ^ para potencias (x^2), sin/cos en minúscula y paréntesis claros.".to_string(),
+            "Repasá notación matemática básica y am1-func.".to_string(),
+        ),
+        _ => (
+            format!("Casi. Esperaba '{solution}', revisá el procedimiento paso a paso."),
+            "Repasá la pista socrática y pedí la animación correspondiente.".to_string(),
+        ),
+    }
+}
+
+struct Assessment {
+    correct: bool,
+    verdict: &'static str,
+    misconception: &'static str,
+    message: String,
+    next_step: String,
+}
+
+fn assess_inner(prompt: &str, solution: &str, answer: &str) -> Assessment {
+    let sol_norm = normalize_answer(solution);
+    let ans_norm = normalize_answer(answer);
+    if sol_norm == ans_norm {
+        return Assessment {
+            correct: true,
+            verdict: "bien",
+            misconception: "None",
+            message: "¡Correcto! Bien razonado.".to_string(),
+            next_step: "Probá el siguiente nivel o pedí una animación.".to_string(),
+        };
+    }
+    if let (Some(sv), Some(av)) = (parse_numeric(solution), parse_numeric(answer)) {
+        if numeric_close(av, sv) {
+            return Assessment {
+                correct: true,
+                verdict: "bien",
+                misconception: "None",
+                message: "¡Correcto! Bien razonado.".to_string(),
+                next_step: "Probá el siguiente nivel o pedí una animación.".to_string(),
+            };
+        }
+        if numeric_close_loose(av, sv) {
+            let misc = diagnose_misconception(prompt, solution, answer);
+            let (mut message, next_step) = misconception_feedback(misc, solution);
+            message = format!("Parcial: estás cerca ({answer} vs {solution}). {message}");
+            return Assessment {
+                correct: false,
+                verdict: "parcial",
+                misconception: misc,
+                message,
+                next_step,
+            };
+        }
+    }
+    let misc = diagnose_misconception(prompt, solution, answer);
+    // Notación cercana (x2 vs x^2) se considera parcial, no mal total.
+    if misc == "Notation" {
+        let (base, next_step) = misconception_feedback(misc, solution);
+        return Assessment {
+            correct: false,
+            verdict: "parcial",
+            misconception: misc,
+            message: format!("Parcial: la idea es correcta pero la notación no. {base}"),
+            next_step,
+        };
+    }
+    let (message, next_step) = misconception_feedback(misc, solution);
+    Assessment {
+        correct: false,
+        verdict: "mal",
+        misconception: misc,
+        message,
+        next_step,
+    }
+}
+
+// ── Scaffold ────────────────────────────────────────────────────────────────
+
+fn scaffold_inner(concept: &str, level: Level) -> (String, Option<String>, String) {
+    match level {
+        Level::Primary => (
+            format!("¿Te imaginás {concept} como algo que ves todos los días? ¿Qué forma tiene?"),
+            Some(format!("Pensá en {concept} con un dibujo. ¿Sube o baja?")),
+            format!("{concept} es como describir cómo cambia algo. En primaria lo vemos con ejemplos y gráficos simples."),
+        ),
+        Level::Secondary => (
+            format!("¿Qué representa {concept} en el gráfico de y = x²?"),
+            Some("Mirá la pendiente de la tangente o el área bajo la curva".to_string()),
+            format!("En secundaria, {concept} aparece como pendiente (derivada) o área (integral). Lo vemos en el canvas y con animación."),
+        ),
+        _ => (
+            format!("¿Cómo definirías {concept} formalmente con límites?"),
+            Some("Recordá la definición por límite: f'(x)=lim_{{h→0}} [f(x+h)-f(x)]/h".to_string()),
+            format!("Formalmente, {concept} se define vía límites y se demuestra con el teorema del valor medio. Grafito puede mostrar la derivada, la tangente y la serie de Taylor."),
+        ),
+    }
+}
+
+// ── Animación (replica protocol.rs) ─────────────────────────────────────────
+
+fn normalize_concept(concept: &str) -> String {
+    let tmp = concept.trim().replace(['\n', '\r', '\t'], " ");
+    let mut out = String::with_capacity(tmp.len());
+    let mut prev_space = false;
+    for ch in tmp.chars() {
+        if ch.is_whitespace() {
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+        } else {
+            out.push(ch);
+            prev_space = false;
+        }
+    }
+    if out.trim().is_empty() {
+        return "matemática".to_string();
+    }
+    if out.len() > 500 {
+        out.chars().take(500).collect()
+    } else {
+        out
+    }
+}
+
+/// ¿`palabra` aparece como token completo en `minusculas`? (R6e: espejo de
+/// `grafito-anim::protocol::contiene_palabra`; evita que "tarea" dispare
+/// "area").
+fn contiene_palabra(minusculas: &str, palabra: &str) -> bool {
+    if palabra.is_empty() {
+        return false;
+    }
+    minusculas
+        .split(|ch: char| !ch.is_alphabetic())
+        .any(|tok| tok == palabra)
+}
+
+fn template_for_concept(concept: &str) -> &'static str {
+    // R6e: espejo pineado de `grafito-anim::protocol::template_for_concept`
+    // (contrato honesto: fallback `universal`, sin curva falsa; catch-alls
+    // con token explícito; `vector`/`probab`/`sin(` pelados NO dibujan).
+    // Ver `r6e_mirror_pineado_paridad_protocolo`.
+    let c = concept.to_lowercase();
+    if c.contains("pitágoras")
+        || c.contains("pitagoras")
+        || c.contains("pythag")
+        || (c.contains("triang") && (c.contains("rect") || c.contains("hipoten")))
+    {
+        return "pitagoras";
+    }
+    if c.contains("integral") || contiene_palabra(&c, "area") || contiene_palabra(&c, "área") {
+        return "integral-area";
+    }
+    if c.contains("taylor")
+        || c.contains("maclaurin")
+        || (c.contains("serie") && (c.contains("potencia") || c.contains("aprox")))
+        || c.contains("aproxima")
+    {
+        return "taylor-series";
+    }
+    if c.contains("conformal")
+        || c.contains("conforme")
+        || c.contains("complej")
+        || c.contains("complex")
+        || c.contains("fractal")
+        || c.contains("mandelb")
+    {
+        return "conformal-map";
+    }
+    if c.contains("deriv")
+        || c.contains("pendiente")
+        || c.contains("tangente")
+        || c.contains("slope")
+        || (c.contains("límite") && c.contains("cociente"))
+    {
+        return "derivative-slope";
+    }
+    if c.contains("logist") || c.contains("bifurc") {
+        return "logistic-bifurcation";
+    }
+    if c.contains("gradiente") || c.contains("gradient") {
+        return "gradient-field";
+    }
+    if c.contains("mobius") || c.contains("möbius") || c.contains("moebius") {
+        return "mobius-transform";
+    }
+    // R6d: `vector` pelado no dibuja conforme solo: exige token explícito
+    // de conforme/complejo/fractal, si no `universal`.
+    if (c.contains("vector") || (c.contains("campo") && c.contains("vectorial")))
+        && (c.contains("conforme")
+            || c.contains("complej")
+            || c.contains("complex")
+            || c.contains("fractal"))
+    {
+        return "conformal-map";
+    }
+    if c.contains("euler")
+        || c.contains("número e")
+        || c.contains("numero e")
+        || c.contains("exp(")
+        || c.contains("exponencial")
+    {
+        return "euler";
+    }
+    if c.contains("fourier")
+        || c.contains("armónico")
+        || c.contains("armonico")
+        || c.contains("serie trigonométrica")
+        || c.contains("serie trigonometrica")
+    {
+        return "fourier";
+    }
+    if (c.contains("probab") || c.contains("binom") || c.contains("distrib") || c.contains("estad"))
+        && (c.contains("integral")
+            || contiene_palabra(&c, "area")
+            || contiene_palabra(&c, "área")
+            || c.contains("densidad")
+            || c.contains("acumulada")
+            || c.contains("histograma"))
+    {
+        return "integral-area";
+    }
+    if c.contains("sin(") || c.contains("cos(") {
+        if c.contains("taylor")
+            || c.contains("serie")
+            || c.contains("aproxima")
+            || c.contains("polinomio")
+        {
+            return "taylor-series";
+        }
+    } else if c.contains("seno") || c.contains("coseno") {
+        return "taylor-series";
+    }
+    "universal"
+}
+
+fn sanitize_template(template: &str, concept: &str) -> Result<String, ToolError> {
+    // R6e: espejo pineado de `grafito-anim::protocol::sanitize_template`
+    // (mismo contrato honesto): alias histórico → `Ok`, canónica → `Ok`
+    // literal, `""`/`"auto"` → `Ok` por concepto, desconocido no vacío →
+    // `Err` (antes degradaba en silencio a otra plantilla).
+    let t = template.trim().to_lowercase();
+    if t == "pythagoras" {
+        return Ok("pitagoras".to_string());
+    }
+    if KNOWN_TEMPLATES.contains(&t.as_str()) {
+        return Ok(t);
+    }
+    if t.is_empty() || t == "auto" {
+        return Ok(template_for_concept(concept).to_string());
+    }
+    Err(ToolError::CampoInvalido {
+        campo: "template",
+        motivo: format!(
+            "{template:?} no es una plantilla canónica (pedí auto o una de: {KNOWN_TEMPLATES:?})"
+        ),
+    })
+}
+
+/// Valida resolución 64..=4096 por lado (igual que `Resolution::try_new`).
+pub fn is_valid_resolution(width: u32, height: u32) -> bool {
+    (MIN_CANVAS..=MAX_CANVAS).contains(&(width as u64))
+        && (MIN_CANVAS..=MAX_CANVAS).contains(&(height as u64))
+}
+
+/// Valida duración 0.1..=30 s (igual que `AnimDuration::try_new`).
+pub fn is_valid_duration_secs(secs: f64) -> bool {
+    secs.is_finite() && (0.1..=30.0).contains(&secs)
+}
+
+/// Comprueba que la plantilla existe en el motor nativo.
+pub fn is_known_template(template: &str) -> bool {
+    KNOWN_TEMPLATES.contains(&template)
+}
+
+// ── Plan de animación extendido (quality/view/effect/duration_s/fps/tracker) ──
+// Puro, sin Document ni I/O: valida contra los mismos presupuestos del núcleo
+// (`AnimDuration` 0.1..=30 s, fps 1..=60 del diálogo, frames 1..=48/total 96).
+
+/// Normaliza `quality` (default `media`); `Err` honesto si no es baja/media/alta.
+pub fn parse_anim_quality(raw: Option<&str>) -> Result<&'static str, ToolError> {
+    let text = raw
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("media");
+    // Fast-path sin alocar para el caso común ASCII (equivale a `to_lowercase`
+    // en ASCII; el fallback cubre plegados Unicode exóticos como 'K' Kelvin).
+    if text.eq_ignore_ascii_case("baja")
+        || text.eq_ignore_ascii_case("baja calidad")
+        || text.eq_ignore_ascii_case("low")
+    {
+        return Ok("baja");
+    }
+    if text.eq_ignore_ascii_case("media") || text.eq_ignore_ascii_case("medium") {
+        return Ok("media");
+    }
+    if text.eq_ignore_ascii_case("alta")
+        || text.eq_ignore_ascii_case("alta calidad")
+        || text.eq_ignore_ascii_case("high")
+    {
+        return Ok("alta");
+    }
+    if text.is_ascii() {
+        return Err(ToolError::CampoInvalido {
+            campo: "quality",
+            motivo: format!("calidad desconocida '{text}' (válidas: baja, media, alta)"),
+        });
+    }
+    let lower = text.to_lowercase();
+    match lower.as_str() {
+        "baja" | "baja calidad" | "low" => Ok("baja"),
+        "media" | "medium" => Ok("media"),
+        "alta" | "alta calidad" | "high" => Ok("alta"),
+        _ => Err(ToolError::CampoInvalido {
+            campo: "quality",
+            motivo: format!("calidad desconocida '{text}' (válidas: baja, media, alta)"),
+        }),
+    }
+}
+
+/// Bitrate sugerido en kbps por calidad (paridad UI 500/2000/8000, rango 100..=20000).
+pub fn suggested_bitrate_kbps(quality: &str) -> u32 {
+    match quality {
+        "baja" => 500,
+        "alta" => 8000,
+        _ => 2000,
+    }
+}
+
+/// Normaliza `view` (default `plana`); `Err` honesto si no es plana/orbita.
+pub fn parse_anim_view(raw: Option<&str>) -> Result<&'static str, ToolError> {
+    let text = raw
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("plana");
+    if text.eq_ignore_ascii_case("plana")
+        || text.eq_ignore_ascii_case("plano")
+        || text.eq_ignore_ascii_case("2d")
+        || text.eq_ignore_ascii_case("flat")
+    {
+        return Ok("plana");
+    }
+    if text.eq_ignore_ascii_case("orbita")
+        || text.eq_ignore_ascii_case("órbita")
+        || text.eq_ignore_ascii_case("orbit")
+        || text.eq_ignore_ascii_case("3d")
+    {
+        return Ok("orbita");
+    }
+    if text.is_ascii() {
+        return Err(ToolError::CampoInvalido {
+            campo: "view",
+            motivo: format!("vista desconocida '{text}' (válidas: plana, orbita)"),
+        });
+    }
+    let lower = text.to_lowercase();
+    match lower.as_str() {
+        "plana" | "plano" | "2d" | "flat" => Ok("plana"),
+        "orbita" | "órbita" | "orbit" | "3d" => Ok("orbita"),
+        _ => Err(ToolError::CampoInvalido {
+            campo: "view",
+            motivo: format!("vista desconocida '{text}' (válidas: plana, orbita)"),
+        }),
+    }
+}
+
+/// Normaliza `effect` (default `none`); `Err` honesto si no es creation conocido.
+pub fn parse_anim_effect(raw: Option<&str>) -> Result<&'static str, ToolError> {
+    let text = raw
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("none");
+    if text.eq_ignore_ascii_case("create")
+        || text.eq_ignore_ascii_case("crear")
+        || text.eq_ignore_ascii_case("traza")
+    {
+        return Ok("create");
+    }
+    if text.eq_ignore_ascii_case("write")
+        || text.eq_ignore_ascii_case("escribir")
+        || text.eq_ignore_ascii_case("revelado")
+    {
+        return Ok("write");
+    }
+    if text.eq_ignore_ascii_case("fade")
+        || text.eq_ignore_ascii_case("alfa")
+        || text.eq_ignore_ascii_case("aparicion")
+        || text.eq_ignore_ascii_case("aparición")
+    {
+        return Ok("fade");
+    }
+    if text.eq_ignore_ascii_case("grow")
+        || text.eq_ignore_ascii_case("growfromcenter")
+        || text.eq_ignore_ascii_case("grow_from_center")
+        || text.eq_ignore_ascii_case("crecer")
+    {
+        return Ok("grow");
+    }
+    if text.eq_ignore_ascii_case("indicate")
+        || text.eq_ignore_ascii_case("pulso")
+        || text.eq_ignore_ascii_case("indicar")
+    {
+        return Ok("indicate");
+    }
+    if text.eq_ignore_ascii_case("none")
+        || text.eq_ignore_ascii_case("ninguno")
+        || text.eq_ignore_ascii_case("morph")
+        || text.eq_ignore_ascii_case("transform")
+    {
+        return Ok("none");
+    }
+    if text.is_ascii() {
+        return Err(ToolError::CampoInvalido {
+            campo: "effect",
+            motivo: format!(
+                "efecto desconocido '{text}' (válidos: create, write, fade, grow, indicate, none)"
+            ),
+        });
+    }
+    let lower = text.to_lowercase();
+    match lower.as_str() {
+        "create" | "crear" | "traza" => Ok("create"),
+        "write" | "escribir" | "revelado" => Ok("write"),
+        "fade" | "alfa" | "aparicion" | "aparición" => Ok("fade"),
+        "grow" | "growfromcenter" | "grow_from_center" | "crecer" => Ok("grow"),
+        "indicate" | "pulso" | "indicar" => Ok("indicate"),
+        "none" | "ninguno" | "morph" | "transform" => Ok("none"),
+        _ => Err(ToolError::CampoInvalido {
+            campo: "effect",
+            motivo: format!(
+                "efecto desconocido '{text}' (válidos: create, write, fade, grow, indicate, none)"
+            ),
+        }),
+    }
+}
+
+/// Brazo `PlayItem` del player para un `effect` ya validado (routing puro).
+pub fn play_kind_for_effect(effect: &str) -> &'static str {
+    match effect {
+        "create" => "Create",
+        "write" => "Write",
+        "fade" => "Fade",
+        "grow" => "GrowFromCenter",
+        "indicate" => "Indicate",
+        _ => "Transform",
+    }
+}
+
+/// Normaliza `format` de exportación (default `gif`); `Err` honesto si no es wire válido.
+pub fn parse_anim_format(raw: Option<&str>) -> Result<&'static str, ToolError> {
+    let text = raw
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("gif");
+    if text.eq_ignore_ascii_case("gif") {
+        return Ok("gif");
+    }
+    if text.eq_ignore_ascii_case("png")
+        || text.eq_ignore_ascii_case("png-sequence")
+        || text.eq_ignore_ascii_case("pngsequence")
+        || text.eq_ignore_ascii_case("pngdir")
+        || text.eq_ignore_ascii_case("secuencia")
+    {
+        return Ok("png");
+    }
+    if text.eq_ignore_ascii_case("mp4") || text.eq_ignore_ascii_case("h264") {
+        return Ok("mp4");
+    }
+    if text.eq_ignore_ascii_case("webm") || text.eq_ignore_ascii_case("vp9") {
+        return Ok("webm");
+    }
+    if text.is_ascii() {
+        return Err(ToolError::CampoInvalido {
+            campo: "format",
+            motivo: format!("formato desconocido '{text}' (válidos: gif, png, mp4, webm)"),
+        });
+    }
+    let lower = text.to_lowercase();
+    match lower.as_str() {
+        "gif" => Ok("gif"),
+        "png" | "png-sequence" | "pngsequence" | "pngdir" | "secuencia" => Ok("png"),
+        "mp4" | "h264" => Ok("mp4"),
+        "webm" | "vp9" => Ok("webm"),
+        _ => Err(ToolError::CampoInvalido {
+            campo: "format",
+            motivo: format!("formato desconocido '{text}' (válidos: gif, png, mp4, webm)"),
+        }),
+    }
+}
+
+/// Extrae `duration_s` (default 2.0) validada contra `AnimDuration` 0.1..=30 s.
+pub fn parse_anim_duration_s(call: &ToolCall) -> Result<f64, ToolError> {
+    let secs = call
+        .arguments
+        .get("duration_s")
+        .or_else(|| call.arguments.get("duration"))
+        .and_then(Value::as_f64)
+        .unwrap_or(2.0);
+    if !is_valid_duration_secs(secs) {
+        return Err(ToolError::CampoInvalido {
+            campo: "duration_s",
+            motivo: format!("duración {secs} fuera de 0.1..=30 s"),
+        });
+    }
+    Ok(secs)
+}
+
+/// Extrae `fps` (default 12) validado 1..=60 (paridad diálogo).
+pub fn parse_anim_fps(call: &ToolCall) -> Result<u32, ToolError> {
+    let fps = call
+        .arguments
+        .get("fps")
+        .and_then(Value::as_u64)
+        .unwrap_or(u64::from(DEFAULT_ANIM_FPS));
+    if fps < u64::from(MIN_ANIM_FPS) || fps > u64::from(MAX_ANIM_FPS) {
+        return Err(ToolError::CampoInvalido {
+            campo: "fps",
+            motivo: format!("fps {fps} fuera de 1..=60"),
+        });
+    }
+    Ok(fps as u32)
+}
+
+/// Plan del tracker (`ValueTracker` + `TrackerMap`), si el LLM lo pide.
+///
+/// Acepta `tracker: {start, end, map}` con bordes finitos y `map` en
+/// opacity/scale/center_x/center_y. `None` = sin tracker (comportamiento histórico).
+/// `Err` honesto si el objeto viene mal formado; jamás ejecuta nada.
+pub fn parse_anim_tracker(call: &ToolCall) -> Result<Option<(f64, f64, &'static str)>, ToolError> {
+    let Some(obj) = call.arguments.get("tracker").and_then(Value::as_object) else {
+        return Ok(None);
+    };
+    let start = obj
+        .get("start")
+        .and_then(Value::as_f64)
+        .ok_or(ToolError::CampoInvalido {
+            campo: "tracker.start",
+            motivo: "requiere número finito".to_string(),
+        })?;
+    let end = obj
+        .get("end")
+        .and_then(Value::as_f64)
+        .ok_or(ToolError::CampoInvalido {
+            campo: "tracker.end",
+            motivo: "requiere número finito".to_string(),
+        })?;
+    if !start.is_finite() || !end.is_finite() {
+        return Err(ToolError::CampoInvalido {
+            campo: "tracker",
+            motivo: "bordes no finitos".to_string(),
+        });
+    }
+    let map_raw = obj
+        .get("map")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("opacity");
+    // Fast-path ASCII sin alocar; fallback Unicode para "opacidad/órbita"-like.
+    let map = if map_raw.eq_ignore_ascii_case("opacity")
+        || map_raw.eq_ignore_ascii_case("opacidad")
+        || map_raw.eq_ignore_ascii_case("alfa")
+    {
+        "opacity"
+    } else if map_raw.eq_ignore_ascii_case("scale") || map_raw.eq_ignore_ascii_case("escala") {
+        "scale"
+    } else if map_raw.eq_ignore_ascii_case("center_x")
+        || map_raw.eq_ignore_ascii_case("centerx")
+        || map_raw.eq_ignore_ascii_case("x")
+    {
+        "center_x"
+    } else if map_raw.eq_ignore_ascii_case("center_y")
+        || map_raw.eq_ignore_ascii_case("centery")
+        || map_raw.eq_ignore_ascii_case("y")
+    {
+        "center_y"
+    } else if map_raw.is_ascii() {
+        return Err(ToolError::CampoInvalido {
+            campo: "tracker.map",
+            motivo: format!(
+                "mapa desconocido '{map_raw}' (válidos: opacity, scale, center_x, center_y)"
+            ),
+        });
+    } else {
+        match map_raw.to_lowercase().as_str() {
+            "opacity" | "opacidad" | "alfa" => "opacity",
+            "scale" | "escala" => "scale",
+            "center_x" | "centerx" | "x" => "center_x",
+            "center_y" | "centery" | "y" => "center_y",
+            _ => {
+                return Err(ToolError::CampoInvalido {
+                    campo: "tracker.map",
+                    motivo: format!(
+                        "mapa desconocido '{map_raw}' (válidos: opacity, scale, center_x, center_y)"
+                    ),
+                });
+            }
+        }
+    };
+    Ok(Some((start, end, map)))
+}
+
+/// Preflight puro del player: frames por item 1..=48 y total ≤96.
+///
+/// Reusa el patrón del CAS (spot-check honesto): `Err` antes de ejecutar.
+pub fn preflight_player_frames(items: &[usize]) -> Result<usize, ToolError> {
+    if items.is_empty() {
+        return Err(ToolError::FaltaCampo { campo: "items" });
+    }
+    let mut total = 0_usize;
+    for (i, frames) in items.iter().enumerate() {
+        if *frames == 0 || *frames > PLAYER_ITEM_MAX_FRAMES {
+            return Err(ToolError::PresupuestoExcedido(format!(
+                "el item {i} trae {frames} frames (válido 1..={PLAYER_ITEM_MAX_FRAMES})"
+            )));
+        }
+        total = total.saturating_add(*frames);
+        if total > PLAYER_TOTAL_MAX_FRAMES {
+            return Err(ToolError::PresupuestoExcedido(format!(
+                "el total {total} excede {PLAYER_TOTAL_MAX_FRAMES}: partí la escena en dos"
+            )));
+        }
+    }
+    Ok(total)
+}
+
+/// Preflight puro del colocado: opacidad 0..=1, escala >0 finita, centro finito.
+pub fn preflight_placed(opacity: f64, scale: f64, center: [f64; 2]) -> Result<(), ToolError> {
+    if !opacity.is_finite() || !(0.0..=1.0).contains(&opacity) {
+        return Err(ToolError::CampoInvalido {
+            campo: "opacity",
+            motivo: format!("{opacity} fuera de 0..=1"),
+        });
+    }
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err(ToolError::CampoInvalido {
+            campo: "scale",
+            motivo: format!("{scale} debe ser >0"),
+        });
+    }
+    if !center[0].is_finite() || !center[1].is_finite() {
+        return Err(ToolError::CampoInvalido {
+            campo: "center",
+            motivo: "centro no finito".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Preflight puro de la órbita: vista válida; `orbita` se declara pedida y la
+/// UI decide soporte según plantilla 3D (acá nunca se inventa soporte).
+pub fn preflight_orbit_view(view: &str) -> Result<bool, ToolError> {
+    match view {
+        "plana" => Ok(false),
+        "orbita" => Ok(true),
+        _ => Err(ToolError::CampoInvalido {
+            campo: "view",
+            motivo: format!("vista desconocida '{view}' (válidas: plana, orbita)"),
+        }),
+    }
+}
+
+fn canvas_from_call(call: &ToolCall) -> (u32, u32) {
+    if let Some(arr) = call.arguments.get("canvas").and_then(Value::as_array) {
+        if arr.len() == 2 {
+            if let (Some(w), Some(h)) = (arr[0].as_u64(), arr[1].as_u64()) {
+                if (MIN_CANVAS..=MAX_CANVAS).contains(&w) && (MIN_CANVAS..=MAX_CANVAS).contains(&h)
+                {
+                    return (w as u32, h as u32);
+                }
+            }
+        }
+    }
+    let mut w_opt = call
+        .arguments
+        .get("width")
+        .and_then(Value::as_u64)
+        .filter(|v| (MIN_CANVAS..=MAX_CANVAS).contains(v))
+        .map(|v| v as u32);
+    let mut h_opt = call
+        .arguments
+        .get("height")
+        .and_then(Value::as_u64)
+        .filter(|v| (MIN_CANVAS..=MAX_CANVAS).contains(v))
+        .map(|v| v as u32);
+    if let Some(obj) = call.arguments.get("params").and_then(Value::as_object) {
+        if w_opt.is_none() {
+            w_opt = obj
+                .get("width")
+                .or_else(|| obj.get("canvas_width"))
+                .and_then(Value::as_u64)
+                .filter(|v| (MIN_CANVAS..=MAX_CANVAS).contains(v))
+                .map(|v| v as u32);
+        }
+        if h_opt.is_none() {
+            h_opt = obj
+                .get("height")
+                .or_else(|| obj.get("canvas_height"))
+                .and_then(Value::as_u64)
+                .filter(|v| (MIN_CANVAS..=MAX_CANVAS).contains(v))
+                .map(|v| v as u32);
+        }
+    }
+    match (w_opt, h_opt) {
+        (Some(w), Some(h)) => (w, h),
+        (Some(w), None) => (w, DEFAULT_CANVAS.1),
+        (None, Some(h)) => (DEFAULT_CANVAS.0, h),
+        (None, None) => DEFAULT_CANVAS,
+    }
+}
+
+// ── Evaluador de expresiones ────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+enum Token {
+    Number(f64),
+    Ident(String),
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    Caret,
+    Percent,
+    LParen,
+    RParen,
+    Comma,
+}
+
+fn tokenize(expr: &str) -> Result<Vec<Token>, ToolError> {
+    if expr.trim().is_empty() {
+        return Err(ToolError::FaltaCampo {
+            campo: "expression",
+        });
+    }
+    if expr.len() > MAX_ARG_BYTES {
+        return Err(ToolError::PresupuestoExcedido(format!(
+            "la expresión excede {MAX_ARG_BYTES} bytes"
+        )));
+    }
+    // Sin `Vec<char>` intermedio: se recorre por `char_indices` y se trocea
+    // por byte-pos (mismo autómata que antes; los números se parsean desde
+    // el slice sin `String` temporal).
+    let mut tokens = Vec::new();
+    let mut chars = expr.char_indices().peekable();
+    while let Some((pos, c)) = chars.next() {
+        if c.is_whitespace() {
+            continue;
+        }
+        if c.is_ascii_digit()
+            || (c == '.' && matches!(chars.peek(), Some((_, next)) if next.is_ascii_digit()))
+        {
+            let start = pos;
+            let mut end = pos + c.len_utf8();
+            while let Some((next_pos, next)) = chars.peek() {
+                if next.is_ascii_digit() || *next == '.' {
+                    end = *next_pos + next.len_utf8();
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            // Exponente `e/E[+-]?digits` (misma regla: sin dígito no se consume).
+            if matches!(chars.peek(), Some((_, e)) if *e == 'e' || *e == 'E') {
+                let mut probe = chars.clone();
+                probe.next();
+                if let Some((_, sign)) = probe.peek() {
+                    if *sign == '+' || *sign == '-' {
+                        probe.next();
+                    }
+                }
+                if matches!(probe.peek(), Some((_, d)) if d.is_ascii_digit()) {
+                    if let Some((epos, _)) = chars.next() {
+                        end = epos + 1;
+                        if let Some((spos, sign)) = chars.peek() {
+                            if *sign == '+' || *sign == '-' {
+                                end = *spos + 1;
+                                chars.next();
+                            }
+                        }
+                        while let Some((dpos, digit)) = chars.peek() {
+                            if digit.is_ascii_digit() {
+                                end = *dpos + 1;
+                                chars.next();
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            let text = &expr[start..end];
+            match text.parse::<f64>() {
+                Ok(v) if v.is_finite() => tokens.push(Token::Number(v)),
+                Ok(_) => {
+                    return Err(ToolError::CampoInvalido {
+                        campo: "expression",
+                        motivo: "literal numérico no finito".to_string(),
+                    });
+                }
+                Err(_) => {
+                    return Err(ToolError::CampoInvalido {
+                        campo: "expression",
+                        motivo: format!("número inválido '{text}'"),
+                    });
+                }
+            }
+            continue;
+        }
+        if c.is_alphabetic() || c == '_' || c == 'π' {
+            let start = pos;
+            let mut end = pos + c.len_utf8();
+            while let Some((next_pos, next)) = chars.peek() {
+                if next.is_alphanumeric() || *next == '_' || *next == 'π' {
+                    end = *next_pos + next.len_utf8();
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            tokens.push(Token::Ident(expr[start..end].to_owned()));
+            continue;
+        }
+        match c {
+            '+' => tokens.push(Token::Plus),
+            '-' => tokens.push(Token::Minus),
+            '*' => tokens.push(Token::Star),
+            '/' => tokens.push(Token::Slash),
+            '^' => tokens.push(Token::Caret),
+            '%' => tokens.push(Token::Percent),
+            '(' => tokens.push(Token::LParen),
+            ')' => tokens.push(Token::RParen),
+            ',' => tokens.push(Token::Comma),
+            _ => {
+                return Err(ToolError::CampoInvalido {
+                    campo: "expression",
+                    motivo: format!("carácter inválido '{c}'"),
+                });
+            }
+        }
+    }
+    if tokens.is_empty() {
+        return Err(ToolError::FaltaCampo {
+            campo: "expression",
+        });
+    }
+    Ok(tokens)
+}
+
+struct ExprParser<'a> {
+    tokens: Vec<Token>,
+    pos: usize,
+    vars: &'a BTreeMap<String, f64>,
+}
+
+impl<'a> ExprParser<'a> {
+    fn peek(&self) -> Option<&Token> {
+        self.tokens.get(self.pos)
+    }
+
+    fn next_is_lparen(&self) -> bool {
+        matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
+    }
+
+    fn parse_expr(&mut self) -> Result<f64, ToolError> {
+        let mut val = self.parse_term()?;
+        loop {
+            match self.peek() {
+                Some(Token::Plus) => {
+                    self.pos += 1;
+                    val += self.parse_term()?;
+                }
+                Some(Token::Minus) => {
+                    self.pos += 1;
+                    val -= self.parse_term()?;
+                }
+                _ => break,
+            }
+        }
+        Ok(val)
+    }
+
+    fn parse_term(&mut self) -> Result<f64, ToolError> {
+        let mut val = self.parse_factor()?;
+        loop {
+            match self.peek() {
+                Some(Token::Star) => {
+                    self.pos += 1;
+                    val *= self.parse_factor()?;
+                }
+                Some(Token::Slash) => {
+                    self.pos += 1;
+                    let rhs = self.parse_factor()?;
+                    if rhs == 0.0 {
+                        return Err(ToolError::EvaluacionFallida(
+                            "división por cero".to_string(),
+                        ));
+                    }
+                    val /= rhs;
+                }
+                Some(Token::Percent) => {
+                    self.pos += 1;
+                    let rhs = self.parse_factor()?;
+                    if rhs == 0.0 {
+                        return Err(ToolError::EvaluacionFallida("módulo por cero".to_string()));
+                    }
+                    val %= rhs;
+                }
+                _ => break,
+            }
+        }
+        Ok(val)
+    }
+
+    fn parse_factor(&mut self) -> Result<f64, ToolError> {
+        let base = self.parse_unary()?;
+        if matches!(self.peek(), Some(Token::Caret)) {
+            self.pos += 1;
+            let exp = self.parse_factor()?;
+            Ok(base.powf(exp))
+        } else {
+            Ok(base)
+        }
+    }
+
+    fn parse_unary(&mut self) -> Result<f64, ToolError> {
+        match self.peek() {
+            Some(Token::Minus) => {
+                self.pos += 1;
+                Ok(-self.parse_unary()?)
+            }
+            Some(Token::Plus) => {
+                self.pos += 1;
+                self.parse_unary()
+            }
+            _ => self.parse_primary(),
+        }
+    }
+
+    fn parse_primary(&mut self) -> Result<f64, ToolError> {
+        match self.peek().cloned() {
+            Some(Token::Number(v)) => {
+                self.pos += 1;
+                Ok(v)
+            }
+            Some(Token::Ident(name)) => {
+                if self.next_is_lparen() {
+                    self.parse_call(&name)
+                } else {
+                    self.pos += 1;
+                    if let Some(v) = self.vars.get(&name) {
+                        if v.is_finite() {
+                            Ok(*v)
+                        } else {
+                            Err(ToolError::CampoInvalido {
+                                campo: "variables",
+                                motivo: format!("variable '{name}' no finita"),
+                            })
+                        }
+                    } else if name.eq_ignore_ascii_case("pi") || name == "π" {
+                        Ok(std::f64::consts::PI)
+                    } else if name == "e" || name == "E" {
+                        Ok(std::f64::consts::E)
+                    } else {
+                        Err(ToolError::CampoInvalido {
+                            campo: "expression",
+                            motivo: format!("variable desconocida '{name}'"),
+                        })
+                    }
+                }
+            }
+            Some(Token::LParen) => {
+                self.pos += 1;
+                let v = self.parse_expr()?;
+                match self.peek() {
+                    Some(Token::RParen) => {
+                        self.pos += 1;
+                        Ok(v)
+                    }
+                    _ => Err(ToolError::CampoInvalido {
+                        campo: "expression",
+                        motivo: "falta ')' de cierre".to_string(),
+                    }),
+                }
+            }
+            _ => Err(ToolError::CampoInvalido {
+                campo: "expression",
+                motivo: "se esperaba número, variable o '('".to_string(),
+            }),
+        }
+    }
+
+    fn parse_call(&mut self, name: &str) -> Result<f64, ToolError> {
+        // consume ident + '('
+        self.pos += 1;
+        match self.peek() {
+            Some(Token::LParen) => self.pos += 1,
+            _ => {
+                return Err(ToolError::CampoInvalido {
+                    campo: "expression",
+                    motivo: format!("llamada a '{name}' sin '('"),
+                });
+            }
+        }
+        let mut args = Vec::new();
+        if matches!(self.peek(), Some(Token::RParen)) {
+            self.pos += 1;
+        } else {
+            loop {
+                args.push(self.parse_expr()?);
+                match self.peek() {
+                    Some(Token::Comma) => {
+                        self.pos += 1;
+                    }
+                    Some(Token::RParen) => {
+                        self.pos += 1;
+                        break;
+                    }
+                    _ => {
+                        return Err(ToolError::CampoInvalido {
+                            campo: "expression",
+                            motivo: format!("llamada a '{name}' sin ')' de cierre"),
+                        });
+                    }
+                }
+                if args.len() > 4 {
+                    return Err(ToolError::CampoInvalido {
+                        campo: "expression",
+                        motivo: format!("demasiados argumentos en '{name}'"),
+                    });
+                }
+            }
+        }
+        eval_function(name, &args)
+    }
+}
+
+fn eval_function(name: &str, args: &[f64]) -> Result<f64, ToolError> {
+    let lower = name.to_lowercase();
+    let one = |f: fn(f64) -> f64| -> Result<f64, ToolError> {
+        if args.len() != 1 {
+            return Err(ToolError::CampoInvalido {
+                campo: "expression",
+                motivo: format!("la función '{name}' espera 1 argumento"),
+            });
+        }
+        Ok(f(args[0]))
+    };
+    match lower.as_str() {
+        "sin" | "sen" => one(f64::sin),
+        "cos" => one(f64::cos),
+        "tan" => one(f64::tan),
+        "asin" | "arcsin" => one(f64::asin),
+        "acos" | "arccos" => one(f64::acos),
+        "atan" | "arctan" => one(f64::atan),
+        "sinh" => one(f64::sinh),
+        "cosh" => one(f64::cosh),
+        "tanh" => one(f64::tanh),
+        "sqrt" => {
+            if args.len() != 1 {
+                return Err(ToolError::CampoInvalido {
+                    campo: "expression",
+                    motivo: "la función 'sqrt' espera 1 argumento".to_string(),
+                });
+            }
+            if args[0] < 0.0 {
+                return Err(ToolError::EvaluacionFallida(
+                    "sqrt de número negativo (dominio)".to_string(),
+                ));
+            }
+            Ok(args[0].sqrt())
+        }
+        "cbrt" => one(|v| v.cbrt()),
+        "exp" => one(f64::exp),
+        "ln" | "log" => {
+            if args.len() == 2 {
+                // log(valor, base)
+                if args[0] <= 0.0 || args[1] <= 0.0 || args[1] == 1.0 {
+                    return Err(ToolError::EvaluacionFallida(
+                        "log con dominio inválido".to_string(),
+                    ));
+                }
+                Ok(args[0].ln() / args[1].ln())
+            } else if args.len() == 1 {
+                if args[0] <= 0.0 {
+                    return Err(ToolError::EvaluacionFallida(
+                        "ln de número no positivo (dominio)".to_string(),
+                    ));
+                }
+                Ok(args[0].ln())
+            } else {
+                Err(ToolError::CampoInvalido {
+                    campo: "expression",
+                    motivo: "la función 'log' espera 1 o 2 argumentos".to_string(),
+                })
+            }
+        }
+        "log10" => {
+            if args.len() != 1 {
+                return Err(ToolError::CampoInvalido {
+                    campo: "expression",
+                    motivo: "la función 'log10' espera 1 argumento".to_string(),
+                });
+            }
+            if args[0] <= 0.0 {
+                return Err(ToolError::EvaluacionFallida(
+                    "log10 de número no positivo (dominio)".to_string(),
+                ));
+            }
+            Ok(args[0].log10())
+        }
+        "abs" => one(f64::abs),
+        "floor" => one(f64::floor),
+        "ceil" => one(f64::ceil),
+        "round" => one(f64::round),
+        "trunc" => one(f64::trunc),
+        "pow" => {
+            if args.len() != 2 {
+                return Err(ToolError::CampoInvalido {
+                    campo: "expression",
+                    motivo: "la función 'pow' espera 2 argumentos".to_string(),
+                });
+            }
+            Ok(args[0].powf(args[1]))
+        }
+        "max" => {
+            if args.len() != 2 {
+                return Err(ToolError::CampoInvalido {
+                    campo: "expression",
+                    motivo: "la función 'max' espera 2 argumentos".to_string(),
+                });
+            }
+            Ok(args[0].max(args[1]))
+        }
+        "min" => {
+            if args.len() != 2 {
+                return Err(ToolError::CampoInvalido {
+                    campo: "expression",
+                    motivo: "la función 'min' espera 2 argumentos".to_string(),
+                });
+            }
+            Ok(args[0].min(args[1]))
+        }
+        _ => Err(ToolError::CampoInvalido {
+            campo: "expression",
+            motivo: format!("función desconocida '{name}'"),
+        }),
+    }
+}
+
+fn evaluate_expression(expr: &str, vars: &BTreeMap<String, f64>) -> Result<f64, ToolError> {
+    let tokens = tokenize(expr)?;
+    let mut parser = ExprParser {
+        tokens,
+        pos: 0,
+        vars,
+    };
+    let value = parser.parse_expr()?;
+    if parser.pos != parser.tokens.len() {
+        return Err(ToolError::CampoInvalido {
+            campo: "expression",
+            motivo: "símbolo inesperado al final".to_string(),
+        });
+    }
+    if !value.is_finite() {
+        return Err(ToolError::EvaluacionFallida(
+            "la expresión dio un valor no finito".to_string(),
+        ));
+    }
+    Ok(value)
+}
+
+fn format_number(value: f64) -> String {
+    if value.fract() == 0.0 && value.abs() < 1e15 {
+        format!("{}", value as i64)
+    } else {
+        format!("{value}")
+    }
+}
+
+// ── Catálogo de docs ────────────────────────────────────────────────────────
+
+struct DocEntry {
+    canonical: &'static str,
+    syntax: &'static str,
+    description: &'static str,
+    keywords: &'static [&'static str],
+}
+
+const DOC_CATALOG: &[DocEntry] = &[
+    DocEntry {
+        canonical: "Function",
+        syntax: "y = x^2 - 1",
+        description: "Grafica una función explícita y = f(x) en 2D",
+        keywords: &["funcion", "grafic", "curva", "polinomio"],
+    },
+    DocEntry {
+        canonical: "ParametricCurve2D",
+        syntax: "x = cos(t), y = sin(t), t in [0, 2*pi]",
+        description: "Curva paramétrica 2D con parámetro t",
+        keywords: &["parametrica", "curva", "trayectoria"],
+    },
+    DocEntry {
+        canonical: "PolarCurve",
+        syntax: "r = 1 + cos(theta)",
+        description: "Curva polar r(theta)",
+        keywords: &["polar", "rosa", "cardioide", "espiral"],
+    },
+    DocEntry {
+        canonical: "ImplicitCurve",
+        syntax: "x^2 + y^2 = 1",
+        description: "Curva implícita lhs = rhs",
+        keywords: &["implicita", "circunferencia", "elipse", "conica"],
+    },
+    DocEntry {
+        canonical: "VectorField2D",
+        syntax: "F(x,y) = (-y, x)",
+        description: "Campo vectorial 2D",
+        keywords: &["vectorial", "campo", "flujo", "fase"],
+    },
+    DocEntry {
+        canonical: "DomainColoring",
+        syntax: "dcolor(f(z) = 1/z)",
+        description: "Coloreado de dominio para funciones complejas",
+        keywords: &["complejo", "dcolor", "dominio", "conforme"],
+    },
+    DocEntry {
+        canonical: "Point",
+        syntax: "P = (1, 2)",
+        description: "Punto 2D",
+        keywords: &["punto", "coordenada", "marca"],
+    },
+    DocEntry {
+        canonical: "Circle",
+        syntax: "Circle(C=(0,0), r=1)",
+        description: "Circunferencia por centro y radio",
+        keywords: &["circulo", "circunferencia", "radio", "conica"],
+    },
+    DocEntry {
+        canonical: "Line",
+        syntax: "Line(A=(0,0), B=(1,1))",
+        description: "Recta por dos puntos",
+        keywords: &["recta", "linea", "pendiente"],
+    },
+    DocEntry {
+        canonical: "Segment",
+        syntax: "Segment(A=(0,0), B=(2,0))",
+        description: "Segmento entre dos puntos",
+        keywords: &["segmento", "distancia", "lado"],
+    },
+    DocEntry {
+        canonical: "Vector",
+        syntax: "Vector(origen=(0,0), fin=(1,2))",
+        description: "Vector geométrico con origen y fin",
+        keywords: &["vector", "flecha", "componente"],
+    },
+    DocEntry {
+        canonical: "Tangent",
+        syntax: "Tangent(curva, punto)",
+        description: "Recta tangente a una curva en un punto",
+        keywords: &["tangente", "derivada", "pendiente"],
+    },
+    DocEntry {
+        canonical: "Histogram",
+        syntax: "Histogram(datos=[1,2,2,3])",
+        description: "Histograma de datos univariados",
+        keywords: &["histograma", "datos", "estadistica", "distribucion"],
+    },
+    DocEntry {
+        canonical: "ScatterPlot",
+        syntax: "Scatter(puntos=[(0,0),(1,1)])",
+        description: "Nube de puntos",
+        keywords: &["dispersion", "puntos", "datos", "regresion"],
+    },
+    DocEntry {
+        canonical: "LinearRegression",
+        syntax: "Regresion(puntos=[(0,0),(1,1)])",
+        description: "Recta de regresión lineal por mínimos cuadrados",
+        keywords: &["regresion", "lineal", "correlacion", "ajuste"],
+    },
+    DocEntry {
+        canonical: "Surface3D",
+        syntax: "z = sin(x)*cos(y)",
+        description: "Superficie 3D z = f(x,y)",
+        keywords: &["superficie", "3d", "malla", "relieve"],
+    },
+    DocEntry {
+        canonical: "Sphere",
+        syntax: "Sphere(C=(0,0,0), r=1)",
+        description: "Esfera 3D",
+        keywords: &["esfera", "3d", "volumen"],
+    },
+    DocEntry {
+        canonical: "Mandelbrot",
+        syntax: "Mandelbrot(iter=100)",
+        description: "Conjunto de Mandelbrot (fractal)",
+        keywords: &["fractal", "mandelbrot", "complejo", "julia"],
+    },
+];
+
+/// Haystacks en minúsculas del catálogo, precomputados una vez.
+///
+/// Antes se hacía `format!` + 3×`to_lowercase` + `join` por entrada y por
+/// búsqueda (18×4 alocaciones). El cache es la misma cadena y comparación.
+static DOCS_LOWER: LazyLock<Vec<String>> = LazyLock::new(|| {
+    DOC_CATALOG
+        .iter()
+        .map(|entry| {
+            format!(
+                "{} {} {} {}",
+                entry.canonical.to_lowercase(),
+                entry.syntax.to_lowercase(),
+                entry.description.to_lowercase(),
+                entry.keywords.join(" ")
+            )
+        })
+        .collect()
+});
+
+fn docs_catalog_search(query: &str, max_bytes: usize) -> String {
+    let q = query.to_lowercase();
+    // Slices prestados de `q` (sin un `String` por término).
+    let terms: Vec<&str> = q
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.chars().count() >= 3 || *t == "3d" || *t == "4d")
+        .collect();
+    if terms.is_empty() {
+        return String::new();
+    }
+    let lowers = &*DOCS_LOWER;
+    let mut scored: Vec<(usize, &DocEntry)> = DOC_CATALOG
+        .iter()
+        .zip(lowers.iter())
+        .filter_map(|(entry, haystack)| {
+            let mut score = 0usize;
+            for term in &terms {
+                if haystack.contains(term) {
+                    score += 1;
+                }
+            }
+            // Boost cálculo -> Function ejecutable
+            if [
+                "integral", "derivada", "derivar", "deriva", "taylor", "serie",
+            ]
+            .iter()
+            .any(|t| q.contains(*t))
+                && entry.canonical == "Function"
+            {
+                score += 2;
+            }
+            if score > 0 {
+                Some((score, entry))
+            } else {
+                None
+            }
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.canonical.cmp(b.1.canonical)));
+    let mut out = String::new();
+    for (_, entry) in scored {
+        let line = format!(
+            "{}: {} — {}",
+            entry.canonical, entry.syntax, entry.description
+        );
+        let sep = usize::from(!out.is_empty());
+        if out.len() + sep + line.len() > max_bytes {
+            break;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&line);
+    }
+    out
+}
+
+// ── Tools base ──────────────────────────────────────────────────────────────
+
+fn evaluate_expr_tool(call: &ToolCall) -> ToolResult {
+    let Some(expression) = arg_str(call, "expression") else {
+        return err_result(
+            &call.id,
+            ToolError::FaltaCampo {
+                campo: "expression",
+            },
+        );
+    };
+    let mut vars = BTreeMap::new();
+    if let Some(obj) = call.arguments.get("variables").and_then(Value::as_object) {
+        for (k, v) in obj {
+            if let Some(n) = v.as_f64() {
+                if n.is_finite() {
+                    vars.insert(k.clone(), n);
+                }
+            }
+        }
+    }
+    match evaluate_expression(expression, &vars) {
+        Ok(v) => ToolResult::text(&call.id, true, format_number(v)),
+        Err(e) => err_result(&call.id, e),
+    }
+}
+
+fn grafito_docs_tool(call: &ToolCall) -> ToolResult {
+    let Some(query) = arg_str(call, "query") else {
+        return err_result(&call.id, ToolError::FaltaCampo { campo: "query" });
+    };
+    let catalog = docs_catalog_search(query, 2_048);
+    if catalog.trim().is_empty() {
+        return err_result(
+            &call.id,
+            ToolError::NoEncontrado(format!("sin comandos catalogados para '{query}'")),
+        );
+    }
+    ToolResult::text(&call.id, true, catalog)
+}
+
+/// Tope de la pregunta de aclaración (UI legible, sin truncar el presupuesto).
+pub const MAX_ASK_USER_QUESTION_CHARS: usize = 300;
+/// Tope de opciones ofrecidas como botones (1-click, sin scroll).
+pub const MAX_ASK_USER_OPTIONS: usize = 4;
+/// Tope por opción (etiqueta de botón legible).
+pub const MAX_ASK_USER_OPTION_CHARS: usize = 64;
+
+/// Pedido de aclaración puro: pregunta + opciones para botones (sin Document, sin I/O).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AskUserRequest {
+    /// Pregunta corta en español rioplatense (`1..=300` chars).
+    pub question: String,
+    /// Opciones para botones (`0..=4`, cada una `1..=64` chars).
+    pub options: Vec<String>,
+}
+
+impl AskUserRequest {
+    /// Vista de la pregunta (ya saneada).
+    #[must_use]
+    pub fn question(&self) -> &str {
+        &self.question
+    }
+
+    /// Vista de las opciones (ya saneadas).
+    #[must_use]
+    pub fn options(&self) -> &[String] {
+        &self.options
+    }
+}
+
+/// Sanea una pregunta: trim + colapso de espacios, `1..=300` chars.
+///
+/// Pura y acotada; `None` si vacía.
+fn sanitize_ask_user_question(raw: &str) -> Option<String> {
+    let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = collapsed.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let clipped: String = trimmed.chars().take(MAX_ASK_USER_QUESTION_CHARS).collect();
+    let clipped = clipped.trim().to_owned();
+    (!clipped.is_empty()).then_some(clipped)
+}
+
+/// Sanea opciones: trim, sin vacías, `1..=64` chars cada una, tope 4.
+///
+/// Pura y determinista; nunca falla (vacío → sin opciones).
+fn sanitize_ask_user_options(value: Option<&Value>) -> Vec<String> {
+    let Some(array) = value.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in array {
+        if out.len() >= MAX_ASK_USER_OPTIONS {
+            break;
+        }
+        let Some(text) = item.as_str() else {
+            continue;
+        };
+        let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let trimmed = collapsed.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let clipped: String = trimmed
+            .chars()
+            .take(MAX_ASK_USER_OPTION_CHARS)
+            .collect::<String>()
+            .trim()
+            .to_owned();
+        if clipped.is_empty() {
+            continue;
+        }
+        if out.iter().any(|known: &String| known == &clipped) {
+            continue;
+        }
+        out.push(clipped);
+    }
+    out
+}
+
+/// Parsea un pedido `ask_user` (pregunta obligatoria, opciones opcionales).
+///
+/// Puro; `Err` solo si falta `question` (el resto se sanea sin fallar).
+pub fn parse_ask_user_request(call: &ToolCall) -> Result<AskUserRequest, ToolError> {
+    let raw = call
+        .arguments
+        .get("question")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    // `string_arg` ya exige no-vacío y ≤2000 bytes; acá se revalida en chars.
+    if raw.trim().is_empty() {
+        return Err(ToolError::FaltaCampo { campo: "question" });
+    }
+    if raw.len() > MAX_ARG_BYTES {
+        return Err(ToolError::PresupuestoExcedido(format!(
+            "el argumento 'question' excede el límite de {MAX_ARG_BYTES} bytes (E_PRESUPUESTO)"
+        )));
+    }
+    let Some(question) = sanitize_ask_user_question(raw) else {
+        return Err(ToolError::FaltaCampo { campo: "question" });
+    };
+    let options = sanitize_ask_user_options(call.arguments.get("options"));
+    Ok(AskUserRequest { question, options })
+}
+
+/// Serializa el pendiente estructurado que la UI muestra como botones.
+///
+/// Incluye `needs_user:true` como marcador estable + `message` en español con
+/// la jerga histórica (`respuesta explícita`/`aclaración`) para compatibilidad
+/// con el contrato anterior (`ok=false`, repetir en chat si no hay UI).
+/// Puro y acotado (pregunta ≤300 + 4×64 + overhead < 2048).
+#[must_use]
+pub fn format_ask_user_pending(request: &AskUserRequest) -> String {
+    let payload = json!({
+        "needs_user": true,
+        "question": request.question,
+        "options": request.options,
+        "message": "ask_user requiere una respuesta explícita del usuario en el chat de Grafito; repítela como pregunta de aclaración en lugar de ejecutarla en silencio (E_CONSENTIMIENTO) / ask_user requires an explicit user answer in the Grafito chat; repeat it as a clarifying question instead of running silently",
+    });
+    payload.to_string()
+}
+
+/// Parsea un pendiente `ask_user` desde el contenido de un `ToolResult`.
+///
+/// Puro; `None` si no es el marcador `needs_user:true` o si la forma es inválida.
+#[must_use]
+pub fn parse_ask_user_pending(content: &str) -> Option<AskUserRequest> {
+    let value: Value = serde_json::from_str(content).ok()?;
+    let object = value.as_object()?;
+    if object.get("needs_user").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let question = object.get("question").and_then(Value::as_str)?;
+    let question = sanitize_ask_user_question(question)?;
+    let options = sanitize_ask_user_options(object.get("options"));
+    Some(AskUserRequest { question, options })
+}
+
+/// Construye el `function_call_output` (Responses API) con la respuesta del usuario.
+///
+/// Puro y acotado (respuesta ≤300 chars); la respuesta vacía se rechaza con `None`.
+#[must_use]
+pub fn ask_user_answer_function_output(call_id: &str, answer: &str) -> Option<Value> {
+    let collapsed = answer.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = collapsed.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let clipped: String = trimmed
+        .chars()
+        .take(MAX_ASK_USER_QUESTION_CHARS)
+        .collect::<String>()
+        .trim()
+        .to_owned();
+    if clipped.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "type": "function_call_output",
+        "call_id": call_id,
+        "output": clipped,
+    }))
+}
+
+/// Construye el mensaje `tool` (Chat Completions) con la respuesta del usuario.
+///
+/// Puro y acotado; `None` si la respuesta está vacía.
+#[must_use]
+pub fn ask_user_answer_tool_message(call_id: &str, answer: &str) -> Option<Value> {
+    let output = ask_user_answer_function_output(call_id, answer)?;
+    let content = output.get("output").and_then(Value::as_str)?.to_owned();
+    Some(json!({
+        "role": "tool",
+        "tool_call_id": call_id,
+        "content": content,
+    }))
+}
+
+fn ask_user_tool(call: &ToolCall) -> ToolResult {
+    let request = match parse_ask_user_request(call) {
+        Ok(request) => request,
+        Err(error) => return err_result(&call.id, error),
+    };
+    ToolResult::text(&call.id, false, format_ask_user_pending(&request))
+}
+
+// ── Tools pedagógicas ───────────────────────────────────────────────────────
+
+fn scaffold_tool(call: &ToolCall) -> ToolResult {
+    let Some(concept) = arg_str(call, "concept") else {
+        return err_result(&call.id, ToolError::FaltaCampo { campo: "concept" });
+    };
+    let level = parse_level(arg_str(call, "level"));
+    let (question, hint, explanation) = scaffold_inner(concept.trim(), level);
+    let payload = json!({
+        "concept": concept.trim(),
+        "level": level_label(level),
+        "question": question,
+        "hint": hint,
+        "explanation": explanation,
+    });
+    ToolResult::text(&call.id, true, payload.to_string())
+}
+
+fn resolve_lo(call: &ToolCall) -> Result<Lo, ToolError> {
+    let lo_id = arg_str(call, "lo_id")
+        .or_else(|| arg_str(call, "learning_objective_id"))
+        .or_else(|| arg_str(call, "exercise_id"))
+        .or_else(|| arg_str(call, "id"))
+        .or_else(|| arg_str(call, "concept"));
+    let Some(lo_id) = lo_id else {
+        return Err(ToolError::FaltaCampo { campo: "lo_id" });
+    };
+    if let Some(lo) = curriculum_get(lo_id.trim()) {
+        return Ok(lo);
+    }
+    let mut candidates = curriculum_find(lo_id);
+    if candidates.is_empty() {
+        return Err(ToolError::NoEncontrado(format!(
+            "LearningObjective no encontrado: '{lo_id}'"
+        )));
+    }
+    Ok(candidates.remove(0))
+}
+
+fn generate_exercise_tool(call: &ToolCall) -> ToolResult {
+    let lo = match resolve_lo(call) {
+        Ok(lo) => lo,
+        Err(e) => return err_result(&call.id, e),
+    };
+    let level = parse_level(arg_str(call, "level"));
+    let seed = call
+        .arguments
+        .get("seed")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let gen = generate_exercise_inner(lo.id, seed);
+    if gen.prompt.trim().is_empty() || gen.solution.trim().is_empty() {
+        return err_result(
+            &call.id,
+            ToolError::EvaluacionFallida("ejercicio incompleto".to_string()),
+        );
+    }
+    if gen.prompt.len() > 500 || gen.solution.len() > 500 {
+        return err_result(
+            &call.id,
+            ToolError::PresupuestoExcedido("ejercicio demasiado largo".to_string()),
+        );
+    }
+    let payload = json!({
+        "lo_id": lo.id,
+        "prompt": gen.prompt,
+        "solution": gen.solution,
+        "kind": gen.kind,
+        "difficulty": level_difficulty(level),
+        "params": gen.params,
+        "seed": seed,
+        "validator": gen.validator,
+        "level": level_label(level),
+    });
+    ToolResult::text(&call.id, true, payload.to_string())
+}
+
+fn assess_answer_tool(call: &ToolCall) -> ToolResult {
+    let Some(answer) = string_arg(call, "answer") else {
+        return err_result(&call.id, ToolError::FaltaCampo { campo: "answer" });
+    };
+    let lo_id_opt = arg_str(call, "exercise_id")
+        .or_else(|| arg_str(call, "lo_id"))
+        .or_else(|| arg_str(call, "learning_objective_id"))
+        .or_else(|| arg_str(call, "id"));
+    if let Some(lo_id) = lo_id_opt {
+        let lo = if let Some(found) = curriculum_get(lo_id.trim()) {
+            found
+        } else {
+            let mut c = curriculum_find(lo_id);
+            if c.is_empty() {
+                return err_result(
+                    &call.id,
+                    ToolError::NoEncontrado(format!(
+                        "LearningObjective no encontrado para assess: '{lo_id}'"
+                    )),
+                );
+            }
+            c.remove(0)
+        };
+        let seed = call
+            .arguments
+            .get("seed")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let level = parse_level(arg_str(call, "level"));
+        let _ = level;
+        let gen = generate_exercise_inner(lo.id, seed);
+        let a = assess_inner(&gen.prompt, &gen.solution, &answer);
+        let payload = json!({
+            "lo_id": lo.id,
+            "exercise_prompt": gen.prompt,
+            "expected": gen.solution,
+            "answer": answer,
+            "correct": a.correct,
+            "veredicto": a.verdict,
+            "misconception": a.misconception,
+            "message": a.message,
+            "next_step": a.next_step,
+        });
+        ToolResult::text(&call.id, true, payload.to_string())
+    } else {
+        let payload = json!({
+            "answer": answer,
+            "correct": false,
+            "veredicto": "mal",
+            "misconception": "Concept",
+            "message": "No se proporcionó exercise_id/lo_id; no se puede validar contra un ejercicio concreto. Provee lo_id para evaluación precisa.",
+            "next_step": "Provee lo_id (ej. am1-der) junto a answer para evaluación exacta.",
+            "hint": "Ejemplo: assess_answer {\"lo_id\": \"am1-der\", \"answer\": \"2*x+1\"}"
+        });
+        ToolResult::text(&call.id, false, payload.to_string())
+    }
+}
+
+fn get_curriculum_tool(call: &ToolCall) -> ToolResult {
+    let query = arg_str(call, "query")
+        .or_else(|| arg_str(call, "concept"))
+        .or_else(|| arg_str(call, "q"))
+        .unwrap_or_default();
+    if query.trim().is_empty() {
+        return err_result(&call.id, ToolError::FaltaCampo { campo: "query" });
+    }
+    let results = curriculum_find(query);
+    if results.is_empty() {
+        return err_result(
+            &call.id,
+            ToolError::NoEncontrado(format!("sin resultados para '{query}'")),
+        );
+    }
+    let items: Vec<Value> = results
+        .into_iter()
+        .take(5)
+        .map(|lo| lo_to_json(&lo))
+        .collect();
+    let payload = json!({
+        "query": query,
+        "count": items.len(),
+        "results": items,
+    });
+    ToolResult::text(&call.id, true, payload.to_string())
+}
+
+fn suggest_next_tool(call: &ToolCall) -> ToolResult {
+    let _ = arg_str(call, "branch_id");
+    // Perfil mock determinista ordenado por mastery ascendente (más débil primero),
+    // enlazado a LOs reales del currículum.
+    let mut branches: Vec<(&str, &str, f64, bool, u32, u64)> = vec![
+        ("am1-func", "Funciones", 0.6, false, 2, 0),
+        ("am1-lim", "Límites", 0.2, false, 1, 0),
+        ("am1-der", "Derivadas", 0.0, false, 1, 0),
+    ];
+    branches.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+    let items: Vec<Value> = branches
+        .iter()
+        .take(3)
+        .map(|(id, name, mastery, covered, box_level, next_review)| {
+            let lo_title = curriculum_get(id)
+                .map(|lo| lo.title.to_string())
+                .unwrap_or_else(|| (*name).to_string());
+            let lo_desc = curriculum_get(id)
+                .map(|lo| lo.description.to_string())
+                .unwrap_or_default();
+            json!({
+                "id": id,
+                "name": name,
+                "title": lo_title,
+                "description": lo_desc,
+                "mastery": mastery,
+                "covered": covered,
+                "box_level": box_level,
+                "next_review_epoch": next_review,
+            })
+        })
+        .collect();
+    if items.is_empty() {
+        return err_result(
+            &call.id,
+            ToolError::NoEncontrado("perfil mock vacío; sin sugerencias".to_string()),
+        );
+    }
+    let payload = json!({
+        "mock": true,
+        "count": items.len(),
+        "next": items,
+        "note": "perfil mock puro; en la app real se usa StudentProfile persistido (recommend_next)",
+    });
+    ToolResult::text(&call.id, true, payload.to_string())
+}
+
+fn generate_animation_tool(call: &ToolCall) -> ToolResult {
+    let template_raw = arg_str(call, "template").unwrap_or_default();
+    let concept_raw = arg_str(call, "concept").unwrap_or_default();
+    let mut params_map = BTreeMap::new();
+    if let Some(obj) = call.arguments.get("params").and_then(Value::as_object) {
+        for (k, v) in obj {
+            if let Some(n) = v.as_f64() {
+                if n.is_finite() {
+                    params_map.insert(k.clone(), n);
+                }
+            }
+        }
+    }
+    if template_raw.trim().is_empty() && concept_raw.trim().is_empty() {
+        return err_result(
+            &call.id,
+            ToolError::FaltaCampo {
+                campo: "concept/template",
+            },
+        );
+    }
+    let concept = if concept_raw.trim().is_empty() {
+        template_raw
+    } else {
+        concept_raw
+    };
+    let template = match sanitize_template(template_raw, concept) {
+        Ok(valid) => valid,
+        Err(error) => return err_result(&call.id, error),
+    };
+    if !is_known_template(&template) {
+        return err_result(
+            &call.id,
+            ToolError::CampoInvalido {
+                campo: "template",
+                motivo: format!("plantilla desconocida '{template}'"),
+            },
+        );
+    }
+    let concept_norm = normalize_concept(concept);
+    if template.len() > 64 {
+        return err_result(
+            &call.id,
+            ToolError::PresupuestoExcedido("plantilla excede 64 caracteres".to_string()),
+        );
+    }
+    let canvas = canvas_from_call(call);
+    if !is_valid_resolution(canvas.0, canvas.1) {
+        return err_result(
+            &call.id,
+            ToolError::CampoInvalido {
+                campo: "canvas",
+                motivo: format!("resolución {}x{} fuera de 64..=4096", canvas.0, canvas.1),
+            },
+        );
+    }
+    // Parámetros extendidos (puros, validados contra presupuestos del núcleo).
+    let quality = match parse_anim_quality(call.arguments.get("quality").and_then(Value::as_str)) {
+        Ok(value) => value,
+        Err(error) => return err_result(&call.id, error),
+    };
+    let view = match parse_anim_view(call.arguments.get("view").and_then(Value::as_str)) {
+        Ok(value) => value,
+        Err(error) => return err_result(&call.id, error),
+    };
+    let effect = match parse_anim_effect(call.arguments.get("effect").and_then(Value::as_str)) {
+        Ok(value) => value,
+        Err(error) => return err_result(&call.id, error),
+    };
+    let format = match parse_anim_format(call.arguments.get("format").and_then(Value::as_str)) {
+        Ok(value) => value,
+        Err(error) => return err_result(&call.id, error),
+    };
+    let duration_s = match parse_anim_duration_s(call) {
+        Ok(value) => value,
+        Err(error) => return err_result(&call.id, error),
+    };
+    let fps = match parse_anim_fps(call) {
+        Ok(value) => value,
+        Err(error) => return err_result(&call.id, error),
+    };
+    let tracker = match parse_anim_tracker(call) {
+        Ok(value) => value,
+        Err(error) => return err_result(&call.id, error),
+    };
+    let duration_ms = (duration_s * 1000.0).round() as u64;
+    if !(MIN_DURATION_MS..=MAX_DURATION_MS).contains(&duration_ms) {
+        return err_result(
+            &call.id,
+            ToolError::CampoInvalido {
+                campo: "duration_s",
+                motivo: format!("duración {duration_ms} ms fuera de 100..=30000"),
+            },
+        );
+    }
+    // Routing puro: effect → brazo PlayItem, tracker → plan ValueTracker, view → órbita.
+    let play_kind = play_kind_for_effect(effect);
+    let orbit_requested = match preflight_orbit_view(view) {
+        Ok(value) => value,
+        Err(error) => return err_result(&call.id, error),
+    };
+    // Preflight del plan (frames estimados por duración×fps, clamp 1..=48).
+    let estimated_frames =
+        ((duration_s * f64::from(fps)).round() as usize).clamp(1, PLAYER_ITEM_MAX_FRAMES);
+    if let Err(error) = preflight_player_frames(&[estimated_frames]) {
+        return err_result(&call.id, error);
+    }
+    let mut payload = json!({
+        "template": template,
+        "concept": concept_norm,
+        "params": params_map,
+        "export": format,
+        "canvas": [canvas.0, canvas.1],
+        "duration_ms": duration_ms,
+        "duration_s": duration_s,
+        "fps": fps,
+        "frames": estimated_frames,
+        "quality": quality,
+        "bitrate_kbps": suggested_bitrate_kbps(quality),
+        "view": view,
+        "orbit_requested": orbit_requested,
+        "orbit_supported": false,
+        "effect": effect,
+        "play_kind": play_kind,
+        "protocol_version": ANIM_PROTOCOL_VERSION,
+        "note": "solicitud validada; el motor de animación se ejecuta en la capa UI tras aprobación explícita"
+    });
+    if let Some((start, end, map)) = tracker {
+        payload["tracker"] = json!({"start": start, "end": end, "map": map});
+    }
+    if orbit_requested {
+        payload["orbit_note"] = json!(
+            "órbita pedida; la UI la habilita solo en plantillas 3D, si no exporta la vista plana"
+        );
+    }
+    ToolResult::text(&call.id, true, payload.to_string())
+}
+
+// ── Dispatchers ─────────────────────────────────────────────────────────────
+
+/// Despachador completo (3 base + 6 pedagógicas).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SafeGrafitoDispatcher;
+
+impl ToolDispatcher for SafeGrafitoDispatcher {
+    fn dispatch(&self, call: &ToolCall) -> ToolResult {
+        dispatch_safe_tool(call)
+    }
+}
+
+/// Despachador solo pedagógico (6 tools).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PedagogyDispatcher;
+
+impl ToolDispatcher for PedagogyDispatcher {
+    fn dispatch(&self, call: &ToolCall) -> ToolResult {
+        dispatch_pedagogy_tool(call)
+    }
+}
+
+fn dispatch_safe_tool(call: &ToolCall) -> ToolResult {
+    if let Some(rejected) = reject_oversized_string_args(call) {
+        return rejected;
+    }
+    match call.name.as_str() {
+        "evaluate_expr" => evaluate_expr_tool(call),
+        "grafito_docs" => grafito_docs_tool(call),
+        "ask_user" => ask_user_tool(call),
+        "scaffold" => scaffold_tool(call),
+        "generate_exercise" => generate_exercise_tool(call),
+        "assess_answer" => assess_answer_tool(call),
+        "get_curriculum" => get_curriculum_tool(call),
+        "suggest_next" => suggest_next_tool(call),
+        "generate_animation" => generate_animation_tool(call),
+        unknown => ToolResult::text(
+            &call.id,
+            false,
+            format!("tool '{unknown}' no disponible en esta sesión (E_NO_ENCONTRADO)"),
+        ),
+    }
+}
+
+fn dispatch_pedagogy_tool(call: &ToolCall) -> ToolResult {
+    if let Some(rejected) = reject_oversized_string_args(call) {
+        return rejected;
+    }
+    match call.name.as_str() {
+        "scaffold" => scaffold_tool(call),
+        "generate_exercise" => generate_exercise_tool(call),
+        "assess_answer" => assess_answer_tool(call),
+        "get_curriculum" => get_curriculum_tool(call),
+        "suggest_next" => suggest_next_tool(call),
+        "generate_animation" => generate_animation_tool(call),
+        unknown => ToolResult::text(
+            &call.id,
+            false,
+            format!("pedagogy tool '{unknown}' no disponible; tools válidas: scaffold, generate_exercise, assess_answer, get_curriculum, suggest_next, generate_animation (E_NO_ENCONTRADO)"),
+        ),
+    }
+}
+
+// ── Schemas OpenAI-compat ───────────────────────────────────────────────────
+
+/// Schema de `evaluate_expr`.
+#[must_use]
+pub fn evaluate_expr_schema() -> ToolSchema {
+    ToolSchema::new(
+        "evaluate_expr",
+        "Evalúa una expresión matemática con variables opcionales; devuelve un número finito o un error de dominio.",
+        json!({
+            "type": "object",
+            "properties": {
+                "expression": {"type": "string", "description": "Expresión a evaluar, ej. 2+2, sin(0), 2*x+1"},
+                "variables": {"type": "object", "description": "Mapa opcional de variables numéricas", "additionalProperties": {"type": "number"}}
+            },
+            "required": ["expression"]
+        }),
+    )
+}
+
+/// Schema de `grafito_docs`.
+#[must_use]
+pub fn grafito_docs_schema() -> ToolSchema {
+    ToolSchema::new(
+        "grafito_docs",
+        "Devuelve el catálogo acotado de comandos verificados de Grafito que coinciden con una consulta.",
+        json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Consulta en lenguaje natural, ej. graficar función, recta, histograma"}
+            },
+            "required": ["query"]
+        }),
+    )
+}
+
+/// Schema de `ask_user` (requiere consentimiento).
+#[must_use]
+pub fn ask_user_schema() -> ToolSchema {
+    ToolSchema::new(
+        "ask_user",
+        "Hace una única pregunta corta de aclaración matemática al usuario cuando falta un valor obligatorio. La UI la muestra como botones; nunca se ejecuta en silencio.",
+        json!({
+            "type": "object",
+            "properties": {
+                "question": {"type": "string", "description": "Pregunta de aclaración para el usuario"},
+                "options": {"type": "array", "description": "Opciones cortas para botones (0-4, cada una 1-64 chars)", "items": {"type": "string"}}
+            },
+            "required": ["question"]
+        }),
+    )
+    .with_consent(true)
+}
+
+/// Schema de `scaffold(concept, level)`.
+#[must_use]
+pub fn scaffold_tool_schema() -> ToolSchema {
+    ToolSchema::new(
+        "scaffold",
+        "Genera un andamiaje socrático puro para un concepto y nivel (pregunta, pista, explicación) sin mutar el documento.",
+        json!({
+            "type": "object",
+            "properties": {
+                "concept": {"type": "string", "description": "Concepto a andamiar, ej. derivada, integral, taylor"},
+                "level": {"type": "string", "description": "Nivel pedagógico: primary, secondary, university, utn_am1, utn_am2, utn_algebra, utn_probabilidad"}
+            },
+            "required": ["concept"]
+        }),
+    )
+}
+
+/// Schema de `generate_exercise(lo_id, level, seed)`.
+#[must_use]
+pub fn generate_exercise_tool_schema() -> ToolSchema {
+    ToolSchema::new(
+        "generate_exercise",
+        "Genera un ejercicio determinista para un LearningObjective y nivel; devuelve prompt, solución y validador sin I/O.",
+        json!({
+            "type": "object",
+            "properties": {
+                "lo_id": {"type": "string", "description": "ID del objetivo de aprendizaje, ej. am1-der, sec-trig, am1-int"},
+                "level": {"type": "string", "description": "Nivel pedagógico opcional"},
+                "seed": {"type": "integer", "description": "Semilla opcional para variante determinista"}
+            },
+            "required": ["lo_id"]
+        }),
+    )
+}
+
+/// Schema de `assess_answer(exercise_id?, answer)`.
+#[must_use]
+pub fn assess_answer_tool_schema() -> ToolSchema {
+    ToolSchema::new(
+        "assess_answer",
+        "Evalúa una respuesta del estudiante contra un ejercicio (por lo_id/exercise_id) y devuelve feedback formativo con misconception y veredicto bien/parcial/mal.",
+        json!({
+            "type": "object",
+            "properties": {
+                "exercise_id": {"type": "string", "description": "ID del LO del ejercicio evaluado, ej. am1-der (alias lo_id)"},
+                "lo_id": {"type": "string", "description": "Alias de exercise_id"},
+                "answer": {"type": "string", "description": "Respuesta del estudiante"},
+                "level": {"type": "string", "description": "Nivel opcional para regenerar el ejercicio"},
+                "seed": {"type": "integer", "description": "Semilla opcional usada al generar el ejercicio"}
+            },
+            "required": ["answer"]
+        }),
+    )
+}
+
+/// Schema de `get_curriculum(query)`.
+#[must_use]
+pub fn get_curriculum_tool_schema() -> ToolSchema {
+    ToolSchema::new(
+        "get_curriculum",
+        "Busca objetivos de aprendizaje del currículum que matchean un concepto (título, descripción, tags); devuelve hasta 5.",
+        json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Texto a buscar, ej. derivada, taylor, integral"},
+                "concept": {"type": "string", "description": "Alias de query"}
+            },
+            "required": ["query"]
+        }),
+    )
+}
+
+/// Schema de `suggest_next`.
+#[must_use]
+pub fn suggest_next_tool_schema() -> ToolSchema {
+    ToolSchema::new(
+        "suggest_next",
+        "Sugiere el siguiente objetivo de aprendizaje desde un perfil MOCK determinista (ordenado por mastery, enlazado a LOs reales del currículum). NOTA honesta: esta hoja del DAG no lee el perfil pedagógico real del alumno (eso vive en grafito-profile / el consumidor); la sugerencia es un placeholder.",
+        json!({
+            "type": "object",
+            "properties": {},
+            "required": []
+        }),
+    )
+}
+
+/// Schema de `generate_animation(template, concept, params, quality, view, effect, format, duration_s, fps, tracker)`.
+///
+/// Enums cerrados + cotas (R6e, paridad con `grafito-assistant`): quality
+/// baja/media/alta, view plana/orbita, effect create/write/fade/grow/
+/// indicate/none, format gif/png/mp4/webm, duration_s 0.1..=30, fps 1..=60,
+/// canvas 64..=4096, tracker.map opacity/scale/center_x/center_y.
+#[must_use]
+pub fn generate_animation_tool_schema() -> ToolSchema {
+    ToolSchema::new(
+        "generate_animation",
+        "Valida y propone una solicitud de animación didáctica (template, concept, params, quality, view, effect, format, duration_s, fps, tracker) sin ejecutar el motor; usa protocolo AnimRequest.",
+        json!({
+            "type": "object",
+            "properties": {
+                "template": {"type": "string", "description": "Plantilla opcional: derivative-slope, integral-area, taylor-series, conformal-map, pitagoras, euler, fourier, logistic-bifurcation, gradient-field, mobius-transform, universal, subspace, fractal, auto"},
+                "concept": {"type": "string", "description": "Concepto en lenguaje natural, ej. derivada como pendiente"},
+                "params": {"type": "object", "description": "Mapa opcional de parámetros numéricos finitos", "additionalProperties": {"type": "number"}},
+                "canvas": {"type": "array", "description": "Resolución opcional [width, height] 64..4096", "items": {"type": "integer", "minimum": 64, "maximum": 4096}, "minItems": 2, "maxItems": 2},
+                "width": {"type": "integer", "description": "Ancho opcional 64..4096 (fallback 640)", "minimum": 64, "maximum": 4096},
+                "height": {"type": "integer", "description": "Alto opcional 64..4096 (fallback 480)", "minimum": 64, "maximum": 4096},
+                "quality": {"type": "string", "description": "Calidad opcional: baja, media (default), alta (bitrate 500/2000/8000 kbps)", "enum": ["baja", "media", "alta"]},
+                "view": {"type": "string", "description": "Vista opcional: plana (default) u orbita (órbita 3D; la UI la habilita solo en plantillas 3D)", "enum": ["plana", "orbita"]},
+                "effect": {"type": "string", "description": "Efecto de creación opcional: create, write, fade, grow, indicate, none (default; none = morph histórico)", "enum": ["create", "write", "fade", "grow", "indicate", "none"]},
+                "format": {"type": "string", "description": "Formato de exportación opcional: gif (default), png, mp4, webm (mp4/webm requieren ffmpeg en la UI)", "enum": ["gif", "png", "mp4", "webm"]},
+                "duration_s": {"type": "number", "description": "Duración opcional en segundos 0.1..=30 (default 2.0)", "minimum": 0.1, "maximum": 30.0},
+                "fps": {"type": "integer", "description": "Fotogramas por segundo 1..=60 (default 12)", "minimum": 1, "maximum": 60},
+                "tracker": {"type": "object", "description": "Tracker opcional {start: number, end: number, map: opacity|scale|center_x|center_y} estilo ValueTracker", "properties": {"start": {"type": "number"}, "end": {"type": "number"}, "map": {"type": "string", "enum": ["opacity", "scale", "center_x", "center_y"]}}, "required": ["start", "end"]}
+            },
+            "required": []
+        }),
+    )
+}
+
+/// Las 6 tools pedagógicas para exponer al LLM.
+#[must_use]
+pub fn pedagogy_tool_schemas() -> Vec<ToolSchema> {
+    vec![
+        scaffold_tool_schema(),
+        generate_exercise_tool_schema(),
+        assess_answer_tool_schema(),
+        get_curriculum_tool_schema(),
+        suggest_next_tool_schema(),
+        generate_animation_tool_schema(),
+    ]
+}
+
+/// Conjunto completo seguro (3 base + 6 pedagógicas = 9).
+#[must_use]
+pub fn all_safe_tool_schemas() -> Vec<ToolSchema> {
+    let mut schemas = vec![
+        evaluate_expr_schema(),
+        grafito_docs_schema(),
+        ask_user_schema(),
+    ];
+    schemas.extend(pedagogy_tool_schemas());
+    schemas
+}
+
+// ── Tests de integración por tool (válido + inválido) ───────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn call(id: &str, name: &str, args: Value) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            arguments: args,
+        }
+    }
+
+    fn safe_dispatch(name: &str, args: Value) -> ToolResult {
+        let dispatcher = SafeGrafitoDispatcher;
+        dispatcher.dispatch(&call("t1", name, args))
+    }
+
+    // — presupuesto de argumentos —
+    #[test]
+    fn reject_oversized_string_args_recurses_into_nested_arrays() {
+        // Regresión A7: `check` solo miraba `item.as_str()` en los arrays:
+        // `{"a":[{"b":"<5000 bytes>"}]}` evadía el filtro. Hoy inofensivo
+        // (los tools no leen anidamientos y `parse_tool_calls` capa el JSON),
+        // pero es una red de seguridad que fallaba ABIERTA si cambia cualquiera
+        // de las dos: ahora recursa en objetos y arrays anidados.
+        let big = "x".repeat(MAX_ARG_BYTES + 3_000);
+        let nested_obj = call("t1", "echo", json!({"a": [{"b": big}]}));
+        assert!(reject_oversized_string_args(&nested_obj).is_some());
+        let deep = call("t1", "echo", json!({"a": [[[{"b": big}]]]}));
+        assert!(reject_oversized_string_args(&deep).is_some());
+        let nested_list = call("t1", "echo", json!({"a": [[big]]}));
+        assert!(reject_oversized_string_args(&nested_list).is_some());
+        // Caso plano sigue rechazado y uno sano pasa.
+        let flat = call("t1", "echo", json!({"a": big}));
+        assert!(reject_oversized_string_args(&flat).is_some());
+        let ok = call("t1", "echo", json!({"a": [{"b": "chico"}]}));
+        assert!(reject_oversized_string_args(&ok).is_none());
+    }
+
+    // — evaluate_expr —
+    #[test]
+    fn evaluate_expr_valido() {
+        let r = safe_dispatch("evaluate_expr", json!({"expression": "2+2"}));
+        assert!(r.ok, "esperaba ok: {}", r.content);
+        assert!(r.content.contains('4'), "salida útil con 4: {}", r.content);
+        let r2 = safe_dispatch("evaluate_expr", json!({"expression": "sin(0)"}));
+        assert!(r2.ok, "{}", r2.content);
+        assert!(r2.content.contains('0'));
+        let r3 = safe_dispatch(
+            "evaluate_expr",
+            json!({"expression": "2*x+1", "variables": {"x": 3.0}}),
+        );
+        assert!(r3.ok, "{}", r3.content);
+        assert!(r3.content.contains('7'));
+    }
+
+    #[test]
+    fn evaluate_expr_invalido() {
+        let r = safe_dispatch("evaluate_expr", json!({}));
+        assert!(!r.ok);
+        assert!(
+            r.content.contains("E_FALTA_CAMPO") || r.content.contains("expression"),
+            "error tipado: {}",
+            r.content
+        );
+        let r2 = safe_dispatch("evaluate_expr", json!({"expression": "2+*"}));
+        assert!(!r2.ok);
+        assert!(
+            r2.content.contains("inválido")
+                || r2.content.contains("E_CAMPO_INVALIDO")
+                || r2.content.contains("E_EVALUACION"),
+            "error tipado en español: {}",
+            r2.content
+        );
+        let r3 = safe_dispatch("evaluate_expr", json!({"expression": "1/0"}));
+        assert!(!r3.ok, "división por cero debe fallar");
+    }
+
+    // — grafito_docs —
+    #[test]
+    fn grafito_docs_valido() {
+        let r = safe_dispatch("grafito_docs", json!({"query": "graficar función"}));
+        assert!(r.ok, "{}", r.content);
+        assert!(
+            r.content.contains("Function"),
+            "catálogo útil: {}",
+            r.content
+        );
+    }
+
+    #[test]
+    fn grafito_docs_invalido() {
+        let r = safe_dispatch("grafito_docs", json!({}));
+        assert!(!r.ok);
+        assert!(
+            r.content.contains("E_FALTA_CAMPO") || r.content.contains("query"),
+            "{}",
+            r.content
+        );
+        let r2 = safe_dispatch("grafito_docs", json!({"query": "zzzqqq-no-existe-123"}));
+        assert!(!r2.ok);
+        assert!(
+            r2.content.contains("E_NO_ENCONTRADO") || r2.content.contains("sin comandos"),
+            "{}",
+            r2.content
+        );
+    }
+
+    // — ask_user —
+    #[test]
+    fn ask_user_valido() {
+        let r = safe_dispatch("ask_user", json!({"question": "¿cuánto vale x?"}));
+        // ask_user nunca ejecuta en silencio: ok=false pero contenido útil y específico.
+        assert!(!r.ok);
+        assert!(
+            r.content.contains("respuesta explícita") || r.content.contains("aclaración"),
+            "salida útil no genérica: {}",
+            r.content
+        );
+    }
+
+    #[test]
+    fn ask_user_invalido() {
+        let r = safe_dispatch("ask_user", json!({}));
+        assert!(!r.ok);
+        assert!(
+            r.content.contains("E_FALTA_CAMPO") || r.content.contains("question"),
+            "{}",
+            r.content
+        );
+    }
+
+    #[test]
+    fn ask_user_pending_round_trip_con_opciones() {
+        // Tool → pendiente estructurado → parse → respuesta → function_call_output.
+        // Nunca bloquea: todo puro y acotado.
+        let r = safe_dispatch(
+            "ask_user",
+            json!({"question": "¿qué valor le doy a x?", "options": ["0", "1", "otra"]}),
+        );
+        assert!(!r.ok, "ask_user nunca ejecuta en silencio: {}", r.content);
+        let pending = parse_ask_user_pending(&r.content).expect("pendiente parseable");
+        assert_eq!(pending.question(), "¿qué valor le doy a x?");
+        assert_eq!(
+            pending.options(),
+            &["0".to_owned(), "1".to_owned(), "otra".to_owned()]
+        );
+        // La respuesta del usuario vuelve al loop como function_call_output.
+        let output = ask_user_answer_function_output(&r.call_id, "1").expect("respuesta no vacía");
+        assert_eq!(output["type"], "function_call_output");
+        assert_eq!(output["call_id"], r.call_id);
+        assert_eq!(output["output"], "1");
+        let tool_msg = ask_user_answer_tool_message(&r.call_id, "1").expect("mensaje tool");
+        assert_eq!(tool_msg["role"], "tool");
+        assert_eq!(tool_msg["tool_call_id"], r.call_id);
+        assert_eq!(tool_msg["content"], "1");
+    }
+
+    #[test]
+    fn ask_user_sanea_y_acota_sin_bloquear() {
+        // Sin opciones → pendiente válido con lista vacía (default honesto).
+        let r = safe_dispatch("ask_user", json!({"question": "  ¿cuánto vale x?  "}));
+        let pending = parse_ask_user_pending(&r.content).expect("pendiente");
+        assert_eq!(pending.question(), "¿cuánto vale x?");
+        assert!(pending.options().is_empty());
+        // Opciones vacías/duplicadas/largas se sanean; tope 4.
+        let r = safe_dispatch(
+            "ask_user",
+            json!({"question": "¿x?", "options": ["", "  ", "a", "a", "b", "c", "d", "e"]}),
+        );
+        let pending = parse_ask_user_pending(&r.content).expect("pendiente");
+        assert_eq!(pending.options().len(), MAX_ASK_USER_OPTIONS);
+        assert_eq!(pending.options()[0], "a");
+        // No-pendiente nunca parsea (texto libre o sin marcador).
+        assert!(parse_ask_user_pending("hola").is_none());
+        assert!(parse_ask_user_pending(r#"{"needs_user":false,"question":"¿x?"}"#).is_none());
+        // Respuesta vacía no produce salida (no se inventa contenido).
+        assert!(ask_user_answer_function_output("c1", "   ").is_none());
+        assert!(ask_user_answer_tool_message("c1", "").is_none());
+    }
+
+    // — scaffold —
+    #[test]
+    fn scaffold_valido() {
+        let r = safe_dispatch(
+            "scaffold",
+            json!({"concept": "derivada", "level": "secondary"}),
+        );
+        assert!(r.ok, "{}", r.content);
+        let v: Value = serde_json::from_str(&r.content).expect("json válido");
+        assert_eq!(v["concept"], "derivada");
+        assert!(v["question"].as_str().unwrap_or_default().len() > 5);
+        assert!(v["explanation"].as_str().unwrap_or_default().len() > 5);
+    }
+
+    #[test]
+    fn scaffold_invalido() {
+        let r = safe_dispatch("scaffold", json!({"concept": ""}));
+        assert!(!r.ok);
+        assert!(
+            r.content.contains("E_FALTA_CAMPO") || r.content.contains("concept"),
+            "{}",
+            r.content
+        );
+    }
+
+    // — generate_exercise —
+    #[test]
+    fn generate_exercise_valido() {
+        let r = safe_dispatch(
+            "generate_exercise",
+            json!({"lo_id": "am1-der", "level": "university", "seed": 42}),
+        );
+        assert!(r.ok, "{}", r.content);
+        let v: Value = serde_json::from_str(&r.content).expect("json");
+        assert_eq!(v["lo_id"], "am1-der");
+        assert!(v["prompt"].as_str().unwrap_or_default().contains("Deriva"));
+        assert!(!v["solution"].as_str().unwrap_or_default().is_empty());
+        // Determinismo
+        let r2 = safe_dispatch(
+            "generate_exercise",
+            json!({"lo_id": "am1-der", "level": "university", "seed": 42}),
+        );
+        assert_eq!(r.content, r2.content);
+    }
+
+    #[test]
+    fn generate_exercise_invalido() {
+        let r = safe_dispatch("generate_exercise", json!({}));
+        assert!(!r.ok);
+        assert!(
+            r.content.contains("E_FALTA_CAMPO") || r.content.contains("lo_id"),
+            "{}",
+            r.content
+        );
+        let r2 = safe_dispatch("generate_exercise", json!({"lo_id": "no-existe-xyz"}));
+        assert!(!r2.ok);
+        assert!(
+            r2.content.contains("E_NO_ENCONTRADO") || r2.content.contains("no encontrado"),
+            "{}",
+            r2.content
+        );
+    }
+
+    // — assess_answer: bien / mal / parcial —
+    #[test]
+    fn assess_answer_bien() {
+        let ex = safe_dispatch("generate_exercise", json!({"lo_id": "am1-der", "seed": 0}));
+        assert!(ex.ok, "{}", ex.content);
+        let ev: Value = serde_json::from_str(&ex.content).expect("json");
+        let expected = ev["solution"].as_str().expect("solution").to_string();
+        let r = safe_dispatch(
+            "assess_answer",
+            json!({"exercise_id": "am1-der", "answer": expected, "seed": 0}),
+        );
+        assert!(r.ok, "{}", r.content);
+        let v: Value = serde_json::from_str(&r.content).expect("json");
+        assert_eq!(v["correct"], true);
+        assert_eq!(v["veredicto"], "bien");
+    }
+
+    #[test]
+    fn assess_answer_mal() {
+        let r = safe_dispatch(
+            "assess_answer",
+            json!({"exercise_id": "am1-der", "answer": "99999", "seed": 0}),
+        );
+        assert!(
+            r.ok,
+            "la evaluación debe tener éxito aunque la respuesta sea mala: {}",
+            r.content
+        );
+        let v: Value = serde_json::from_str(&r.content).expect("json");
+        assert_eq!(v["correct"], false);
+        assert_eq!(v["veredicto"], "mal");
+        assert!(v["misconception"].as_str().unwrap_or_default().len() > 2);
+        assert!(v["message"].as_str().unwrap_or_default().len() > 5);
+    }
+
+    #[test]
+    fn assess_answer_parcial() {
+        // am1-der seed 0: a,b deterministas; solución numérica S. Respuesta a +8 % => parcial.
+        let ex = safe_dispatch("generate_exercise", json!({"lo_id": "am1-der", "seed": 0}));
+        let ev: Value = serde_json::from_str(&ex.content).expect("json");
+        let sol: f64 = ev["solution"].as_str().expect("sol").parse().expect("num");
+        let parcial = format!("{}", sol * 1.08);
+        let r = safe_dispatch(
+            "assess_answer",
+            json!({"exercise_id": "am1-der", "answer": parcial, "seed": 0}),
+        );
+        assert!(r.ok, "{}", r.content);
+        let v: Value = serde_json::from_str(&r.content).expect("json");
+        assert_eq!(v["correct"], false);
+        assert_eq!(
+            v["veredicto"], "parcial",
+            "8 % debe ser parcial: {}",
+            r.content
+        );
+    }
+
+    #[test]
+    fn assess_answer_invalido() {
+        let r = safe_dispatch("assess_answer", json!({"exercise_id": "am1-der"}));
+        assert!(!r.ok);
+        assert!(
+            r.content.contains("E_FALTA_CAMPO") || r.content.contains("answer"),
+            "{}",
+            r.content
+        );
+    }
+
+    // — get_curriculum —
+    #[test]
+    fn get_curriculum_valido() {
+        let r = safe_dispatch("get_curriculum", json!({"query": "derivada"}));
+        assert!(r.ok, "{}", r.content);
+        let v: Value = serde_json::from_str(&r.content).expect("json");
+        assert!(v["count"].as_u64().unwrap_or(0) > 0, "LOs reales no vacíos");
+        let first_id = v["results"][0]["id"].as_str().unwrap_or("");
+        assert!(!first_id.is_empty());
+        assert!(
+            curriculum_get(first_id).is_some(),
+            "el LO devuelto debe existir en el currículum real: {first_id}"
+        );
+    }
+
+    #[test]
+    fn get_curriculum_invalido() {
+        let r = safe_dispatch("get_curriculum", json!({"query": ""}));
+        assert!(!r.ok);
+        assert!(
+            r.content.contains("E_FALTA_CAMPO") || r.content.contains("query"),
+            "{}",
+            r.content
+        );
+    }
+
+    // — suggest_next —
+    #[test]
+    fn suggest_next_valido() {
+        let r = safe_dispatch("suggest_next", json!({}));
+        assert!(r.ok, "{}", r.content);
+        let v: Value = serde_json::from_str(&r.content).expect("json");
+        assert_eq!(v["mock"], true);
+        let next = v["next"].as_array().expect("next array");
+        assert!(
+            !next.is_empty(),
+            "suggest_next no debe devolver lista vacía"
+        );
+        for item in next {
+            let id = item["id"].as_str().unwrap_or("");
+            assert!(curriculum_get(id).is_some(), "LO real enlazado: {id}");
+        }
+        // Ordenado por mastery ascendente (más débil primero: am1-der primero).
+        let first = next[0]["id"].as_str().unwrap_or("");
+        assert_eq!(first, "am1-der", "el más débil primero: {}", r.content);
+    }
+
+    #[test]
+    fn suggest_next_invalido_oversized() {
+        let big = "x".repeat(MAX_ARG_BYTES + 10);
+        let r = safe_dispatch("suggest_next", json!({"branch_id": big}));
+        assert!(!r.ok);
+        assert!(
+            r.content.contains("E_PRESUPUESTO") || r.content.contains("excede"),
+            "{}",
+            r.content
+        );
+    }
+
+    // — generate_animation —
+    #[test]
+    fn generate_animation_valido() {
+        let r = safe_dispatch(
+            "generate_animation",
+            json!({"concept": "derivada como pendiente", "template": "derivative-slope", "params": {"a": 1.0}}),
+        );
+        assert!(r.ok, "{}", r.content);
+        let v: Value = serde_json::from_str(&r.content).expect("json");
+        assert_eq!(v["template"], "derivative-slope");
+        assert!(v["concept"].as_str().unwrap_or_default().len() > 3);
+        assert_eq!(v["export"], "gif");
+    }
+
+    #[test]
+    fn generate_animation_invalido() {
+        let r = safe_dispatch("generate_animation", json!({"template": "", "concept": ""}));
+        assert!(!r.ok);
+        assert!(
+            r.content.contains("E_FALTA_CAMPO") || r.content.contains("concept"),
+            "{}",
+            r.content
+        );
+    }
+
+    #[test]
+    fn generate_animation_parametros_nativos() {
+        // Debe producir parámetros válidos para el motor nativo:
+        // plantilla existente, Resolution 64..=4096 y Duration 100..=30000 ms.
+        let r = safe_dispatch(
+            "generate_animation",
+            json!({"concept": "integral área bajo curva", "canvas": [640, 480]}),
+        );
+        assert!(r.ok, "{}", r.content);
+        let v: Value = serde_json::from_str(&r.content).expect("json");
+        let template = v["template"].as_str().unwrap_or("");
+        assert!(
+            is_known_template(template),
+            "plantilla nativa válida: {template}"
+        );
+        let w = v["canvas"][0].as_u64().expect("w");
+        let h = v["canvas"][1].as_u64().expect("h");
+        assert!(
+            is_valid_resolution(w as u32, h as u32),
+            "Resolution válida {w}x{h}"
+        );
+        let dur = v["duration_ms"].as_u64().expect("duration_ms");
+        assert!(
+            (MIN_DURATION_MS..=MAX_DURATION_MS).contains(&dur),
+            "Duration válida {dur} ms"
+        );
+        assert_eq!(v["protocol_version"], 1);
+        // Auto-template: integral -> integral-area
+        assert_eq!(template, "integral-area");
+    }
+
+    #[test]
+    fn generate_animation_parametros_extendidos_validos() {
+        let r = safe_dispatch(
+            "generate_animation",
+            json!({
+                "concept": "derivada como pendiente",
+                "quality": "alta",
+                "view": "plana",
+                "effect": "create",
+                "format": "mp4",
+                "duration_s": 3.0,
+                "fps": 24,
+                "tracker": {"start": 0.0, "end": 1.0, "map": "opacity"},
+            }),
+        );
+        assert!(r.ok, "{}", r.content);
+        let v: Value = serde_json::from_str(&r.content).expect("json");
+        assert_eq!(v["quality"], "alta");
+        assert_eq!(v["bitrate_kbps"], 8000);
+        assert_eq!(v["view"], "plana");
+        assert_eq!(v["orbit_requested"], false);
+        assert_eq!(v["effect"], "create");
+        assert_eq!(v["play_kind"], "Create");
+        assert_eq!(v["export"], "mp4");
+        assert_eq!(v["duration_s"], 3.0);
+        assert_eq!(v["duration_ms"], 3000);
+        assert_eq!(v["fps"], 24);
+        assert_eq!(v["tracker"]["map"], "opacity");
+    }
+
+    #[test]
+    fn generate_animation_orbita_y_tracker() {
+        let r = safe_dispatch(
+            "generate_animation",
+            json!({
+                "concept": "mapa conforme",
+                "template": "conformal-map",
+                "view": "orbita",
+                "effect": "grow",
+                "tracker": {"start": -4.0, "end": 4.0, "map": "center_x"},
+            }),
+        );
+        assert!(r.ok, "{}", r.content);
+        let v: Value = serde_json::from_str(&r.content).expect("json");
+        assert_eq!(v["view"], "orbita");
+        assert_eq!(v["orbit_requested"], true);
+        assert_eq!(v["orbit_supported"], false);
+        assert!(v["orbit_note"].is_string(), "órbita honesta: {}", r.content);
+        assert_eq!(v["play_kind"], "GrowFromCenter");
+        assert_eq!(v["tracker"]["map"], "center_x");
+    }
+
+    #[test]
+    fn generate_animation_rechaza_fps_duracion_efecto_invalidos() {
+        for args in [
+            json!({"concept": "derivada", "fps": 0}),
+            json!({"concept": "derivada", "fps": 61}),
+            json!({"concept": "derivada", "duration_s": 0.05}),
+            json!({"concept": "derivada", "duration_s": 31.0}),
+            json!({"concept": "derivada", "effect": "explotar"}),
+            json!({"concept": "derivada", "view": "holograma"}),
+            json!({"concept": "derivada", "quality": "ultra"}),
+            json!({"concept": "derivada", "format": "exe"}),
+            json!({"concept": "derivada", "tracker": {"start": 0.0, "end": 1.0, "map": "rotar"}}),
+            json!({"concept": "derivada", "tracker": {"start": 0.0}}),
+        ] {
+            let r = safe_dispatch("generate_animation", args);
+            assert!(!r.ok, "debía rechazar: {}", r.content);
+            assert!(
+                r.content.contains("E_CAMPO_INVALIDO") || r.content.contains("E_PRESUPUESTO"),
+                "error tipado: {}",
+                r.content
+            );
+        }
+    }
+
+    #[test]
+    fn preflight_player_frames_colocado_y_orbita() {
+        assert_eq!(preflight_player_frames(&[12, 24]).expect("frames"), 36);
+        assert!(preflight_player_frames(&[]).is_err());
+        assert!(preflight_player_frames(&[0]).is_err());
+        assert!(preflight_player_frames(&[49]).is_err());
+        assert!(preflight_player_frames(&[48, 48, 1]).is_err());
+        assert!(preflight_placed(1.0, 1.0, [0.0, 0.0]).is_ok());
+        assert!(preflight_placed(2.0, 1.0, [0.0, 0.0]).is_err());
+        assert!(preflight_placed(1.0, 0.0, [0.0, 0.0]).is_err());
+        assert!(preflight_placed(1.0, 1.0, [f64::NAN, 0.0]).is_err());
+        assert!(!preflight_orbit_view("plana").expect("plana"));
+        assert!(preflight_orbit_view("orbita").expect("orbita"));
+        assert!(preflight_orbit_view("holograma").is_err());
+        assert_eq!(play_kind_for_effect("create"), "Create");
+        assert_eq!(play_kind_for_effect("write"), "Write");
+        assert_eq!(play_kind_for_effect("fade"), "Fade");
+        assert_eq!(play_kind_for_effect("grow"), "GrowFromCenter");
+        assert_eq!(play_kind_for_effect("indicate"), "Indicate");
+        assert_eq!(play_kind_for_effect("none"), "Transform");
+        assert_eq!(suggested_bitrate_kbps("baja"), 500);
+        assert_eq!(suggested_bitrate_kbps("media"), 2000);
+        assert_eq!(suggested_bitrate_kbps("alta"), 8000);
+    }
+
+    // — Schemas OpenAI-compat —
+    #[test]
+    fn schemas_openai_validos() {
+        let all = all_safe_tool_schemas();
+        assert_eq!(all.len(), 9, "3 base + 6 pedagógicas");
+        for schema in &all {
+            assert!(schema.validate().is_ok(), "schema {} inválido", schema.name);
+            let openai = schema.openai_tool().expect("openai_tool");
+            assert_eq!(openai["type"], "function");
+            assert_eq!(openai["function"]["name"], schema.name.as_str());
+            let params = &openai["function"]["parameters"];
+            assert_eq!(params["type"], "object");
+            assert!(params["properties"].is_object(), "{}", schema.name);
+        }
+        // required/properties correctos por tool
+        let by_name = |n: &str| all.iter().find(|s| s.name == n).expect(n);
+        let req = |n: &str| {
+            by_name(n).parameters["required"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
+                .unwrap_or_default()
+        };
+        assert!(req("evaluate_expr").contains(&"expression"));
+        assert!(req("grafito_docs").contains(&"query"));
+        assert!(req("ask_user").contains(&"question"));
+        assert!(req("scaffold").contains(&"concept"));
+        assert!(req("generate_exercise").contains(&"lo_id"));
+        assert!(req("assess_answer").contains(&"answer"));
+        assert!(req("get_curriculum").contains(&"query"));
+        assert!(req("suggest_next").is_empty());
+        assert!(req("generate_animation").is_empty());
+        // ask_user requiere consentimiento
+        assert!(by_name("ask_user").needs_consent);
+        assert_eq!(pedagogy_tool_schemas().len(), 6);
+    }
+
+    #[test]
+    fn dispatcher_cubre_las_9_tools() {
+        for (name, args) in [
+            ("evaluate_expr", json!({"expression": "1+1"})),
+            ("grafito_docs", json!({"query": "recta"})),
+            ("ask_user", json!({"question": "¿x?"})),
+            ("scaffold", json!({"concept": "derivada"})),
+            ("generate_exercise", json!({"lo_id": "am1-der"})),
+            ("assess_answer", json!({"answer": "2", "lo_id": "am1-der"})),
+            ("get_curriculum", json!({"query": "derivada"})),
+            ("suggest_next", json!({})),
+            ("generate_animation", json!({"concept": "derivada"})),
+        ] {
+            let call = ToolCall {
+                id: "cov".to_string(),
+                name: name.to_string(),
+                arguments: args,
+            };
+            let result = SafeGrafitoDispatcher.dispatch(&call);
+            // ask_user devuelve ok=false por diseño (requiere usuario), el resto ok=true.
+            if name == "ask_user" {
+                assert!(!result.ok, "{name}");
+                assert!(
+                    result.content.contains("respuesta explícita"),
+                    "{name}: {}",
+                    result.content
+                );
+            } else {
+                assert!(result.ok, "{name} debe tener éxito: {}", result.content);
+            }
+        }
+    }
+
+    #[test]
+    fn pedagogy_dispatcher_aisla_pedagogia() {
+        let pedagogy = PedagogyDispatcher;
+        let ok = pedagogy.dispatch(&call("p1", "scaffold", json!({"concept": "integral"})));
+        assert!(ok.ok);
+        let denied = pedagogy.dispatch(&call("p2", "evaluate_expr", json!({"expression": "2+2"})));
+        assert!(!denied.ok);
+        assert!(denied.content.contains("no disponible"));
+    }
+
+    #[test]
+    fn curriculum_real_tiene_43_los() {
+        assert_eq!(all_los().len(), 43);
+        for id in [
+            "am1-der",
+            "am1-int",
+            "am1-func",
+            "sec-trig",
+            "sec-pitagoras",
+            "am2-taylor",
+            "alg-vectores",
+            "prob-basica",
+        ] {
+            assert!(curriculum_get(id).is_some(), "LO real {id}");
+        }
+    }
+
+    #[test]
+    fn r6e_schema_enums_cerrados_y_rechazo_fuera_de_enum() {
+        // Schema: enums cerrados + cotas numéricas (paridad con assistant).
+        let schema = generate_animation_tool_schema();
+        assert!(schema.validate().is_ok(), "schema válido");
+        let props = &schema.parameters["properties"];
+        assert_eq!(props["quality"]["enum"], json!(["baja", "media", "alta"]));
+        assert_eq!(props["view"]["enum"], json!(["plana", "orbita"]));
+        assert_eq!(
+            props["effect"]["enum"],
+            json!(["create", "write", "fade", "grow", "indicate", "none"])
+        );
+        assert_eq!(
+            props["format"]["enum"],
+            json!(["gif", "png", "mp4", "webm"])
+        );
+        assert_eq!(
+            props["tracker"]["properties"]["map"]["enum"],
+            json!(["opacity", "scale", "center_x", "center_y"])
+        );
+        assert_eq!(props["duration_s"]["minimum"], json!(0.1));
+        assert_eq!(props["duration_s"]["maximum"], json!(30.0));
+        assert_eq!(props["fps"]["minimum"], json!(1));
+        assert_eq!(props["fps"]["maximum"], json!(60));
+        // Dispatch: valor fuera de enum → Err tipado honesto.
+        for args in [
+            json!({"concept": "derivada", "quality": "ultra"}),
+            json!({"concept": "derivada", "view": "isometrica"}),
+            json!({"concept": "derivada", "effect": "explotar"}),
+            json!({"concept": "derivada", "format": "avi"}),
+            json!({"concept": "derivada", "template": "typo-xyz"}),
+            json!({"concept": "derivada", "duration_s": 99.0}),
+            json!({"concept": "derivada", "fps": 999}),
+        ] {
+            let r = safe_dispatch("generate_animation", args);
+            assert!(!r.ok, "debía rechazar: {}", r.content);
+            assert!(
+                r.content.contains("E_CAMPO_INVALIDO") || r.content.contains("E_PRESUPUESTO"),
+                "error tipado: {}",
+                r.content
+            );
+        }
+    }
+
+    #[test]
+    fn r6e_mirror_pineado_paridad_protocolo() {
+        // R6e: espejo pineado de `grafito-anim::protocol` (este crate es hoja
+        // sin esa dep: no delega el símbolo, replica el contrato). Misma
+        // honestidad: typo→Err, `""`/`auto` por concepto, fallback universal.
+        // Si el protocolo cambia, esta tabla debe cambiar a la par.
+        assert_eq!(
+            KNOWN_TEMPLATES.len(),
+            70,
+            "espejo 1:1 de CANONICAL_TEMPLATES (13 base + 52 dominio + 4 extra + 1 trig)"
+        );
+        assert_eq!(
+            KNOWN_TEMPLATES,
+            &[
+                "derivative-slope",
+                "integral-area",
+                "taylor-series",
+                "conformal-map",
+                "pitagoras",
+                "euler",
+                "fourier",
+                "logistic-bifurcation",
+                "gradient-field",
+                "mobius-transform",
+                "universal",
+                "subspace",
+                "fractal",
+                "cambio-de-base",
+                "determinante-area",
+                "eigenvectores",
+                "matriz-transformacion",
+                "producto-cruz",
+                "vectores-combinacion-lineal",
+                "chain-rule",
+                "epsilon-delta",
+                "improper-integral",
+                "ode-slope-field",
+                "riemann-sums",
+                "taylor-remainder",
+                "double-integral",
+                "gradient-descent",
+                "green-stokes",
+                "jacobian",
+                "lagrange-multipliers",
+                "partial-derivatives",
+                "chaos-bifurcacion-barrido",
+                "chaos-julia-morph",
+                "chaos-lorenz",
+                "chaos-mandelbrot-zoom",
+                "chaos-pendulo-doble",
+                "edo-calor-onda",
+                "edo-campo-direcciones",
+                "edo-convolucion",
+                "edo-fourier-epiciclos",
+                "edo-laplace",
+                "backprop-flujo",
+                "descenso-gradiente-3d",
+                "distribuciones",
+                "limite-central",
+                "pca-rotacion",
+                "perceptron-mlp",
+                "regresion-lineal",
+                "teorema-bayes",
+                "sup-campo-vectorial",
+                "sup-interseccion",
+                "sup-onda-3d",
+                "sup-paraboloide-tangente",
+                "sup-silla-descenso",
+                "sup-toro-rotante",
+                "celda-24",
+                "estereografica",
+                "hipercubo-corte",
+                "simplex-nd",
+                "tesseract-xw",
+                "bfs-animado",
+                "camino-minimo",
+                "force-directed",
+                "moser-spindle-coloreo",
+                "unit-distance",
+                "matriz-inversa-nucleo",
+                "matriz-no-cuadrada",
+                "producto-punto-dualidad",
+                "sup-laplace-3d",
+                "trig-circulo-unitario",
+            ]
+        );
+        // `""`, `"auto"` y blancos → Ok por concepto.
+        for tpl in ["", "auto", "  "] {
+            assert_eq!(
+                sanitize_template(tpl, "derivada pendiente"),
+                Ok("derivative-slope".to_string()),
+                "tpl={tpl:?}"
+            );
+        }
+        // Canónicas (las 70) pasan literales; alias y case-insensitive también.
+        for known in KNOWN_TEMPLATES {
+            assert_eq!(
+                sanitize_template(known, "cualquiera"),
+                Ok((*known).to_string())
+            );
+        }
+        assert_eq!(
+            sanitize_template("pythagoras", "x"),
+            Ok("pitagoras".to_string())
+        );
+        assert_eq!(
+            sanitize_template("Derivative-Slope", "x"),
+            Ok("derivative-slope".to_string())
+        );
+        // Typo / desconocido no vacío → Err honesto (jamás fallback silencioso).
+        for typo in ["unknown-xyz", "typo-xyz", "universal2", "derivada"] {
+            assert!(
+                sanitize_template(typo, "derivada").is_err(),
+                "typo={typo:?}"
+            );
+        }
+        // Tabla pineada (paridad con el protocolo): 13 familias.
+        for (concept, expected) in [
+            ("teorema de pitágoras", "pitagoras"),
+            ("integral área bajo curva", "integral-area"),
+            ("serie de taylor", "taylor-series"),
+            ("mapeo conforme complejo", "conformal-map"),
+            ("derivada pendiente tangente", "derivative-slope"),
+            ("vector en el plano", "universal"),
+            ("vector conforme complejo", "conformal-map"),
+            ("euler exponencial exp(x)", "euler"),
+            ("serie de fourier", "fourier"),
+            ("probabilidad binomial", "universal"),
+            ("probabilidad con histograma", "integral-area"),
+            ("sin(x) coseno", "universal"),
+            ("seno y coseno", "taylor-series"),
+            ("bifurcación logística", "logistic-bifurcation"),
+            ("campo gradiente", "gradient-field"),
+            ("transformada de mobius", "mobius-transform"),
+            ("tarea de matemática", "universal"),
+        ] {
+            assert_eq!(template_for_concept(concept), expected, "{concept}");
+        }
+        // El dispatch honra el contrato: typo→!ok, auto→ok.
+        let typo = safe_dispatch(
+            "generate_animation",
+            json!({"concept": "derivada", "template": "typo-xyz"}),
+        );
+        assert!(!typo.ok, "typo debe fallar: {}", typo.content);
+        assert!(
+            typo.content.contains("E_CAMPO_INVALIDO"),
+            "{}",
+            typo.content
+        );
+        let auto = safe_dispatch(
+            "generate_animation",
+            json!({"concept": "vector en el plano"}),
+        );
+        assert!(auto.ok, "{}", auto.content);
+        assert!(auto.content.contains("universal"), "{}", auto.content);
+    }
+}

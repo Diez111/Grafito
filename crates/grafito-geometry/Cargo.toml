@@ -1,0 +1,57 @@
+[package]
+name = "grafito-geometry"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+glam.workspace = true
+nalgebra.workspace = true
+geo.workspace = true
+geo-types.workspace = true
+spade.workspace = true
+robust.workspace = true
+evalexpr.workspace = true
+serde.workspace = true
+log.workspace = true
+libm = "0.2"
+num-complex.workspace = true
+rayon.workspace = true
+lru.workspace = true
+num-bigint = "0.4"
+num-rational = "0.4"
+num-traits = "0.2"
+
+[dev-dependencies]
+# Sin `html_reports` (ver grafito-anim: plotters fuera de `cargo test`).
+criterion = "0.5"
+proptest = "1"
+
+[[bench]]
+name = "expr_bench"
+harness = false
+
+# F5: bench informativo de la matematica de frames de integral (sin gate).
+[[bench]]
+name = "integral_frames"
+harness = false
+
+# P2-perf: bench informativo del morph puro + órbita de cámara (sin gate).
+[[bench]]
+name = "morph_orbit"
+harness = false
+
+# Ola 2 B14: benches informativos ODE/CAS/matrices (sin gate).
+[[bench]]
+name = "ode_bench"
+harness = false
+
+[[bench]]
+name = "cas_matrices_bench"
+harness = false
+
+[lints]
+workspace = true

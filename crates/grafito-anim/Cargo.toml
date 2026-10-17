@@ -1,0 +1,34 @@
+[package]
+name = "grafito-anim"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Puente de Grafito hacia motores de animación externos (IPC stdio, protocolo JSON versionado)"
+
+[dependencies]
+grafito-geometry = { path = "../grafito-geometry" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+# F5: benches informativos (sin gate). Misma version que grafito-geometry.
+# Sin `html_reports`: el HTML de benches arrastraba plotters a cada
+# `cargo test` sin aportar gates (benches informativos F5).
+criterion = "0.5"
+
+[[bench]]
+name = "native_frames"
+harness = false
+
+[[bench]]
+name = "tpl_throughput"
+harness = false
+
+[lints]
+workspace = true
+

@@ -1,0 +1,10642 @@
+//! Grafito Symbolic CAS — Computer Algebra System propio sobre el AST nativo.
+//!
+//! Implementación propia de derivación simbólica, integración (simbólica básica
+//! y numérica), límites (Richardson), simplificación algebraica, expansión,
+//! factorización, series de Taylor y resolución de ecuaciones polinómicas
+//! (lineal, cuadrática, cúbica vía Cardano, cuártica vía Ferrari, y Newton
+//! numérico para grados mayores).
+//!
+//! Todo el cómputo se realiza sobre el `Expr` de `crate::ast` (parseo, evaluación
+//! numérica `eval_at`, impresión `to_expr_string`). No se utiliza `evalexpr` ni
+//! el módulo `crate::expr` en absoluto: el CAS es 100% nativo del AST de Grafito.
+
+#![allow(clippy::all)]
+
+use crate::assumptions::{Assumption, Assumptions};
+use crate::ast::{parse_ast, Expr};
+use crate::exact::{ExactRational, ExactRationalError};
+use crate::{MathError, MathOperation, MathResult, MAX_MATH_INPUT_BYTES};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::error::Error;
+use std::fmt;
+
+const MAX_EXPAND_AST_NODES: usize = 32_768;
+const MAX_EXPAND_WORK_UNITS: usize = 131_072;
+const MAX_EXPAND_OUTPUT_BYTES: usize = 100_000;
+
+// ============================================================================
+// API pública
+// ============================================================================
+
+/// Resultado de una simplificación que puede requerir hipótesis de dominio.
+///
+/// La variante condicional nunca borra una restricción: por ejemplo, `x / x`
+/// pasa a `1` únicamente bajo `NonZero("x")`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SimplificationOutcome {
+    /// La expresión simplificada es válida sin hipótesis adicionales.
+    Unconditional(Expr),
+    /// La expresión simplificada requiere las condiciones declaradas.
+    Conditional(ConditionalExpr),
+}
+
+/// Expresión simplificada junto con las hipótesis necesarias para su validez.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConditionalExpr {
+    /// Expresión equivalente bajo [`Self::conditions`].
+    pub expression: Expr,
+    /// Restricciones de dominio que no pueden descartarse.
+    pub conditions: BTreeSet<Assumption>,
+}
+
+/// Error al intentar evaluar sintácticamente una expresión como racional exacto.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExactEvaluationError {
+    /// La expresión no pudo convertirse al AST de Grafito.
+    Parse(String),
+    /// Una operación racional exacta no está definida o excede `i128`.
+    Arithmetic(ExactRationalError),
+}
+
+impl fmt::Display for ExactEvaluationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Parse(reason) => write!(f, "no se pudo parsear la expresión exacta: {reason}"),
+            Self::Arithmetic(error) => error.fmt(f),
+        }
+    }
+}
+
+impl Error for ExactEvaluationError {}
+
+impl From<ExactRationalError> for ExactEvaluationError {
+    fn from(error: ExactRationalError) -> Self {
+        Self::Arithmetic(error)
+    }
+}
+
+/// Evalúa una expresión aritmética entera como racional exacto, cuando es posible.
+///
+/// La gramática continúa siendo la del AST de Grafito, por compatibilidad. Como
+/// sus literales ya se almacenan como `f64`, esta API acepta solo constantes
+/// enteras representables exactamente por `f64`; para literales `i128` completos
+/// use `ExactRational::from_str`. Variables y funciones devuelven `Ok(None)`.
+pub fn evaluate_exact_rational(expr: &str) -> Result<Option<ExactRational>, ExactEvaluationError> {
+    let ast = parse_ast(&expr.replace(' ', "")).map_err(ExactEvaluationError::Parse)?;
+    exact_rational_from_expr(&ast)
+}
+
+/// Simplifica identidades seguras bajo `assumptions` sin modificar la API `f64`
+/// legacy de [`simplify`]. Cuando una identidad elimina un posible punto fuera de
+/// dominio, devuelve una condición explícita en lugar de afirmarla globalmente.
+#[must_use]
+pub fn simplify_with_assumptions(expr: &Expr, assumptions: &Assumptions) -> SimplificationOutcome {
+    let (expression, conditions) = simplify_conditionally(expr, assumptions);
+    if conditions.is_empty() {
+        SimplificationOutcome::Unconditional(expression)
+    } else {
+        SimplificationOutcome::Conditional(ConditionalExpr {
+            expression,
+            conditions,
+        })
+    }
+}
+
+fn exact_rational_from_expr(
+    expression: &Expr,
+) -> Result<Option<ExactRational>, ExactEvaluationError> {
+    use Expr::*;
+
+    let exact_binary = |left: &Expr,
+                        right: &Expr,
+                        operation: fn(
+        ExactRational,
+        ExactRational,
+    ) -> Result<ExactRational, ExactRationalError>| {
+        let Some(left) = exact_rational_from_expr(left)? else {
+            return Ok(None);
+        };
+        let Some(right) = exact_rational_from_expr(right)? else {
+            return Ok(None);
+        };
+        operation(left, right).map(Some).map_err(Into::into)
+    };
+
+    match expression {
+        Const(value) => Ok(exact_integer_constant(*value).map(ExactRational::from)),
+        Neg(value) => exact_rational_from_expr(value)?
+            .map(ExactRational::checked_neg)
+            .transpose()
+            .map_err(Into::into),
+        Add(left, right) => exact_binary(left, right, ExactRational::checked_add),
+        Sub(left, right) => exact_binary(left, right, ExactRational::checked_sub),
+        Mul(left, right) => exact_binary(left, right, ExactRational::checked_mul),
+        Div(left, right) => exact_binary(left, right, ExactRational::checked_div),
+        _ => Ok(None),
+    }
+}
+
+fn exact_integer_constant(value: f64) -> Option<i128> {
+    // `f64` can preserve every integer only through 2^53. Larger constants
+    // belong to ExactRational::from_str, before the AST erases their digits.
+    const MAX_EXACT_F64_INTEGER: f64 = 9_007_199_254_740_992.0;
+    if value.is_finite()
+        && value.fract() == 0.0
+        && (-MAX_EXACT_F64_INTEGER..=MAX_EXACT_F64_INTEGER).contains(&value)
+    {
+        Some(value as i128)
+    } else {
+        None
+    }
+}
+
+fn simplify_conditionally(
+    expression: &Expr,
+    assumptions: &Assumptions,
+) -> (Expr, BTreeSet<Assumption>) {
+    use Expr::*;
+
+    match expression {
+        Const(_) | Var(_) => (expression.clone(), BTreeSet::new()),
+        Neg(value) => {
+            let (value, conditions) = simplify_conditionally(value, assumptions);
+            match value {
+                Const(value) => (Const(-value), conditions),
+                Neg(inner) => (*inner, conditions),
+                value => (Neg(Box::new(value)), conditions),
+            }
+        }
+        Add(left, right) => {
+            let (left, mut conditions) = simplify_conditionally(left, assumptions);
+            let (right, right_conditions) = simplify_conditionally(right, assumptions);
+            conditions.extend(right_conditions);
+            match (&left, &right) {
+                (Const(left), Const(right)) => (Const(left + right), conditions),
+                (Const(0.0), _) => (right, conditions),
+                (_, Const(0.0)) => (left, conditions),
+                _ => (Add(Box::new(left), Box::new(right)), conditions),
+            }
+        }
+        Sub(left, right) => {
+            let (left, mut conditions) = simplify_conditionally(left, assumptions);
+            let (right, right_conditions) = simplify_conditionally(right, assumptions);
+            conditions.extend(right_conditions);
+            match (&left, &right) {
+                (Const(left), Const(right)) => (Const(left - right), conditions),
+                (_, Const(0.0)) => (left, conditions),
+                _ => (Sub(Box::new(left), Box::new(right)), conditions),
+            }
+        }
+        Mul(left, right) => {
+            let (left, mut conditions) = simplify_conditionally(left, assumptions);
+            let (right, right_conditions) = simplify_conditionally(right, assumptions);
+            conditions.extend(right_conditions);
+            match (&left, &right) {
+                (Const(left), Const(right)) => (Const(left * right), conditions),
+                (Const(1.0), _) => (right, conditions),
+                (_, Const(1.0)) => (left, conditions),
+                (Const(-1.0), _) => (Neg(Box::new(right)), conditions),
+                (_, Const(-1.0)) => (Neg(Box::new(left)), conditions),
+                // Do not fold 0 * f to zero: f can still be undefined.
+                _ => (Mul(Box::new(left), Box::new(right)), conditions),
+            }
+        }
+        Div(left, right) => {
+            let (left, mut conditions) = simplify_conditionally(left, assumptions);
+            let (right, right_conditions) = simplify_conditionally(right, assumptions);
+            conditions.extend(right_conditions);
+            match (&left, &right) {
+                (_, Const(0.0)) => (Div(Box::new(left), Box::new(right)), conditions),
+                (Const(left), Const(right)) => (Const(left / right), conditions),
+                (_, Const(1.0)) => (left, conditions),
+                (Const(0.0), Var(variable)) => {
+                    require_nonzero(variable, assumptions, &mut conditions);
+                    (Const(0.0), conditions)
+                }
+                (Var(left), Var(right)) if left == right => {
+                    require_nonzero(left, assumptions, &mut conditions);
+                    (Const(1.0), conditions)
+                }
+                _ => (Div(Box::new(left), Box::new(right)), conditions),
+            }
+        }
+        Pow(base, exponent) => {
+            let (base, mut conditions) = simplify_conditionally(base, assumptions);
+            let (exponent, exponent_conditions) = simplify_conditionally(exponent, assumptions);
+            conditions.extend(exponent_conditions);
+            match (&base, &exponent) {
+                (Const(0.0), Const(0.0)) => (Pow(Box::new(base), Box::new(exponent)), conditions),
+                (Const(base), Const(exponent)) if *base != 0.0 || *exponent > 0.0 => {
+                    (Const(base.powf(*exponent)), conditions)
+                }
+                (_, Const(1.0)) => (base, conditions),
+                (Var(variable), Const(0.0)) => {
+                    require_nonzero(variable, assumptions, &mut conditions);
+                    (Const(1.0), conditions)
+                }
+                _ => (Pow(Box::new(base), Box::new(exponent)), conditions),
+            }
+        }
+        // Keeping unsupported forms intact is intentional: this additive API
+        // only applies identities whose domain proof is represented above.
+        Sqrt(inner) => {
+            let (inner, conditions) = simplify_conditionally(inner, assumptions);
+            match &inner {
+                Pow(base, exponent)
+                    if matches!(base.as_ref(), Var(_))
+                        && matches!(exponent.as_ref(), Const(e) if *e == 2.0) =>
+                {
+                    if let Var(variable) = base.as_ref() {
+                        if assumptions.is_real(variable) {
+                            // sqrt(x²) = |x| solo si x es real (respaldado).
+                            return (Abs(Box::new(Var(variable.clone()))), conditions);
+                        }
+                    }
+                    (Sqrt(Box::new(inner)), conditions)
+                }
+                _ => (Sqrt(Box::new(inner)), conditions),
+            }
+        }
+        Ln(inner) => {
+            let (inner, conditions) = simplify_conditionally(inner, assumptions);
+            match &inner {
+                Exp(arg) => {
+                    if let Var(variable) = arg.as_ref() {
+                        if assumptions.is_real(variable) {
+                            // ln(eˣ) = x solo si x es real (respaldado).
+                            return (Var(variable.clone()), conditions);
+                        }
+                    }
+                    (Ln(Box::new(inner)), conditions)
+                }
+                _ => (Ln(Box::new(inner)), conditions),
+            }
+        }
+        Exp(inner) => {
+            let (inner, conditions) = simplify_conditionally(inner, assumptions);
+            match &inner {
+                Ln(arg) => {
+                    if let Var(variable) = arg.as_ref() {
+                        if assumptions.is_positive(variable) {
+                            // e^(ln x) = x solo si x > 0 (respaldado).
+                            return (Var(variable.clone()), conditions);
+                        }
+                    }
+                    (Exp(Box::new(inner)), conditions)
+                }
+                _ => (Exp(Box::new(inner)), conditions),
+            }
+        }
+        Abs(inner) => {
+            let (inner, conditions) = simplify_conditionally(inner, assumptions);
+            match &inner {
+                Var(variable) => {
+                    if assumptions.is_positive(variable) {
+                        // |x| = x respaldado por x > 0.
+                        return (Var(variable.clone()), conditions);
+                    }
+                    if assumptions.is_nonpositive(variable) {
+                        // |x| = -x respaldado por x ≤ 0.
+                        return (Neg(Box::new(Var(variable.clone()))), conditions);
+                    }
+                    (Abs(Box::new(inner)), conditions)
+                }
+                _ => (Abs(Box::new(inner)), conditions),
+            }
+        }
+        _ => (expression.clone(), BTreeSet::new()),
+    }
+}
+
+fn require_nonzero(
+    variable: &str,
+    assumptions: &Assumptions,
+    conditions: &mut BTreeSet<Assumption>,
+) {
+    if !assumptions.is_nonzero(variable) {
+        conditions.insert(Assumption::NonZero(variable.to_owned()));
+    }
+}
+
+/// Derivada simbólica tipada de `expr` respecto de `var`.
+///
+/// Las derivadas construidas por reglas simbólicas se devuelven como
+/// [`MathResult::Exact`]. Las derivadas que requieren funciones aún no
+/// representables por el AST se devuelven como [`MathResult::Unsupported`].
+pub fn derivative_typed(expr: &str, var: &str) -> MathResult<String> {
+    let ast = match parse_math_expression(expr, MathOperation::SymbolicDerivative) {
+        Ok(ast) => ast,
+        Err(error) => return math_failure(error),
+    };
+    let mut variables = HashSet::new();
+    ast.get_variables(&mut variables);
+    if ast.to_expr_string().contains("trigamma(") && variables.contains(var) {
+        return MathResult::Unsupported(MathError::DerivativeUnavailable {
+            expression: expr.into(),
+            variable: var.into(),
+            reason: "requiere polygamma de orden superior".into(),
+        });
+    }
+    let d = simplify_expr(&diff_expr(&ast, var));
+    MathResult::Exact(d.to_expr_string())
+}
+
+/// Adaptador compatible de [`derivative_typed`] para consumidores que esperan
+/// mensajes de error como texto.
+pub fn derivative(expr: &str, var: &str) -> Result<String, String> {
+    adapt_symbolic_result(derivative_typed(expr, var))
+}
+
+/// Integración indefinida simbólica básica.
+///
+/// Soporta: constantes, potencias (regla de la potencia, incluida 1/x → ln|x|),
+/// linealidad, constante por función, sin(x) → -cos(x), cos(x) → sin(x),
+/// exp(x) → exp(x), ln(x) → x·ln(x) − x. Para casos más complejos cae al
+/// integrador simbólico nativo (`Expr::integrate`). Si no hay una primitiva
+/// soportada devuelve un error; una cuadratura sobre un intervalo arbitrario
+/// no representa una integral indefinida.
+pub fn integrate_typed(expr: &str, var: &str) -> MathResult<String> {
+    let ast = match parse_math_expression(expr, MathOperation::IndefiniteIntegration) {
+        Ok(ast) => ast,
+        Err(error) => return math_failure(error),
+    };
+    if let Some(prim) = integrate_expr(&ast, var).or_else(|| ast.integrate(var)) {
+        return MathResult::Exact(simplify_expr(&prim).to_expr_string());
+    }
+    MathResult::Unsupported(MathError::AntiderivativeUnavailable {
+        expression: expr.into(),
+        variable: var.into(),
+    })
+}
+
+/// Adaptador compatible de [`integrate_typed`] para consumidores que esperan
+/// mensajes de error como texto.
+pub fn integrate(expr: &str, var: &str) -> Result<String, String> {
+    adapt_symbolic_result(integrate_typed(expr, var))
+}
+
+/// Integral definida de `a` a `b`.
+///
+/// Intenta antidiferenciación simbólica y evalúa en los extremos; si no es
+/// posible, usa cuadratura numérica (Simpson adaptativo) sobre el AST.
+pub fn integrate_definite_typed(expr: &str, var: &str, a: f64, b: f64) -> MathResult<f64> {
+    let ast = match parse_math_expression(expr, MathOperation::DefiniteIntegration) {
+        Ok(ast) => ast,
+        Err(error) => return math_failure(error),
+    };
+    if has_potential_interval_domain_error(&ast, var, a, b) {
+        return MathResult::DomainError(MathError::IntervalDomainViolation {
+            expression: expr.into(),
+            variable: var.into(),
+            lower: a,
+            upper: b,
+        });
+    }
+    // Validate the interval before accepting an otherwise finite endpoint
+    // difference from an antiderivative, which can hide interior poles.
+    let numeric = match numeric_integrate(&ast, expr, var, a, b, 1e-10, 20) {
+        MathResult::Approximate {
+            value,
+            error_estimate,
+        } => (value, error_estimate),
+        MathResult::DomainError(error) => return MathResult::DomainError(error),
+        MathResult::NotConverged(error) => return MathResult::NotConverged(error),
+        MathResult::Unsupported(error) => return MathResult::Unsupported(error),
+        MathResult::ResourceLimit(error) => return MathResult::ResourceLimit(error),
+        MathResult::Exact(value) => {
+            debug_assert!(false, "numeric integration is never exact");
+            return MathResult::Approximate {
+                value,
+                error_estimate: 0.0,
+            };
+        }
+    };
+    if let Some(prim) = integrate_expr(&ast, var).or_else(|| ast.integrate(var)) {
+        let prim = simplify_expr(&prim);
+        let fa = prim.eval_at(var, a);
+        let fb = prim.eval_at(var, b);
+        if fa.is_finite() && fb.is_finite() {
+            return MathResult::Exact(fb - fa);
+        }
+    }
+    MathResult::Approximate {
+        value: numeric.0,
+        error_estimate: numeric.1,
+    }
+}
+
+/// Integral definida numérica con tolerancia y profundidad explícitas.
+///
+/// El resultado usa Simpson adaptativo y siempre es [`MathResult::Approximate`]
+/// al converger; no se declara exactitud para una cuadratura.
+pub fn integrate_numerical_with_limits(
+    expr: &str,
+    var: &str,
+    a: f64,
+    b: f64,
+    tolerance: f64,
+    max_depth: u32,
+) -> MathResult<f64> {
+    let ast = match parse_math_expression(expr, MathOperation::NumericalIntegration) {
+        Ok(ast) => ast,
+        Err(error) => return math_failure(error),
+    };
+    if has_potential_interval_domain_error(&ast, var, a, b) {
+        return MathResult::DomainError(MathError::IntervalDomainViolation {
+            expression: expr.into(),
+            variable: var.into(),
+            lower: a,
+            upper: b,
+        });
+    }
+    numeric_integrate(&ast, expr, var, a, b, tolerance, max_depth)
+}
+
+/// Integral definida numérica con la tolerancia `1e-10` y profundidad máxima 20.
+pub fn integrate_numerical(expr: &str, var: &str, a: f64, b: f64) -> MathResult<f64> {
+    integrate_numerical_with_limits(expr, var, a, b, 1e-10, 20)
+}
+
+/// Adaptador compatible de [`integrate_definite_typed`] para consumidores que
+/// esperan una descripción textual de la integral.
+pub fn integrate_definite(expr: &str, var: &str, a: f64, b: f64) -> Result<String, String> {
+    match integrate_definite_typed(expr, var, a, b) {
+        MathResult::Exact(value) => Ok(format!("\u{222b}[{a},{b}] {expr} d{var} = {value:.8}")),
+        MathResult::Approximate { value, .. } => Ok(format!(
+            "\u{222b}[{a},{b}] {expr} d{var} \u{2248} {value:.8}"
+        )),
+        result => Err(legacy_error(result)),
+    }
+}
+
+fn parse_math_expression(expr: &str, operation: MathOperation) -> Result<Expr, MathError> {
+    if expr.len() > MAX_MATH_INPUT_BYTES {
+        return Err(MathError::InputTooLarge {
+            operation,
+            provided_bytes: expr.len(),
+            maximum_bytes: MAX_MATH_INPUT_BYTES,
+        });
+    }
+    let normalized = expr.replace(' ', "");
+    parse_ast(&normalized).map_err(|reason| MathError::InvalidExpression {
+        operation,
+        expression: expr.into(),
+        reason,
+    })
+}
+
+fn math_failure<T>(error: MathError) -> MathResult<T> {
+    match error {
+        error @ MathError::InputTooLarge { .. } => MathResult::ResourceLimit(error),
+        error @ MathError::DerivativeUnavailable { .. }
+        | error @ MathError::AntiderivativeUnavailable { .. } => MathResult::Unsupported(error),
+        error @ MathError::RecursionLimit { .. } => MathResult::NotConverged(error),
+        error => MathResult::DomainError(error),
+    }
+}
+
+fn adapt_symbolic_result(result: MathResult<String>) -> Result<String, String> {
+    match result {
+        MathResult::Exact(value) => Ok(value),
+        result => Err(legacy_error(result)),
+    }
+}
+
+fn legacy_error<T>(result: MathResult<T>) -> String {
+    match result {
+        MathResult::DomainError(MathError::InvalidExpression {
+            operation: MathOperation::SymbolicDerivative,
+            expression,
+            reason,
+        }) => format!("No se pudo derivar '{expression}': {reason}"),
+        MathResult::DomainError(MathError::InvalidExpression {
+            operation: MathOperation::IndefiniteIntegration | MathOperation::DefiniteIntegration,
+            expression,
+            reason,
+        }) => format!("No se pudo integrar '{expression}': {reason}"),
+        MathResult::Unsupported(MathError::DerivativeUnavailable { .. }) => {
+            "La derivada de trigamma requiere polygamma de orden superior".into()
+        }
+        MathResult::Unsupported(MathError::AntiderivativeUnavailable {
+            expression,
+            variable,
+        }) => format!(
+            "No hay una antiderivada simbólica soportada para '{expression}' respecto de {variable}"
+        ),
+        MathResult::DomainError(MathError::IntervalDomainViolation { .. }) => {
+            "La integral definida puede no estar definida en el intervalo".into()
+        }
+        MathResult::DomainError(MathError::NonFiniteValue { variable, at, .. }) => format!(
+            "La integral definida no es finita: la expresión no está definida en {variable} = {at}"
+        ),
+        MathResult::NotConverged(MathError::RecursionLimit { .. }) => {
+            "La integral definida no convergió dentro del límite de recursión".into()
+        }
+        MathResult::ResourceLimit(MathError::InputTooLarge {
+            provided_bytes,
+            maximum_bytes,
+            ..
+        }) => format!(
+            "La expresión excede el límite de entrada: {provided_bytes} bytes (máximo {maximum_bytes})"
+        ),
+        MathResult::Unsupported(MathError::NonFiniteLimitPoint { .. }) => {
+            "Los límites en infinito no están soportados todavía".into()
+        }
+        _ => "La operación matemática no pudo completarse".into(),
+    }
+}
+
+/// Conservatively detects rational and elementary-domain failures that a
+/// quadrature grid could miss between sampled points.
+pub fn has_potential_interval_domain_error(ast: &Expr, var: &str, a: f64, b: f64) -> bool {
+    use Expr::*;
+    match ast {
+        Div(numerator, denominator) => {
+            interval_bounds(denominator, var, a, b).is_none_or(|(lo, hi)| lo <= 0.0 && hi >= 0.0)
+                || has_potential_interval_domain_error(numerator, var, a, b)
+                || has_potential_interval_domain_error(denominator, var, a, b)
+        }
+        Ln(argument) | Log(argument) => {
+            interval_bounds(argument, var, a, b).is_none_or(|(lo, _)| lo <= 0.0)
+                || has_potential_interval_domain_error(argument, var, a, b)
+        }
+        Sqrt(argument) => {
+            interval_bounds(argument, var, a, b).is_none_or(|(lo, _)| lo < 0.0)
+                || has_potential_interval_domain_error(argument, var, a, b)
+        }
+        Neg(argument) | Sin(argument) | Cos(argument) | Tan(argument) | Asin(argument)
+        | Acos(argument) | Atan(argument) | Exp(argument) | Abs(argument) | Sinh(argument)
+        | Cosh(argument) | Tanh(argument) | Floor(argument) | Ceil(argument) | Round(argument)
+        | Sec(argument) | Csc(argument) | Cot(argument) | Asinh(argument) | Acosh(argument)
+        | Atanh(argument) | Sign(argument) | Heaviside(argument) | Cbrt(argument)
+        | Re(argument) | Im(argument) | Arg(argument) | Conj(argument) | Erf(argument)
+        | Erfc(argument) | Gamma(argument) | LnGamma(argument) | Digamma(argument)
+        | Trigamma(argument) => has_potential_interval_domain_error(argument, var, a, b),
+        Add(left, right)
+        | Sub(left, right)
+        | Mul(left, right)
+        | Pow(left, right)
+        | Atan2(left, right)
+        | Modulo(left, right)
+        | Min(left, right)
+        | Max(left, right)
+        | Beta(left, right)
+        | BesselJ(left, right)
+        | BesselY(left, right)
+        | BesselI(left, right)
+        | Lt(left, right)
+        | Gt(left, right)
+        | Le(left, right)
+        | Ge(left, right)
+        | Eq(left, right)
+        | Ne(left, right) => {
+            has_potential_interval_domain_error(left, var, a, b)
+                || has_potential_interval_domain_error(right, var, a, b)
+        }
+        Clamp(value, lo, hi) => {
+            has_potential_interval_domain_error(value, var, a, b)
+                || has_potential_interval_domain_error(lo, var, a, b)
+                || has_potential_interval_domain_error(hi, var, a, b)
+        }
+        Sum(body, _, start, end) | Product(body, _, start, end) => {
+            has_potential_interval_domain_error(body, var, a, b)
+                || has_potential_interval_domain_error(start, var, a, b)
+                || has_potential_interval_domain_error(end, var, a, b)
+        }
+        Piecewise(branches, default) => {
+            branches.iter().any(|(condition, value)| {
+                has_potential_interval_domain_error(condition, var, a, b)
+                    || has_potential_interval_domain_error(value, var, a, b)
+            }) || has_potential_interval_domain_error(default, var, a, b)
+        }
+        Const(_) | Var(_) => false,
+    }
+}
+
+fn interval_bounds(ast: &Expr, var: &str, a: f64, b: f64) -> Option<(f64, f64)> {
+    use Expr::*;
+    let (a, b) = (a.min(b), a.max(b));
+    match ast {
+        Const(value) if value.is_finite() => Some((*value, *value)),
+        Var(name) if name == var => Some((a, b)),
+        Neg(argument) => interval_bounds(argument, var, a, b).map(|(lo, hi)| (-hi, -lo)),
+        Add(left, right) => {
+            let (left_lo, left_hi) = interval_bounds(left, var, a, b)?;
+            let (right_lo, right_hi) = interval_bounds(right, var, a, b)?;
+            Some((left_lo + right_lo, left_hi + right_hi))
+        }
+        Sub(left, right) => {
+            let (left_lo, left_hi) = interval_bounds(left, var, a, b)?;
+            let (right_lo, right_hi) = interval_bounds(right, var, a, b)?;
+            Some((left_lo - right_hi, left_hi - right_lo))
+        }
+        Mul(left, right) => {
+            let (left_lo, left_hi) = interval_bounds(left, var, a, b)?;
+            let (right_lo, right_hi) = interval_bounds(right, var, a, b)?;
+            let products = [
+                left_lo * right_lo,
+                left_lo * right_hi,
+                left_hi * right_lo,
+                left_hi * right_hi,
+            ];
+            Some((
+                products.iter().copied().fold(f64::INFINITY, f64::min),
+                products.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+            ))
+        }
+        Div(numerator, denominator) => {
+            let (num_lo, num_hi) = interval_bounds(numerator, var, a, b)?;
+            let (den_lo, den_hi) = interval_bounds(denominator, var, a, b)?;
+            if den_lo <= 0.0 && den_hi >= 0.0 {
+                // Denominator interval crosses zero → guaranteed pole inside [a,b].
+                // Return an infinite interval to ensure has_potential treats it as domain error
+                // and to propagate unboundedness to enclosing expressions (e.g. Ln(Div)).
+                return Some((f64::NEG_INFINITY, f64::INFINITY));
+            }
+            let candidates = [
+                num_lo / den_lo,
+                num_lo / den_hi,
+                num_hi / den_lo,
+                num_hi / den_hi,
+            ];
+            if candidates.iter().any(|v| !v.is_finite()) {
+                return Some((f64::NEG_INFINITY, f64::INFINITY));
+            }
+            Some((
+                candidates.iter().copied().fold(f64::INFINITY, f64::min),
+                candidates.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+            ))
+        }
+        Pow(base, exponent) => {
+            let (lo, hi) = interval_bounds(base, var, a, b)?;
+            let exponent = match exponent.as_ref() {
+                Const(value) if value.is_finite() && *value >= 0.0 && value.fract() == 0.0 => {
+                    *value as i32
+                }
+                _ => return None,
+            };
+            let left = lo.powi(exponent);
+            let right = hi.powi(exponent);
+            if exponent % 2 == 0 && lo <= 0.0 && hi >= 0.0 {
+                Some((0.0, left.max(right)))
+            } else {
+                Some((left.min(right), left.max(right)))
+            }
+        }
+        Exp(argument) => interval_bounds(argument, var, a, b).map(|(lo, hi)| (lo.exp(), hi.exp())),
+        Abs(argument) => interval_bounds(argument, var, a, b).map(|(lo, hi)| {
+            if lo <= 0.0 && hi >= 0.0 {
+                (0.0, lo.abs().max(hi.abs()))
+            } else {
+                (lo.abs().min(hi.abs()), lo.abs().max(hi.abs()))
+            }
+        }),
+        _ => None,
+    }
+}
+
+/// Cota intervalar rectangular multivariante: evalúa `ast` sobre el hiper-rectángulo
+/// definido por `intervals` (clave = nombre de variable, valor = (lo,hi)).
+/// Mantiene la misma semántica conservadora que la versión 1D: si la expresión
+/// contiene operadores no acotables devuelve `None`, lo que el detector trata como
+/// posible singularidad.
+fn interval_bounds_rect(ast: &Expr, intervals: &HashMap<String, (f64, f64)>) -> Option<(f64, f64)> {
+    use Expr::*;
+    match ast {
+        Const(value) if value.is_finite() => Some((*value, *value)),
+        Var(name) => {
+            if let Some((lo, hi)) = intervals.get(name) {
+                let (lo, hi) = (lo.min(*hi), lo.max(*hi));
+                if lo.is_finite() && hi.is_finite() {
+                    Some((lo, hi))
+                } else {
+                    None
+                }
+            } else {
+                // Variable libre no acotada → desconocido
+                None
+            }
+        }
+        Neg(argument) => interval_bounds_rect(argument, intervals).map(|(lo, hi)| (-hi, -lo)),
+        Add(left, right) => {
+            let (left_lo, left_hi) = interval_bounds_rect(left, intervals)?;
+            let (right_lo, right_hi) = interval_bounds_rect(right, intervals)?;
+            Some((left_lo + right_lo, left_hi + right_hi))
+        }
+        Sub(left, right) => {
+            let (left_lo, left_hi) = interval_bounds_rect(left, intervals)?;
+            let (right_lo, right_hi) = interval_bounds_rect(right, intervals)?;
+            Some((left_lo - right_hi, left_hi - right_lo))
+        }
+        Mul(left, right) => {
+            let (left_lo, left_hi) = interval_bounds_rect(left, intervals)?;
+            let (right_lo, right_hi) = interval_bounds_rect(right, intervals)?;
+            let products = [
+                left_lo * right_lo,
+                left_lo * right_hi,
+                left_hi * right_lo,
+                left_hi * right_hi,
+            ];
+            Some((
+                products.iter().copied().fold(f64::INFINITY, f64::min),
+                products.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+            ))
+        }
+        Div(numerator, denominator) => {
+            let (num_lo, num_hi) = interval_bounds_rect(numerator, intervals)?;
+            let (den_lo, den_hi) = interval_bounds_rect(denominator, intervals)?;
+            if den_lo <= 0.0 && den_hi >= 0.0 {
+                return Some((f64::NEG_INFINITY, f64::INFINITY));
+            }
+            let candidates = [
+                num_lo / den_lo,
+                num_lo / den_hi,
+                num_hi / den_lo,
+                num_hi / den_hi,
+            ];
+            if candidates.iter().any(|v| !v.is_finite()) {
+                return Some((f64::NEG_INFINITY, f64::INFINITY));
+            }
+            Some((
+                candidates.iter().copied().fold(f64::INFINITY, f64::min),
+                candidates.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+            ))
+        }
+        Pow(base, exponent) => {
+            let (lo, hi) = interval_bounds_rect(base, intervals)?;
+            let exponent = match exponent.as_ref() {
+                Const(value) if value.is_finite() && *value >= 0.0 && value.fract() == 0.0 => {
+                    *value as i32
+                }
+                _ => return None,
+            };
+            let left = lo.powi(exponent);
+            let right = hi.powi(exponent);
+            if exponent % 2 == 0 && lo <= 0.0 && hi >= 0.0 {
+                Some((0.0, left.max(right)))
+            } else {
+                Some((left.min(right), left.max(right)))
+            }
+        }
+        Exp(argument) => {
+            interval_bounds_rect(argument, intervals).map(|(lo, hi)| (lo.exp(), hi.exp()))
+        }
+        Abs(argument) => interval_bounds_rect(argument, intervals).map(|(lo, hi)| {
+            if lo <= 0.0 && hi >= 0.0 {
+                (0.0, lo.abs().max(hi.abs()))
+            } else {
+                (lo.abs().min(hi.abs()), lo.abs().max(hi.abs()))
+            }
+        }),
+        _ => None,
+    }
+}
+
+/// Detecta posible error de dominio dentro de un rectángulo nD usando aritmética
+/// intervalar conservadora y muestreo puntual 3^n (cuando la aritmética no concluye).
+/// Si `intervals` es vacío retorna `false`.
+pub fn has_potential_rect_domain_error(
+    ast: &Expr,
+    intervals: &HashMap<String, (f64, f64)>,
+) -> bool {
+    if intervals.is_empty() {
+        return false;
+    }
+    has_potential_rect_domain_error_inner(ast, intervals)
+}
+
+fn has_potential_rect_domain_error_inner(
+    ast: &Expr,
+    intervals: &HashMap<String, (f64, f64)>,
+) -> bool {
+    use Expr::*;
+    match ast {
+        Div(numerator, denominator) => {
+            interval_bounds_rect(denominator, intervals)
+                .is_none_or(|(lo, hi)| lo <= 0.0 && hi >= 0.0)
+                || has_potential_rect_domain_error_inner(numerator, intervals)
+                || has_potential_rect_domain_error_inner(denominator, intervals)
+        }
+        Ln(argument) | Log(argument) => {
+            interval_bounds_rect(argument, intervals).is_none_or(|(lo, _)| lo <= 0.0)
+                || has_potential_rect_domain_error_inner(argument, intervals)
+        }
+        Sqrt(argument) => {
+            interval_bounds_rect(argument, intervals).is_none_or(|(lo, _)| lo < 0.0)
+                || has_potential_rect_domain_error_inner(argument, intervals)
+        }
+        Neg(argument) | Sin(argument) | Cos(argument) | Tan(argument) | Asin(argument)
+        | Acos(argument) | Atan(argument) | Exp(argument) | Abs(argument) | Sinh(argument)
+        | Cosh(argument) | Tanh(argument) | Floor(argument) | Ceil(argument) | Round(argument)
+        | Sec(argument) | Csc(argument) | Cot(argument) | Asinh(argument) | Acosh(argument)
+        | Atanh(argument) | Sign(argument) | Heaviside(argument) | Cbrt(argument)
+        | Re(argument) | Im(argument) | Arg(argument) | Conj(argument) | Erf(argument)
+        | Erfc(argument) | Gamma(argument) | LnGamma(argument) | Digamma(argument)
+        | Trigamma(argument) => has_potential_rect_domain_error_inner(argument, intervals),
+        Add(left, right)
+        | Sub(left, right)
+        | Mul(left, right)
+        | Pow(left, right)
+        | Atan2(left, right)
+        | Modulo(left, right)
+        | Min(left, right)
+        | Max(left, right)
+        | Beta(left, right)
+        | BesselJ(left, right)
+        | BesselY(left, right)
+        | BesselI(left, right)
+        | Lt(left, right)
+        | Gt(left, right)
+        | Le(left, right)
+        | Ge(left, right)
+        | Eq(left, right)
+        | Ne(left, right) => {
+            has_potential_rect_domain_error_inner(left, intervals)
+                || has_potential_rect_domain_error_inner(right, intervals)
+        }
+        Clamp(value, lo, hi) => {
+            has_potential_rect_domain_error_inner(value, intervals)
+                || has_potential_rect_domain_error_inner(lo, intervals)
+                || has_potential_rect_domain_error_inner(hi, intervals)
+        }
+        Sum(body, _, start, end) | Product(body, _, start, end) => {
+            has_potential_rect_domain_error_inner(body, intervals)
+                || has_potential_rect_domain_error_inner(start, intervals)
+                || has_potential_rect_domain_error_inner(end, intervals)
+        }
+        Piecewise(branches, default) => {
+            branches.iter().any(|(condition, value)| {
+                has_potential_rect_domain_error_inner(condition, intervals)
+                    || has_potential_rect_domain_error_inner(value, intervals)
+            }) || has_potential_rect_domain_error_inner(default, intervals)
+        }
+        Const(_) | Var(_) => false,
+    }
+}
+
+/// Wrapper de conveniencia para el caso 2D rectangular.
+pub fn has_potential_interval_domain_error_2d(
+    ast: &Expr,
+    x_var: &str,
+    x_lo: f64,
+    x_hi: f64,
+    y_var: &str,
+    y_lo: f64,
+    y_hi: f64,
+) -> bool {
+    let mut intervals = HashMap::new();
+    intervals.insert(x_var.to_string(), (x_lo, x_hi));
+    intervals.insert(y_var.to_string(), (y_lo, y_hi));
+    has_potential_rect_domain_error(ast, &intervals)
+}
+
+/// Wrapper de conveniencia para el caso 3D rectangular.
+#[allow(clippy::too_many_arguments)]
+pub fn has_potential_interval_domain_error_3d(
+    ast: &Expr,
+    x_var: &str,
+    x_lo: f64,
+    x_hi: f64,
+    y_var: &str,
+    y_lo: f64,
+    y_hi: f64,
+    z_var: &str,
+    z_lo: f64,
+    z_hi: f64,
+) -> bool {
+    let mut intervals = HashMap::new();
+    intervals.insert(x_var.to_string(), (x_lo, x_hi));
+    intervals.insert(y_var.to_string(), (y_lo, y_hi));
+    intervals.insert(z_var.to_string(), (z_lo, z_hi));
+    has_potential_rect_domain_error(ast, &intervals)
+}
+
+/// Límite finito de `expr` cuando `var → at`.
+///
+/// La estimación usa extrapolación bilateral de Richardson. Un valor finito
+/// siempre informa una estimación de error; la falta de coincidencia lateral
+/// no se codifica como un mensaje de éxito.
+pub fn limit_typed(expr: &str, var: &str, at: f64) -> MathResult<f64> {
+    if !at.is_finite() {
+        return MathResult::Unsupported(MathError::NonFiniteLimitPoint {
+            expression: expr.into(),
+            variable: var.into(),
+            at,
+        });
+    }
+    let ast = match parse_math_expression(expr, MathOperation::Limit) {
+        Ok(ast) => ast,
+        Err(error) => return math_failure(error),
+    };
+    limit_typed_ast(&ast, var, at, expr)
+}
+
+/// Variante de [`limit_typed`] sobre un AST ya construido (sin re-parsear).
+/// `expr_label` solo alimenta los mensajes de error (el valor no depende
+/// de él). La usa el loop L'Hôpital de Gruntz, que deriva cocientes como
+/// AST y antes los serializaba a texto por iteración para re-parsearlos.
+pub fn limit_typed_ast(ast: &Expr, var: &str, at: f64, expr_label: &str) -> MathResult<f64> {
+    if has_proven_squeezed_zero_limit(ast, var, at) {
+        return MathResult::Approximate {
+            value: 0.0,
+            error_estimate: 0.0,
+        };
+    }
+    if has_unresolved_oscillatory_singularity(ast, var, at) {
+        return MathResult::DomainError(MathError::LimitDoesNotExist {
+            expression: expr_label.into(),
+            variable: var.into(),
+            at,
+        });
+    }
+    match richardson_limit(ast, var, at) {
+        Some(estimate) => MathResult::Approximate {
+            value: estimate.value,
+            error_estimate: estimate.error_estimate,
+        },
+        None => MathResult::DomainError(MathError::LimitDoesNotExist {
+            expression: expr_label.into(),
+            variable: var.into(),
+            at,
+        }),
+    }
+}
+
+/// Adaptador compatible de [`limit_typed`] para consumidores que esperan un
+/// mensaje legible. La inexistencia del límite conserva el texto histórico.
+pub fn limit(expr: &str, var: &str, at: f64) -> Result<String, String> {
+    match limit_typed(expr, var, at) {
+        MathResult::Exact(value) | MathResult::Approximate { value, .. } => {
+            Ok(format!("lim({var}\u{2192}{at}) {expr} = {value:.8}"))
+        }
+        MathResult::DomainError(MathError::LimitDoesNotExist { .. }) => Ok(format!(
+            "lim({var}\u{2192}{at}) {expr} = no existe (o es \u{221e})"
+        )),
+        result => Err(legacy_error(result)),
+    }
+}
+
+/// Límite lateral por la derecha (`var → at⁺`).
+///
+/// Usa extrapolación de Richardson unilateral. Si el límite no converge o
+/// diverge, devuelve `LimitDoesNotExist`. Los presupuestos y validaciones
+/// son idénticos a [`limit_typed`].
+pub fn limit_above_typed(expr: &str, var: &str, at: f64) -> MathResult<f64> {
+    if !at.is_finite() {
+        return MathResult::Unsupported(MathError::NonFiniteLimitPoint {
+            expression: expr.into(),
+            variable: var.into(),
+            at,
+        });
+    }
+    let ast = match parse_math_expression(expr, MathOperation::Limit) {
+        Ok(ast) => ast,
+        Err(error) => return math_failure(error),
+    };
+    limit_above_typed_ast(&ast, var, at, expr)
+}
+
+/// Variante de [`limit_above_typed`] sobre AST ya construido (ver
+/// [`limit_typed_ast`]).
+pub fn limit_above_typed_ast(ast: &Expr, var: &str, at: f64, expr_label: &str) -> MathResult<f64> {
+    if has_proven_squeezed_zero_limit(ast, var, at) {
+        return MathResult::Approximate {
+            value: 0.0,
+            error_estimate: 0.0,
+        };
+    }
+    if has_unresolved_oscillatory_singularity(ast, var, at) {
+        return MathResult::DomainError(MathError::LimitDoesNotExist {
+            expression: expr_label.into(),
+            variable: var.into(),
+            at,
+        });
+    }
+    match richardson_one_side_limit(ast, var, at, 1.0) {
+        Some(estimate) => MathResult::Approximate {
+            value: estimate.value,
+            error_estimate: estimate.error_estimate,
+        },
+        None => MathResult::DomainError(MathError::LimitDoesNotExist {
+            expression: expr_label.into(),
+            variable: var.into(),
+            at,
+        }),
+    }
+}
+
+/// Límite lateral por la izquierda (`var → at⁻`).
+pub fn limit_below_typed(expr: &str, var: &str, at: f64) -> MathResult<f64> {
+    if !at.is_finite() {
+        return MathResult::Unsupported(MathError::NonFiniteLimitPoint {
+            expression: expr.into(),
+            variable: var.into(),
+            at,
+        });
+    }
+    let ast = match parse_math_expression(expr, MathOperation::Limit) {
+        Ok(ast) => ast,
+        Err(error) => return math_failure(error),
+    };
+    limit_below_typed_ast(&ast, var, at, expr)
+}
+
+/// Variante de [`limit_below_typed`] sobre AST ya construido (ver
+/// [`limit_typed_ast`]).
+pub fn limit_below_typed_ast(ast: &Expr, var: &str, at: f64, expr_label: &str) -> MathResult<f64> {
+    if has_proven_squeezed_zero_limit(ast, var, at) {
+        return MathResult::Approximate {
+            value: 0.0,
+            error_estimate: 0.0,
+        };
+    }
+    if has_unresolved_oscillatory_singularity(ast, var, at) {
+        return MathResult::DomainError(MathError::LimitDoesNotExist {
+            expression: expr_label.into(),
+            variable: var.into(),
+            at,
+        });
+    }
+    match richardson_one_side_limit(ast, var, at, -1.0) {
+        Some(estimate) => MathResult::Approximate {
+            value: estimate.value,
+            error_estimate: estimate.error_estimate,
+        },
+        None => MathResult::DomainError(MathError::LimitDoesNotExist {
+            expression: expr_label.into(),
+            variable: var.into(),
+            at,
+        }),
+    }
+}
+
+/// Adaptador para `LimitAbove` con mensaje legible.
+pub fn limit_above(expr: &str, var: &str, at: f64) -> Result<String, String> {
+    match limit_above_typed(expr, var, at) {
+        MathResult::Exact(value) | MathResult::Approximate { value, .. } => {
+            Ok(format!("lim({var}→{at}⁺) {expr} = {value:.8}"))
+        }
+        MathResult::DomainError(MathError::LimitDoesNotExist { .. }) => {
+            Ok(format!("lim({var}→{at}⁺) {expr} = no existe (o es ∞)"))
+        }
+        result => Err(legacy_error(result)),
+    }
+}
+
+/// Adaptador para `LimitBelow` con mensaje legible.
+pub fn limit_below(expr: &str, var: &str, at: f64) -> Result<String, String> {
+    match limit_below_typed(expr, var, at) {
+        MathResult::Exact(value) | MathResult::Approximate { value, .. } => {
+            Ok(format!("lim({var}→{at}⁻) {expr} = {value:.8}"))
+        }
+        MathResult::DomainError(MathError::LimitDoesNotExist { .. }) => {
+            Ok(format!("lim({var}→{at}⁻) {expr} = no existe (o es ∞)"))
+        }
+        result => Err(legacy_error(result)),
+    }
+}
+
+/// Derivada paramétrica `dy/dx = (dy/dt)/(dx/dt)`.
+///
+/// Recibe las componentes `x(t)`, `y(t)` simbólicas y la variable `var` (por
+/// ejemplo `"t"`). Si ambas derivadas son calculables simbólicamente, devuelve
+/// la expresión simplificada de `dy/dx`. Si `dx/dt` es idénticamente cero,
+/// informa `DerivativeUnavailable` sin pánico. Mantiene presupuestos y no usa
+/// `unwrap`.
+pub fn parametric_derivative_typed(x_expr: &str, y_expr: &str, var: &str) -> MathResult<String> {
+    if x_expr.len() > MAX_MATH_INPUT_BYTES || y_expr.len() > MAX_MATH_INPUT_BYTES {
+        let provided = x_expr.len().max(y_expr.len());
+        return MathResult::ResourceLimit(MathError::InputTooLarge {
+            operation: MathOperation::SymbolicDerivative,
+            provided_bytes: provided,
+            maximum_bytes: MAX_MATH_INPUT_BYTES,
+        });
+    }
+    if !is_math_identifier(var) {
+        return MathResult::DomainError(MathError::InvalidExpression {
+            operation: MathOperation::SymbolicDerivative,
+            expression: var.into(),
+            reason: "variable no es un identificador válido".into(),
+        });
+    }
+    let x_ast = match parse_math_expression(x_expr, MathOperation::SymbolicDerivative) {
+        Ok(ast) => ast,
+        Err(error) => return math_failure(error),
+    };
+    let y_ast = match parse_math_expression(y_expr, MathOperation::SymbolicDerivative) {
+        Ok(ast) => ast,
+        Err(error) => return math_failure(error),
+    };
+    let dx = simplify_expr(&diff_expr(&x_ast, var));
+    let dy = simplify_expr(&diff_expr(&y_ast, var));
+    // Detectar fallo de profundidad (Const(NaN) es marcador interno).
+    if matches!(dx, Expr::Const(v) if v.is_nan()) || matches!(dy, Expr::Const(v) if v.is_nan()) {
+        return MathResult::NotConverged(MathError::RecursionLimit {
+            operation: MathOperation::SymbolicDerivative,
+            lower: 0.0,
+            upper: 0.0,
+            max_depth: 256,
+            tolerance: 0.0,
+            error_estimate: f64::NAN,
+        });
+    }
+    if is_identically_zero(&dx) {
+        return MathResult::DomainError(MathError::DerivativeUnavailable {
+            expression: format!("x(t)={x_expr}, y(t)={y_expr}"),
+            variable: var.into(),
+            reason: "dx/dt es cero, derivada paramétrica no definida (tangente vertical)".into(),
+        });
+    }
+    // Si dx es una constante cero aproximada, también rechazar.
+    if let Some(value) = constant_scalar_value(&dx) {
+        if value == 0.0 {
+            return MathResult::DomainError(MathError::DerivativeUnavailable {
+                expression: format!("x(t)={x_expr}, y(t)={y_expr}"),
+                variable: var.into(),
+                reason: "dx/dt es cero".into(),
+            });
+        }
+    }
+    let result = Expr::Div(Box::new(dy), Box::new(dx));
+    let simplified = simplify_expr(&result);
+    let output = simplified.to_expr_string();
+    if output.len() > MAX_MATH_INPUT_BYTES {
+        return MathResult::ResourceLimit(MathError::InputTooLarge {
+            operation: MathOperation::SymbolicDerivative,
+            provided_bytes: output.len(),
+            maximum_bytes: MAX_MATH_INPUT_BYTES,
+        });
+    }
+    MathResult::Exact(output)
+}
+
+/// Adaptador compatible de [`parametric_derivative_typed`].
+pub fn parametric_derivative(x_expr: &str, y_expr: &str, var: &str) -> Result<String, String> {
+    adapt_symbolic_result(parametric_derivative_typed(x_expr, y_expr, var))
+}
+
+/// Asíntota oblicua/horizontal de `f(var)`.
+///
+/// Calcula `m = lim_{var→±∞} f/var` y `b = lim_{var→±∞} f - m·var` por
+/// muestreo numérico en escalas crecientes. Si ambos límites convergen
+/// devuelve `"y = m*x + b"` (o `"y = b"` si `m≈0`). Si no converge,
+/// devuelve `LimitDoesNotExist` o `Unsupported`. No usa `unwrap` y respeta
+/// presupuestos de entrada.
+/// Estimador genérico para límites en infinito: convergencia dentro de `1e-7+1e-6·scale`.
+/// Extraído de `asymptote_typed:estimate_limit` para reuso en `limit_infinite_typed`.
+fn estimate_limit_values(values: &[f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let last = *values.last()?;
+    if !last.is_finite() {
+        return None;
+    }
+    let scale = values.iter().map(|v| v.abs()).fold(1.0_f64, f64::max);
+    let tol = 1e-7 + 1e-6 * scale;
+    if values
+        .iter()
+        .all(|v| v.is_finite() && (v - last).abs() <= tol)
+    {
+        Some(last)
+    } else {
+        None
+    }
+}
+
+/// Cálculo de pendiente y ordenada al origen para asíntota vía muestreo secante.
+/// Extraído de `asymptote_typed:try_direction` para reuso.
+fn try_asymptote_direction(ast: &Expr, var: &str, direction: f64) -> Option<(f64, f64)> {
+    const SCALES: [f64; 4] = [1e6, 1e8, 1e10, 1e12];
+    let mut xs = Vec::with_capacity(SCALES.len());
+    let mut ys = Vec::with_capacity(SCALES.len());
+    for &scale in &SCALES {
+        let x = direction * scale;
+        let fx = ast.eval_at(var, x);
+        if !fx.is_finite() || !x.is_finite() || x == 0.0 {
+            return None;
+        }
+        xs.push(x);
+        ys.push(fx);
+    }
+    let mut m_vals = Vec::with_capacity(SCALES.len() - 1);
+    for i in 0..xs.len() - 1 {
+        let dx = xs[i + 1] - xs[i];
+        let dy = ys[i + 1] - ys[i];
+        if dx == 0.0 || !dx.is_finite() || !dy.is_finite() {
+            return None;
+        }
+        let m = dy / dx;
+        if !m.is_finite() {
+            return None;
+        }
+        m_vals.push(m);
+    }
+    let m = estimate_limit_values(&m_vals)?;
+    let mut b_vals = Vec::with_capacity(xs.len());
+    for (&x, &y) in xs.iter().zip(ys.iter()) {
+        let b = y - m * x;
+        if !b.is_finite() {
+            return None;
+        }
+        b_vals.push(b);
+    }
+    // Usa cola de 3 para b: el primer punto 1e6 puede estar 3e-6 lejos y exceder tol 2.1e-6,
+    // pero la cola 1e8..1e12 ya converge (2.97e-08 < tol). Sin esto (2*x+1)/(x-1) fallaría.
+    let b = if b_vals.len() >= 3 {
+        estimate_limit_values(&b_vals[b_vals.len() - 3..])
+            .or_else(|| estimate_limit_values(&b_vals))?
+    } else {
+        estimate_limit_values(&b_vals)?
+    };
+    Some((m, b))
+}
+
+pub fn asymptote_typed(expr: &str, var: &str) -> MathResult<String> {
+    if !is_math_identifier(var) {
+        return MathResult::DomainError(MathError::InvalidExpression {
+            operation: MathOperation::Limit,
+            expression: var.into(),
+            reason: "variable no es un identificador válido".into(),
+        });
+    }
+    let ast = match parse_math_expression(expr, MathOperation::Limit) {
+        Ok(ast) => ast,
+        Err(error) => return math_failure(error),
+    };
+
+    let pos = try_asymptote_direction(&ast, var, 1.0);
+    let neg = try_asymptote_direction(&ast, var, -1.0);
+
+    let format_asymptote = |m: f64, b: f64| -> String {
+        const EPS: f64 = 1e-9;
+        if m.abs() < EPS {
+            format!("y = {b:.6}")
+        } else if b.abs() < EPS {
+            format!("y = {m:.6}*{var}")
+        } else if b > 0.0 {
+            format!("y = {m:.6}*{var} + {b:.6}")
+        } else {
+            format!("y = {m:.6}*{var} - {:.6}", b.abs())
+        }
+    };
+
+    match (pos, neg) {
+        (Some((m_pos, b_pos)), Some((m_neg, b_neg))) => {
+            let same_m = (m_pos - m_neg).abs() <= 1e-6 * m_pos.abs().max(m_neg.abs()).max(1.0);
+            let same_b = (b_pos - b_neg).abs() <= 1e-6 * b_pos.abs().max(b_neg.abs()).max(1.0);
+            if same_m && same_b {
+                MathResult::Exact(format_asymptote(m_pos, b_pos))
+            } else {
+                MathResult::Exact(format!(
+                    "y = {} (x→+∞), y = {} (x→-∞)",
+                    format_asymptote(m_pos, b_pos),
+                    format_asymptote(m_neg, b_neg)
+                ))
+            }
+        }
+        (Some((m, b)), None) | (None, Some((m, b))) => MathResult::Exact(format_asymptote(m, b)),
+        (None, None) => MathResult::DomainError(MathError::LimitDoesNotExist {
+            expression: expr.into(),
+            variable: var.into(),
+            at: f64::INFINITY,
+        }),
+    }
+}
+
+/// Adaptador compatible de [`asymptote_typed`].
+pub fn asymptote(expr: &str, var: &str) -> Result<String, String> {
+    adapt_symbolic_result(asymptote_typed(expr, var))
+}
+
+// ---------------------------------------------------------------------------
+// Límites en ±∞ genéricos: extrae estimate_limit/try_direction de asymptote
+// y añade sustitución t=1/x + detección de oscilatorios.
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::match_like_matches_macro)]
+fn is_bounded_expr(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Const(_)
+            | Expr::Sin(_)
+            | Expr::Cos(_)
+            | Expr::Atan(_)
+            | Expr::Atanh(_)
+            | Expr::Tanh(_)
+            | Expr::Asin(_)
+            | Expr::Acos(_)
+    )
+}
+
+fn contains_unbounded_oscillatory(expr: &Expr, var: &str) -> bool {
+    use Expr::*;
+    match expr {
+        Sin(arg) | Cos(arg) | Tan(arg) | Sec(arg) | Csc(arg) | Cot(arg) => {
+            if contains_var(arg, var) {
+                return true;
+            }
+            contains_unbounded_oscillatory(arg, var)
+        }
+        Neg(inner) | Asin(inner) | Acos(inner) | Atan(inner) | Exp(inner) | Ln(inner)
+        | Log(inner) | Sqrt(inner) | Abs(inner) | Sinh(inner) | Cosh(inner) | Tanh(inner)
+        | Asinh(inner) | Acosh(inner) | Atanh(inner) | Cbrt(inner) | Re(inner) | Im(inner)
+        | Arg(inner) | Conj(inner) | Erf(inner) | Erfc(inner) | Gamma(inner) | LnGamma(inner)
+        | Digamma(inner) | Trigamma(inner) | Floor(inner) | Ceil(inner) | Round(inner)
+        | Sign(inner) | Heaviside(inner) => contains_unbounded_oscillatory(inner, var),
+        Add(left, right)
+        | Sub(left, right)
+        | Mul(left, right)
+        | Div(left, right)
+        | Pow(left, right)
+        | Atan2(left, right)
+        | Modulo(left, right)
+        | Min(left, right)
+        | Max(left, right)
+        | Beta(left, right)
+        | BesselJ(left, right)
+        | BesselY(left, right)
+        | BesselI(left, right)
+        | Lt(left, right)
+        | Gt(left, right)
+        | Le(left, right)
+        | Ge(left, right)
+        | Eq(left, right)
+        | Ne(left, right) => {
+            contains_unbounded_oscillatory(left, var) || contains_unbounded_oscillatory(right, var)
+        }
+        Clamp(v, lo, hi) => {
+            contains_unbounded_oscillatory(v, var)
+                || contains_unbounded_oscillatory(lo, var)
+                || contains_unbounded_oscillatory(hi, var)
+        }
+        Sum(body, _, s, e) | Product(body, _, s, e) => {
+            contains_unbounded_oscillatory(body, var)
+                || contains_unbounded_oscillatory(s, var)
+                || contains_unbounded_oscillatory(e, var)
+        }
+        Piecewise(branches, default) => {
+            branches.iter().any(|(c, v)| {
+                contains_unbounded_oscillatory(c, var) || contains_unbounded_oscillatory(v, var)
+            }) || contains_unbounded_oscillatory(default, var)
+        }
+        Const(_) | Var(_) => false,
+    }
+}
+
+fn has_proven_squeezed_zero_at_infinity(expr: &Expr, var: &str) -> bool {
+    if let Expr::Mul(left, right) = expr {
+        let left_bounded = is_bounded_expr(left) || contains_unbounded_oscillatory(left, var);
+        let right_bounded = is_bounded_expr(right) || contains_unbounded_oscillatory(right, var);
+        let left_zero = sample_tends_to_zero(left, var);
+        let right_zero = sample_tends_to_zero(right, var);
+        if (left_bounded && right_zero) || (right_bounded && left_zero) {
+            return true;
+        }
+    }
+    if let Expr::Div(num, den) = expr {
+        let num_bounded = is_bounded_expr(num) || contains_unbounded_oscillatory(num, var);
+        if num_bounded && matches!(den.as_ref(), Expr::Var(name) if name == var) {
+            return true;
+        }
+        if num_bounded && expr_is_linear_in(den, var) {
+            if let Some((a, _)) = expr_linear_coeff(den, var) {
+                if a.abs() > 1e-12 {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn sample_tends_to_zero(expr: &Expr, var: &str) -> bool {
+    const SCALES: [f64; 4] = [1e6, 1e8, 1e10, 1e12];
+    let mut vals = Vec::with_capacity(SCALES.len());
+    for &s in &SCALES {
+        let v = expr.eval_at(var, s);
+        if !v.is_finite() {
+            return false;
+        }
+        vals.push(v.abs());
+    }
+    let last = *vals.last().unwrap_or(&f64::INFINITY);
+    last < 1e-6 && vals.windows(2).all(|w| w[1] <= w[0] * 0.6)
+}
+
+fn sample_limit_at_infinity(ast: &Expr, var: &str, direction: f64) -> Option<LimitEstimate> {
+    const SCALES: [f64; 4] = [1e6, 1e8, 1e10, 1e12];
+    let mut values = Vec::with_capacity(SCALES.len());
+    for &scale in &SCALES {
+        let x = direction * scale;
+        let fx = ast.eval_at(var, x);
+        if !fx.is_finite() {
+            return None;
+        }
+        values.push(fx);
+    }
+    let limit = estimate_limit_values(&values)?;
+    let scale = values.iter().map(|v| v.abs()).fold(1.0_f64, f64::max);
+    let spread = values
+        .iter()
+        .map(|v| (v - limit).abs())
+        .fold(0.0_f64, f64::max);
+    let error = spread.max(1e-9 + 1e-6 * scale);
+    if !limit.is_finite() || !error.is_finite() {
+        return None;
+    }
+    Some(LimitEstimate {
+        value: limit,
+        error_estimate: error,
+    })
+}
+
+fn estimate_via_substitution(ast: &Expr, var: &str, direction: f64) -> Option<LimitEstimate> {
+    const T_SCALES: [f64; 6] = [1e-2, 1e-3, 1e-4, 1e-6, 1e-8, 1e-10];
+    let mut values = Vec::with_capacity(T_SCALES.len());
+    for &t in &T_SCALES {
+        if t == 0.0 || !t.is_finite() {
+            return None;
+        }
+        let x = direction / t;
+        if !x.is_finite() {
+            return None;
+        }
+        let fx = ast.eval_at(var, x);
+        if !fx.is_finite() {
+            return None;
+        }
+        values.push(fx);
+    }
+    let tail = &values[values.len() - 3..];
+    let limit = estimate_limit_values(tail)?;
+    let scale = tail.iter().map(|v| v.abs()).fold(1.0_f64, f64::max);
+    let spread = tail
+        .iter()
+        .map(|v| (v - limit).abs())
+        .fold(0.0_f64, f64::max);
+    let error = spread.max(1e-9 + 1e-6 * scale);
+    (limit.is_finite() && error.is_finite() && error <= limit_tolerance(limit)).then_some(
+        LimitEstimate {
+            value: limit,
+            error_estimate: error,
+        },
+    )
+}
+
+fn has_unresolved_oscillatory_at_infinity(expr: &Expr, var: &str) -> bool {
+    if has_proven_squeezed_zero_at_infinity(expr, var) {
+        return false;
+    }
+    contains_unbounded_oscillatory(expr, var)
+}
+
+/// Límite genérico en ±∞ vía muestreo y sustitución t=1/x.
+///
+/// Calcula `lim_{var→±∞} f(var)` con `m = lim f/x` y `b = lim f−m·x` implícitos
+/// en la estimación por muestreo secante heredada de `asymptote`. Si la función
+/// es oscilatoria no amortiguada, devuelve `DomainError(LimitDoesNotExist)`.
+/// La sustitución `t=1/x` se usa como segundo intento (Richardson en t→0).
+pub fn limit_infinite_typed(expr: &str, var: &str, positive: bool) -> MathResult<f64> {
+    if expr.len() > MAX_MATH_INPUT_BYTES {
+        return MathResult::ResourceLimit(MathError::InputTooLarge {
+            operation: MathOperation::Limit,
+            provided_bytes: expr.len(),
+            maximum_bytes: MAX_MATH_INPUT_BYTES,
+        });
+    }
+    if !is_math_identifier(var) {
+        return MathResult::DomainError(MathError::InvalidExpression {
+            operation: MathOperation::Limit,
+            expression: var.into(),
+            reason: "variable no es un identificador válido".into(),
+        });
+    }
+    let ast = match parse_math_expression(expr, MathOperation::Limit) {
+        Ok(ast) => ast,
+        Err(error) => return math_failure(error),
+    };
+    let direction = if positive { 1.0 } else { -1.0 };
+    let at = if positive {
+        f64::INFINITY
+    } else {
+        f64::NEG_INFINITY
+    };
+
+    if has_proven_squeezed_zero_at_infinity(&ast, var) {
+        return MathResult::Approximate {
+            value: 0.0,
+            error_estimate: 0.0,
+        };
+    }
+    if has_unresolved_oscillatory_at_infinity(&ast, var) {
+        return MathResult::DomainError(MathError::LimitDoesNotExist {
+            expression: expr.into(),
+            variable: var.into(),
+            at,
+        });
+    }
+
+    if let Some(est) = sample_limit_at_infinity(&ast, var, direction) {
+        return MathResult::Approximate {
+            value: est.value,
+            error_estimate: est.error_estimate,
+        };
+    }
+    if let Some(est) = estimate_via_substitution(&ast, var, direction) {
+        return MathResult::Approximate {
+            value: est.value,
+            error_estimate: est.error_estimate,
+        };
+    }
+    if let Some((m, b)) = try_asymptote_direction(&ast, var, direction) {
+        if m.abs() > 1e-12 {
+            return MathResult::DomainError(MathError::LimitDoesNotExist {
+                expression: expr.into(),
+                variable: var.into(),
+                at,
+            });
+        }
+        return MathResult::Approximate {
+            value: b,
+            error_estimate: limit_tolerance(b),
+        };
+    }
+    MathResult::DomainError(MathError::LimitDoesNotExist {
+        expression: expr.into(),
+        variable: var.into(),
+        at,
+    })
+}
+
+/// Atajo para límite en +∞.
+pub fn limit_pos_infinity_typed(expr: &str, var: &str) -> MathResult<f64> {
+    limit_infinite_typed(expr, var, true)
+}
+
+/// Atajo para límite en −∞.
+pub fn limit_neg_infinity_typed(expr: &str, var: &str) -> MathResult<f64> {
+    limit_infinite_typed(expr, var, false)
+}
+
+/// Límite para factorización prima (1e12) — respeta MAX y evita explosión.
+const MAX_PRIME_FACTOR: u64 = 1_000_000_000_000;
+
+/// Convierte `a*x^2 + b*x + c` a `a*(x + b/(2a))^2 + (c - b^2/(4a))`.
+///
+/// Valida `MAX_MATH_INPUT_BYTES`, identificador y que sea cuadrático. No usa
+/// `unwrap` y respeta presupuestos de salida.
+pub fn complete_square_typed(expr: &str, var: &str) -> MathResult<String> {
+    if expr.len() > MAX_MATH_INPUT_BYTES {
+        return MathResult::ResourceLimit(MathError::InputTooLarge {
+            operation: MathOperation::SymbolicDerivative,
+            provided_bytes: expr.len(),
+            maximum_bytes: MAX_MATH_INPUT_BYTES,
+        });
+    }
+    if !is_math_identifier(var) {
+        return MathResult::DomainError(MathError::InvalidExpression {
+            operation: MathOperation::SymbolicDerivative,
+            expression: var.into(),
+            reason: "variable no es un identificador válido".into(),
+        });
+    }
+    let ast = match parse_math_expression(expr, MathOperation::SymbolicDerivative) {
+        Ok(ast) => ast,
+        Err(error) => return math_failure(error),
+    };
+    let Some(coeffs) = collect_polynomial_coeffs(&ast, var, 2) else {
+        return MathResult::DomainError(MathError::InvalidExpression {
+            operation: MathOperation::SymbolicDerivative,
+            expression: expr.into(),
+            reason: "no es polinomio cuadrático en la variable indicada".into(),
+        });
+    };
+    if coeffs.iter().any(|c| !c.is_finite()) {
+        return MathResult::DomainError(MathError::InvalidExpression {
+            operation: MathOperation::SymbolicDerivative,
+            expression: expr.into(),
+            reason: "coeficientes no finitos".into(),
+        });
+    }
+    let a = coeffs[2];
+    let b = coeffs[1];
+    let c = coeffs[0];
+    if a == 0.0 || !a.is_finite() {
+        return MathResult::DomainError(MathError::InvalidExpression {
+            operation: MathOperation::SymbolicDerivative,
+            expression: expr.into(),
+            reason: "el coeficiente cuadrático es cero, no es grado 2".into(),
+        });
+    }
+    if !b.is_finite() || !c.is_finite() {
+        return MathResult::DomainError(MathError::InvalidExpression {
+            operation: MathOperation::SymbolicDerivative,
+            expression: expr.into(),
+            reason: "coeficientes no finitos".into(),
+        });
+    }
+    let two_a = 2.0 * a;
+    let four_a = 4.0 * a;
+    if two_a == 0.0 || four_a == 0.0 || !two_a.is_finite() || !four_a.is_finite() {
+        return MathResult::DomainError(MathError::InvalidExpression {
+            operation: MathOperation::SymbolicDerivative,
+            expression: expr.into(),
+            reason: "división por cero en completar cuadrado".into(),
+        });
+    }
+    let h = b / two_a;
+    let k = c - b * b / four_a;
+    if !h.is_finite() || !k.is_finite() {
+        return MathResult::DomainError(MathError::InvalidExpression {
+            operation: MathOperation::SymbolicDerivative,
+            expression: expr.into(),
+            reason: "resultado no finito al completar cuadrado".into(),
+        });
+    }
+    // Normaliza -0.0 a 0.0
+    let h = if h == 0.0 { 0.0 } else { h };
+    let k = if k == 0.0 { 0.0 } else { k };
+    let a_norm = if a == 0.0 { 0.0 } else { a };
+    // Construcción con manejo de signos
+    let fmt = |v: f64| {
+        if v == 0.0 {
+            "0".to_string()
+        } else {
+            // Evita -0
+            let v = if v == 0.0 { 0.0 } else { v };
+            v.to_string()
+        }
+    };
+    let inner = if h == 0.0 {
+        format!("({var})")
+    } else if h > 0.0 {
+        format!("({var} + {})", fmt(h))
+    } else {
+        format!("({var} - {})", fmt(-h))
+    };
+    let inner_sq = format!("{inner}^2");
+    let a_part = if a_norm == 1.0 {
+        inner_sq
+    } else if a_norm == -1.0 {
+        format!("-{inner_sq}")
+    } else {
+        format!("{}*{inner_sq}", fmt(a_norm))
+    };
+    let output = if k == 0.0 {
+        a_part
+    } else if k > 0.0 {
+        format!("{a_part} + {}", fmt(k))
+    } else {
+        format!("{a_part} - {}", fmt(-k))
+    };
+    if output.len() > MAX_MATH_INPUT_BYTES {
+        return MathResult::ResourceLimit(MathError::InputTooLarge {
+            operation: MathOperation::SymbolicDerivative,
+            provided_bytes: output.len(),
+            maximum_bytes: MAX_MATH_INPUT_BYTES,
+        });
+    }
+    MathResult::Exact(output)
+}
+
+/// Adaptador de `CompleteSquare` para consumidores de texto.
+pub fn complete_square(expr: &str, var: &str) -> Result<String, String> {
+    adapt_symbolic_result(complete_square_typed(expr, var))
+}
+
+/// Factorización prima por trial division hasta sqrt.
+///
+/// Respeta `n <= 1e12` y `MAX_MATH_INPUT_BYTES`, sin `unwrap`. Devuelve
+/// cadena tipo "2^2 * 3 * 5".
+pub fn prime_factors_typed(n_str: &str) -> MathResult<String> {
+    if n_str.len() > MAX_MATH_INPUT_BYTES {
+        return MathResult::ResourceLimit(MathError::InputTooLarge {
+            operation: MathOperation::SymbolicDerivative,
+            provided_bytes: n_str.len(),
+            maximum_bytes: MAX_MATH_INPUT_BYTES,
+        });
+    }
+    let trimmed = n_str.trim();
+    if trimmed.is_empty() {
+        return MathResult::DomainError(MathError::InvalidExpression {
+            operation: MathOperation::SymbolicDerivative,
+            expression: n_str.into(),
+            reason: "entrada vacía para PrimeFactors".into(),
+        });
+    }
+    // Intenta parseo entero directo, si falla intenta evaluación numérica
+    let mut parsed: Option<i128> = trimmed.replace(' ', "").parse::<i128>().ok();
+    if parsed.is_none() {
+        if let Ok(val) = crate::expr::evaluate(trimmed, &[]) {
+            if val.is_finite() && val.fract() == 0.0 && val.abs() <= MAX_PRIME_FACTOR as f64 * 2.0 {
+                let as_i128 = val as i128;
+                if (as_i128 as f64) == val {
+                    parsed = Some(as_i128);
+                }
+            }
+        }
+    }
+    let Some(n_raw) = parsed else {
+        return MathResult::DomainError(MathError::InvalidExpression {
+            operation: MathOperation::SymbolicDerivative,
+            expression: n_str.into(),
+            reason: "no se pudo interpretar como entero".into(),
+        });
+    };
+    if n_raw == 0 {
+        return MathResult::DomainError(MathError::InvalidExpression {
+            operation: MathOperation::SymbolicDerivative,
+            expression: n_str.into(),
+            reason: "no se puede factorizar 0".into(),
+        });
+    }
+    if n_raw == 1 || n_raw == -1 {
+        return MathResult::Exact("1".to_string());
+    }
+    let negative = n_raw < 0;
+    let n_abs_u128 = n_raw.unsigned_abs();
+    if n_abs_u128 > MAX_PRIME_FACTOR as u128 {
+        return MathResult::ResourceLimit(MathError::InputTooLarge {
+            operation: MathOperation::SymbolicDerivative,
+            provided_bytes: n_abs_u128.to_string().len(),
+            maximum_bytes: MAX_PRIME_FACTOR.to_string().len(),
+        });
+    }
+    let n_abs = n_abs_u128 as u64;
+    let factors = prime_factors_u64(n_abs);
+    if factors.is_empty() {
+        return MathResult::Exact(n_abs.to_string());
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for (prime, exp) in factors {
+        if exp == 1 {
+            parts.push(prime.to_string());
+        } else {
+            parts.push(format!("{prime}^{exp}"));
+        }
+    }
+    let mut out = parts.join(" * ");
+    if negative {
+        out = format!("-1 * {out}");
+    }
+    if out.len() > MAX_MATH_INPUT_BYTES {
+        return MathResult::ResourceLimit(MathError::InputTooLarge {
+            operation: MathOperation::SymbolicDerivative,
+            provided_bytes: out.len(),
+            maximum_bytes: MAX_MATH_INPUT_BYTES,
+        });
+    }
+    MathResult::Exact(out)
+}
+
+/// Adaptador de `PrimeFactors` para consumidores de texto.
+pub fn prime_factors(n_str: &str) -> Result<String, String> {
+    adapt_symbolic_result(prime_factors_typed(n_str))
+}
+
+fn prime_factors_u64(mut n: u64) -> Vec<(u64, u32)> {
+    let mut factors: Vec<(u64, u32)> = Vec::new();
+    if n < 2 {
+        return factors;
+    }
+    let mut count = 0u32;
+    while n.is_multiple_of(2) {
+        n /= 2;
+        count += 1;
+    }
+    if count > 0 {
+        factors.push((2, count));
+    }
+    let mut p: u64 = 3;
+    while p * p <= n {
+        if n.is_multiple_of(p) {
+            let mut c = 0u32;
+            while n.is_multiple_of(p) {
+                n /= p;
+                c += 1;
+            }
+            factors.push((p, c));
+        }
+        p += 2;
+        // Evita bucle infinito para n grande: p*p puede desbordar u64, pero n <=1e12 así que p <=1e6
+        if p > 1_000_000 && n > 1 {
+            break;
+        }
+    }
+    if n > 1 {
+        factors.push((n, 1));
+    }
+    factors
+}
+
+/// Factorización entera: si `expr` es entero delega a `PrimeFactors`, si es
+/// polinomio extrae contenido entero (gcd) y lo factoriza con `PrimeFactors`.
+///
+/// Reusa `PrimeFactors` para coeficientes como pide la tarea.
+pub fn ifactor_typed(expr: &str, var: &str) -> MathResult<String> {
+    if expr.len() > MAX_MATH_INPUT_BYTES {
+        return MathResult::ResourceLimit(MathError::InputTooLarge {
+            operation: MathOperation::SymbolicDerivative,
+            provided_bytes: expr.len(),
+            maximum_bytes: MAX_MATH_INPUT_BYTES,
+        });
+    }
+    let var = if var.trim().is_empty() {
+        "x"
+    } else {
+        var.trim()
+    };
+    if !is_math_identifier(var) {
+        return MathResult::DomainError(MathError::InvalidExpression {
+            operation: MathOperation::SymbolicDerivative,
+            expression: var.into(),
+            reason: "variable no es un identificador válido".into(),
+        });
+    }
+    let trimmed = expr.trim();
+    if trimmed.is_empty() {
+        return MathResult::DomainError(MathError::InvalidExpression {
+            operation: MathOperation::SymbolicDerivative,
+            expression: expr.into(),
+            reason: "expresión vacía para IFactor".into(),
+        });
+    }
+    // Caso entero puro: delega directamente
+    let direct_int = trimmed.replace(' ', "").parse::<i128>().ok();
+    if let Some(n) = direct_int {
+        if n.unsigned_abs() <= MAX_PRIME_FACTOR as u128 && n != 0 {
+            return prime_factors_typed(&n.to_string());
+        }
+    }
+    // Intenta evaluación numérica entera (ej. "2*30")
+    if let Ok(val) = crate::expr::evaluate(trimmed, &[]) {
+        if val.is_finite() && val.fract() == 0.0 && val.abs() <= MAX_PRIME_FACTOR as f64 {
+            let as_i128 = val as i128;
+            if (as_i128 as f64) == val && as_i128 != 0 {
+                return prime_factors_typed(&as_i128.to_string());
+            }
+        }
+    }
+    // Caso polinómico: intenta extraer coeficientes enteros
+    let ast = match parse_math_expression(expr, MathOperation::SymbolicDerivative) {
+        Ok(ast) => ast,
+        Err(error) => return math_failure(error),
+    };
+    if let Some(coeffs) = collect_polynomial_coeffs(&ast, var, 20) {
+        // Verifica que todos los coeficientes sean finitos y enteros (con tolerancia)
+        let mut int_coeffs: Vec<i128> = Vec::new();
+        let mut all_integer = true;
+        for &c in &coeffs {
+            if !c.is_finite() {
+                all_integer = false;
+                break;
+            }
+            // Tolerancia para f64 entero
+            let rounded = c.round();
+            if (c - rounded).abs() > 1e-9 {
+                all_integer = false;
+                break;
+            }
+            if rounded.abs() > MAX_PRIME_FACTOR as f64 {
+                all_integer = false;
+                break;
+            }
+            int_coeffs.push(rounded as i128);
+        }
+        if all_integer && !int_coeffs.is_empty() {
+            // Calcula gcd del contenido (valor absoluto, ignora ceros)
+            let mut gcd_val: i128 = 0;
+            for &ic in &int_coeffs {
+                let av = ic.abs();
+                if av == 0 {
+                    continue;
+                }
+                if gcd_val == 0 {
+                    gcd_val = av;
+                } else {
+                    gcd_val = gcd_i128(gcd_val, av);
+                }
+            }
+            if gcd_val > 1 {
+                // Factoriza gcd con PrimeFactors y muestra contenido
+                let gcd_factors = match prime_factors_typed(&gcd_val.to_string()) {
+                    MathResult::Exact(s) => s,
+                    _ => gcd_val.to_string(),
+                };
+                // Construye polinomio primitivo dividiendo por gcd
+                let primitive_coeffs: Vec<f64> =
+                    coeffs.iter().map(|&c| c / gcd_val as f64).collect();
+                let prim_str = format_polynomial_from_coeffs(&primitive_coeffs, var);
+                // Intenta factorizar la parte primitiva con `factor`
+                let factored_prim = match factor(&prim_str, var) {
+                    Ok(s) => {
+                        // `factor` devuelve "x = ..." o "2 * (x+...)"? Para polinomio devuelve "a * (x ...)"?
+                        // Si es polinomio, factor devuelve "a * (x - r)..." ya formateado.
+                        // Extrae solo la parte de factores si contiene "="
+                        if s.contains('=') {
+                            s.split('=').next_back().unwrap_or(&s).trim().to_string()
+                        } else {
+                            s
+                        }
+                    }
+                    Err(_) => prim_str.clone(),
+                };
+                // Decide salida: si prim es "1" o "0" simplifica
+                let primitive_display_raw = if prim_str.trim() == "0" || prim_str.trim().is_empty()
+                {
+                    "0".to_string()
+                } else {
+                    factored_prim
+                };
+                // Limpia prefijo redundante "1 * " que produce `factor` para polinomios mónicos
+                let primitive_display = {
+                    let trimmed = primitive_display_raw.trim();
+                    if let Some(rest) = trimmed.strip_prefix("1 * ") {
+                        rest.trim_start().to_string()
+                    } else if let Some(rest) = trimmed.strip_prefix("1*") {
+                        rest.trim_start().to_string()
+                    } else {
+                        trimmed.to_string()
+                    }
+                };
+                let out = if primitive_display == "1" {
+                    gcd_factors
+                } else if primitive_display.trim() == "0" {
+                    "0".to_string()
+                } else {
+                    // Evita doble paréntesis si ya está parentizado
+                    let needs_wrap =
+                        !(primitive_display.starts_with('(') && primitive_display.ends_with(')'));
+                    if primitive_display.contains('+')
+                        || primitive_display.contains('-')
+                        || primitive_display.contains('*')
+                    {
+                        if needs_wrap {
+                            format!("{gcd_factors} * ({primitive_display})")
+                        } else {
+                            format!("{gcd_factors} * {primitive_display}")
+                        }
+                    } else {
+                        format!("{gcd_factors} * {primitive_display}")
+                    }
+                };
+                if out.len() > MAX_MATH_INPUT_BYTES {
+                    return MathResult::ResourceLimit(MathError::InputTooLarge {
+                        operation: MathOperation::SymbolicDerivative,
+                        provided_bytes: out.len(),
+                        maximum_bytes: MAX_MATH_INPUT_BYTES,
+                    });
+                }
+                return MathResult::Exact(out);
+            }
+        }
+    }
+    // Fallback: factorización polinómica normal
+    match factor(expr, var) {
+        Ok(f) => {
+            if f.len() > MAX_MATH_INPUT_BYTES {
+                return MathResult::ResourceLimit(MathError::InputTooLarge {
+                    operation: MathOperation::SymbolicDerivative,
+                    provided_bytes: f.len(),
+                    maximum_bytes: MAX_MATH_INPUT_BYTES,
+                });
+            }
+            MathResult::Exact(f)
+        }
+        Err(e) => MathResult::DomainError(MathError::InvalidExpression {
+            operation: MathOperation::SymbolicDerivative,
+            expression: expr.into(),
+            reason: e,
+        }),
+    }
+}
+
+/// Adaptador de `IFactor`.
+pub fn ifactor(expr: &str, var: &str) -> Result<String, String> {
+    adapt_symbolic_result(ifactor_typed(expr, var))
+}
+
+fn gcd_i128(mut a: i128, mut b: i128) -> i128 {
+    a = a.abs();
+    b = b.abs();
+    while b != 0 {
+        let r = a % b;
+        a = b;
+        b = r;
+    }
+    a
+}
+
+fn format_polynomial_from_coeffs(coeffs: &[f64], var: &str) -> String {
+    if coeffs.is_empty() {
+        return "0".to_string();
+    }
+    let mut terms: Vec<String> = Vec::new();
+    for (deg, &coeff) in coeffs.iter().enumerate().rev() {
+        if coeff == 0.0 {
+            continue;
+        }
+        let abs_coeff = coeff.abs();
+        let sign_positive = coeff > 0.0;
+        let coeff_str = if deg == 0 {
+            abs_coeff.to_string()
+        } else if abs_coeff == 1.0 {
+            "".to_string()
+        } else {
+            abs_coeff.to_string()
+        };
+        let var_part = match deg {
+            0 => "".to_string(),
+            1 => var.to_string(),
+            _ => format!("{var}^{deg}"),
+        };
+        let term_body = match (coeff_str.is_empty(), var_part.is_empty()) {
+            (true, true) => "1".to_string(),
+            (true, false) => var_part,
+            (false, true) => coeff_str,
+            (false, false) => format!("{coeff_str}*{var_part}"),
+        };
+        if terms.is_empty() {
+            if sign_positive {
+                terms.push(term_body);
+            } else {
+                terms.push(format!("-{term_body}"));
+            }
+        } else if sign_positive {
+            terms.push(format!(" + {term_body}"));
+        } else {
+            terms.push(format!(" - {term_body}"));
+        }
+    }
+    if terms.is_empty() {
+        "0".to_string()
+    } else {
+        terms.concat()
+    }
+}
+
+/// Intenta extraer coeficientes lineales `a_i` y término constante para `expr`
+/// respecto de `vars`. Usa evaluación numérica y verifica linealidad en varios
+/// puntos. Devuelve `None` si no es lineal.
+fn linear_coeffs_for_expr(expr: &str, vars: &[String]) -> Option<(Vec<f64>, f64)> {
+    if vars.is_empty() {
+        return None;
+    }
+    // Coeficiente constante en origen
+    let zero_vars: Vec<(String, f64)> = vars.iter().map(|v| (v.clone(), 0.0)).collect();
+    let c = crate::expr::evaluate(expr, &zero_vars).ok()?;
+    if !c.is_finite() {
+        return None;
+    }
+    let mut coeffs: Vec<f64> = Vec::with_capacity(vars.len());
+    for (idx, _var) in vars.iter().enumerate() {
+        let mut one_vars = zero_vars.clone();
+        one_vars[idx].1 = 1.0;
+        let val = crate::expr::evaluate(expr, &one_vars).ok()?;
+        if !val.is_finite() {
+            return None;
+        }
+        let coeff = val - c;
+        if !coeff.is_finite() {
+            return None;
+        }
+        // Verifica que mover 2 unidades duplique el efecto (lineal)
+        let mut two_vars = zero_vars.clone();
+        two_vars[idx].1 = 2.0;
+        let val2 = crate::expr::evaluate(expr, &two_vars).ok()?;
+        if !val2.is_finite() {
+            return None;
+        }
+        let coeff2 = val2 - c;
+        if (coeff2 - 2.0 * coeff).abs() > 1e-6 * coeff.abs().max(1.0) {
+            return None;
+        }
+        coeffs.push(coeff);
+    }
+    // Verificación con puntos mixtos para descartar términos cruzados o cuadráticos
+    let test_cases: Vec<Vec<f64>> = if vars.len() == 2 {
+        vec![
+            vec![1.0, 1.0],
+            vec![2.0, -1.0],
+            vec![-1.0, 2.0],
+            vec![0.5, 0.5],
+        ]
+    } else if vars.len() == 3 {
+        vec![vec![1.0, 1.0, 1.0], vec![1.0, 2.0, -1.0]]
+    } else {
+        vec![vec![1.0; vars.len()]]
+    };
+    for point in test_cases {
+        if point.len() != vars.len() {
+            continue;
+        }
+        let test_vars: Vec<(String, f64)> = vars
+            .iter()
+            .zip(point.iter())
+            .map(|(v, &x)| (v.clone(), x))
+            .collect();
+        let actual = crate::expr::evaluate(expr, &test_vars).ok()?;
+        if !actual.is_finite() {
+            return None;
+        }
+        let predicted: f64 = coeffs
+            .iter()
+            .zip(point.iter())
+            .map(|(a, x)| a * x)
+            .sum::<f64>()
+            + c;
+        let tol = 1e-6 * actual.abs().max(predicted.abs()).max(1.0);
+        if (actual - predicted).abs() > tol {
+            return None;
+        }
+    }
+    Some((coeffs, c))
+}
+
+fn format_linear_poly(coeffs: &[f64], constant: f64, vars: &[String]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for (coeff, var) in coeffs.iter().zip(vars.iter()) {
+        if *coeff == 0.0 {
+            continue;
+        }
+        let coeff_str = if *coeff == 1.0 {
+            var.clone()
+        } else if *coeff == -1.0 {
+            format!("-{var}")
+        } else {
+            format!("{coeff}*{var}")
+        };
+        parts.push(coeff_str);
+    }
+    // El término constante se añade al final con signo explícito
+    let constant_is_zero = constant == 0.0;
+    if parts.is_empty() {
+        return if constant_is_zero {
+            "0".to_string()
+        } else {
+            constant.to_string()
+        };
+    }
+    let mut out = parts[0].clone();
+    for p in parts.iter().skip(1) {
+        if let Some(stripped) = p.strip_prefix('-') {
+            out.push_str(&format!(" - {stripped}"));
+        } else {
+            out.push_str(&format!(" + {p}"));
+        }
+    }
+    if !constant_is_zero {
+        if constant > 0.0 {
+            out.push_str(&format!(" + {constant}"));
+        } else {
+            out.push_str(&format!(" - {}", -constant));
+        }
+    }
+    out
+}
+
+/// Mapea `CasError` del Buchberger a `MathResult` honesto.
+///
+/// Precedente local: los errores de presupuesto de Groebner ya usan
+/// `MathOperation::SymbolicDerivative` (ver chequeo 64/16 abajo).
+fn cas_groebner_error(
+    polys: &[String],
+    vars: &[String],
+    error: crate::cas::CasError,
+) -> MathResult<String> {
+    use crate::cas::CasError;
+    let expression = polys.join(", ");
+    let variable = vars.join(", ");
+    match error {
+        CasError::InputTooLong { provided, maximum } => {
+            MathResult::ResourceLimit(MathError::InputTooLarge {
+                operation: MathOperation::SymbolicDerivative,
+                provided_bytes: provided,
+                maximum_bytes: maximum,
+            })
+        }
+        CasError::InvalidVariable { variable } => {
+            MathResult::DomainError(MathError::InvalidExpression {
+                operation: MathOperation::SymbolicDerivative,
+                expression: variable,
+                reason: "variable no es un identificador válido".to_string(),
+            })
+        }
+        CasError::Parse { reason } => MathResult::DomainError(MathError::InvalidExpression {
+            operation: MathOperation::SymbolicDerivative,
+            expression,
+            reason,
+        }),
+        CasError::Unsupported { hint, .. } => {
+            MathResult::Unsupported(MathError::DerivativeUnavailable {
+                expression,
+                variable,
+                reason: hint,
+            })
+        }
+        // Límite de cómputo (S-polinomios, nº de polys/vars, grado): la
+        // variante `ResourceLimit` es lo honesto; los bytes son los reales
+        // de la entrada como escala (el detalle fino vive en el motor).
+        CasError::ResourceLimit { .. } => MathResult::ResourceLimit(MathError::InputTooLarge {
+            operation: MathOperation::SymbolicDerivative,
+            provided_bytes: expression.len() + variable.len(),
+            maximum_bytes: MAX_MATH_INPUT_BYTES,
+        }),
+        CasError::NonFinitePoint | CasError::LimitDoesNotExist { .. } => {
+            MathResult::DomainError(MathError::InvalidExpression {
+                operation: MathOperation::SymbolicDerivative,
+                expression,
+                reason: error.to_string(),
+            })
+        }
+    }
+}
+
+/// Base de Groebner — 2×2 lineal directo + Buchberger real para el resto.
+///
+/// Si detecta dos polinomios lineales en dos variables, calcula eliminación
+/// por combinación lineal (rápido y exacto). En cualquier otro caso delega
+/// al Buchberger real (`crate::cas::buchberger_basis_ordered`, vía exacta
+/// sobre Q con autoverificación + fallback `f64`, orden `lex` histórico);
+/// lo no polinómico o fuera de presupuesto da error honesto
+/// (`Unsupported`/`ResourceLimit`/`DomainError`), nunca stub de texto.
+pub fn groebner_basis_typed(polys: &[String], vars: &[String]) -> MathResult<String> {
+    if polys.len() > 64 || vars.len() > 16 {
+        return MathResult::ResourceLimit(MathError::InputTooLarge {
+            operation: MathOperation::SymbolicDerivative,
+            provided_bytes: polys.len() + vars.len(),
+            maximum_bytes: 64,
+        });
+    }
+    for poly in polys {
+        if poly.len() > MAX_MATH_INPUT_BYTES {
+            return MathResult::ResourceLimit(MathError::InputTooLarge {
+                operation: MathOperation::SymbolicDerivative,
+                provided_bytes: poly.len(),
+                maximum_bytes: MAX_MATH_INPUT_BYTES,
+            });
+        }
+    }
+    // Normaliza entrada: si viene un único string con llaves "{a,b}", lo expande
+    let normalized_polys: Vec<String> = if polys.len() == 1 && polys[0].trim().starts_with('{') {
+        let inner = polys[0].trim();
+        let inner = inner.strip_prefix('{').unwrap_or(inner);
+        let inner = inner.strip_suffix('}').unwrap_or(inner);
+        // split_args respeta anidamiento; reimplementación simple aquí
+        let mut out: Vec<String> = Vec::new();
+        let mut current = String::new();
+        let mut depth: i32 = 0;
+        for ch in inner.chars() {
+            match ch {
+                '(' | '[' | '{' => {
+                    depth += 1;
+                    current.push(ch);
+                }
+                ')' | ']' | '}' => {
+                    depth -= 1;
+                    current.push(ch);
+                }
+                ',' if depth == 0 => {
+                    let t = current.trim().to_string();
+                    if !t.is_empty() {
+                        out.push(t);
+                    }
+                    current.clear();
+                }
+                _ => current.push(ch),
+            }
+        }
+        let t = current.trim().to_string();
+        if !t.is_empty() {
+            out.push(t);
+        }
+        if out.is_empty() {
+            polys.to_vec()
+        } else {
+            out
+        }
+    } else {
+        polys.to_vec()
+    };
+    let normalized_vars: Vec<String> = if vars.len() == 1 && vars[0].trim().starts_with('{') {
+        let inner = vars[0].trim();
+        let inner = inner.strip_prefix('{').unwrap_or(inner);
+        let inner = inner.strip_suffix('}').unwrap_or(inner);
+        inner
+            .split(',')
+            .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    } else {
+        vars.iter()
+            .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
+            .collect()
+    };
+    // Intento de eliminación lineal para 2 polinomios en 2 variables
+    if normalized_polys.len() == 2 && normalized_vars.len() == 2 {
+        let var_x = normalized_vars[0].clone();
+        let var_y = normalized_vars[1].clone();
+        if is_math_identifier(&var_x) && is_math_identifier(&var_y) {
+            let vars_pair = vec![var_x.clone(), var_y.clone()];
+            if let (Some((coeffs1, c1)), Some((coeffs2, c2))) = (
+                linear_coeffs_for_expr(&normalized_polys[0], &vars_pair),
+                linear_coeffs_for_expr(&normalized_polys[1], &vars_pair),
+            ) {
+                // Coeffs: [a,b] para x,y
+                if coeffs1.len() == 2 && coeffs2.len() == 2 {
+                    let a1 = coeffs1[0];
+                    let b1 = coeffs1[1];
+                    let a2 = coeffs2[0];
+                    let b2 = coeffs2[1];
+                    // Evita degeneración
+                    if a1.is_finite()
+                        && b1.is_finite()
+                        && c1.is_finite()
+                        && a2.is_finite()
+                        && b2.is_finite()
+                        && c2.is_finite()
+                    {
+                        // Eliminación por combinación lineal
+                        // poly1: a1 x + b1 y + c1 =0 ; poly2: a2 x + b2 y + c2=0
+                        // Elimina x: (a2*b1 - a1*b2) y + (a2*c1 - a1*c2)=0
+                        // Elimina y: (b2*a1 - b1*a2) x + (b2*c1 - b1*c2)=0  (simétrico)
+                        let coeff_y = a2 * b1 - a1 * b2;
+                        let const_y = a2 * c1 - a1 * c2;
+                        let coeff_x = b2 * a1 - b1 * a2; // = -coeff_y
+                        let const_x = b2 * c1 - b1 * c2;
+                        let mut basis: Vec<String> = Vec::new();
+                        // Solo añade polinomios no degenerados
+                        if coeff_y.abs() > 1e-12 || const_y.abs() > 1e-12 {
+                            // Normaliza para que el coeficiente líder sea 1 si es posible
+                            let (nc, nconst) = if coeff_y.abs() > 1e-12 {
+                                (1.0, const_y / coeff_y)
+                            } else {
+                                (coeff_y, const_y)
+                            };
+                            // Formatea como "coeff*y + const"
+                            let poly_y = if coeff_y.abs() > 1e-12 {
+                                format_linear_poly(&[nc], nconst, std::slice::from_ref(&var_y))
+                            } else {
+                                nconst.to_string()
+                            };
+                            // Si es trivial "0", lo omite
+                            if poly_y.trim() != "0" && !poly_y.trim().is_empty() {
+                                basis.push(poly_y);
+                            }
+                        }
+                        if coeff_x.abs() > 1e-12 || const_x.abs() > 1e-12 {
+                            let (nc, nconst) = if coeff_x.abs() > 1e-12 {
+                                (1.0, const_x / coeff_x)
+                            } else {
+                                (coeff_x, const_x)
+                            };
+                            let poly_x = if coeff_x.abs() > 1e-12 {
+                                format_linear_poly(&[nc], nconst, std::slice::from_ref(&var_x))
+                            } else {
+                                nconst.to_string()
+                            };
+                            if poly_x.trim() != "0" && !poly_x.trim().is_empty() {
+                                // Evita duplicar si ya está
+                                if !basis.contains(&poly_x) {
+                                    basis.push(poly_x);
+                                }
+                            }
+                        }
+                        // Si se pudo construir una base no vacía, la devuelve
+                        if !basis.is_empty() {
+                            // Añade también los polinomios originales si no están representados?
+                            // Para dar base triangular completa, si solo se generó uno (cuando el otro es dependiente),
+                            // incluye el original más simple como segundo elemento.
+                            if basis.len() == 1 {
+                                // Incluye el primer polinomio normalizado como segundo elemento si aporta info
+                                let orig = format_linear_poly(&coeffs1, c1, &vars_pair);
+                                if !basis.contains(&orig) && orig.trim() != "0" {
+                                    basis.push(orig);
+                                }
+                            }
+                            let out = format!("{{{}}}", basis.join(", "));
+                            if out.len() <= MAX_MATH_INPUT_BYTES {
+                                return MathResult::Exact(out);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Resto: Buchberger real en `lex` (histórico de `buchberger_basis`).
+    // Los presupuestos de entrada ya se chequearon arriba (64/16 + bytes);
+    // los de cómputo (12 polys/6 vars/384 S-polys) los aplica el motor.
+    match crate::cas::buchberger_basis_ordered(
+        &normalized_polys,
+        &normalized_vars,
+        crate::cas::MonomialOrder::Lex,
+    ) {
+        Ok(outcome) => MathResult::Exact(format!("{{{}}}", outcome.basis.join(", "))),
+        Err(cas_error) => cas_groebner_error(&normalized_polys, &normalized_vars, cas_error),
+    }
+}
+
+/// Atajo para una sola expresión (usado por comandos con sintaxis simple).
+pub fn groebner_single_typed(expr: &str) -> MathResult<String> {
+    groebner_basis_typed(&[expr.to_string()], &[])
+}
+
+/// Adaptador de `groebner` para consumidores de texto.
+pub fn groebner_stub(expr: &str) -> Result<String, String> {
+    adapt_symbolic_result(groebner_single_typed(expr))
+}
+
+fn is_math_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_alphabetic() || first == '_')
+        && chars.all(|ch| ch.is_alphanumeric() || ch == '_')
+}
+
+// ============================================================================
+// CASRAT: Yun squarefree + GCD subresultant PRS, Horner, trig Fu, Hermite/Rothstein
+// Límite exacto: Expr almacena f64, se preserva ExactRational solo cuando
+// coeficientes son enteros representables en f64 (≤2^53) o fracciones i128 sin
+// overflow; caso contrario se usa f64 con tolerancia 1e-12 y se documenta como
+// aproximado sin romper la API f64. Subresultant PRS evita blow-up de
+// coeficientes intermedios; si el sistema supera MAX_POLY_DEG (64) o
+// MAX_MATH_INPUT_BYTES se devuelve Unsupported honesto.
+// ============================================================================
+
+const POLY_EPS: f64 = 1e-12;
+const MAX_POLY_DEG: usize = 64;
+
+fn poly_trim(coeffs: &[f64]) -> Vec<f64> {
+    let mut out = coeffs.to_vec();
+    while out.len() > 1 {
+        let last = out.last().copied().unwrap_or(0.0);
+        if last.abs() <= POLY_EPS {
+            out.pop();
+        } else {
+            break;
+        }
+    }
+    if out.is_empty() {
+        out.push(0.0);
+    }
+    out
+}
+
+fn poly_degree(coeffs: &[f64]) -> Option<usize> {
+    let t = poly_trim(coeffs);
+    if t.len() == 1 && t[0].abs() <= POLY_EPS {
+        None
+    } else {
+        Some(t.len() - 1)
+    }
+}
+
+fn poly_is_zero(coeffs: &[f64]) -> bool {
+    poly_degree(coeffs).is_none()
+}
+
+fn poly_derivative(coeffs: &[f64]) -> Vec<f64> {
+    if coeffs.len() <= 1 {
+        return vec![0.0];
+    }
+    let mut out = Vec::with_capacity(coeffs.len() - 1);
+    for (i, &c) in coeffs.iter().enumerate().skip(1) {
+        out.push(c * i as f64);
+    }
+    poly_trim(&out)
+}
+
+#[allow(dead_code)]
+fn poly_add(a: &[f64], b: &[f64]) -> Vec<f64> {
+    let n = a.len().max(b.len());
+    let mut out = vec![0.0; n];
+    for (i, &v) in a.iter().enumerate() {
+        out[i] += v;
+    }
+    for (i, &v) in b.iter().enumerate() {
+        out[i] += v;
+    }
+    poly_trim(&out)
+}
+
+fn poly_sub(a: &[f64], b: &[f64]) -> Vec<f64> {
+    let n = a.len().max(b.len());
+    let mut out = vec![0.0; n];
+    for (i, &v) in a.iter().enumerate() {
+        out[i] += v;
+    }
+    for (i, &v) in b.iter().enumerate() {
+        out[i] -= v;
+    }
+    poly_trim(&out)
+}
+
+#[allow(dead_code)]
+fn poly_scale(coeffs: &[f64], s: f64) -> Vec<f64> {
+    if s == 0.0 {
+        return vec![0.0];
+    }
+    let v: Vec<f64> = coeffs.iter().map(|c| c * s).collect();
+    poly_trim(&v)
+}
+
+fn poly_mul(a: &[f64], b: &[f64]) -> Option<Vec<f64>> {
+    if poly_is_zero(a) || poly_is_zero(b) {
+        return Some(vec![0.0]);
+    }
+    let da = poly_degree(a).unwrap_or(0);
+    let db = poly_degree(b).unwrap_or(0);
+    let deg = da.checked_add(db)?;
+    if deg > MAX_POLY_DEG {
+        return None;
+    }
+    let mut out = vec![0.0; deg + 1];
+    for (i, &ca) in a.iter().enumerate() {
+        if ca.abs() <= POLY_EPS {
+            continue;
+        }
+        for (j, &cb) in b.iter().enumerate() {
+            if cb.abs() <= POLY_EPS {
+                continue;
+            }
+            let k = i + j;
+            if k < out.len() {
+                out[k] += ca * cb;
+            }
+        }
+    }
+    Some(poly_trim(&out))
+}
+
+/// Evaluación Horner: O(n) estable, evita pow.
+fn horner_eval(coeffs: &[f64], x: f64) -> f64 {
+    let t = poly_trim(coeffs);
+    let mut acc = 0.0;
+    for &c in t.iter().rev() {
+        acc = acc * x + c;
+    }
+    acc
+}
+
+fn poly_div_rem(a: &[f64], b: &[f64]) -> Option<(Vec<f64>, Vec<f64>)> {
+    let mut rem = poly_trim(a);
+    let div = poly_trim(b);
+    if poly_is_zero(&div) {
+        return None;
+    }
+    let deg_b = poly_degree(&div).unwrap_or(0);
+    let lc_b = div[deg_b];
+    if lc_b.abs() <= POLY_EPS {
+        return None;
+    }
+    let mut quot = vec![0.0; rem.len()];
+    while let Some(deg_r) = poly_degree(&rem) {
+        if deg_r < deg_b {
+            break;
+        }
+        let lc_r = rem[deg_r];
+        let coeff = lc_r / lc_b;
+        let shift = deg_r - deg_b;
+        quot[shift] = coeff;
+        for (i, &cb) in div.iter().enumerate() {
+            let idx = i + shift;
+            if idx < rem.len() {
+                rem[idx] -= coeff * cb;
+            }
+        }
+        rem = poly_trim(&rem);
+    }
+    let qtrim = poly_trim(&quot);
+    Some((qtrim, rem))
+}
+
+fn poly_rem(a: &[f64], b: &[f64]) -> Option<Vec<f64>> {
+    poly_div_rem(a, b).map(|(_, r)| r)
+}
+
+fn poly_exact_div(a: &[f64], b: &[f64]) -> Option<Vec<f64>> {
+    let (q, r) = poly_div_rem(a, b)?;
+    if poly_is_zero(&r) {
+        Some(q)
+    } else {
+        // tolerancia: si resto pequeño relativo a escala, considera divisible
+        let scale = a.iter().map(|c| c.abs()).fold(0.0_f64, f64::max).max(1.0);
+        let rscale = r.iter().map(|c| c.abs()).fold(0.0_f64, f64::max);
+        if rscale <= 1e-9 * scale {
+            Some(q)
+        } else {
+            None
+        }
+    }
+}
+
+/// GCD vía PRS subresultante primitivo con normalización mónica.
+/// Para coeficientes enteros pequeños usa ExactRational implícitamente vía
+/// normalización por contenido; para f64 generales usa Euclides con
+/// tolerancia y escala para evitar blow-up.
+///
+/// Contrato público (`grafito_geometry::symbolic::poly_gcd_subresultant`):
+/// coeficientes en orden ascendente (`v[i]` = coef. de `xⁱ`); devuelve el
+/// GCD normalizado mónico (o `vec![0.0]` si ambos son cero).
+pub fn poly_gcd_subresultant(a: Vec<f64>, b: Vec<f64>) -> Vec<f64> {
+    let mut a = poly_trim(&a);
+    let mut b = poly_trim(&b);
+    if poly_is_zero(&a) {
+        return poly_monic(&b);
+    }
+    if poly_is_zero(&b) {
+        return poly_monic(&a);
+    }
+    // Hacer primitivos: dividir por contenido (gcd de coeficientes) si entero
+    a = poly_primitive(&a);
+    b = poly_primitive(&b);
+    // Euclid con resto pseudo-escalado subresultante simplificado
+    let mut depth = 0usize;
+    while !poly_is_zero(&b) && depth < 64 {
+        depth += 1;
+        let Some(r) = poly_rem(&a, &b) else {
+            break;
+        };
+        let r_trim = poly_trim(&r);
+        if poly_is_zero(&r_trim) {
+            a = b;
+            break;
+        }
+        // Normaliza resto a primitivo para evitar crecimiento
+        let r_prim = poly_primitive(&r_trim);
+        a = b;
+        b = r_prim;
+    }
+    poly_monic(&a)
+}
+
+fn poly_monic(coeffs: &[f64]) -> Vec<f64> {
+    let t = poly_trim(coeffs);
+    if poly_is_zero(&t) {
+        return vec![0.0];
+    }
+    let d = poly_degree(&t).unwrap_or(0);
+    let lc = t[d];
+    if lc.abs() <= POLY_EPS {
+        return t;
+    }
+    let v: Vec<f64> = t.iter().map(|c| c / lc).collect();
+    poly_trim(&v)
+}
+
+fn poly_primitive(coeffs: &[f64]) -> Vec<f64> {
+    let t = poly_trim(coeffs);
+    if poly_is_zero(&t) {
+        return vec![0.0];
+    }
+    // Si coeficientes son "casi enteros", extrae contenido entero
+    let mut int_coeffs: Vec<i128> = Vec::new();
+    let mut all_int = true;
+    for &c in &t {
+        if c.abs() <= POLY_EPS {
+            int_coeffs.push(0);
+            continue;
+        }
+        let r = c.round();
+        if (c - r).abs() > 1e-9 {
+            all_int = false;
+            break;
+        }
+        if r.abs() > 9_007_199_254_740_992.0 {
+            all_int = false;
+            break;
+        }
+        int_coeffs.push(r as i128);
+    }
+    if all_int {
+        let mut g: i128 = 0;
+        for &ic in &int_coeffs {
+            let av = ic.abs();
+            if av == 0 {
+                continue;
+            }
+            if g == 0 {
+                g = av;
+            } else {
+                g = gcd_i128(g, av);
+            }
+        }
+        if g > 1 {
+            let v: Vec<f64> = t.iter().map(|c| c / g as f64).collect();
+            return poly_trim(&v);
+        }
+    }
+    // Normaliza por máximo para evitar overflow
+    let max = t.iter().map(|c| c.abs()).fold(0.0_f64, f64::max);
+    if max > 0.0 && max.is_finite() {
+        let v: Vec<f64> = t.iter().map(|c| c / max).collect();
+        return poly_trim(&v);
+    }
+    t
+}
+
+/// Yun squarefree: f = ∏ b_i^i  con b_i squarefree y coprimos.
+/// Devuelve Vec<(b_i, i)>. Usa PRS subresultante para GCD.
+#[allow(dead_code)]
+fn yun_squarefree(f: &[f64]) -> Vec<(Vec<f64>, usize)> {
+    let mut out: Vec<(Vec<f64>, usize)> = Vec::new();
+    let ff = poly_trim(f);
+    if poly_is_zero(&ff) || poly_degree(&ff).is_none_or(|d| d == 0) {
+        return out;
+    }
+    let deriv = poly_derivative(&ff);
+    if poly_is_zero(&deriv) {
+        // Característica p o constante: f es p-ésima potencia (no aplica en ℚ)
+        return out;
+    }
+    let g = poly_gcd_subresultant(ff.clone(), deriv.clone());
+    let Some(mut w) = poly_exact_div(&ff, &g) else {
+        return out;
+    };
+    let Some(mut y) = poly_exact_div(&deriv, &g) else {
+        return out;
+    };
+    // z = y - w'
+    let mut z = poly_sub(&y, &poly_derivative(&w));
+    z = poly_trim(&z);
+    let mut i = 1usize;
+    while !poly_is_zero(&z) {
+        let g2 = poly_gcd_subresultant(w.clone(), z.clone());
+        let g_trim = poly_trim(&g2);
+        // g es factor con multiplicidad i
+        if !poly_is_zero(&g_trim) && !(g_trim.len() == 1 && (g_trim[0] - 1.0).abs() <= POLY_EPS) {
+            out.push((poly_monic(&g_trim), i));
+        }
+        let Some(w_next) = poly_exact_div(&w, &g_trim) else {
+            break;
+        };
+        let Some(y_next) = poly_exact_div(&z, &g_trim) else {
+            break;
+        };
+        w = poly_trim(&w_next);
+        y = poly_trim(&y_next);
+        let wp = poly_derivative(&w);
+        z = poly_sub(&y, &wp);
+        z = poly_trim(&z);
+        i += 1;
+        if w.len() == 1 && (w[0] - 1.0).abs() <= POLY_EPS {
+            break;
+        }
+        if i > MAX_POLY_DEG {
+            break;
+        }
+    }
+    if !(w.len() == 1 && (w[0] - 1.0).abs() <= POLY_EPS) && !poly_is_zero(&w) {
+        // w restante tiene multiplicidad i
+        if w.len() > 1 || (w[0] - 1.0).abs() > POLY_EPS {
+            out.push((poly_monic(&w), i));
+        }
+    }
+    out
+}
+
+// --- Trig Fu-TR simplificación subset TR0..TR13 ---
+// Frente trigonométricas + racionalización (subset honesto S): `trig_sum_step`,
+// `trig_double_step` y `trig_pow_step` son las reglas de expansión (antes inline
+// en `trig_simplify_once`, ahora compartidas sin duplicar con los comandos
+// TrigExpand/TrigCombine/TrigSimplify); `trig_pythag_step` suma la pitagórica
+// legacy más 1+tan²→sec²; `trig_combine_step` es producto→suma.
+
+/// Pasos máximos del fixpoint trigonométrico (presupuesto anti-loop).
+const MAX_TRIG_REWRITE_STEPS: usize = 8;
+/// Entrada máxima en caracteres. Espeja
+/// `grafito_core::validation::MAX_EXPR_LENGTH` (geometry no depende de core;
+/// el brazo repite el chequeo: defensa en profundidad).
+const MAX_TRIG_INPUT_CHARS: usize = 2_000;
+/// Salida máxima en bytes (igual que `MAX_EXPAND_OUTPUT_BYTES`).
+const MAX_TRIG_OUTPUT_BYTES: usize = 100_000;
+/// Tolerancia para constantes del subset (2·u, potencias ², unos).
+const TRIG_CONST_TOL: f64 = 1e-12;
+
+fn trig_is_const(expr: &Expr, want: f64) -> bool {
+    matches!(expr, Expr::Const(value) if (*value - want).abs() < TRIG_CONST_TOL)
+}
+
+fn trig_const(expr: &Expr) -> Option<f64> {
+    if let Expr::Const(value) = expr {
+        Some(*value)
+    } else {
+        None
+    }
+}
+
+// Constructores con plegado mínimo (solo Const op Const finito y neutros
+// seguros; 0·f NO se pliega para no borrar dominio, como `simplify_once`).
+fn trig_mk_add(left: Expr, right: Expr) -> Expr {
+    match (&left, &right) {
+        (Expr::Const(a), Expr::Const(b)) if a.is_finite() && b.is_finite() => Expr::Const(a + b),
+        (Expr::Const(a), _) if *a == 0.0 => right,
+        (_, Expr::Const(b)) if *b == 0.0 => left,
+        _ => Expr::Add(Box::new(left), Box::new(right)),
+    }
+}
+
+fn trig_mk_sub(left: Expr, right: Expr) -> Expr {
+    match (&left, &right) {
+        (Expr::Const(a), Expr::Const(b)) if a.is_finite() && b.is_finite() => Expr::Const(a - b),
+        (_, Expr::Const(b)) if *b == 0.0 => left,
+        _ => Expr::Sub(Box::new(left), Box::new(right)),
+    }
+}
+
+fn trig_mk_mul(left: Expr, right: Expr) -> Expr {
+    match (&left, &right) {
+        (Expr::Const(a), Expr::Const(b)) if a.is_finite() && b.is_finite() => Expr::Const(a * b),
+        (Expr::Const(a), _) if *a == 1.0 => right,
+        (_, Expr::Const(b)) if *b == 1.0 => left,
+        _ => Expr::Mul(Box::new(left), Box::new(right)),
+    }
+}
+
+fn trig_mk_div(num: Expr, den: Expr) -> Expr {
+    match (&num, &den) {
+        (Expr::Const(a), Expr::Const(b)) if a.is_finite() && b.is_finite() && b.abs() > 1e-300 => {
+            Expr::Const(a / b)
+        }
+        (_, Expr::Const(b)) if *b == 1.0 => num,
+        (inner, Expr::Const(b)) if *b == -1.0 => Expr::Neg(Box::new(inner.clone())),
+        _ => Expr::Div(Box::new(num), Box::new(den)),
+    }
+}
+
+/// Suma/diferencia de ángulos para sin/cos (regla legacy, ahora compartida).
+fn trig_sum_step(expr: &Expr) -> Option<Expr> {
+    use Expr::*;
+    // TR: sin(x+y) expansión, cos(x+y)
+    if let Sin(arg) = expr {
+        if let Add(a, b) = arg.as_ref() {
+            let sa = Sin(a.clone());
+            let ca = Cos(a.clone());
+            let sb = Sin(b.clone());
+            let cb = Cos(b.clone());
+            // sin(a+b)= sin a cos b + cos a sin b
+            let term1 = Mul(Box::new(sa), Box::new(cb));
+            let term2 = Mul(Box::new(ca), Box::new(sb));
+            return Some(Add(Box::new(term1), Box::new(term2)));
+        }
+        if let Sub(a, b) = arg.as_ref() {
+            let sa = Sin(a.clone());
+            let ca = Cos(a.clone());
+            let sb = Sin(b.clone());
+            let cb = Cos(b.clone());
+            let term1 = Mul(Box::new(sa), Box::new(cb));
+            let term2 = Mul(Box::new(ca), Box::new(sb));
+            return Some(Sub(Box::new(term1), Box::new(term2)));
+        }
+    }
+    if let Cos(arg) = expr {
+        if let Add(a, b) = arg.as_ref() {
+            let ca = Cos(a.clone());
+            let cb = Cos(b.clone());
+            let sa = Sin(a.clone());
+            let sb = Sin(b.clone());
+            // cos(a+b)= cos a cos b - sin a sin b
+            let term1 = Mul(Box::new(ca), Box::new(cb));
+            let term2 = Mul(Box::new(sa), Box::new(sb));
+            return Some(Sub(Box::new(term1), Box::new(term2)));
+        }
+        if let Sub(a, b) = arg.as_ref() {
+            let ca = Cos(a.clone());
+            let cb = Cos(b.clone());
+            let sa = Sin(a.clone());
+            let sb = Sin(b.clone());
+            let term1 = Mul(Box::new(ca), Box::new(cb));
+            let term2 = Mul(Box::new(sa), Box::new(sb));
+            return Some(Add(Box::new(term1), Box::new(term2)));
+        }
+    }
+    None
+}
+
+/// Doble ángulo: sin(2·u)→2·sin u·cos u, cos(2·u)→cos²u−sin²u.
+/// Solo coeficiente exactamente 2; otro múltiplo exige motor general.
+fn trig_double_step(expr: &Expr) -> Option<Expr> {
+    use Expr::*;
+    // Extrae u si el argumento es 2·u (cualquier orden).
+    fn double_arg(arg: &Expr) -> Option<Expr> {
+        if let Expr::Mul(left, right) = arg {
+            if trig_is_const(left, 2.0) {
+                return Some((**right).clone());
+            }
+            if trig_is_const(right, 2.0) {
+                return Some((**left).clone());
+            }
+        }
+        None
+    }
+    match expr {
+        Sin(arg) => {
+            let u = double_arg(arg)?;
+            Some(trig_mk_mul(
+                Const(2.0),
+                Mul(
+                    Box::new(Sin(Box::new(u.clone()))),
+                    Box::new(Cos(Box::new(u))),
+                ),
+            ))
+        }
+        Cos(arg) => {
+            let u = double_arg(arg)?;
+            Some(trig_mk_sub(
+                Mul(
+                    Box::new(Cos(Box::new(u.clone()))),
+                    Box::new(Cos(Box::new(u.clone()))),
+                ),
+                Mul(
+                    Box::new(Sin(Box::new(u.clone()))),
+                    Box::new(Sin(Box::new(u))),
+                ),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Potencias cuadráticas: sin²x -> (1 - cos(2x))/2, cos²x -> (1+cos(2x))/2
+/// (regla legacy, ahora compartida).
+fn trig_pow_step(expr: &Expr) -> Option<Expr> {
+    use Expr::*;
+    if let Pow(base, exp) = expr {
+        if let Const(v) = exp.as_ref() {
+            if (*v - 2.0).abs() < TRIG_CONST_TOL {
+                if let Sin(arg) = base.as_ref() {
+                    let two = Mul(Box::new(Const(2.0)), arg.clone());
+                    let c2 = Cos(Box::new(two));
+                    // (1 - cos2)/2
+                    let num = Sub(Box::new(Const(1.0)), Box::new(c2));
+                    return Some(Mul(Box::new(num), Box::new(Const(0.5))));
+                }
+                if let Cos(arg) = base.as_ref() {
+                    let two = Mul(Box::new(Const(2.0)), arg.clone());
+                    let c2 = Cos(Box::new(two));
+                    let num = Add(Box::new(Const(1.0)), Box::new(c2));
+                    return Some(Mul(Box::new(num), Box::new(Const(0.5))));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Toda expansión trigonométrica del subset (suma/dif + doble + potencias).
+fn trig_expand_step(expr: &Expr) -> Option<Expr> {
+    trig_sum_step(expr)
+        .or_else(|| trig_double_step(expr))
+        .or_else(|| trig_pow_step(expr))
+}
+
+/// Pitagóricas: sin²x + cos²x -> 1 (legacy, ambos órdenes) más 1+tan²u ->
+/// sec²u (ambos órdenes; vale donde tan está definida, que es el dominio
+/// donde sec existe).
+fn trig_pythag_step(expr: &Expr) -> Option<Expr> {
+    use Expr::*;
+    if let Add(left, right) = expr {
+        // TR0 legacy: sin²x + cos²x ->1 (y variantes conmutadas).
+        let is_sin2 = |e: &Expr| matches!(e, Pow(b, exp) if matches!(b.as_ref(), Sin(_)) && matches!(exp.as_ref(), Const(v) if (*v - 2.0).abs() < TRIG_CONST_TOL));
+        let is_cos2 = |e: &Expr| matches!(e, Pow(b, exp) if matches!(b.as_ref(), Cos(_)) && matches!(exp.as_ref(), Const(v) if (*v - 2.0).abs() < TRIG_CONST_TOL));
+        let arg_of = |e: &Expr| -> Option<Expr> {
+            if let Pow(b, _) = e {
+                if let Sin(a) | Cos(a) = b.as_ref() {
+                    return Some((**a).clone());
+                }
+            }
+            None
+        };
+        if (is_sin2(left) && is_cos2(right)) || (is_cos2(left) && is_sin2(right)) {
+            if let (Some(a1), Some(a2)) = (arg_of(left), arg_of(right)) {
+                if a1.structurally_eq(&a2) {
+                    return Some(Const(1.0));
+                }
+            }
+        }
+        // 1+tan²u -> sec²u (ambos órdenes).
+        let is_tan2 = |e: &Expr| matches!(e, Pow(b, exp) if matches!(b.as_ref(), Tan(_)) && matches!(exp.as_ref(), Const(v) if (*v - 2.0).abs() < TRIG_CONST_TOL));
+        let tan_arg_of = |e: &Expr| -> Option<Expr> {
+            if let Pow(b, _) = e {
+                if let Tan(a) = b.as_ref() {
+                    return Some((**a).clone());
+                }
+            }
+            None
+        };
+        let one_left = trig_is_const(left, 1.0) && is_tan2(right);
+        let one_right = trig_is_const(right, 1.0) && is_tan2(left);
+        if one_left || one_right {
+            let tan_expr = if one_left { right } else { left };
+            if let Some(u) = tan_arg_of(tan_expr) {
+                // 1+tan²u = sec²u (cuadrado, no sec simple).
+                return Some(Pow(Box::new(Sec(Box::new(u))), Box::new(Const(2.0))));
+            }
+        }
+    }
+    None
+}
+
+/// Separa un producto en (factor constante total, factores simbólicos) en
+/// orden textual, aplanando `Mul` anidados con cota. Las consts no finitas
+/// van a factores (no al coef). Si se agota la cota devuelve `None`.
+fn trig_split_product(expr: &Expr) -> Option<(f64, Vec<Expr>)> {
+    const MAX_TRIG_FACTORS: usize = 32;
+    fn collect(node: &Expr, coef: &mut f64, out: &mut Vec<Expr>, budget: &mut usize) -> bool {
+        if *budget == 0 {
+            return false;
+        }
+        *budget -= 1;
+        match node {
+            Expr::Mul(a, b) => collect(a, coef, out, budget) && collect(b, coef, out, budget),
+            Expr::Const(v) if v.is_finite() => {
+                *coef *= v;
+                true
+            }
+            _ => {
+                out.push(node.clone());
+                true
+            }
+        }
+    }
+    let mut coef = 1.0;
+    let mut factors = Vec::new();
+    let mut budget = MAX_TRIG_FACTORS;
+    if collect(expr, &mut coef, &mut factors, &mut budget) {
+        Some((coef, factors))
+    } else {
+        None
+    }
+}
+
+/// Combinación producto→suma con un factor constante externo opcional:
+/// sin·cos→(sin(a+b)+sin(a−b))/2, cos·cos→(cos(a−b)+cos(a+b))/2,
+/// sin·sin→(cos(a−b)−cos(a+b))/2. Con argumentos iguales colapsa al doble
+/// ángulo inverso (sin(2a)/2, (1±cos(2a))/2) para no oscilar con la expansión.
+fn trig_combine_step(expr: &Expr) -> Option<Expr> {
+    use Expr::*;
+    // Separa factor constante total y factores simbólicos (cualquier
+    // asociatividad: 2·sin·cos parsea left-assoc). Solo dos trigs puros.
+    let (coef, factors) = trig_split_product(expr)?;
+    if factors.len() != 2 {
+        return None;
+    }
+    let (left, right) = (&factors[0], &factors[1]);
+    // Familia de cada lado: 0 = sin, 1 = cos.
+    let fam = |e: &Expr| -> Option<(u8, Expr)> {
+        if let Sin(a) = e {
+            Some((0, (**a).clone()))
+        } else if let Cos(a) = e {
+            Some((1, (**a).clone()))
+        } else {
+            None
+        }
+    };
+    let (f1, a) = fam(left)?;
+    let (f2, b) = fam(right)?;
+    let double = |u: Expr| trig_mk_mul(Const(2.0), u);
+    let unscaled = match (f1, f2) {
+        (0, 0) => {
+            if a.structurally_eq(&b) {
+                trig_mk_sub(Const(1.0), Cos(Box::new(double(a))))
+            } else {
+                trig_mk_sub(
+                    Cos(Box::new(trig_mk_sub(a.clone(), b.clone()))),
+                    Cos(Box::new(trig_mk_add(a, b))),
+                )
+            }
+        }
+        (1, 1) => {
+            if a.structurally_eq(&b) {
+                trig_mk_add(Const(1.0), Cos(Box::new(double(a))))
+            } else {
+                trig_mk_add(
+                    Cos(Box::new(trig_mk_sub(a.clone(), b.clone()))),
+                    Cos(Box::new(trig_mk_add(a, b))),
+                )
+            }
+        }
+        // sin·cos en cualquier orden.
+        _ => {
+            let (s, c) = if f1 == 0 { (a, b) } else { (b, a) };
+            if s.structurally_eq(&c) {
+                Sin(Box::new(double(s)))
+            } else {
+                trig_mk_add(
+                    Sin(Box::new(trig_mk_add(s.clone(), c.clone()))),
+                    Sin(Box::new(trig_mk_sub(s, c))),
+                )
+            }
+        }
+    };
+    // Reaplica el factor externo: k=1 → forma/2, k=2 → forma directa.
+    if (coef - 1.0).abs() < TRIG_CONST_TOL {
+        Some(trig_mk_div(unscaled, Const(2.0)))
+    } else if (coef - 2.0).abs() < TRIG_CONST_TOL {
+        Some(unscaled)
+    } else {
+        Some(trig_mk_mul(Const(coef / 2.0), unscaled))
+    }
+}
+
+fn trig_simplify_once(expr: &Expr) -> Option<Expr> {
+    // TR0 + 1+tan² primero (reducen), luego expansión (delega sin duplicar).
+    if let Some(next) = trig_pythag_step(expr) {
+        return Some(next);
+    }
+    trig_expand_step(expr)
+}
+
+/// Una pasada bottom-up: reescribe hijos primero y luego aplica `rule` al
+/// nodo reconstruido (los nodos recién creados no se revisitan en la pasada).
+fn trig_rewrite_bottom_up(
+    expr: &Expr,
+    rule: &dyn Fn(&Expr) -> Result<Option<Expr>, String>,
+) -> Result<(Expr, bool), String> {
+    trig_pass_bottom_up(expr, rule)
+}
+
+fn trig_pass_bottom_up(
+    expr: &Expr,
+    rule: &dyn Fn(&Expr) -> Result<Option<Expr>, String>,
+) -> Result<(Expr, bool), String> {
+    let rec = |child: &Expr| trig_pass_bottom_up(child, rule);
+    let (rebuilt, child_changed) = trig_map_children(expr, &rec)?;
+    if let Some(next) = rule(&rebuilt)? {
+        return Ok((next, true));
+    }
+    Ok((rebuilt, child_changed))
+}
+
+/// Una pasada top-down con reintento: aplica `rule` al nodo antes de bajar;
+/// si el nodo no matcheó pero algún hijo cambió, reintenta en el reconstruido.
+/// Así la pitagórica (padre) gana a la expansión (hijos).
+fn trig_pass_top_down(
+    expr: &Expr,
+    rule: &dyn Fn(&Expr) -> Result<Option<Expr>, String>,
+) -> Result<(Expr, bool), String> {
+    if let Some(next) = rule(expr)? {
+        return Ok((next, true));
+    }
+    let rec = |child: &Expr| trig_pass_top_down(child, rule);
+    let (rebuilt, child_changed) = trig_map_children(expr, &rec)?;
+    if child_changed {
+        if let Some(next) = rule(&rebuilt)? {
+            return Ok((next, true));
+        }
+        return Ok((rebuilt, true));
+    }
+    Ok((rebuilt, false))
+}
+
+fn trig_map_children(
+    expr: &Expr,
+    rec: &dyn Fn(&Expr) -> Result<(Expr, bool), String>,
+) -> Result<(Expr, bool), String> {
+    use Expr::*;
+    let mut child_changed = false;
+    let mut one = |child: &Expr| -> Result<Box<Expr>, String> {
+        let (next, changed) = rec(child)?;
+        child_changed |= changed;
+        Ok(Box::new(next))
+    };
+    match expr {
+        Const(_) | Var(_) => Ok((expr.clone(), false)),
+        Neg(a) => Ok((Neg(one(a)?), child_changed)),
+        Sin(a) => Ok((Sin(one(a)?), child_changed)),
+        Cos(a) => Ok((Cos(one(a)?), child_changed)),
+        Tan(a) => Ok((Tan(one(a)?), child_changed)),
+        Asin(a) => Ok((Asin(one(a)?), child_changed)),
+        Acos(a) => Ok((Acos(one(a)?), child_changed)),
+        Atan(a) => Ok((Atan(one(a)?), child_changed)),
+        Exp(a) => Ok((Exp(one(a)?), child_changed)),
+        Ln(a) => Ok((Ln(one(a)?), child_changed)),
+        Log(a) => Ok((Log(one(a)?), child_changed)),
+        Sqrt(a) => Ok((Sqrt(one(a)?), child_changed)),
+        Abs(a) => Ok((Abs(one(a)?), child_changed)),
+        Sinh(a) => Ok((Sinh(one(a)?), child_changed)),
+        Cosh(a) => Ok((Cosh(one(a)?), child_changed)),
+        Tanh(a) => Ok((Tanh(one(a)?), child_changed)),
+        Floor(a) => Ok((Floor(one(a)?), child_changed)),
+        Ceil(a) => Ok((Ceil(one(a)?), child_changed)),
+        Round(a) => Ok((Round(one(a)?), child_changed)),
+        Sec(a) => Ok((Sec(one(a)?), child_changed)),
+        Csc(a) => Ok((Csc(one(a)?), child_changed)),
+        Cot(a) => Ok((Cot(one(a)?), child_changed)),
+        Asinh(a) => Ok((Asinh(one(a)?), child_changed)),
+        Acosh(a) => Ok((Acosh(one(a)?), child_changed)),
+        Atanh(a) => Ok((Atanh(one(a)?), child_changed)),
+        Sign(a) => Ok((Sign(one(a)?), child_changed)),
+        Heaviside(a) => Ok((Heaviside(one(a)?), child_changed)),
+        Cbrt(a) => Ok((Cbrt(one(a)?), child_changed)),
+        Re(a) => Ok((Re(one(a)?), child_changed)),
+        Im(a) => Ok((Im(one(a)?), child_changed)),
+        Arg(a) => Ok((Arg(one(a)?), child_changed)),
+        Conj(a) => Ok((Conj(one(a)?), child_changed)),
+        Erf(a) => Ok((Erf(one(a)?), child_changed)),
+        Erfc(a) => Ok((Erfc(one(a)?), child_changed)),
+        Gamma(a) => Ok((Gamma(one(a)?), child_changed)),
+        LnGamma(a) => Ok((LnGamma(one(a)?), child_changed)),
+        Digamma(a) => Ok((Digamma(one(a)?), child_changed)),
+        Trigamma(a) => Ok((Trigamma(one(a)?), child_changed)),
+        Add(a, b) => Ok((Add(one(a)?, one(b)?), child_changed)),
+        Sub(a, b) => Ok((Sub(one(a)?, one(b)?), child_changed)),
+        Mul(a, b) => Ok((Mul(one(a)?, one(b)?), child_changed)),
+        Div(a, b) => Ok((Div(one(a)?, one(b)?), child_changed)),
+        Pow(a, b) => Ok((Pow(one(a)?, one(b)?), child_changed)),
+        Atan2(a, b) => Ok((Atan2(one(a)?, one(b)?), child_changed)),
+        Modulo(a, b) => Ok((Modulo(one(a)?, one(b)?), child_changed)),
+        Min(a, b) => Ok((Min(one(a)?, one(b)?), child_changed)),
+        Max(a, b) => Ok((Max(one(a)?, one(b)?), child_changed)),
+        Beta(a, b) => Ok((Beta(one(a)?, one(b)?), child_changed)),
+        BesselJ(a, b) => Ok((BesselJ(one(a)?, one(b)?), child_changed)),
+        BesselY(a, b) => Ok((BesselY(one(a)?, one(b)?), child_changed)),
+        BesselI(a, b) => Ok((BesselI(one(a)?, one(b)?), child_changed)),
+        Lt(a, b) => Ok((Lt(one(a)?, one(b)?), child_changed)),
+        Gt(a, b) => Ok((Gt(one(a)?, one(b)?), child_changed)),
+        Le(a, b) => Ok((Le(one(a)?, one(b)?), child_changed)),
+        Ge(a, b) => Ok((Ge(one(a)?, one(b)?), child_changed)),
+        Eq(a, b) => Ok((Eq(one(a)?, one(b)?), child_changed)),
+        Ne(a, b) => Ok((Ne(one(a)?, one(b)?), child_changed)),
+        Clamp(a, b, c) => Ok((Clamp(one(a)?, one(b)?, one(c)?), child_changed)),
+        Sum(body, var, start, end) => Ok((
+            Sum(one(body)?, var.clone(), one(start)?, one(end)?),
+            child_changed,
+        )),
+        Product(body, var, start, end) => Ok((
+            Product(one(body)?, var.clone(), one(start)?, one(end)?),
+            child_changed,
+        )),
+        Piecewise(pieces, default) => {
+            let mut next_pieces = Vec::with_capacity(pieces.len());
+            for (cond, value) in pieces {
+                next_pieces.push((one(cond)?, one(value)?));
+            }
+            Ok((Piecewise(next_pieces, one(default)?), child_changed))
+        }
+    }
+}
+
+/// Itera pasadas bottom-up hasta punto fijo o `max_steps`. Devuelve la forma
+/// alcanzada y si convergió (solo para reglas que convergen, como suma/dif).
+fn trig_fixpoint(
+    expr: &Expr,
+    rule: &dyn Fn(&Expr) -> Result<Option<Expr>, String>,
+    max_steps: usize,
+) -> Result<(Expr, bool), String> {
+    let mut current = expr.clone();
+    for _ in 0..max_steps {
+        let (next, changed) = trig_rewrite_bottom_up(&current, rule)?;
+        if !changed {
+            return Ok((next, true));
+        }
+        current = next;
+    }
+    Ok((current, false))
+}
+
+/// Itera pasadas top-down y devuelve la MEJOR forma vista (menor
+/// `node_count`, primera en caso de empate) más si convergió. Así el loop
+/// mixto de `trig_simplify` nunca devuelve una forma peor que un intermedio:
+/// si expandir/combinar oscilan, corta por cota con la forma más compacta.
+fn trig_fixpoint_best(
+    expr: &Expr,
+    rule: &dyn Fn(&Expr) -> Result<Option<Expr>, String>,
+    max_steps: usize,
+) -> Result<(Expr, bool), String> {
+    let mut current = expr.clone();
+    let mut best: Option<Expr> = None;
+    let mut best_size = usize::MAX;
+    let mut converged = false;
+    for _ in 0..max_steps {
+        let (next, changed) = trig_pass_top_down(&current, rule)?;
+        if !changed {
+            let size = current.node_count();
+            if size < best_size {
+                best = Some(current.clone());
+            }
+            converged = true;
+            break;
+        }
+        let size = next.node_count();
+        if size < best_size {
+            best_size = size;
+            best = Some(next.clone());
+        }
+        current = next;
+    }
+    if let Some(best) = best {
+        Ok((best, converged))
+    } else {
+        Ok((current, true))
+    }
+}
+
+fn parse_trig_input(cmd: &str, expr: &str) -> Result<Expr, String> {
+    if expr.len() > MAX_TRIG_INPUT_CHARS {
+        return Err(format!(
+            "{cmd}: la expresión excede el máximo {MAX_TRIG_INPUT_CHARS} (presupuesto MAX_EXPR_LENGTH)"
+        ));
+    }
+    let compact = expr.replace(' ', "");
+    parse_ast(&compact)
+        .map_err(|reason| format!("{cmd}: no se pudo interpretar '{expr}': {reason}"))
+}
+
+fn finish_trig_output(cmd: &str, expr: Expr) -> Result<String, String> {
+    let out = expr.to_expr_string();
+    if out.len() > MAX_TRIG_OUTPUT_BYTES {
+        return Err(format!(
+            "{cmd}: la salida excede el máximo {MAX_TRIG_OUTPUT_BYTES} (presupuesto de expansión)"
+        ));
+    }
+    Ok(out)
+}
+
+/// Expande identidades del subset en fases ordenadas: doble ángulo (una
+/// pasada), suma/diferencia (punto fijo: achica argumentos, converge) y
+/// potencias cuadráticas (una pasada; lo creado no se revisita).
+/// Ejemplos: sin(a+b)→sin a·cos b+cos a·sin b, cos(2x)→cos²x−sin²x,
+/// sin²x→(1−cos(2x))/2. Fuera del subset (tan, potencias ≠2) → `Err` honesto.
+pub fn trig_expand(expr: &str) -> Result<String, String> {
+    const CMD: &str = "TrigExpand";
+    let ast = parse_trig_input(CMD, expr)?;
+    let expand_sum = |node: &Expr| Ok(trig_sum_step(node));
+    let expand_double = |node: &Expr| Ok(trig_double_step(node));
+    let expand_pow = |node: &Expr| Ok(trig_pow_step(node));
+    let (pass1, changed_double) = trig_rewrite_bottom_up(&ast, &expand_double)?;
+    let (pass2, _) = trig_fixpoint(&pass1, &expand_sum, MAX_TRIG_REWRITE_STEPS)?;
+    let (pass3, changed_pow) = trig_rewrite_bottom_up(&pass2, &expand_pow)?;
+    if !changed_double && pass2.structurally_eq(&pass1) && !changed_pow {
+        return Err(format!(
+            "{CMD}: fuera del subset (solo sin/cos de suma o resta, doble ángulo 2·u y potencias cuadráticas sin²/cos²; tan, sec y potencias ≠2 exigen motor general)"
+        ));
+    }
+    finish_trig_output(CMD, pass3)
+}
+
+/// Combina productos del subset en suma o diferencia (una pasada bottom-up;
+/// lo creado no se revisita). Fuera del subset → `Err` honesto.
+pub fn trig_combine(expr: &str) -> Result<String, String> {
+    const CMD: &str = "TrigCombine";
+    let ast = parse_trig_input(CMD, expr)?;
+    let combine = |node: &Expr| Ok(trig_combine_step(node));
+    let (out, changed) = trig_rewrite_bottom_up(&ast, &combine)?;
+    if !changed {
+        return Err(format!(
+            "{CMD}: fuera del subset (solo productos sin·sin, sin·cos y cos·cos, con un factor constante opcional)"
+        ));
+    }
+    finish_trig_output(CMD, out)
+}
+
+/// Simplifica con pitagóricas (sin²+cos²→1, 1+tan²→sec²) más expansión y
+/// combinación en loop acotado de 8 pasos con pasada top-down (el padre gana
+/// a los hijos) y devolviendo la MEJOR forma vista. Si la forma oscila entre
+/// expandida y combinada, corta por cota con la más compacta (determinista).
+/// Sin identidad aplicable → `Err` honesto.
+pub fn trig_simplify(expr: &str) -> Result<String, String> {
+    const CMD: &str = "TrigSimplify";
+    let ast = parse_trig_input(CMD, expr)?;
+    let all = |node: &Expr| -> Result<Option<Expr>, String> {
+        if let Some(next) = trig_pythag_step(node) {
+            return Ok(Some(next));
+        }
+        if let Some(next) = trig_combine_step(node) {
+            return Ok(Some(next));
+        }
+        Ok(trig_expand_step(node))
+    };
+    let (out, _) = trig_fixpoint_best(&ast, &all, MAX_TRIG_REWRITE_STEPS)?;
+    if out.structurally_eq(&ast) {
+        return Err(format!(
+            "{CMD}: no se encontró identidad del subset (pitagóricas sin²+cos²→1 y 1+tan²→sec², expansión de suma/doble/potencias o combinación producto→suma)"
+        ));
+    }
+    finish_trig_output(CMD, out)
+}
+
+/// Cuadrado simbólico: (√x)² = x; resto E² = E·E (con plegado de consts).
+fn trig_square(expr: Expr) -> Expr {
+    if let Expr::Sqrt(inner) = expr {
+        (*inner).clone()
+    } else {
+        let other = expr.clone();
+        trig_mk_mul(expr, other)
+    }
+}
+
+fn trig_has_direct_sqrt(expr: &Expr) -> bool {
+    matches!(expr, Expr::Sqrt(_))
+}
+
+/// Una regla de racionalización sobre un `Div`: 1/√d → √d/d, a/(k·√c) →
+/// a·√c/(k·c) y binomio a/(b±√c) → a·(b∓√c)/(b²−c) por conjugada (también
+/// √a±√b → /(a−b)). Denominador nulo constante → `Err`; resto → `None`.
+fn rationalize_step(expr: &Expr) -> Result<Option<Expr>, String> {
+    use Expr::*;
+    const CMD: &str = "Rationalize";
+    let Div(num, den) = expr else {
+        return Ok(None);
+    };
+    // Caso 1/√d → √d/d.
+    if let Sqrt(radicand) = den.as_ref() {
+        if matches!(radicand.as_ref(), Const(v) if *v == 0.0) {
+            return Err(format!(
+                "{CMD}: denominador nulo (1/sqrt(0) no está definido)"
+            ));
+        }
+        return Ok(Some(trig_mk_div(
+            Sqrt(radicand.clone()),
+            (**radicand).clone(),
+        )));
+    }
+    // Caso a/(k·√c) → a·√c/(k·c), con factor constante un nivel.
+    if let Mul(a, b) = den.as_ref() {
+        let factor = match (trig_const(a), trig_const(b)) {
+            (Some(k), None) if k.is_finite() => Some((k, b.as_ref())),
+            (None, Some(k)) if k.is_finite() => Some((k, a.as_ref())),
+            _ => None,
+        };
+        if let Some((k, root)) = factor {
+            if let Sqrt(radicand) = root {
+                if k == 0.0 {
+                    return Err(format!("{CMD}: denominador nulo (factor 0·sqrt(c))"));
+                }
+                if matches!(radicand.as_ref(), Const(v) if *v == 0.0) {
+                    return Err(format!(
+                        "{CMD}: denominador nulo (sqrt(0) en el denominador)"
+                    ));
+                }
+                let new_den = trig_mk_mul(Const(k), (**radicand).clone());
+                if matches!(new_den, Const(v) if v == 0.0) {
+                    return Err(format!("{CMD}: denominador nulo tras racionalizar"));
+                }
+                return Ok(Some(trig_mk_div(
+                    trig_mk_mul((**num).clone(), Sqrt(radicand.clone())),
+                    new_den,
+                )));
+            }
+        }
+        return Ok(None);
+    }
+    // Caso binomio: a/(L±R) con al menos una raíz directa → conjugada.
+    // (L+R)(L−R) = L²−R² con (√x)² = x.
+    if let Add(l, r) | Sub(l, r) = den.as_ref() {
+        if !trig_has_direct_sqrt(l) && !trig_has_direct_sqrt(r) {
+            return Ok(None);
+        }
+        let conj = if matches!(den.as_ref(), Add(..)) {
+            Sub(l.clone(), r.clone())
+        } else {
+            Add(l.clone(), r.clone())
+        };
+        let new_den = trig_mk_sub(trig_square((**l).clone()), trig_square((**r).clone()));
+        if matches!(new_den, Const(v) if v == 0.0) {
+            return Err(format!(
+                "{CMD}: denominador nulo tras conjugada (b²=c, división por cero)"
+            ));
+        }
+        return Ok(Some(trig_mk_div(
+            trig_mk_mul((**num).clone(), conj),
+            new_den,
+        )));
+    }
+    Ok(None)
+}
+
+/// Quita radicales cuadráticos del denominador (una pasada; lo creado no se
+/// revisita): 1/√d, a/(k·√c) y binomios por conjugada. Resto (cbrt,
+/// radicales fuera del binomio) → `Err` honesto.
+pub fn rationalize(expr: &str) -> Result<String, String> {
+    const CMD: &str = "Rationalize";
+    let ast = parse_trig_input(CMD, expr)?;
+    let rat = |node: &Expr| rationalize_step(node);
+    let (out, changed) = trig_rewrite_bottom_up(&ast, &rat)?;
+    if !changed {
+        return Err(format!(
+            "{CMD}: fuera del subset (solo 1/sqrt(d), a/(k·sqrt(c)) y a/(b±sqrt(c)) con radical cuadrático; cbrt y resto exigen motor general)"
+        ));
+    }
+    finish_trig_output(CMD, out)
+}
+
+// --- Hermite / Rothstein-Trager helpers ---
+
+fn poly_to_expr(coeffs: &[f64], var: &str) -> Expr {
+    let t = poly_trim(coeffs);
+    if poly_is_zero(&t) {
+        return Expr::Const(0.0);
+    }
+    let mut expr: Option<Expr> = None;
+    for (deg, &c) in t.iter().enumerate() {
+        if c.abs() <= POLY_EPS {
+            continue;
+        }
+        let term = if deg == 0 {
+            Expr::Const(c)
+        } else if deg == 1 {
+            if (c - 1.0).abs() <= POLY_EPS {
+                Expr::Var(var.to_string())
+            } else if (c + 1.0).abs() <= POLY_EPS {
+                Expr::Neg(Box::new(Expr::Var(var.to_string())))
+            } else {
+                Expr::Mul(
+                    Box::new(Expr::Const(c)),
+                    Box::new(Expr::Var(var.to_string())),
+                )
+            }
+        } else if (c - 1.0).abs() <= POLY_EPS {
+            Expr::Pow(
+                Box::new(Expr::Var(var.to_string())),
+                Box::new(Expr::Const(deg as f64)),
+            )
+        } else if (c + 1.0).abs() <= POLY_EPS {
+            Expr::Neg(Box::new(Expr::Pow(
+                Box::new(Expr::Var(var.to_string())),
+                Box::new(Expr::Const(deg as f64)),
+            )))
+        } else {
+            Expr::Mul(
+                Box::new(Expr::Const(c)),
+                Box::new(Expr::Pow(
+                    Box::new(Expr::Var(var.to_string())),
+                    Box::new(Expr::Const(deg as f64)),
+                )),
+            )
+        };
+        expr = Some(match expr {
+            None => term,
+            Some(prev) => {
+                if matches!(&term, Expr::Neg(_)) {
+                    Expr::Sub(
+                        Box::new(prev),
+                        Box::new(match term {
+                            Expr::Neg(inner) => *inner,
+                            _ => term,
+                        }),
+                    )
+                } else {
+                    Expr::Add(Box::new(prev), Box::new(term))
+                }
+            }
+        });
+    }
+    expr.unwrap_or(Expr::Const(0.0))
+}
+
+fn expr_to_poly(expr: &Expr, var: &str) -> Option<Vec<f64>> {
+    collect_polynomial_coeffs(expr, var, MAX_POLY_DEG).map(|v| poly_trim(&v))
+}
+
+fn solve_linear_system(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Option<Vec<f64>> {
+    let n = a.len();
+    if n == 0 || a.iter().any(|row| row.len() != n) || b.len() != n {
+        return None;
+    }
+    for col in 0..n {
+        // pivot
+        let mut pivot = col;
+        let mut best = a[col][col].abs();
+        for row in (col + 1)..n {
+            let v = a[row][col].abs();
+            if v > best {
+                best = v;
+                pivot = row;
+            }
+        }
+        if best <= 1e-12 {
+            return None;
+        }
+        if pivot != col {
+            a.swap(col, pivot);
+            b.swap(col, pivot);
+        }
+        let piv = a[col][col];
+        for row in (col + 1)..n {
+            let factor = a[row][col] / piv;
+            if factor.abs() <= 1e-14 {
+                continue;
+            }
+            for k in col..n {
+                a[row][k] -= factor * a[col][k];
+            }
+            b[row] -= factor * b[col];
+        }
+    }
+    let mut x = vec![0.0; n];
+    for i in (0..n).rev() {
+        let mut sum = b[i];
+        for j in (i + 1)..n {
+            sum -= a[i][j] * x[j];
+        }
+        let piv = a[i][i];
+        if piv.abs() <= 1e-12 {
+            return None;
+        }
+        x[i] = sum / piv;
+    }
+    Some(x)
+}
+
+fn hermite_ostrogradsky(
+    p_coeffs: &[f64],
+    q_coeffs: &[f64],
+) -> Option<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>)> {
+    // Devuelve (P1, Q1, P2, Q2) tal que ∫P/Q = P1/Q1 + ∫P2/Q2 con Q2 squarefree
+    let q = poly_trim(q_coeffs);
+    let p = poly_trim(p_coeffs);
+    if poly_is_zero(&q) {
+        return None;
+    }
+    let q_deg = poly_degree(&q)?;
+    let p_deg = poly_degree(&p).unwrap_or(0);
+    if p_deg >= q_deg && !poly_is_zero(&p) {
+        return None;
+    }
+    let q_der = poly_derivative(&q);
+    let q1 = poly_gcd_subresultant(q.clone(), q_der);
+    let q1_trim = poly_trim(&q1);
+    if poly_is_zero(&q1_trim) {
+        return None;
+    }
+    let Some(q2) = poly_exact_div(&q, &q1_trim) else {
+        return None;
+    };
+    let q2_trim = poly_trim(&q2);
+    if poly_is_zero(&q2_trim) {
+        return None;
+    }
+    // Si Q es squarefree (Q1=1) no hay parte racional
+    if q1_trim.len() == 1 && (q1_trim[0] - 1.0).abs() <= POLY_EPS {
+        return Some((vec![0.0], vec![1.0], p, q2_trim));
+    }
+    // Calcula S = Q1' * Q2 / Q1
+    let q1_der = poly_derivative(&q1_trim);
+    let Some(num_s) = poly_mul(&q1_der, &q2_trim) else {
+        return None;
+    };
+    let Some(s) = poly_exact_div(&num_s, &q1_trim) else {
+        return None;
+    };
+    let s_trim = poly_trim(&s);
+    let n = poly_degree(&q1_trim).unwrap_or(0);
+    let m = poly_degree(&q2_trim).unwrap_or(0);
+    if n == 0 || m == 0 {
+        // Degenerado
+        return None;
+    }
+    if n + m != q_deg {
+        return None;
+    }
+    let d = q_deg;
+    // Construye sistema T = P1' Q2 - P1 S + P2 Q1 = P
+    // Unknowns: A_{n-1}..A0 (P1), B_{m-1}..B0 (P2)  total d
+    let mut mat = vec![vec![0.0; d]; d];
+    let mut rhs = vec![0.0; d];
+    for (i, &c) in p.iter().enumerate() {
+        if i < d {
+            rhs[i] = c;
+        }
+    }
+    // columnas 0..n-1 -> A
+    for col in 0..n {
+        // P1 = x^{col}
+        let mut p1 = vec![0.0; col + 1];
+        p1[col] = 1.0;
+        let p1_trim = poly_trim(&p1);
+        let p1_der = poly_derivative(&p1_trim);
+        let Some(term1) = poly_mul(&p1_der, &q2_trim) else {
+            continue;
+        };
+        let Some(term2) = poly_mul(&p1_trim, &s_trim) else {
+            continue;
+        };
+        let contrib = poly_sub(&term1, &term2);
+        for (row, &c) in contrib.iter().enumerate() {
+            if row < d {
+                mat[row][col] += c;
+            }
+        }
+    }
+    // columnas n .. n+m-1 -> B
+    for col in 0..m {
+        let mat_col = n + col;
+        let mut p2 = vec![0.0; col + 1];
+        p2[col] = 1.0;
+        let Some(term) = poly_mul(&p2, &q1_trim) else {
+            continue;
+        };
+        for (row, &c) in term.iter().enumerate() {
+            if row < d {
+                mat[row][mat_col] += c;
+            }
+        }
+    }
+    let Some(sol) = solve_linear_system(mat, rhs) else {
+        return None;
+    };
+    let p1_coeffs = sol[0..n].to_vec();
+    let p2_coeffs = sol[n..n + m].to_vec();
+    Some((
+        poly_trim(&p1_coeffs),
+        q1_trim,
+        poly_trim(&p2_coeffs),
+        q2_trim,
+    ))
+}
+
+fn find_rational_roots(poly: &[f64]) -> Vec<f64> {
+    let t = poly_trim(poly);
+    if poly_is_zero(&t) {
+        return Vec::new();
+    }
+    // Solo si coeficientes casi enteros
+    let mut int_coeffs: Vec<i128> = Vec::new();
+    for &c in &t {
+        let r = c.round();
+        if (c - r).abs() > 1e-9 {
+            return Vec::new();
+        }
+        if r.abs() > 1_000_000.0 {
+            return Vec::new();
+        }
+        int_coeffs.push(r as i128);
+    }
+    let deg = poly_degree(&t).unwrap_or(0);
+    let lead = int_coeffs[deg];
+    let constant = int_coeffs[0];
+    if lead == 0 || constant == 0 {
+        // raíz 0 es trivial, la tratamos aparte
+        let mut roots = Vec::new();
+        if constant == 0 {
+            roots.push(0.0);
+        }
+        return roots;
+    }
+    let lead_abs = lead.unsigned_abs() as u64;
+    let const_abs = constant.unsigned_abs() as u64;
+    let divisors = |n: u64| -> Vec<u64> {
+        let mut d = Vec::new();
+        let mut i = 1u64;
+        while i * i <= n {
+            if n.is_multiple_of(i) {
+                d.push(i);
+                if i * i != n {
+                    d.push(n / i);
+                }
+            }
+            i += 1;
+        }
+        d
+    };
+    let lead_divs = divisors(lead_abs);
+    let const_divs = divisors(const_abs);
+    let mut candidates: Vec<f64> = Vec::new();
+    for &cn in &const_divs {
+        for &ld in &lead_divs {
+            let cand = cn as f64 / ld as f64;
+            candidates.push(cand);
+            candidates.push(-cand);
+        }
+    }
+    candidates.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    candidates.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
+    let mut roots = Vec::new();
+    for cand in candidates {
+        let v = horner_eval(&t, cand);
+        if v.abs() <= 1e-9 * t.iter().map(|c| c.abs()).fold(1.0_f64, f64::max)
+            && !roots.iter().any(|r: &f64| (*r - cand).abs() < 1e-9)
+        {
+            roots.push(cand);
+        }
+    }
+    roots
+}
+
+#[allow(dead_code)]
+fn factor_poly_real(poly: &[f64]) -> Option<Vec<(Vec<f64>, usize)>> {
+    // Usa Yun squarefree + raíces racionales para separar lineales; el resto cuadrático queda como bloque
+    let sq = yun_squarefree(poly);
+    if !sq.is_empty() {
+        // Yun ya da factores con multiplicidad
+        let mut out: Vec<(Vec<f64>, usize)> = Vec::new();
+        for (fac, mult) in sq {
+            // Intenta romper fac en lineales racionales
+            let mut rem = fac.clone();
+            let roots = find_rational_roots(&rem);
+            for r in roots {
+                // divide por (x - r) mientras sea divisible
+                loop {
+                    let lin = vec![-r, 1.0];
+                    let Some(q) = poly_exact_div(&rem, &lin) else {
+                        break;
+                    };
+                    out.push((lin, mult));
+                    rem = q;
+                    if poly_is_zero(&rem) || rem.len() == 1 {
+                        break;
+                    }
+                }
+            }
+            if !(rem.len() == 1 && (rem[0] - 1.0).abs() <= POLY_EPS) && !poly_is_zero(&rem) {
+                out.push((rem, mult));
+            }
+        }
+        if !out.is_empty() {
+            return Some(out);
+        }
+    }
+    // Fallback: intenta raíces racionales simples
+    let roots = find_rational_roots(poly);
+    if roots.is_empty() {
+        return None;
+    }
+    let mut rem = poly_trim(poly);
+    let mut facs: Vec<(Vec<f64>, usize)> = Vec::new();
+    for r in roots {
+        let lin = vec![-r, 1.0];
+        let mut cnt = 0usize;
+        while let Some(q) = poly_exact_div(&rem, &lin) {
+            cnt += 1;
+            rem = q;
+            if rem.len() == 1 {
+                break;
+            }
+        }
+        if cnt > 0 {
+            facs.push((lin, cnt));
+        }
+    }
+    if !poly_is_zero(&rem) && !(rem.len() == 1 && (rem[0] - 1.0).abs() <= POLY_EPS) {
+        facs.push((rem, 1));
+    }
+    Some(facs)
+}
+
+fn integrate_squarefree_via_partial(p: &[f64], q: &[f64], var: &str) -> Option<Expr> {
+    let q_trim = poly_trim(q);
+    let p_trim = poly_trim(p);
+    let q_deg = poly_degree(&q_trim)?;
+    let p_deg = poly_degree(&p_trim).unwrap_or(0);
+    if !poly_is_zero(&p_trim) && p_deg >= q_deg {
+        return None;
+    }
+    // Caso 1/(x²+ a²) ya manejado por try_atan_form, pero aquí generaliza
+    // Factor q en lineales y cuadráticos reales
+    // Para 1/(x²-1): q = x²-1 -> raíces -1,1
+    // Para x/(x³-1): q = x³-1 -> raíz 1 y cuadrático x²+x+1
+    let roots = find_rational_roots(&q_trim);
+    let mut linear_factors: Vec<f64> = Vec::new();
+    let mut rem = q_trim.clone();
+    for r in &roots {
+        let lin = vec![-*r, 1.0];
+        while let Some(q) = poly_exact_div(&rem, &lin) {
+            linear_factors.push(*r);
+            rem = q;
+        }
+    }
+    rem = poly_trim(&rem);
+    // rem ahora es 1 o cuadrático (si grado 2) o mayor
+    // Si rem ==1 => solo lineales
+    if rem.len() == 1 && (rem[0] - 1.0).abs() <= POLY_EPS {
+        // Solo lineales distintos (squarefree garantiza simples)
+        let n = linear_factors.len();
+        if n == 0 {
+            return None;
+        }
+        // Resolver A_i para p/q = Σ A_i/(x - r_i)
+        // Sistema lineal: p = Σ A_i * q/(x - r_i)
+        let mut mat = vec![vec![0.0; n]; q_deg];
+        for (col, &r) in linear_factors.iter().enumerate() {
+            let lin = vec![-r, 1.0];
+            let Some(q_div) = poly_exact_div(&q_trim, &lin) else {
+                return None;
+            };
+            for (row, &c) in q_div.iter().enumerate() {
+                if row < q_deg {
+                    mat[row][col] = c;
+                }
+            }
+        }
+        if q_deg != n {
+            return None;
+        }
+        let mut a_mat = vec![vec![0.0; n]; n];
+        for r in 0..n {
+            for c in 0..n {
+                a_mat[r][c] = mat[r][c];
+            }
+        }
+        let mut rhs = vec![0.0; q_deg];
+        for (i, &c) in p_trim.iter().enumerate() {
+            if i < q_deg {
+                rhs[i] = c;
+            }
+        }
+        let coeffs = solve_linear_system(a_mat, rhs)?;
+        // Construir expresión Σ A_i ln|x - r_i|
+        let mut expr: Option<Expr> = None;
+        for (a, &r) in coeffs.iter().zip(linear_factors.iter()) {
+            if a.abs() <= 1e-12 {
+                continue;
+            }
+            let lin_expr = if r == 0.0 {
+                Expr::Var(var.to_string())
+            } else if r > 0.0 {
+                Expr::Sub(
+                    Box::new(Expr::Var(var.to_string())),
+                    Box::new(Expr::Const(r)),
+                )
+            } else {
+                Expr::Add(
+                    Box::new(Expr::Var(var.to_string())),
+                    Box::new(Expr::Const(-r)),
+                )
+            };
+            let term = Expr::Mul(
+                Box::new(Expr::Const(*a)),
+                Box::new(Expr::Ln(Box::new(Expr::Abs(Box::new(lin_expr))))),
+            );
+            expr = Some(match expr {
+                None => term,
+                Some(prev) => Expr::Add(Box::new(prev), Box::new(term)),
+            });
+        }
+        return expr;
+    }
+    // Caso con cuadrático restante
+    if rem.len() == 3 {
+        // rem = a x² + b x + c  (mónico o no)
+        // Normaliza a mónico para fórmula
+        let a2 = rem[2];
+        if a2.abs() <= POLY_EPS {
+            return None;
+        }
+        let b = rem[1] / a2;
+        let c = rem[0] / a2;
+        // rem_monic = x² + b x + c
+        // linear_factors ya extraídos
+        let n_lin = linear_factors.len();
+        if n_lin == 0 && q_deg == 2 {
+            // Solo cuadrático: p = B x + C  -> integral directa
+            // No debería llegar aquí porque try_atan lo cubre, pero lo manejamos
+            return None;
+        }
+        // Sistema para A_i y (B x + C)
+        // Unknowns: n_lin A_i + 2 (B,C) = n_lin+2 = q_deg
+        let n_unknown = n_lin + 2;
+        if n_unknown != q_deg {
+            return None;
+        }
+        let mut mat = vec![vec![0.0; n_unknown]; q_deg];
+        // columnas A
+        for (col, &r) in linear_factors.iter().enumerate() {
+            let lin = vec![-r, 1.0];
+            let Some(q_div) = poly_exact_div(&q_trim, &lin) else {
+                return None;
+            };
+            for (row, &coeff) in q_div.iter().enumerate() {
+                if row < q_deg {
+                    mat[row][col] = coeff;
+                }
+            }
+        }
+        // columna B: B x * (q / rem)  -> q/rem = producto lineales
+        let Some(q_over_rem) = poly_exact_div(&q_trim, &rem) else {
+            return None;
+        };
+        // B x term: (B x) * q_over_rem -> convolución
+        // Para desconocida B, contribución = x * q_over_rem
+        let b_contrib = {
+            let mut v = vec![0.0; q_over_rem.len() + 1];
+            for (i, &c) in q_over_rem.iter().enumerate() {
+                v[i + 1] += c;
+            }
+            poly_trim(&v)
+        };
+        for (row, &c) in b_contrib.iter().enumerate() {
+            if row < q_deg {
+                mat[row][n_lin] = c;
+            }
+        }
+        // C term: C * q_over_rem
+        for (row, &c) in q_over_rem.iter().enumerate() {
+            if row < q_deg {
+                mat[row][n_lin + 1] = c;
+            }
+        }
+        let mut rhs = vec![0.0; q_deg];
+        for (i, &c) in p_trim.iter().enumerate() {
+            if i < q_deg {
+                rhs[i] = c;
+            }
+        }
+        let coeffs = solve_linear_system(mat, rhs)?;
+        // Construir expresión
+        let mut expr: Option<Expr> = None;
+        for (idx, &r) in linear_factors.iter().enumerate() {
+            let a = coeffs[idx];
+            if a.abs() <= 1e-12 {
+                continue;
+            }
+            let lin_expr = if r == 0.0 {
+                Expr::Var(var.to_string())
+            } else if r > 0.0 {
+                Expr::Sub(
+                    Box::new(Expr::Var(var.to_string())),
+                    Box::new(Expr::Const(r)),
+                )
+            } else {
+                Expr::Add(
+                    Box::new(Expr::Var(var.to_string())),
+                    Box::new(Expr::Const(-r)),
+                )
+            };
+            let term = Expr::Mul(
+                Box::new(Expr::Const(a)),
+                Box::new(Expr::Ln(Box::new(Expr::Abs(Box::new(lin_expr))))),
+            );
+            expr = Some(match expr {
+                None => term,
+                Some(prev) => Expr::Add(Box::new(prev), Box::new(term)),
+            });
+        }
+        let b_coef = coeffs[n_lin];
+        let c_coef = coeffs[n_lin + 1];
+        // Integral de (B x + C)/(x² + b x + c)
+        // = B/2 ln(quad) + (C - B b/2)/sqrt(4c - b²) * atan((2x + b)/sqrt(...))
+        // Solo si discriminante negativo (irreducible)
+        let disc = b * b - 4.0 * c;
+        if disc >= -1e-12 {
+            // No es irreducible, debería haberse factorizado en lineales; fallback
+            return None;
+        }
+        let quad_expr = Expr::Add(
+            Box::new(Expr::Add(
+                Box::new(Expr::Pow(
+                    Box::new(Expr::Var(var.to_string())),
+                    Box::new(Expr::Const(2.0)),
+                )),
+                Box::new(Expr::Mul(
+                    Box::new(Expr::Const(b)),
+                    Box::new(Expr::Var(var.to_string())),
+                )),
+            )),
+            Box::new(Expr::Const(c)),
+        );
+        if b_coef.abs() > 1e-12 {
+            let term_ln = Expr::Mul(
+                Box::new(Expr::Const(b_coef / 2.0)),
+                Box::new(Expr::Ln(Box::new(Expr::Abs(Box::new(quad_expr))))),
+            );
+            expr = Some(match expr {
+                None => term_ln,
+                Some(prev) => Expr::Add(Box::new(prev), Box::new(term_ln)),
+            });
+        }
+        let atan_coef = c_coef - b_coef * b / 2.0;
+        if atan_coef.abs() > 1e-12 {
+            let sqrt_disc = (-disc).sqrt();
+            if sqrt_disc.abs() <= 1e-12 {
+                return None;
+            }
+            let factor = atan_coef * 2.0 / sqrt_disc;
+            let inner = Expr::Div(
+                Box::new(Expr::Add(
+                    Box::new(Expr::Mul(
+                        Box::new(Expr::Const(2.0)),
+                        Box::new(Expr::Var(var.to_string())),
+                    )),
+                    Box::new(Expr::Const(b)),
+                )),
+                Box::new(Expr::Const(sqrt_disc)),
+            );
+            let term_atan = Expr::Mul(
+                Box::new(Expr::Const(factor)),
+                Box::new(Expr::Atan(Box::new(inner))),
+            );
+            expr = Some(match expr {
+                None => term_atan,
+                Some(prev) => Expr::Add(Box::new(prev), Box::new(term_atan)),
+            });
+        }
+        return expr;
+    }
+    None
+}
+
+fn try_rational_integration(expr: &Expr, var: &str) -> Option<Expr> {
+    // Detecta P/Q racional puro
+    let (num, den) = match expr {
+        Expr::Div(n, d) => (n.as_ref(), d.as_ref()),
+        _ => return None,
+    };
+    let p_coeffs = expr_to_poly(num, var)?;
+    let q_coeffs = expr_to_poly(den, var)?;
+    if poly_is_zero(&q_coeffs) {
+        return None;
+    }
+    // Haz división si impropio
+    let q_deg = poly_degree(&q_coeffs)?;
+    let p_deg = poly_degree(&p_coeffs);
+    let mut rational_part: Option<Expr> = None;
+    let (p_rem, _poly_part) = if let Some(d) = p_deg {
+        if d >= q_deg {
+            let Some((quot, rem)) = poly_div_rem(&p_coeffs, &q_coeffs) else {
+                return None;
+            };
+            let _poly_expr = poly_to_expr(&quot, var);
+            // integral del cociente polinómico (fácil)
+            let quot_integ = {
+                let mut integ = Vec::new();
+                for (deg, &c) in quot.iter().enumerate() {
+                    if c.abs() <= POLY_EPS {
+                        continue;
+                    }
+                    let new_deg = deg + 1;
+                    let new_c = c / new_deg as f64;
+                    let term = if new_deg == 1 {
+                        Expr::Mul(
+                            Box::new(Expr::Const(new_c)),
+                            Box::new(Expr::Var(var.to_string())),
+                        )
+                    } else {
+                        Expr::Mul(
+                            Box::new(Expr::Const(new_c)),
+                            Box::new(Expr::Pow(
+                                Box::new(Expr::Var(var.to_string())),
+                                Box::new(Expr::Const(new_deg as f64)),
+                            )),
+                        )
+                    };
+                    integ.push(term);
+                }
+                integ.into_iter().fold(None::<Expr>, |acc, t| {
+                    Some(match acc {
+                        None => t,
+                        Some(prev) => Expr::Add(Box::new(prev), Box::new(t)),
+                    })
+                })
+            };
+            rational_part = quot_integ;
+            (poly_trim(&rem), poly_to_expr(&quot, var))
+        } else {
+            (poly_trim(&p_coeffs), poly_to_expr(&[0.0], var))
+        }
+    } else {
+        (poly_trim(&p_coeffs), poly_to_expr(&[0.0], var))
+    };
+    if poly_is_zero(&p_rem) {
+        return rational_part;
+    }
+    // Hermite reduction
+    let hermite = hermite_ostrogradsky(&p_rem, &q_coeffs);
+    if let Some((p1, q1, p2, q2)) = hermite {
+        // P1/Q1 es parte racional
+        let rational_hermite = if !poly_is_zero(&p1) {
+            // P1/Q1
+            let num_e = poly_to_expr(&p1, var);
+            let den_e = poly_to_expr(&q1, var);
+            Expr::Div(Box::new(num_e), Box::new(den_e))
+        } else {
+            Expr::Const(0.0)
+        };
+        let combined_rational = match (&rational_part, &rational_hermite) {
+            (None, Expr::Const(v)) if *v == 0.0 => None,
+            (Some(prev), Expr::Const(v)) if *v == 0.0 => Some(prev.clone()),
+            (None, r) => Some(r.clone()),
+            (Some(prev), r) => Some(Expr::Add(Box::new(prev.clone()), Box::new(r.clone()))),
+        };
+        // Integrar P2/Q2 (squarefree)
+        if poly_is_zero(&p2) {
+            return combined_rational;
+        }
+        if let Some(transc) = integrate_squarefree_via_partial(&p2, &q2, var) {
+            return Some(match combined_rational {
+                None => transc,
+                Some(prev) => Expr::Add(Box::new(prev), Box::new(transc)),
+            });
+        }
+        // Si no se pudo integrar P2/Q2, intenta directo sin Hermite
+    }
+    // Fallback directo squarefree (si Q ya era squarefree)
+    if let Some(transc) = integrate_squarefree_via_partial(&p_rem, &q_coeffs, var) {
+        return Some(match rational_part {
+            None => transc,
+            Some(prev) => Expr::Add(Box::new(prev), Box::new(transc)),
+        });
+    }
+    None
+}
+
+/// Expande productos y potencias enteras no negativas por distributividad.
+///
+/// Las potencias cero permanecen intactas para no borrar el caso indefinido
+/// `0^0`. La operación falla si el AST, el trabajo acumulado o la salida
+/// proyectada exceden sus presupuestos, antes de materializar una expansión
+/// potencialmente explosiva.
+pub fn expand(expr: &str) -> Result<String, String> {
+    let pp = expr.replace(' ', "");
+    let ast = parse_ast(&pp).map_err(|e| format!("No se pudo expandir '{expr}': {e}"))?;
+    validate_expand_expression(&ast)?;
+
+    let mut budget = ExpandBudget::default();
+    let terms = expand_expr(&ast, &mut budget)?;
+    let expanded = expanded_terms_into_expr(terms, &mut budget)?;
+    let simplified = simplify_expanded_expr(expanded, &mut budget)?;
+    validate_expand_expression(&simplified)?;
+
+    let output = simplified.to_expr_string();
+    if output.len() > MAX_EXPAND_OUTPUT_BYTES {
+        return Err(expand_budget_error(
+            "output",
+            output.len(),
+            MAX_EXPAND_OUTPUT_BYTES,
+        ));
+    }
+    Ok(output)
+}
+
+/// Factoriza polinomios lineales y cuadráticos preservando equivalencia.
+///
+/// Para expresiones fuera de este subconjunto devuelve la expresión original:
+/// es preferible no factorizar a publicar factores numéricos incompletos.
+
+/// Ola 2.4: factorización de Kronecker acotada (coeficientes enteros,
+/// grado ≤ `MAX_KRONECKER_DEGREE`, presupuesto de candidatos). Devuelve los
+/// factores con multiplicidad; un polinomio irreducible sobre Q vuelve como
+/// un único factor igual al original. `None` si no aplica o se agota el
+/// presupuesto (el llamador conserva el error honesto histórico).
+const MAX_KRONECKER_CANDIDATES: usize = 30_000;
+const MAX_KRONECKER_DEGREE: usize = 6;
+const MAX_KRONECKER_COEFF: i128 = 10_000;
+
+fn poly_eval_i128(coeffs: &[i128], x: i128) -> Option<i128> {
+    let mut acc = 0i128;
+    for &c in coeffs.iter().rev() {
+        acc = acc.checked_mul(x)?.checked_add(c)?;
+    }
+    Some(acc)
+}
+
+fn integer_divisors(value: i128) -> Vec<i128> {
+    let v = value.abs();
+    if v == 0 {
+        return vec![0];
+    }
+    let mut out = Vec::new();
+    let mut d = 1i128;
+    while d * d <= v {
+        if v % d == 0 {
+            out.push(d);
+            if d * d != v {
+                out.push(v / d);
+            }
+        }
+        d += 1;
+    }
+    out.sort_unstable();
+    out
+}
+
+fn poly_div_rem_i128(a: &[i128], b: &[i128]) -> Option<(Vec<i128>, Vec<i128>)> {
+    let mut rem: Vec<i128> = a.to_vec();
+    let b_deg = b.len().checked_sub(1)?;
+    let lead = *b.last()?;
+    if lead == 0 {
+        return None;
+    }
+    if rem.len() < b.len() {
+        return Some((vec![0], rem));
+    }
+    let mut quot = vec![0i128; rem.len() - b_deg];
+    while rem.len() >= b.len() && !rem.is_empty() {
+        let shift = rem.len() - b.len();
+        let top = rem[rem.len() - 1];
+        // División exacta en Z[i]: si el coeficiente líder no divide, no es
+        // factor (evita un "resto cero" espurio por truncamiento).
+        if top % lead != 0 {
+            return None;
+        }
+        let factor = top / lead;
+        quot[shift] = factor;
+        for i in 0..b.len() {
+            rem[shift + i] -= factor * b[i];
+        }
+        while rem.last() == Some(&0) {
+            rem.pop();
+        }
+    }
+    Some((quot, rem))
+}
+
+fn interpolate_integer_poly(points: &[(i128, i128)]) -> Option<Vec<i128>> {
+    let n = points.len();
+    if n == 0 {
+        return None;
+    }
+    let xs: Vec<f64> = points.iter().map(|(x, _)| *x as f64).collect();
+    let mut coef: Vec<f64> = points.iter().map(|(_, y)| *y as f64).collect();
+    for j in 1..n {
+        for i in (j..n).rev() {
+            let den = xs[i] - xs[i - j];
+            if den == 0.0 {
+                return None;
+            }
+            coef[i] = (coef[i] - coef[i - 1]) / den;
+        }
+    }
+    // Expansión a coeficientes monomiales: poly = coef[n-1]; por cada punto
+    // restante poly = poly*(x - x_i) + coef[i].
+    let mut poly: Vec<f64> = vec![coef[n - 1]];
+    for i in (0..n - 1).rev() {
+        let mut next = vec![0.0; poly.len() + 1];
+        for (deg, &value) in poly.iter().enumerate() {
+            next[deg + 1] += value;
+            next[deg] -= value * xs[i];
+        }
+        next[0] += coef[i];
+        poly = next;
+    }
+    let mut rounded: Vec<i128> = poly
+        .iter()
+        .map(|value| {
+            if !value.is_finite() || value.abs() > 1e9 {
+                return None;
+            }
+            let round = value.round();
+            ((value - round).abs() < 1e-6).then_some(round as i128)
+        })
+        .collect::<Option<Vec<i128>>>()?;
+    while rounded.len() > 1 && rounded.last() == Some(&0) {
+        rounded.pop();
+    }
+    Some(rounded)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn kronecker_search(
+    f: &[i128],
+    budget: &mut usize,
+    depth: usize,
+    out: &mut Vec<(Vec<i128>, usize)>,
+) -> bool {
+    let degree = f.len().saturating_sub(1);
+    // Base: lineales y cuadráticos son atómicos sobre Q (las raíces
+    // racionales ya se extrajeron antes de Kronecker).
+    if degree <= 2 {
+        out.push((f.to_vec(), 1));
+        return true;
+    }
+    if depth > 4 || *budget == 0 {
+        return false;
+    }
+    let n = degree;
+    // Puntos distintos fijos (0, ±1, ±2, 3) según el grado pedido.
+    const KRONECKER_POINTS: [i128; 6] = [0, 1, -1, 2, -2, 3];
+    let points: Vec<i128> = KRONECKER_POINTS.iter().copied().take(n).collect();
+    let values: Vec<i128> = points
+        .iter()
+        .map(|x| poly_eval_i128(f, *x))
+        .collect::<Option<Vec<_>>>()
+        .unwrap_or_default();
+    if values.len() != n {
+        return false;
+    }
+    // Raíz entera directa: deflacta.
+    for (index, value) in values.iter().enumerate() {
+        if *value == 0 {
+            let x = points[index];
+            if let Some((quot, rem)) = poly_div_rem_i128(f, &[-x, 1]) {
+                if rem.is_empty() && quot.len() >= 2 {
+                    out.push((vec![-x, 1], 1));
+                    return kronecker_search(&quot, budget, depth + 1, out);
+                }
+            }
+        }
+    }
+    let candidate_sets: Vec<Vec<i128>> = values
+        .iter()
+        .map(|value| {
+            let mut set: Vec<i128> = Vec::new();
+            for divisor in integer_divisors(*value) {
+                if !set.contains(&divisor) {
+                    set.push(divisor);
+                }
+                if !set.contains(&(-divisor)) {
+                    set.push(-divisor);
+                }
+            }
+            set
+        })
+        .collect();
+    // Búsqueda de un factor g de grado 1..n-1 con g(x_i) = y_i (y_i | f(x_i)).
+    let mut choice = vec![0usize; n];
+    loop {
+        if *budget == 0 {
+            return false;
+        }
+        *budget = budget.saturating_sub(1);
+        let chosen: Vec<(i128, i128)> = points
+            .iter()
+            .enumerate()
+            .map(|(index, x)| (*x, candidate_sets[index][choice[index]]))
+            .collect();
+        let any_zero = chosen.iter().any(|(_, y)| *y == 0);
+        if !any_zero {
+            if let Some(g) = interpolate_integer_poly(&chosen) {
+                let g_deg = g.len().saturating_sub(1);
+                if g_deg >= 1 && g_deg < degree && g.last() != Some(&0) {
+                    if let Some((quot, rem)) = poly_div_rem_i128(f, &g) {
+                        if rem.is_empty() && !quot.is_empty() {
+                            return kronecker_search(&g, budget, depth + 1, out)
+                                && kronecker_search(&quot, budget, depth + 1, out);
+                        }
+                    }
+                }
+            }
+        }
+        // Siguiente combinación (odómetro).
+        let mut index = 0usize;
+        loop {
+            if index == n {
+                // Sin factor no trivial en la búsqueda acotada: el polinomio
+                // es irreducible sobre Q (dentro de la cota) y vuelve atómico.
+                out.push((f.to_vec(), 1));
+                return true;
+            }
+            choice[index] += 1;
+            if choice[index] < candidate_sets[index].len() {
+                break;
+            }
+            choice[index] = 0;
+            index += 1;
+        }
+    }
+}
+
+fn kronecker_factor_integer_poly(coeffs: &[f64]) -> Option<Vec<(Vec<f64>, usize)>> {
+    let degree = coeffs.iter().rposition(|c| *c != 0.0)?;
+    if degree <= 2 || degree > MAX_KRONECKER_DEGREE {
+        return None;
+    }
+    let integer: Vec<i128> = coeffs[..=degree]
+        .iter()
+        .map(|value| {
+            if !value.is_finite() {
+                return None;
+            }
+            let round = value.round();
+            if (value - round).abs() > 1e-9 || round.abs() > MAX_KRONECKER_COEFF as f64 {
+                return None;
+            }
+            Some(round as i128)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if integer.last().is_none_or(|lead| *lead <= 0) {
+        return None;
+    }
+    // Parte primitiva (contenido 1) para que los factores la reconstruyan.
+    let content = integer
+        .iter()
+        .fold(0i128, |acc, value| gcd_i128(acc, *value));
+    if content > 1 {
+        return None;
+    }
+    let mut budget = MAX_KRONECKER_CANDIDATES;
+    let mut factors: Vec<(Vec<i128>, usize)> = Vec::new();
+    if !kronecker_search(&integer, &mut budget, 0, &mut factors) {
+        return None;
+    }
+    // Combina iguales (multiplicidad) y pasa a f64.
+    let mut merged: Vec<(Vec<f64>, usize)> = Vec::new();
+    for (factor, mult) in factors {
+        let as_f64: Vec<f64> = factor.iter().map(|value| *value as f64).collect();
+        if let Some(entry) = merged.iter_mut().find(|(existing, _)| *existing == as_f64) {
+            entry.1 += mult;
+        } else {
+            merged.push((as_f64, mult));
+        }
+    }
+    Some(merged)
+}
+pub fn factor(expr: &str, var: &str) -> Result<String, String> {
+    if !is_math_identifier(var) {
+        return Err(format!("variable '{var}' no es un identificador válido"));
+    }
+    let pp = expr.replace(' ', "");
+    let ast = parse_ast(&pp).map_err(|e| format!("No se pudo factorizar '{expr}': {e}"))?;
+    let simplified = simplify_expr(&ast);
+    // Detección honesta de grado con cota amplia para distinguir grado>2 de no-polinomio.
+    let Some(coeffs_wide) = collect_polynomial_coeffs(&simplified, var, 64) else {
+        return Ok(pp);
+    };
+    if coeffs_wide
+        .iter()
+        .any(|coefficient| !coefficient.is_finite())
+    {
+        return Ok(pp);
+    }
+    let degree_opt = coeffs_wide
+        .iter()
+        .rposition(|coefficient| *coefficient != 0.0);
+    let Some(degree) = degree_opt else {
+        return Ok("0".to_string());
+    };
+    if degree > 2 {
+        // Intento honesto grado>2 vía Yun + raíces racionales (subresultant PRS cimiento)
+        let trimmed = poly_trim(&coeffs_wide);
+        let mut rem = trimmed;
+        let mut fac_strs: Vec<String> = Vec::new();
+        let orig_leading = coeffs_wide[degree];
+        // Extrae raíces racionales iterativamente (Yun ya separa multiplicidades)
+        loop {
+            let cur_deg = poly_degree(&rem).unwrap_or(0);
+            if cur_deg <= 2 {
+                break;
+            }
+            let roots = find_rational_roots(&rem);
+            if roots.is_empty() {
+                break;
+            }
+            let mut progressed = false;
+            for r in roots {
+                let lin = vec![-r, 1.0];
+                while let Some(q) = poly_exact_div(&rem, &lin) {
+                    fac_strs.push(linear_factor(var, r));
+                    rem = q;
+                    progressed = true;
+                    if poly_is_zero(&rem) || poly_degree(&rem).is_none() {
+                        break;
+                    }
+                }
+                if progressed {
+                    break;
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+        let rem_deg = poly_degree(&rem);
+        // Ola 2.4: Kronecker acotado para el resto entero que las raíces
+        // racionales no parten. Irreducible sobre Q → se devuelve tal cual
+        // (paridad GeoGebra), sin error.
+        if matches!(rem_deg, Some(d) if d > 2) {
+            if let Some(factors) = kronecker_factor_integer_poly(&rem) {
+                let rem_degree = rem_deg.unwrap_or(0);
+                let nontrivial = factors
+                    .iter()
+                    .any(|(factor, _)| factor.len().saturating_sub(1) < rem_degree);
+                if !nontrivial {
+                    fac_strs.push(format!("({})", format_polynomial_from_coeffs(&rem, var)));
+                    if orig_leading != 1.0 {
+                        fac_strs.insert(0, orig_leading.to_string());
+                    }
+                    return Ok(fac_strs.join(" * "));
+                }
+                for (factor, mult) in factors {
+                    let piece = if factor.len() == 2 {
+                        let leading = factor[1];
+                        if leading == 0.0 {
+                            format!("({})", format_polynomial_from_coeffs(&factor, var))
+                        } else {
+                            linear_factor(var, -factor[0] / leading)
+                        }
+                    } else {
+                        format!("({})", format_polynomial_from_coeffs(&factor, var))
+                    };
+                    if mult > 1 {
+                        fac_strs.push(format!("{piece}^{mult}"));
+                    } else {
+                        fac_strs.push(piece);
+                    }
+                }
+                if orig_leading != 1.0 {
+                    fac_strs.insert(0, orig_leading.to_string());
+                }
+                return Ok(fac_strs.join(" * "));
+            }
+        }
+        match rem_deg {
+            None => {
+                // todo factorizado
+                if orig_leading != 1.0 {
+                    fac_strs.insert(0, orig_leading.to_string());
+                }
+                if fac_strs.is_empty() {
+                    return Ok(pp);
+                }
+                return Ok(fac_strs.join(" * "));
+            }
+            Some(1) => {
+                let leading = rem[1];
+                let root = -rem[0] / leading;
+                if root.is_finite() {
+                    fac_strs.push(linear_factor(var, root));
+                    if orig_leading != 1.0 {
+                        fac_strs.insert(0, orig_leading.to_string());
+                    }
+                    return Ok(fac_strs.join(" * "));
+                }
+                return Err("grado>2 no soportado: factor solo soporta grado 1-2".to_string());
+            }
+            Some(2) => {
+                // Factorización cuadrática existente la reutiliza
+                let leading_q = rem[2];
+                let scale = rem.iter().map(|c| c.abs()).fold(0.0, f64::max);
+                if scale != 0.0 && scale.is_finite() {
+                    let a = leading_q / scale;
+                    let b = rem[1] / scale;
+                    let c = rem[0] / scale;
+                    let disc = b.mul_add(b, -4.0 * a * c);
+                    if disc.is_finite() && disc >= 0.0 {
+                        // raíces reales
+                        let s = disc.sqrt();
+                        let qv = if b >= 0.0 {
+                            -0.5 * (b + s)
+                        } else {
+                            -0.5 * (b - s)
+                        };
+                        let (r1, r2) = if qv == 0.0 {
+                            let r = -b / (2.0 * a);
+                            (r, r)
+                        } else {
+                            (qv / a, c / qv)
+                        };
+                        if r1.is_finite() && r2.is_finite() {
+                            fac_strs.push(linear_factor(var, r1));
+                            fac_strs.push(linear_factor(var, r2));
+                            if orig_leading != 1.0 {
+                                fac_strs.insert(0, orig_leading.to_string());
+                            }
+                            return Ok(fac_strs.join(" * "));
+                        }
+                    }
+                }
+                // cuadrática irreducible -> deja como factor cuadrático
+                let quad_str = format!("({})", format_polynomial_from_coeffs(&rem, var));
+                fac_strs.push(quad_str);
+                if orig_leading != 1.0 {
+                    // evita duplicar leading si ya está en rem
+                    let has_lead = fac_strs
+                        .first()
+                        .is_some_and(|s| *s == orig_leading.to_string());
+                    if !has_lead {
+                        fac_strs.insert(0, orig_leading.to_string());
+                    }
+                }
+                return Ok(fac_strs.join(" * "));
+            }
+            _ => {
+                return Err("grado>2 no soportado: factor solo soporta grado 1-2".to_string());
+            }
+        }
+    }
+    if degree == 0 {
+        return Ok(pp);
+    }
+    let coeffs = coeffs_wide;
+    if coeffs.iter().any(|coefficient| !coefficient.is_finite()) {
+        return Ok(pp);
+    }
+    let degree = coeffs.iter().rposition(|coefficient| *coefficient != 0.0);
+    let Some(degree) = degree else {
+        return Ok("0".to_string());
+    };
+
+    let factors = match degree {
+        1 => {
+            let leading = coeffs[1];
+            let root = -coeffs[0] / leading;
+            if !root.is_finite()
+                || (coeffs[0] != 0.0 && root == 0.0)
+                || !preserves_linear_coefficients(leading, root, coeffs[0])
+            {
+                return Ok(pp);
+            }
+            vec![leading.to_string(), linear_factor(var, root)]
+        }
+        2 => {
+            let leading = coeffs[2];
+            let scale = coeffs[..=2]
+                .iter()
+                .map(|coefficient| coefficient.abs())
+                .fold(0.0, f64::max);
+            if scale == 0.0 || !scale.is_finite() {
+                return Ok(pp);
+            }
+            let a = leading / scale;
+            let b = coeffs[1] / scale;
+            let c = coeffs[0] / scale;
+            let discriminant = b.mul_add(b, -4.0 * a * c);
+            if !discriminant.is_finite() || discriminant < 0.0 {
+                return Ok(pp);
+            }
+            let root_delta = discriminant.sqrt();
+            let q = if b >= 0.0 {
+                -0.5 * (b + root_delta)
+            } else {
+                -0.5 * (b - root_delta)
+            };
+            let (first, second) = if q == 0.0 {
+                let root = -b / (2.0 * a);
+                (root, root)
+            } else {
+                (q / a, c / q)
+            };
+            if !first.is_finite()
+                || !second.is_finite()
+                || (coeffs[0] != 0.0 && (first == 0.0 || second == 0.0))
+                || !preserves_quadratic_coefficients(leading, first, second, &coeffs)
+            {
+                return Ok(pp);
+            }
+            vec![
+                leading.to_string(),
+                linear_factor(var, first),
+                linear_factor(var, second),
+            ]
+        }
+        _ => return Ok(pp),
+    };
+
+    Ok(factors.join(" * "))
+}
+
+/// Variante tipada de [`factor`] con errores estructurados.
+///
+/// Para grado>2 devuelve `Unsupported` con razón `"grado>2 no soportado"`,
+/// preservando el camino feliz grado 1-2 idéntico a [`factor`].
+pub fn factor_typed(expr: &str, var: &str) -> MathResult<String> {
+    if expr.len() > MAX_MATH_INPUT_BYTES {
+        return MathResult::ResourceLimit(MathError::InputTooLarge {
+            operation: MathOperation::SymbolicDerivative,
+            provided_bytes: expr.len(),
+            maximum_bytes: MAX_MATH_INPUT_BYTES,
+        });
+    }
+    if !is_math_identifier(var) {
+        return MathResult::DomainError(MathError::InvalidExpression {
+            operation: MathOperation::SymbolicDerivative,
+            expression: var.into(),
+            reason: "variable no es un identificador válido".into(),
+        });
+    }
+    let ast = match parse_math_expression(expr, MathOperation::SymbolicDerivative) {
+        Ok(ast) => ast,
+        Err(error) => return math_failure(error),
+    };
+    let _simplified = simplify_expr(&ast);
+    match factor(expr, var) {
+        Ok(value) => {
+            if value.len() > MAX_MATH_INPUT_BYTES {
+                MathResult::ResourceLimit(MathError::InputTooLarge {
+                    operation: MathOperation::SymbolicDerivative,
+                    provided_bytes: value.len(),
+                    maximum_bytes: MAX_MATH_INPUT_BYTES,
+                })
+            } else {
+                MathResult::Exact(value)
+            }
+        }
+        Err(reason) => {
+            if reason.contains("grado>2") {
+                MathResult::Unsupported(MathError::DerivativeUnavailable {
+                    expression: expr.into(),
+                    variable: var.into(),
+                    reason,
+                })
+            } else {
+                MathResult::DomainError(MathError::InvalidExpression {
+                    operation: MathOperation::SymbolicDerivative,
+                    expression: expr.into(),
+                    reason,
+                })
+            }
+        }
+    }
+}
+
+fn preserves_linear_coefficients(leading: f64, root: f64, constant: f64) -> bool {
+    -leading * root == constant
+}
+
+fn preserves_quadratic_coefficients(
+    leading: f64,
+    first_root: f64,
+    second_root: f64,
+    coeffs: &[f64],
+) -> bool {
+    leading == coeffs[2]
+        && -(leading * first_root + leading * second_root) == coeffs[1]
+        && leading * first_root * second_root == coeffs[0]
+}
+
+fn linear_factor(var: &str, root: f64) -> String {
+    if root == 0.0 {
+        var.to_string()
+    } else if root > 0.0 {
+        format!("({var} - {root})")
+    } else {
+        format!("({var} + {})", -root)
+    }
+}
+
+/// Factor lineal complejo `(var - (re ± im·i))` con formato estable.
+fn complex_linear_factor(var: &str, re: f64, im: f64) -> String {
+    if im.abs() < 1e-12 {
+        return linear_factor(var, re);
+    }
+    let re_s = format!("{re}");
+    let im_s = format!("{}", im.abs());
+    if im >= 0.0 {
+        format!("({var} - ({re_s} + {im_s}*i))")
+    } else {
+        format!("({var} - ({re_s} - {im_s}*i))")
+    }
+}
+
+/// Factorización compleja: grado 1-2 con raíces complejas + raíces racionales
+/// para grado>2 con resto cuadrático complejo. Fuera del subset devuelve la
+/// expresión original (igual que [`factor`]); grado>2 sin raíz racional da `Err`.
+pub fn c_factor(expr: &str, var: &str) -> Result<String, String> {
+    if !is_math_identifier(var) {
+        return Err(format!("variable '{var}' no es un identificador válido"));
+    }
+    let pp = expr.replace(' ', "");
+    let ast = parse_ast(&pp).map_err(|e| format!("No se pudo factorizar '{expr}': {e}"))?;
+    let simplified = simplify_expr(&ast);
+    let Some(coeffs_wide) = collect_polynomial_coeffs(&simplified, var, 64) else {
+        return Ok(pp);
+    };
+    if coeffs_wide.iter().any(|c| !c.is_finite()) {
+        return Ok(pp);
+    }
+    let degree_opt = coeffs_wide.iter().rposition(|c| *c != 0.0);
+    let Some(degree) = degree_opt else {
+        return Ok("0".to_string());
+    };
+    if degree == 0 {
+        return Ok(pp);
+    }
+    if degree == 1 {
+        return factor(expr, var);
+    }
+    if degree == 2 {
+        let (Some(a), Some(b), Some(c)) = (
+            coeffs_wide.get(2).copied(),
+            coeffs_wide.get(1).copied(),
+            coeffs_wide.get(0).copied(),
+        ) else {
+            return Ok(pp);
+        };
+        if a == 0.0 {
+            return factor(expr, var);
+        }
+        let disc = b.mul_add(b, -4.0 * a * c);
+        if !disc.is_finite() {
+            return Ok(pp);
+        }
+        if disc >= 0.0 {
+            return factor(expr, var);
+        }
+        // Raíces complejas conjugadas.
+        let re = -b / (2.0 * a);
+        let im = (-disc).sqrt() / (2.0 * a);
+        if !re.is_finite() || !im.is_finite() || im == 0.0 {
+            return Ok(pp);
+        }
+        let f1 = complex_linear_factor(var, re, im);
+        let f2 = complex_linear_factor(var, re, -im);
+        if a == 1.0 {
+            return Ok(format!("{f1} * {f2}"));
+        }
+        return Ok(format!("{a} * {f1} * {f2}"));
+    }
+    // Grado>2: extrae raíces racionales y factoriza el resto (real o complejo).
+    let trimmed = poly_trim(&coeffs_wide);
+    let mut rem = trimmed;
+    let mut fac_strs: Vec<String> = Vec::new();
+    let orig_leading = coeffs_wide[degree];
+    loop {
+        let cur_deg = poly_degree(&rem).unwrap_or(0);
+        if cur_deg <= 2 {
+            break;
+        }
+        let roots = find_rational_roots(&rem);
+        if roots.is_empty() {
+            break;
+        }
+        let mut progressed = false;
+        for r in roots {
+            let lin = vec![-r, 1.0];
+            while let Some(q) = poly_exact_div(&rem, &lin) {
+                fac_strs.push(linear_factor(var, r));
+                rem = q;
+                progressed = true;
+                if poly_is_zero(&rem) || poly_degree(&rem).is_none() {
+                    break;
+                }
+            }
+            if progressed {
+                break;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    let rem_deg = poly_degree(&rem);
+    match rem_deg {
+        None => {
+            if orig_leading != 1.0 {
+                fac_strs.insert(0, orig_leading.to_string());
+            }
+            if fac_strs.is_empty() {
+                return Ok(pp);
+            }
+            return Ok(fac_strs.join(" * "));
+        }
+        Some(1) => {
+            let leading = rem[1];
+            let root = -rem[0] / leading;
+            if root.is_finite() {
+                fac_strs.push(linear_factor(var, root));
+                if orig_leading != 1.0 {
+                    fac_strs.insert(0, orig_leading.to_string());
+                }
+                return Ok(fac_strs.join(" * "));
+            }
+            return Err(
+                "grado>2 no soportado: CFactor solo factoriza con raíces racionales".to_string(),
+            );
+        }
+        Some(2) => {
+            let (Some(a), Some(b), Some(c)) = (
+                rem.get(2).copied(),
+                rem.get(1).copied(),
+                rem.get(0).copied(),
+            ) else {
+                return Err("grado>2 no soportado: resto cuadrático inválido".to_string());
+            };
+            if a == 0.0 {
+                return Err("grado>2 no soportado: resto degenerado".to_string());
+            }
+            let disc = b.mul_add(b, -4.0 * a * c);
+            if !disc.is_finite() {
+                return Err("grado>2 no soportado: discriminante no finito".to_string());
+            }
+            if disc >= 0.0 {
+                // Reúsa camino real vía factor del resto.
+                let rem_str = format_polynomial_from_coeffs(&rem, var);
+                match factor(&rem_str, var) {
+                    Ok(f) => {
+                        fac_strs.push(format!("({f})"));
+                        if orig_leading != 1.0 {
+                            fac_strs.insert(0, orig_leading.to_string());
+                        }
+                        return Ok(fac_strs.join(" * "));
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            let re = -b / (2.0 * a);
+            let im = (-disc).sqrt() / (2.0 * a);
+            if !re.is_finite() || !im.is_finite() || im == 0.0 {
+                return Err("grado>2 no soportado: raíces complejas no finitas".to_string());
+            }
+            fac_strs.push(complex_linear_factor(var, re, im));
+            fac_strs.push(complex_linear_factor(var, re, -im));
+            if orig_leading != 1.0 {
+                fac_strs.insert(0, orig_leading.to_string());
+            }
+            return Ok(fac_strs.join(" * "));
+        }
+        _ => {
+            return Err(
+                "grado>2 no soportado: CFactor requiere raíces racionales o resto ≤2".to_string(),
+            );
+        }
+    }
+}
+
+/// Variante tipada de [`c_factor`] con errores estructurados.
+pub fn c_factor_typed(expr: &str, var: &str) -> MathResult<String> {
+    if expr.len() > MAX_MATH_INPUT_BYTES {
+        return MathResult::ResourceLimit(MathError::InputTooLarge {
+            operation: MathOperation::SymbolicDerivative,
+            provided_bytes: expr.len(),
+            maximum_bytes: MAX_MATH_INPUT_BYTES,
+        });
+    }
+    if !is_math_identifier(var) {
+        return MathResult::DomainError(MathError::InvalidExpression {
+            operation: MathOperation::SymbolicDerivative,
+            expression: var.into(),
+            reason: "variable no es un identificador válido".into(),
+        });
+    }
+    match c_factor(expr, var) {
+        Ok(value) => {
+            if value.len() > MAX_MATH_INPUT_BYTES {
+                MathResult::ResourceLimit(MathError::InputTooLarge {
+                    operation: MathOperation::SymbolicDerivative,
+                    provided_bytes: value.len(),
+                    maximum_bytes: MAX_MATH_INPUT_BYTES,
+                })
+            } else {
+                MathResult::Exact(value)
+            }
+        }
+        Err(reason) => {
+            if reason.contains("grado>2") {
+                MathResult::Unsupported(MathError::DerivativeUnavailable {
+                    expression: expr.into(),
+                    variable: var.into(),
+                    reason,
+                })
+            } else {
+                MathResult::DomainError(MathError::InvalidExpression {
+                    operation: MathOperation::SymbolicDerivative,
+                    expression: expr.into(),
+                    reason,
+                })
+            }
+        }
+    }
+}
+
+/// Adaptador de `CFactor`.
+pub fn cfactor(expr: &str, var: &str) -> Result<String, String> {
+    adapt_symbolic_result(c_factor_typed(expr, var))
+}
+
+/// Factorización gaussiana: contenido entero (vía `PrimeFactors`, como
+/// `IFactor`) + resto factorizado en complejos (vía [`c_factor`]).
+pub fn ci_factor_typed(expr: &str, var: &str) -> MathResult<String> {
+    if expr.len() > MAX_MATH_INPUT_BYTES {
+        return MathResult::ResourceLimit(MathError::InputTooLarge {
+            operation: MathOperation::SymbolicDerivative,
+            provided_bytes: expr.len(),
+            maximum_bytes: MAX_MATH_INPUT_BYTES,
+        });
+    }
+    let var_eff = if var.trim().is_empty() {
+        "x"
+    } else {
+        var.trim()
+    };
+    if !is_math_identifier(var_eff) {
+        return MathResult::DomainError(MathError::InvalidExpression {
+            operation: MathOperation::SymbolicDerivative,
+            expression: var.into(),
+            reason: "variable no es un identificador válido".into(),
+        });
+    }
+    let trimmed = expr.trim();
+    if trimmed.is_empty() {
+        return MathResult::DomainError(MathError::InvalidExpression {
+            operation: MathOperation::SymbolicDerivative,
+            expression: expr.into(),
+            reason: "expresión vacía para CIFactor".into(),
+        });
+    }
+    // Reúsa IFactor para el contenido entero cuando hay gcd>1.
+    let content_part: Option<String> = (|| {
+        let ast = parse_math_expression(expr, MathOperation::SymbolicDerivative).ok()?;
+        let coeffs = collect_polynomial_coeffs(&ast, var_eff, 20)?;
+        let mut int_coeffs: Vec<i128> = Vec::new();
+        for &c in &coeffs {
+            if !c.is_finite() {
+                return None;
+            }
+            let rounded = c.round();
+            if (c - rounded).abs() > 1e-9 {
+                return None;
+            }
+            if rounded.abs() > MAX_PRIME_FACTOR as f64 {
+                return None;
+            }
+            int_coeffs.push(rounded as i128);
+        }
+        let mut gcd_val: i128 = 0;
+        for &ic in &int_coeffs {
+            let av = ic.abs();
+            if av == 0 {
+                continue;
+            }
+            gcd_val = if gcd_val == 0 {
+                av
+            } else {
+                gcd_i128(gcd_val, av)
+            };
+        }
+        if gcd_val > 1 {
+            match prime_factors_typed(&gcd_val.to_string()) {
+                MathResult::Exact(s) => Some(s),
+                _ => Some(gcd_val.to_string()),
+            }
+        } else {
+            None
+        }
+    })();
+    // Parte primitiva factorizada en complejos.
+    let prim_factored = match c_factor(expr, var_eff) {
+        Ok(s) => {
+            if s.contains('=') {
+                s.split('=').next_back().unwrap_or(&s).trim().to_string()
+            } else {
+                s
+            }
+        }
+        Err(e) => {
+            return MathResult::Unsupported(MathError::DerivativeUnavailable {
+                expression: expr.into(),
+                variable: var_eff.into(),
+                reason: e,
+            });
+        }
+    };
+    let cleaned = {
+        let t = prim_factored.trim();
+        if let Some(rest) = t.strip_prefix("1 * ") {
+            rest.trim_start().to_string()
+        } else if let Some(rest) = t.strip_prefix("1*") {
+            rest.trim_start().to_string()
+        } else {
+            t.to_string()
+        }
+    };
+    let out = match content_part {
+        None => cleaned,
+        Some(g) => {
+            if cleaned == "1" || cleaned.is_empty() {
+                g
+            } else {
+                format!("{g} * ({cleaned})")
+            }
+        }
+    };
+    if out.len() > MAX_MATH_INPUT_BYTES {
+        return MathResult::ResourceLimit(MathError::InputTooLarge {
+            operation: MathOperation::SymbolicDerivative,
+            provided_bytes: out.len(),
+            maximum_bytes: MAX_MATH_INPUT_BYTES,
+        });
+    }
+    MathResult::Exact(out)
+}
+
+/// Adaptador de `CIFactor`.
+pub fn cifactor(expr: &str, var: &str) -> Result<String, String> {
+    adapt_symbolic_result(ci_factor_typed(expr, var))
+}
+
+/// Divide `expr` en numerador/denominador por la `/` top-level (fuera de paréntesis).
+fn split_rational_top_level(expr: &str) -> Option<(String, String)> {
+    let mut depth_paren = 0usize;
+    let mut depth_brack = 0usize;
+    let mut depth_brace = 0usize;
+    let bytes = expr.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'(' => depth_paren += 1,
+            b')' => depth_paren = depth_paren.saturating_sub(1),
+            b'[' => depth_brack += 1,
+            b']' => depth_brack = depth_brack.saturating_sub(1),
+            b'{' => depth_brace += 1,
+            b'}' => depth_brace = depth_brace.saturating_sub(1),
+            b'/' => {
+                if depth_paren == 0 && depth_brack == 0 && depth_brace == 0 {
+                    let num = expr[..i].trim().to_string();
+                    let den = expr[i + 1..].trim().to_string();
+                    if num.is_empty() || den.is_empty() {
+                        return None;
+                    }
+                    return Some((num, den));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Evalúa polinomio en coeficientes ascendentes.
+fn poly_eval(coeffs: &[f64], x: f64) -> f64 {
+    let mut acc = 0.0;
+    for &c in coeffs.iter().rev() {
+        acc = acc * x + c;
+    }
+    acc
+}
+
+/// Fracciones parciales: denominador factorizable en lineales (con
+/// multiplicidad) + cuadráticas irreducibles. Requiere fracción propia y
+/// denominador de grado 2..=6 con coeficientes finitos. Devuelve suma de
+/// términos `A/(x-r)^k` y `(Bx+C)/(quad)^k` verificable por re-suma.
+pub fn partial_fractions(expr: &str, var: &str) -> Result<String, String> {
+    if !is_math_identifier(var) {
+        return Err(format!("variable '{var}' no es un identificador válido"));
+    }
+    let pp = expr.replace(' ', "");
+    if pp.is_empty() {
+        return Err("PartialFractions requiere una expresión racional no vacía".to_string());
+    }
+    let (num_s, den_s) = split_rational_top_level(&pp).ok_or_else(|| {
+        "PartialFractions requiere forma num/den (p.ej. (2*x+3)/((x-1)*(x+2)))".to_string()
+    })?;
+    let num_ast =
+        parse_ast(&num_s).map_err(|e| format!("No se pudo parsear numerador '{num_s}': {e}"))?;
+    let den_ast =
+        parse_ast(&den_s).map_err(|e| format!("No se pudo parsear denominador '{den_s}': {e}"))?;
+    let Some(num_c) = collect_polynomial_coeffs(&num_ast, var, 12) else {
+        return Err("PartialFractions: numerador no es polinomio en la variable".to_string());
+    };
+    let Some(den_c) = collect_polynomial_coeffs(&den_ast, var, 12) else {
+        return Err("PartialFractions: denominador no es polinomio en la variable".to_string());
+    };
+    if num_c.iter().any(|c| !c.is_finite()) || den_c.iter().any(|c| !c.is_finite()) {
+        return Err("PartialFractions: coeficientes no finitos".to_string());
+    }
+    let num_d = poly_degree(&poly_trim(&num_c));
+    let den_d = poly_degree(&poly_trim(&den_c))
+        .ok_or_else(|| "PartialFractions: denominador nulo no admite descomposición".to_string())?;
+    if den_d < 2 || den_d > 6 {
+        return Err(format!(
+            "PartialFractions: denominador grado {den_d} fuera de 2..=6 (subset honesto)"
+        ));
+    }
+    let num_deg = num_d.unwrap_or(0);
+    if num_deg >= den_d {
+        return Err(
+            "PartialFractions requiere fracción propia (grado num < grado den)".to_string(),
+        );
+    }
+    // Factoriza denominador: raíces racionales con multiplicidad + resto cuadrático.
+    let mut rem = poly_trim(&den_c);
+    let mut linears: Vec<(f64, usize)> = Vec::new();
+    loop {
+        let cur = poly_degree(&rem).unwrap_or(0);
+        if cur <= 2 {
+            break;
+        }
+        let roots = find_rational_roots(&rem);
+        if roots.is_empty() {
+            break;
+        }
+        let mut progressed = false;
+        for r in roots {
+            let lin = vec![-r, 1.0];
+            let mut mult = 0usize;
+            while let Some(q) = poly_exact_div(&rem, &lin) {
+                rem = q;
+                mult += 1;
+                progressed = true;
+                if poly_is_zero(&rem) || poly_degree(&rem).is_none() {
+                    break;
+                }
+            }
+            if mult > 0 {
+                if let Some(entry) = linears
+                    .iter_mut()
+                    .find(|(root, _)| (*root - r).abs() < 1e-9)
+                {
+                    entry.1 += mult;
+                } else {
+                    linears.push((r, mult));
+                }
+                break;
+            }
+            if progressed {
+                break;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    let mut quads: Vec<(f64, f64, usize)> = Vec::new();
+    match poly_degree(&rem) {
+        None => {
+            return Err("PartialFractions: denominador degenerado tras factorizar".to_string());
+        }
+        Some(1) => {
+            let r = -rem[0] / rem[1];
+            if !r.is_finite() {
+                return Err("PartialFractions: raíz lineal no finita".to_string());
+            }
+            if let Some(entry) = linears
+                .iter_mut()
+                .find(|(root, _)| (*root - r).abs() < 1e-9)
+            {
+                entry.1 += 1;
+            } else {
+                linears.push((r, 1));
+            }
+        }
+        Some(2) => {
+            let (Some(a), Some(b), Some(c)) = (
+                rem.get(2).copied(),
+                rem.get(1).copied(),
+                rem.get(0).copied(),
+            ) else {
+                return Err("PartialFractions: resto cuadrático inválido".to_string());
+            };
+            if a == 0.0 {
+                let r = -c / b;
+                if !r.is_finite() {
+                    return Err("PartialFractions: resto lineal no finito".to_string());
+                }
+                linears.push((r, 1));
+            } else {
+                let disc = b.mul_add(b, -4.0 * a * c);
+                if !disc.is_finite() {
+                    return Err("PartialFractions: discriminante no finito".to_string());
+                }
+                if disc >= 0.0 {
+                    // Parte en dos lineales reales estables.
+                    let s = disc.sqrt();
+                    let qv = if b >= 0.0 {
+                        -0.5 * (b + s)
+                    } else {
+                        -0.5 * (b - s)
+                    };
+                    let (r1, r2) = if qv == 0.0 {
+                        let r = -b / (2.0 * a);
+                        (r, r)
+                    } else {
+                        (qv / a, c / qv)
+                    };
+                    if !r1.is_finite() || !r2.is_finite() {
+                        return Err("PartialFractions: raíces reales no finitas".to_string());
+                    }
+                    for r in [r1, r2] {
+                        if let Some(entry) = linears
+                            .iter_mut()
+                            .find(|(root, _)| (*root - r).abs() < 1e-9)
+                        {
+                            entry.1 += 1;
+                        } else {
+                            linears.push((r, 1));
+                        }
+                    }
+                } else {
+                    // Cuadrática mónica irreducible (divide por a).
+                    quads.push((b / a, c / a, 1));
+                }
+            }
+        }
+        Some(0) => {}
+        _ => {
+            return Err(
+                "PartialFractions: denominador no factorizable en lineales/cuadráticas (subset)"
+                    .to_string(),
+            );
+        }
+    }
+    let total_unknowns: usize =
+        linears.iter().map(|(_, m)| *m).sum::<usize>() + quads.iter().map(|_| 2).sum::<usize>();
+    if total_unknowns != den_d {
+        return Err(
+            "PartialFractions: la factorización no cubre el grado del denominador".to_string(),
+        );
+    }
+    // Construye muestras evitando raíces (puntos -4..=4 + 0.5 offsets).
+    let roots_flat: Vec<f64> = linears.iter().map(|(r, _)| *r).collect();
+    let mut samples: Vec<f64> = Vec::new();
+    let mut cand = -4.0;
+    while samples.len() < total_unknowns && cand <= 12.0 {
+        let clash = roots_flat.iter().any(|r| (cand - *r).abs() < 0.35);
+        if !clash {
+            // Evita ceros del cuadrático irreducible.
+            let mut ok = true;
+            for (bq, cq, _) in &quads {
+                let v = cand * cand + bq * cand + cq;
+                if v.abs() < 1e-6 {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                samples.push(cand);
+            }
+        }
+        cand += 0.5;
+    }
+    if samples.len() < total_unknowns {
+        return Err("PartialFractions: sin muestras estables para el sistema".to_string());
+    }
+    // Columnas: para lineal (r,m): den/(x-r)^k evaluado; para quad: den/quad * x y den/quad.
+    let den_eval = |x: f64| poly_eval(&den_c, x);
+    let mut mat: Vec<Vec<f64>> = Vec::with_capacity(total_unknowns);
+    let mut rhs: Vec<f64> = Vec::with_capacity(total_unknowns);
+    for &x in &samples {
+        let d = den_eval(x);
+        if !d.is_finite() || d.abs() < 1e-9 {
+            continue;
+        }
+        let n = poly_eval(&num_c, x);
+        if !n.is_finite() {
+            continue;
+        }
+        let mut row: Vec<f64> = Vec::with_capacity(total_unknowns);
+        for (r, m) in &linears {
+            for k in 1..=*m {
+                let pw = (x - *r).powi(k as i32);
+                if !pw.is_finite() || pw.abs() < 1e-12 {
+                    row.push(0.0);
+                } else {
+                    let v = d / pw;
+                    row.push(if v.is_finite() { v } else { 0.0 });
+                }
+            }
+        }
+        for (bq, cq, _) in &quads {
+            let q = x * x + bq * x + cq;
+            if !q.is_finite() || q.abs() < 1e-12 {
+                row.push(0.0);
+                row.push(0.0);
+            } else {
+                let base = d / q;
+                row.push(if (base * x).is_finite() {
+                    base * x
+                } else {
+                    0.0
+                });
+                row.push(if base.is_finite() { base } else { 0.0 });
+            }
+        }
+        if row.len() != total_unknowns {
+            continue;
+        }
+        mat.push(row);
+        rhs.push(n);
+        if mat.len() == total_unknowns {
+            break;
+        }
+    }
+    if mat.len() != total_unknowns {
+        return Err("PartialFractions: sistema subdeterminado (muestras)".to_string());
+    }
+    let sol = solve_linear_system(mat, rhs)
+        .ok_or_else(|| "PartialFractions: sistema singular (denominador degenerado)".to_string())?;
+    // Formatea términos con tolerancia de cero.
+    let mut terms: Vec<String> = Vec::new();
+    let mut idx = 0usize;
+    for (r, m) in &linears {
+        for k in 1..=*m {
+            let a = sol[idx];
+            idx += 1;
+            if !a.is_finite() {
+                return Err("PartialFractions: coeficiente no finito".to_string());
+            }
+            if a.abs() < 1e-9 {
+                continue;
+            }
+            let denom = if k == 1 {
+                linear_factor(var, *r)
+            } else {
+                format!("{} ^{k}", linear_factor(var, *r))
+            };
+            terms.push(format!("{a} / {denom}"));
+        }
+    }
+    for (bq, cq, _) in &quads {
+        let bcoef = sol[idx];
+        let ccoef = sol[idx + 1];
+        idx += 2;
+        if !bcoef.is_finite() || !ccoef.is_finite() {
+            return Err("PartialFractions: coeficiente cuadrático no finito".to_string());
+        }
+        if bcoef.abs() < 1e-9 && ccoef.abs() < 1e-9 {
+            continue;
+        }
+        let num_s = if bcoef.abs() < 1e-9 {
+            format!("{ccoef}")
+        } else if ccoef.abs() < 1e-9 {
+            format!("{bcoef}*{var}")
+        } else if ccoef >= 0.0 {
+            format!("{bcoef}*{var} + {ccoef}")
+        } else {
+            format!("{bcoef}*{var} - {}", ccoef.abs())
+        };
+        let quad_s = if bq.abs() < 1e-12 && cq.abs() < 1e-12 {
+            format!("{var}^2")
+        } else {
+            format!("({} + {bq}*{var} + {cq})", format!("{var}^2"))
+        };
+        terms.push(format!("({num_s}) / {quad_s}"));
+    }
+    if terms.is_empty() {
+        return Err("PartialFractions: descomposición nula (numerador cero?)".to_string());
+    }
+    Ok(terms.join(" + "))
+}
+
+/// Variante tipada de [`partial_fractions`].
+pub fn partial_fractions_typed(expr: &str, var: &str) -> MathResult<String> {
+    if expr.len() > MAX_MATH_INPUT_BYTES {
+        return MathResult::ResourceLimit(MathError::InputTooLarge {
+            operation: MathOperation::SymbolicDerivative,
+            provided_bytes: expr.len(),
+            maximum_bytes: MAX_MATH_INPUT_BYTES,
+        });
+    }
+    if !is_math_identifier(var) {
+        return MathResult::DomainError(MathError::InvalidExpression {
+            operation: MathOperation::SymbolicDerivative,
+            expression: var.into(),
+            reason: "variable no es un identificador válido".into(),
+        });
+    }
+    match partial_fractions(expr, var) {
+        Ok(v) => {
+            if v.len() > MAX_MATH_INPUT_BYTES {
+                MathResult::ResourceLimit(MathError::InputTooLarge {
+                    operation: MathOperation::SymbolicDerivative,
+                    provided_bytes: v.len(),
+                    maximum_bytes: MAX_MATH_INPUT_BYTES,
+                })
+            } else {
+                MathResult::Exact(v)
+            }
+        }
+        Err(reason) => MathResult::DomainError(MathError::InvalidExpression {
+            operation: MathOperation::SymbolicDerivative,
+            expression: expr.into(),
+            reason,
+        }),
+    }
+}
+
+/// Simplificación algebraica: const folding aritmético e identidades
+/// (0+x=x, 1*x=x, x^1=x, -(-x)=x, x-x=0, …), sin eliminar
+/// condiciones de dominio como `x/x`, `0/x` o `f^0`.
+pub fn simplify(expr: &str) -> Result<String, String> {
+    let pp = expr.replace(' ', "");
+    let ast = parse_ast(&pp).map_err(|e| format!("No se pudo simplificar '{expr}': {e}"))?;
+    Ok(simplify_expr(&ast).to_expr_string())
+}
+
+/// Comprueba igualdad estructural entre dos expresiones parseadas sin aplicar
+/// identidades que puedan eliminar errores de dominio.
+pub fn structurally_equal(left: &str, right: &str) -> Result<bool, String> {
+    let left = parse_ast(left).map_err(|error| format!("Expresión izquierda inválida: {error}"))?;
+    let right = parse_ast(right).map_err(|error| format!("Expresión derecha inválida: {error}"))?;
+    Ok(left.structurally_eq(&right))
+}
+
+/// Indica si una expresión finita es diferenciable en todo punto real según
+/// las reglas simbólicas soportadas por Grafito.
+pub fn is_everywhere_differentiable(expression: &str) -> Result<bool, String> {
+    let expression = parse_ast(expression)
+        .map_err(|error| format!("No se pudo validar diferenciabilidad: {error}"))?;
+    Ok(expression.is_everywhere_differentiable())
+}
+
+/// Serie de Taylor de `expr` alrededor de `center` hasta orden `order`
+/// (derivadas n-ésimas calculadas simbólicamente y evaluadas en `center`).
+pub fn taylor_series(expr: &str, var: &str, center: f64, order: usize) -> Result<String, String> {
+    if order > crate::analysis::MAX_TAYLOR_ORDER {
+        return Err(format!(
+            "Taylor order {order} exceeds maximum {}",
+            crate::analysis::MAX_TAYLOR_ORDER
+        ));
+    }
+    let pp = expr.replace(' ', "");
+    let ast = parse_ast(&pp).map_err(|e| format!("No se pudo calcular Taylor de '{expr}': {e}"))?;
+    let coefficients = crate::analysis::taylor_coefficients_from_ast(&ast, var, center, order)?;
+    let mut terms = Vec::new();
+    for (n, coef) in coefficients.into_iter().enumerate() {
+        if coef.abs() > 1e-12 {
+            let term = if n == 0 {
+                format!("{coef}")
+            } else if n == 1 {
+                if center == 0.0 {
+                    format!("{coef}*{var}")
+                } else {
+                    format!("{coef}*({var} - {center})")
+                }
+            } else if center == 0.0 {
+                format!("{coef}*{var}^{n}")
+            } else {
+                format!("{coef}*({var} - {center})^{n}")
+            };
+            terms.push(term);
+        }
+    }
+    if terms.is_empty() {
+        Ok("0".to_string())
+    } else {
+        Ok(terms.join(" + ").replace("+ -", "- "))
+    }
+}
+
+/// Sustitución simbólica de `var` por `value` en `expr`.
+pub fn substitute(expr: &str, var: &str, value: &str) -> Result<String, String> {
+    let pp = expr.replace(' ', "");
+    let ast = parse_ast(&pp).map_err(|e| format!("No se pudo sustituir en '{expr}': {e}"))?;
+    let val_pp = value.replace(' ', "");
+    let val_ast = parse_ast(&val_pp)
+        .or_else(|_| parse_ast(value))
+        .map_err(|e| format!("No se pudo parsear el valor '{value}': {e}"))?;
+    let result = if let Expr::Const(c) = val_ast {
+        let mut map = BTreeMap::new();
+        map.insert(var.to_string(), c);
+        simplify_expr(&ast.substitute_vars(&map, &[]))
+    } else {
+        let replaced = replace_var_token(&pp, var, &val_pp);
+        parse_ast(&replaced)
+            .map(|a| simplify_expr(&a))
+            .unwrap_or(ast)
+    };
+    Ok(result.to_expr_string())
+}
+
+/// Resuelve la ecuación `expr = 0` para la variable `var`.
+///
+/// Extrae coeficientes polinómicos (grado ≤ 4) y usa fórmulas cerradas
+/// (lineal, cuadrática, cúbica de Cardano, cuártica de Ferrari). Para grados
+/// mayores o expresiones no polinómicas, busca raíces numéricamente en
+/// [-10, 10] (bisección sobre `eval_at`).
+pub fn solve(expr: &str, var: &str) -> Result<String, String> {
+    let pp = expr.replace(' ', "");
+    let ast = parse_ast(&pp).map_err(|e| format!("No se pudo resolver '{expr}': {e}"))?;
+    if let Some(roots) = solve_polynomial_ast(&ast, var) {
+        if roots.is_empty() {
+            let nr = find_real_roots_numeric(&ast, var, -10.0, 10.0);
+            if nr.is_empty() {
+                return Ok("No real roots found".to_string());
+            }
+            return Ok(format_roots(var, &nr));
+        }
+        return Ok(format_roots(var, &roots));
+    }
+    let nr = find_real_roots_numeric(&ast, var, -10.0, 10.0);
+    if nr.is_empty() {
+        Ok("No real roots found in [-10, 10]".to_string())
+    } else {
+        Ok(format_roots(var, &nr))
+    }
+}
+
+fn format_roots(var: &str, roots: &[f64]) -> String {
+    roots
+        .iter()
+        .map(|r| format!("{var} = {:.8}", r))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+// ============================================================================
+// Derivación simbólica (reglas propias sobre el AST)
+// ============================================================================
+
+/// Derivada de un `Expr` respecto de `var` aplicando las reglas simbólicas.
+/// Las variantes no listadas delegan al derivador nativo `Expr::diff`.
+fn diff_expr(e: &Expr, var: &str) -> Expr {
+    diff_expr_depth(e, var, 0)
+}
+
+fn diff_expr_depth(e: &Expr, var: &str, depth: u32) -> Expr {
+    const MAX_DIFF_EXPR_DEPTH: u32 = 256;
+    if depth > MAX_DIFF_EXPR_DEPTH {
+        return Expr::Const(f64::NAN);
+    }
+    use Expr::*;
+    let du = |x: &Expr| Box::new(diff_expr_depth(x, var, depth + 1));
+    match e {
+        Const(_) => Const(0.0),
+        Var(v) => {
+            if v == var {
+                Const(1.0)
+            } else {
+                Const(0.0)
+            }
+        }
+        Neg(a) => Neg(du(a)),
+        Add(a, b) => Add(du(a), du(b)),
+        Sub(a, b) => Sub(du(a), du(b)),
+
+        // Regla del producto: (u*v)' = u'v + uv'
+        Mul(u, v) => Add(
+            Box::new(Mul(du(u), v.clone())),
+            Box::new(Mul(u.clone(), du(v))),
+        ),
+
+        // Regla del cociente: (u/v)' = (u'v - uv') / v²
+        Div(u, v) => Div(
+            Box::new(Sub(
+                Box::new(Mul(du(u), v.clone())),
+                Box::new(Mul(u.clone(), du(v))),
+            )),
+            Box::new(Pow(v.clone(), Box::new(Const(2.0)))),
+        ),
+
+        // Potencia: exponente constante → n·u^(n-1)·u'; caso general → u^v·(v'·ln u + v·u'/u)
+        Pow(base, exp) => match exp.as_ref() {
+            Const(n) => Mul(
+                Box::new(Mul(
+                    Box::new(Const(*n)),
+                    Box::new(Pow(base.clone(), Box::new(Const(n - 1.0)))),
+                )),
+                du(base),
+            ),
+            _ => {
+                let dv = diff_expr_depth(exp, var, depth + 1);
+                Mul(
+                    Box::new(Pow(base.clone(), exp.clone())),
+                    Box::new(Add(
+                        Box::new(Mul(Box::new(dv), Box::new(Ln(base.clone())))),
+                        Box::new(Mul(exp.clone(), Box::new(Div(du(base), base.clone())))),
+                    )),
+                )
+            }
+        },
+
+        // Trigonométricas (regla de la cadena)
+        Sin(u) => Mul(Box::new(Cos(u.clone())), du(u)),
+        Cos(u) => Mul(Box::new(Neg(Box::new(Sin(u.clone())))), du(u)),
+        Tan(u) => Mul(
+            Box::new(Div(
+                Box::new(Const(1.0)),
+                Box::new(Pow(Box::new(Cos(u.clone())), Box::new(Const(2.0)))),
+            )),
+            du(u),
+        ),
+        Sec(u) => Mul(
+            Box::new(Mul(Box::new(Sec(u.clone())), Box::new(Tan(u.clone())))),
+            du(u),
+        ),
+        Csc(u) => Mul(
+            Box::new(Neg(Box::new(Mul(
+                Box::new(Csc(u.clone())),
+                Box::new(Cot(u.clone())),
+            )))),
+            du(u),
+        ),
+        Cot(u) => Mul(
+            Box::new(Neg(Box::new(Pow(
+                Box::new(Csc(u.clone())),
+                Box::new(Const(2.0)),
+            )))),
+            du(u),
+        ),
+
+        // Inversas trigonométricas
+        Asin(u) => Mul(
+            Box::new(Div(
+                Box::new(Const(1.0)),
+                Box::new(Sqrt(Box::new(Sub(
+                    Box::new(Const(1.0)),
+                    Box::new(Pow(u.clone(), Box::new(Const(2.0)))),
+                )))),
+            )),
+            du(u),
+        ),
+        Acos(u) => Mul(
+            Box::new(Neg(Box::new(Div(
+                Box::new(Const(1.0)),
+                Box::new(Sqrt(Box::new(Sub(
+                    Box::new(Const(1.0)),
+                    Box::new(Pow(u.clone(), Box::new(Const(2.0)))),
+                )))),
+            )))),
+            du(u),
+        ),
+        Atan(u) => Mul(
+            Box::new(Div(
+                Box::new(Const(1.0)),
+                Box::new(Add(
+                    Box::new(Const(1.0)),
+                    Box::new(Pow(u.clone(), Box::new(Const(2.0)))),
+                )),
+            )),
+            du(u),
+        ),
+
+        // Hiperbólicas
+        Sinh(u) => Mul(Box::new(Cosh(u.clone())), du(u)),
+        Cosh(u) => Mul(Box::new(Sinh(u.clone())), du(u)),
+        Tanh(u) => Mul(
+            Box::new(Div(
+                Box::new(Const(1.0)),
+                Box::new(Pow(Box::new(Cosh(u.clone())), Box::new(Const(2.0)))),
+            )),
+            du(u),
+        ),
+        Asinh(u) => Mul(
+            Box::new(Div(
+                Box::new(Const(1.0)),
+                Box::new(Sqrt(Box::new(Add(
+                    Box::new(Const(1.0)),
+                    Box::new(Pow(u.clone(), Box::new(Const(2.0)))),
+                )))),
+            )),
+            du(u),
+        ),
+        Acosh(u) => Mul(
+            Box::new(Div(
+                Box::new(Const(1.0)),
+                Box::new(Sqrt(Box::new(Sub(
+                    Box::new(Pow(u.clone(), Box::new(Const(2.0)))),
+                    Box::new(Const(1.0)),
+                )))),
+            )),
+            du(u),
+        ),
+        Atanh(u) => Mul(
+            Box::new(Div(
+                Box::new(Const(1.0)),
+                Box::new(Sub(
+                    Box::new(Const(1.0)),
+                    Box::new(Pow(u.clone(), Box::new(Const(2.0)))),
+                )),
+            )),
+            du(u),
+        ),
+
+        // Exponencial y logaritmos
+        Exp(u) => Mul(Box::new(Exp(u.clone())), du(u)),
+        Ln(u) => Mul(Box::new(Div(Box::new(Const(1.0)), u.clone())), du(u)),
+        Log(u) => Mul(
+            Box::new(Div(
+                Box::new(Const(1.0)),
+                Box::new(Mul(u.clone(), Box::new(Const(std::f64::consts::LN_10)))),
+            )),
+            du(u),
+        ),
+
+        // Raíces
+        Sqrt(u) => Mul(
+            Box::new(Div(
+                Box::new(Const(1.0)),
+                Box::new(Mul(Box::new(Const(2.0)), Box::new(Sqrt(u.clone())))),
+            )),
+            du(u),
+        ),
+        Cbrt(u) => Mul(
+            Box::new(Div(
+                Box::new(Const(1.0)),
+                Box::new(Mul(
+                    Box::new(Const(3.0)),
+                    Box::new(Pow(Box::new(Cbrt(u.clone())), Box::new(Const(2.0)))),
+                )),
+            )),
+            du(u),
+        ),
+
+        // Misc
+        Abs(u) => Mul(Box::new(Sign(u.clone())), du(u)),
+        // No diferenciables (derivada 0 en casi todo punto)
+        Sign(_) | Floor(_) | Ceil(_) | Round(_) | Heaviside(_) => Const(0.0),
+
+        // Resto de variantes: delega al derivador nativo del AST.
+        _ => e.diff(var),
+    }
+}
+
+// ============================================================================
+// Simplificación algebraica (propias, iterada hasta punto fijo)
+// ============================================================================
+
+pub(crate) fn simplify_expr(e: &Expr) -> Expr {
+    let mut current = e.clone();
+    for _ in 0..30 {
+        let next = simplify_once(&current);
+        if next.structurally_eq(&current) {
+            return next;
+        }
+        current = next;
+    }
+    current
+}
+
+/// Una pasada bottom-up de simplificación con const folding aritmético e
+/// identidades algebraicas básicas.
+fn simplify_once(e: &Expr) -> Expr {
+    if let Some(v) = trig_simplify_once(e) {
+        return v;
+    }
+    use Expr::*;
+    let res = match e {
+        Neg(a) => {
+            let sa = simplify_once(a);
+            match sa {
+                Const(c) => Const(-c),
+                Neg(inner) => *inner,
+                _ => Neg(Box::new(sa)),
+            }
+        }
+        Add(a, b) => {
+            let sa = simplify_once(a);
+            let sb = simplify_once(b);
+            match (&sa, &sb) {
+                (Const(ca), Const(cb)) => Const(ca + cb),
+                (Const(ca), _) if *ca == 0.0 => sb,
+                (_, Const(cb)) if *cb == 0.0 => sa,
+                _ => Add(Box::new(sa), Box::new(sb)),
+            }
+        }
+        Sub(a, b) => {
+            let sa = simplify_once(a);
+            let sb = simplify_once(b);
+            match (&sa, &sb) {
+                (Const(ca), Const(cb)) => Const(ca - cb),
+                (_, Const(cb)) if *cb == 0.0 => sa,
+                (Const(ca), _) if *ca == 0.0 => Neg(Box::new(sb)),
+                _ if sa.structurally_eq(&sb) && sa.is_guaranteed_finite() => Const(0.0),
+                _ => Sub(Box::new(sa), Box::new(sb)),
+            }
+        }
+        Mul(a, b) => {
+            let sa = simplify_once(a);
+            let sb = simplify_once(b);
+            match (&sa, &sb) {
+                (Const(ca), Const(cb)) => Const(ca * cb),
+                (Const(ca), _) if *ca == 0.0 && sb.is_guaranteed_finite() => Const(0.0),
+                (_, Const(cb)) if *cb == 0.0 && sa.is_guaranteed_finite() => Const(0.0),
+                (Const(ca), _) if *ca == 1.0 => sb,
+                (_, Const(cb)) if *cb == 1.0 => sa,
+                (Const(ca), _) if *ca == -1.0 => Neg(Box::new(sb)),
+                (_, Const(cb)) if *cb == -1.0 => Neg(Box::new(sa)),
+                _ => Mul(Box::new(sa), Box::new(sb)),
+            }
+        }
+        Div(a, b) => {
+            let sa = simplify_once(a);
+            let sb = simplify_once(b);
+            match (&sa, &sb) {
+                (Const(ca), Const(cb)) if cb.abs() > 1e-300 => Const(ca / cb),
+                (_, Const(cb)) if *cb == 1.0 => sa,
+                _ => Div(Box::new(sa), Box::new(sb)),
+            }
+        }
+        Pow(a, b) => {
+            let sa = simplify_once(a);
+            let sb = simplify_once(b);
+            match (&sa, &sb) {
+                (Const(ca), Const(cb)) if *ca != 0.0 || *cb > 0.0 => Const(ca.powf(*cb)),
+                (_, Const(cb)) if *cb == 1.0 => sa,
+                _ => Pow(Box::new(sa), Box::new(sb)),
+            }
+        }
+
+        // Funciones unarias: simplificar el argumento (sin const folding).
+        Sin(a) => Sin(Box::new(simplify_once(a))),
+        Cos(a) => Cos(Box::new(simplify_once(a))),
+        Tan(a) => Tan(Box::new(simplify_once(a))),
+        Asin(a) => Asin(Box::new(simplify_once(a))),
+        Acos(a) => Acos(Box::new(simplify_once(a))),
+        Atan(a) => Atan(Box::new(simplify_once(a))),
+        Exp(a) => Exp(Box::new(simplify_once(a))),
+        Ln(a) => Ln(Box::new(simplify_once(a))),
+        Log(a) => Log(Box::new(simplify_once(a))),
+        Sqrt(a) => Sqrt(Box::new(simplify_once(a))),
+        Abs(a) => Abs(Box::new(simplify_once(a))),
+        Sinh(a) => Sinh(Box::new(simplify_once(a))),
+        Cosh(a) => Cosh(Box::new(simplify_once(a))),
+        Tanh(a) => Tanh(Box::new(simplify_once(a))),
+        Asinh(a) => Asinh(Box::new(simplify_once(a))),
+        Acosh(a) => Acosh(Box::new(simplify_once(a))),
+        Atanh(a) => Atanh(Box::new(simplify_once(a))),
+        Sec(a) => Sec(Box::new(simplify_once(a))),
+        Csc(a) => Csc(Box::new(simplify_once(a))),
+        Cot(a) => Cot(Box::new(simplify_once(a))),
+        Floor(a) => Floor(Box::new(simplify_once(a))),
+        Ceil(a) => Ceil(Box::new(simplify_once(a))),
+        Round(a) => Round(Box::new(simplify_once(a))),
+        Sign(a) => Sign(Box::new(simplify_once(a))),
+        Heaviside(a) => Heaviside(Box::new(simplify_once(a))),
+        Cbrt(a) => Cbrt(Box::new(simplify_once(a))),
+        Re(a) => Re(Box::new(simplify_once(a))),
+        Im(a) => Im(Box::new(simplify_once(a))),
+        Arg(a) => Arg(Box::new(simplify_once(a))),
+        Conj(a) => Conj(Box::new(simplify_once(a))),
+        Erf(a) => Erf(Box::new(simplify_once(a))),
+        Erfc(a) => Erfc(Box::new(simplify_once(a))),
+        Gamma(a) => Gamma(Box::new(simplify_once(a))),
+        LnGamma(a) => LnGamma(Box::new(simplify_once(a))),
+        Digamma(a) => Digamma(Box::new(simplify_once(a))),
+        Trigamma(a) => Trigamma(Box::new(simplify_once(a))),
+
+        // Binarias no aritméticas: recursión en ambos operandos.
+        Atan2(a, b) => Atan2(Box::new(simplify_once(a)), Box::new(simplify_once(b))),
+        Modulo(a, b) => Modulo(Box::new(simplify_once(a)), Box::new(simplify_once(b))),
+        Min(a, b) => Min(Box::new(simplify_once(a)), Box::new(simplify_once(b))),
+        Max(a, b) => Max(Box::new(simplify_once(a)), Box::new(simplify_once(b))),
+        Beta(a, b) => Beta(Box::new(simplify_once(a)), Box::new(simplify_once(b))),
+        BesselJ(a, b) => BesselJ(Box::new(simplify_once(a)), Box::new(simplify_once(b))),
+        BesselY(a, b) => BesselY(Box::new(simplify_once(a)), Box::new(simplify_once(b))),
+        BesselI(a, b) => BesselI(Box::new(simplify_once(a)), Box::new(simplify_once(b))),
+        Lt(a, b) => Lt(Box::new(simplify_once(a)), Box::new(simplify_once(b))),
+        Gt(a, b) => Gt(Box::new(simplify_once(a)), Box::new(simplify_once(b))),
+        Le(a, b) => Le(Box::new(simplify_once(a)), Box::new(simplify_once(b))),
+        Ge(a, b) => Ge(Box::new(simplify_once(a)), Box::new(simplify_once(b))),
+        Eq(a, b) => Eq(Box::new(simplify_once(a)), Box::new(simplify_once(b))),
+        Ne(a, b) => Ne(Box::new(simplify_once(a)), Box::new(simplify_once(b))),
+
+        Clamp(a, b, c) => Clamp(
+            Box::new(simplify_once(a)),
+            Box::new(simplify_once(b)),
+            Box::new(simplify_once(c)),
+        ),
+        Sum(body, v, s, t) => Sum(
+            Box::new(simplify_once(body)),
+            v.clone(),
+            Box::new(simplify_once(s)),
+            Box::new(simplify_once(t)),
+        ),
+        Product(body, v, s, t) => Product(
+            Box::new(simplify_once(body)),
+            v.clone(),
+            Box::new(simplify_once(s)),
+            Box::new(simplify_once(t)),
+        ),
+        Piecewise(pieces, default) => {
+            let np: Vec<(Box<Expr>, Box<Expr>)> = pieces
+                .iter()
+                .map(|(c, v)| (Box::new(simplify_once(c)), Box::new(simplify_once(v))))
+                .collect();
+            Piecewise(np, Box::new(simplify_once(default)))
+        }
+
+        Const(_) | Var(_) => e.clone(),
+    };
+    if let Some(v) = trig_simplify_once(&res) {
+        return v;
+    }
+    res
+}
+
+// ============================================================================
+// Integración simbólica básica (propias) + numérica
+// ============================================================================
+
+/// Integración indefinida por reglas básicas. Devuelve `None` si la expresión
+/// no encaja en las reglas soportadas (quedando el fallback a `Expr::integrate`).
+pub(crate) fn integrate_expr(e: &Expr, var: &str) -> Option<Expr> {
+    integrate_expr_depth(e, var, 0)
+}
+
+/// Helpers para detección lineal `a·x + b` (funde tabla symbolic:2663 + fallback ast:2841).
+fn expr_is_linear_in(expr: &Expr, var: &str) -> bool {
+    use Expr::*;
+    match expr {
+        Var(name) => name == var,
+        Const(_) => true,
+        Neg(inner) => expr_is_linear_in(inner, var),
+        Add(left, right) | Sub(left, right) => {
+            expr_is_linear_in(left, var) && expr_is_linear_in(right, var)
+        }
+        Mul(left, right) => {
+            if let Const(_) = left.as_ref() {
+                expr_is_linear_in(right, var)
+            } else if let Const(_) = right.as_ref() {
+                expr_is_linear_in(left, var)
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+fn expr_linear_coeff(expr: &Expr, var: &str) -> Option<(f64, f64)> {
+    use Expr::*;
+    match expr {
+        Var(name) if name == var => Some((1.0, 0.0)),
+        Const(value) if value.is_finite() => Some((0.0, *value)),
+        Neg(inner) => {
+            let (a, b) = expr_linear_coeff(inner, var)?;
+            Some((-a, -b))
+        }
+        Add(left, right) => {
+            let (a1, b1) = expr_linear_coeff(left, var)?;
+            let (a2, b2) = expr_linear_coeff(right, var)?;
+            let a = a1 + a2;
+            let b = b1 + b2;
+            (a.is_finite() && b.is_finite()).then_some((a, b))
+        }
+        Sub(left, right) => {
+            let (a1, b1) = expr_linear_coeff(left, var)?;
+            let (a2, b2) = expr_linear_coeff(right, var)?;
+            let a = a1 - a2;
+            let b = b1 - b2;
+            (a.is_finite() && b.is_finite()).then_some((a, b))
+        }
+        Mul(left, right) => {
+            if let Const(coeff) = left.as_ref() {
+                let (a, b) = expr_linear_coeff(right, var)?;
+                let a2 = coeff * a;
+                let b2 = coeff * b;
+                (a2.is_finite() && b2.is_finite()).then_some((a2, b2))
+            } else if let Const(coeff) = right.as_ref() {
+                let (a, b) = expr_linear_coeff(left, var)?;
+                let a2 = coeff * a;
+                let b2 = coeff * b;
+                (a2.is_finite() && b2.is_finite()).then_some((a2, b2))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Detecta `sec(a·x+b)^2` y devuelve `tan(a·x+b)/a`.
+fn try_sec_squared_form(expr: &Expr, var: &str) -> Option<Expr> {
+    use Expr::*;
+    if let Pow(base, exp) = expr {
+        if let Const(n) = exp.as_ref() {
+            if (*n - 2.0).abs() < 1e-12 {
+                if let Sec(arg) = base.as_ref() {
+                    if expr_is_linear_in(arg, var) {
+                        let (a, _) = expr_linear_coeff(arg, var)?;
+                        if a.abs() > 1e-12 {
+                            return Some(Mul(Box::new(Const(1.0 / a)), Box::new(Tan(arg.clone()))));
+                        }
+                    }
+                }
+            }
+            if (*n - 2.0).abs() < 1e-12 {
+                if let Csc(arg) = base.as_ref() {
+                    if expr_is_linear_in(arg, var) {
+                        let (a, _) = expr_linear_coeff(arg, var)?;
+                        if a.abs() > 1e-12 {
+                            return Some(Mul(
+                                Box::new(Const(-1.0 / a)),
+                                Box::new(Cot(arg.clone())),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Mul(left, right) = expr {
+        if let (Sec(arg1), Sec(arg2)) = (left.as_ref(), right.as_ref()) {
+            if arg1 == arg2 && expr_is_linear_in(arg1, var) {
+                let (a, _) = expr_linear_coeff(arg1, var)?;
+                if a.abs() > 1e-12 {
+                    return Some(Mul(Box::new(Const(1.0 / a)), Box::new(Tan(arg1.clone()))));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Detecta `c / (x² + a²)` → `(c/a)·atan(x/a)` con `a = sqrt(a²)`.
+fn try_atan_form(expr: &Expr, var: &str) -> Option<Expr> {
+    use Expr::*;
+    let (num, den) = match expr {
+        Div(n, d) => (n.as_ref(), d.as_ref()),
+        _ => return None,
+    };
+    if contains_var(num, var) {
+        return None;
+    }
+    let coeff = constant_scalar_value(num)?;
+    if !coeff.is_finite() {
+        return None;
+    }
+    let (pow_base, pow_exp, const_val) = match den {
+        Add(left, right) => match (left.as_ref(), right.as_ref()) {
+            (Pow(b, e), Const(k)) => (b.as_ref(), e.as_ref(), *k),
+            (Const(k), Pow(b, e)) => (b.as_ref(), e.as_ref(), *k),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let Const(exp_val) = pow_exp else {
+        return None;
+    };
+    if (*exp_val - 2.0).abs() >= 1e-12 {
+        return None;
+    }
+    let Var(name) = pow_base else {
+        return None;
+    };
+    if name != var {
+        return None;
+    }
+    if !const_val.is_finite() || const_val <= 0.0 {
+        return None;
+    }
+    let a = const_val.sqrt();
+    if !a.is_finite() || a == 0.0 {
+        return None;
+    }
+    let factor = coeff / a;
+    if !factor.is_finite() {
+        return None;
+    }
+    Some(Mul(
+        Box::new(Const(factor)),
+        Box::new(Atan(Box::new(Div(
+            Box::new(Var(var.to_string())),
+            Box::new(Const(a)),
+        )))),
+    ))
+}
+
+/// Intento genérico por partes `∫u·dv = u·v − ∫v·du`.
+fn try_generic_parts(expr: &Expr, var: &str, depth: u32) -> Option<Expr> {
+    use Expr::*;
+    // Cota anti-DoS (cuelgue FourierSeries[x^2,x,1,2] 2026-09-26): partes por
+    // partes puede ciclar (∫x²·cos reproduce x²·cos dos niveles después con
+    // otras constantes) y el árbol crece exponencial por nivel — 18 GB antes
+    // de tocar el tope de profundidad. Se aborta con integrando grande: la
+    // ruta numérica (Gauss–Legendre) lo resuelve igual y es el fallback
+    // declarado de `expansion_coefficients`.
+    if format!("{expr:?}").len() > 4096 {
+        return None;
+    }
+    const MAX_PARTS_DEPTH: u32 = 24;
+    if depth > MAX_PARTS_DEPTH {
+        return None;
+    }
+    let (left, right) = match expr {
+        Mul(a, b) => (a.as_ref(), b.as_ref()),
+        _ => return None,
+    };
+    for (u_cand, dv_cand) in [(left, right), (right, left)] {
+        let v = integrate_expr_depth(dv_cand, var, depth + 1).or_else(|| dv_cand.integrate(var))?;
+        let du = diff_expr(u_cand, var);
+        let du_s = simplify_expr(&du);
+        if is_identically_zero(&du_s) {
+            continue;
+        }
+        let v_du = Mul(Box::new(v.clone()), Box::new(du_s));
+        let int_vdu =
+            integrate_expr_depth(&v_du, var, depth + 1).or_else(|| v_du.integrate(var))?;
+        let uv = Mul(Box::new(u_cand.clone()), Box::new(v));
+        let result = Sub(Box::new(uv), Box::new(int_vdu));
+        let simplified = simplify_expr(&result);
+        return Some(simplified);
+    }
+    None
+}
+
+#[allow(clippy::collapsible_match)]
+fn integrate_expr_depth(e: &Expr, var: &str, depth: u32) -> Option<Expr> {
+    const MAX_INTEGRATE_DEPTH: u32 = 256;
+    if depth > MAX_INTEGRATE_DEPTH {
+        return None;
+    }
+    use Expr::*;
+    let v = var.to_string();
+    if !contains_var(e, var) {
+        return Some(Mul(Box::new(e.clone()), Box::new(Var(v))));
+    }
+    if let Some(sec_form) = try_sec_squared_form(e, var) {
+        return Some(sec_form);
+    }
+    if let Some(atan_form) = try_atan_form(e, var) {
+        return Some(atan_form);
+    }
+    if let Some(rat) = try_rational_integration(e, var) {
+        return Some(rat);
+    }
+    let rec = |x: &Expr| integrate_expr_depth(x, var, depth + 1);
+    Some(match e {
+        Const(c) => {
+            if *c == 0.0 {
+                Const(0.0)
+            } else {
+                Mul(Box::new(Const(*c)), Box::new(Var(v)))
+            }
+        }
+        Var(name) if name == var => Mul(
+            Box::new(Pow(Box::new(Var(v)), Box::new(Const(2.0)))),
+            Box::new(Const(0.5)),
+        ),
+        Neg(a) => Neg(Box::new(rec(a)?)),
+        Add(a, b) => Add(Box::new(rec(a)?), Box::new(rec(b)?)),
+        Sub(a, b) => Sub(Box::new(rec(a)?), Box::new(rec(b)?)),
+        Mul(a, b) => {
+            if !contains_var(a, var) {
+                Mul(a.clone(), Box::new(rec(b)?))
+            } else if !contains_var(b, var) {
+                Mul(Box::new(rec(a)?), b.clone())
+            } else if let Some(parts) = try_generic_parts(e, var, depth) {
+                return Some(parts);
+            } else {
+                return None;
+            }
+        }
+        Pow(base, exp) => {
+            if let Var(name) = base.as_ref() {
+                if name == var {
+                    if let Const(n) = exp.as_ref() {
+                        if (*n + 1.0).abs() < 1e-12 {
+                            // ∫ x^-1 dx = ln|x|
+                            Ln(Box::new(Abs(Box::new(Var(v)))))
+                        } else {
+                            let new_exp = n + 1.0;
+                            Mul(
+                                Box::new(Const(1.0 / new_exp)),
+                                Box::new(Pow(Box::new(Var(v)), Box::new(Const(new_exp)))),
+                            )
+                        }
+                    } else {
+                        return None;
+                    }
+                } else {
+                    return None;
+                }
+            } else {
+                return None;
+            }
+        }
+        Div(num, den) => {
+            if let Var(name) = den.as_ref() {
+                if name == var && !contains_var(num, var) {
+                    return Some(Mul(
+                        num.clone(),
+                        Box::new(Ln(Box::new(Abs(Box::new(Var(v)))))),
+                    ));
+                }
+            }
+            return None;
+        }
+        Sin(arg) => {
+            if expr_is_linear_in(arg, var) {
+                let (a, _) = expr_linear_coeff(arg, var)?;
+                if a.abs() < 1e-12 {
+                    return None;
+                }
+                Mul(Box::new(Const(-1.0 / a)), Box::new(Cos(arg.clone())))
+            } else {
+                return None;
+            }
+        }
+        Cos(arg) => {
+            if expr_is_linear_in(arg, var) {
+                let (a, _) = expr_linear_coeff(arg, var)?;
+                if a.abs() < 1e-12 {
+                    return None;
+                }
+                Mul(Box::new(Const(1.0 / a)), Box::new(Sin(arg.clone())))
+            } else {
+                return None;
+            }
+        }
+        Tan(arg) => {
+            if expr_is_linear_in(arg, var) {
+                let (a, _) = expr_linear_coeff(arg, var)?;
+                if a.abs() < 1e-12 {
+                    return None;
+                }
+                Mul(
+                    Box::new(Const(-1.0 / a)),
+                    Box::new(Ln(Box::new(Abs(Box::new(Cos(arg.clone())))))),
+                )
+            } else {
+                return None;
+            }
+        }
+        Exp(arg) => {
+            if expr_is_linear_in(arg, var) {
+                let (a, _) = expr_linear_coeff(arg, var)?;
+                if a.abs() < 1e-12 {
+                    return None;
+                }
+                if (a - 1.0).abs() < 1e-12 {
+                    Exp(arg.clone())
+                } else {
+                    Mul(Box::new(Const(1.0 / a)), Box::new(Exp(arg.clone())))
+                }
+            } else {
+                return None;
+            }
+        }
+        Ln(u) if matches!(u.as_ref(), Var(name) if name == var) => Sub(
+            Box::new(Mul(
+                Box::new(Var(v.clone())),
+                Box::new(Ln(Box::new(Var(v.clone())))),
+            )),
+            Box::new(Var(v)),
+        ),
+        Sec(_arg) => {
+            return None;
+        }
+        _ => return None,
+    })
+}
+
+/// Integración numérica por Simpson adaptativo sobre `Expr::eval_at`.
+fn numeric_integrate(
+    ast: &Expr,
+    expression: &str,
+    var: &str,
+    a: f64,
+    b: f64,
+    tolerance: f64,
+    max_depth: u32,
+) -> MathResult<f64> {
+    fn simpson<F: Fn(f64) -> Result<f64, MathError>>(
+        f: &F,
+        a: f64,
+        b: f64,
+    ) -> Result<f64, MathError> {
+        let m = (a + b) / 2.0;
+        Ok((b - a) / 6.0 * (f(a)? + 4.0 * f(m)? + f(b)?))
+    }
+    fn adaptive<F: Fn(f64) -> Result<f64, MathError>>(
+        f: &F,
+        a: f64,
+        b: f64,
+        eps: f64,
+        depth: u32,
+        max_depth: u32,
+    ) -> MathResult<f64> {
+        let whole = match simpson(f, a, b) {
+            Ok(value) => value,
+            Err(error) => return math_failure(error),
+        };
+        let mid = (a + b) / 2.0;
+        let left = match simpson(f, a, mid) {
+            Ok(value) => value,
+            Err(error) => return math_failure(error),
+        };
+        let right = match simpson(f, mid, b) {
+            Ok(value) => value,
+            Err(error) => return math_failure(error),
+        };
+        let correction = (left + right - whole) / 15.0;
+        let error_estimate = correction.abs();
+        if error_estimate < eps {
+            MathResult::Approximate {
+                value: left + right + correction,
+                error_estimate,
+            }
+        } else if depth == 0 {
+            MathResult::NotConverged(MathError::RecursionLimit {
+                operation: MathOperation::NumericalIntegration,
+                lower: a,
+                upper: b,
+                max_depth,
+                tolerance: eps,
+                error_estimate,
+            })
+        } else {
+            match (
+                adaptive(f, a, mid, eps / 2.0, depth - 1, max_depth),
+                adaptive(f, mid, b, eps / 2.0, depth - 1, max_depth),
+            ) {
+                (
+                    MathResult::Approximate {
+                        value: left_value,
+                        error_estimate: left_error,
+                    },
+                    MathResult::Approximate {
+                        value: right_value,
+                        error_estimate: right_error,
+                    },
+                ) => MathResult::Approximate {
+                    value: left_value + right_value,
+                    error_estimate: left_error + right_error,
+                },
+                (MathResult::DomainError(error), _) | (_, MathResult::DomainError(error)) => {
+                    MathResult::DomainError(error)
+                }
+                (MathResult::NotConverged(error), _) | (_, MathResult::NotConverged(error)) => {
+                    MathResult::NotConverged(error)
+                }
+                (MathResult::Unsupported(error), _) | (_, MathResult::Unsupported(error)) => {
+                    MathResult::Unsupported(error)
+                }
+                (MathResult::ResourceLimit(error), _) | (_, MathResult::ResourceLimit(error)) => {
+                    MathResult::ResourceLimit(error)
+                }
+                (MathResult::Exact(value), _) | (_, MathResult::Exact(value)) => {
+                    debug_assert!(false, "numeric integration is never exact");
+                    MathResult::Approximate {
+                        value,
+                        error_estimate: 0.0,
+                    }
+                }
+            }
+        }
+    }
+    let f = |x: f64| {
+        let val = ast.eval_at(var, x);
+        if val.is_finite() {
+            Ok(val)
+        } else {
+            Err(MathError::NonFiniteValue {
+                expression: expression.into(),
+                variable: var.into(),
+                at: x,
+            })
+        }
+    };
+    if !a.is_finite() || !b.is_finite() {
+        return MathResult::DomainError(MathError::IntervalDomainViolation {
+            expression: expression.into(),
+            variable: var.into(),
+            lower: a,
+            upper: b,
+        });
+    }
+    if !tolerance.is_finite() || tolerance <= 0.0 {
+        return MathResult::DomainError(MathError::IntervalDomainViolation {
+            expression: expression.into(),
+            variable: var.into(),
+            lower: a,
+            upper: b,
+        });
+    }
+    adaptive(&f, a, b, tolerance, max_depth, max_depth)
+}
+
+// ============================================================================
+// Límite numérico (Richardson bilateral)
+// ============================================================================
+
+struct LimitEstimate {
+    value: f64,
+    error_estimate: f64,
+}
+
+fn has_proven_squeezed_zero_limit(expression: &Expr, var: &str, at: f64) -> bool {
+    let Expr::Mul(left, right) = expression else {
+        return false;
+    };
+
+    (is_continuous_zero_factor(left, var, at) && is_bounded_singular_sin_or_cos(right, var, at))
+        || (is_continuous_zero_factor(right, var, at)
+            && is_bounded_singular_sin_or_cos(left, var, at))
+}
+
+fn is_continuous_zero_factor(expression: &Expr, var: &str, at: f64) -> bool {
+    expression.is_everywhere_differentiable()
+        && positive_zero_order_at_target(expression, var, at).is_some()
+}
+
+fn positive_zero_order_at_target(expression: &Expr, var: &str, at: f64) -> Option<u32> {
+    use Expr::*;
+
+    match expression {
+        Var(name) if name == var && at == 0.0 => Some(1),
+        Sub(left, right) => match (left.as_ref(), right.as_ref()) {
+            (Var(name), Const(target)) | (Const(target), Var(name))
+                if name == var && target.is_finite() && *target == at =>
+            {
+                Some(1)
+            }
+            _ => Some(
+                positive_zero_order_at_target(left, var, at)?
+                    .min(positive_zero_order_at_target(right, var, at)?),
+            ),
+        },
+        Add(left, right) => Some(
+            positive_zero_order_at_target(left, var, at)?
+                .min(positive_zero_order_at_target(right, var, at)?),
+        ),
+        Neg(inner) => positive_zero_order_at_target(inner, var, at),
+        Mul(left, right) => {
+            let left_order = positive_zero_order_at_target(left, var, at);
+            let right_order = positive_zero_order_at_target(right, var, at);
+            match (left_order, right_order) {
+                (Some(left), Some(right)) => left.checked_add(right),
+                (Some(order), None) if right.is_everywhere_differentiable() => Some(order),
+                (None, Some(order)) if left.is_everywhere_differentiable() => Some(order),
+                _ => None,
+            }
+        }
+        Pow(base, exponent) => {
+            let Const(exponent) = exponent.as_ref() else {
+                return None;
+            };
+            if !exponent.is_finite()
+                || *exponent <= 0.0
+                || exponent.fract() != 0.0
+                || *exponent > u32::MAX as f64
+            {
+                return None;
+            }
+            positive_zero_order_at_target(base, var, at)?.checked_mul(*exponent as u32)
+        }
+        _ => None,
+    }
+}
+
+fn is_bounded_singular_sin_or_cos(expression: &Expr, var: &str, at: f64) -> bool {
+    let argument = match expression {
+        Expr::Sin(argument) | Expr::Cos(argument) => argument.as_ref(),
+        _ => return false,
+    };
+    contains_var(argument, var)
+        && !argument.eval_at(var, at).is_finite()
+        && is_finite_on_punctured_probes(argument, var, at)
+}
+
+fn is_finite_on_punctured_probes(expression: &Expr, var: &str, at: f64) -> bool {
+    const PROBE_SCALES: [f64; 6] = [0.113, 0.071, 0.043, 0.019, 0.007, 0.0023];
+
+    let local_scale = at.abs().max(1.0);
+    [-1.0, 1.0].into_iter().all(|sign| {
+        PROBE_SCALES.into_iter().all(|scale| {
+            let point = at + sign * scale * local_scale;
+            point.is_finite() && point != at && expression.eval_at(var, point).is_finite()
+        })
+    })
+}
+
+fn has_unresolved_oscillatory_singularity(expression: &Expr, var: &str, at: f64) -> bool {
+    use Expr::*;
+
+    let singular_argument =
+        |argument: &Expr| contains_var(argument, var) && !argument.eval_at(var, at).is_finite();
+    match expression {
+        Sin(argument) | Cos(argument) | Tan(argument) | Sec(argument) | Csc(argument)
+        | Cot(argument) | Floor(argument) | Ceil(argument) | Round(argument) | Sign(argument)
+        | Heaviside(argument) => {
+            singular_argument(argument) || has_unresolved_oscillatory_singularity(argument, var, at)
+        }
+        Neg(argument) | Asin(argument) | Acos(argument) | Atan(argument) | Exp(argument)
+        | Ln(argument) | Log(argument) | Sqrt(argument) | Abs(argument) | Sinh(argument)
+        | Cosh(argument) | Tanh(argument) | Asinh(argument) | Acosh(argument) | Atanh(argument)
+        | Cbrt(argument) | Re(argument) | Im(argument) | Arg(argument) | Conj(argument)
+        | Erf(argument) | Erfc(argument) | Gamma(argument) | LnGamma(argument)
+        | Digamma(argument) | Trigamma(argument) => {
+            has_unresolved_oscillatory_singularity(argument, var, at)
+        }
+        Modulo(left, right) => {
+            singular_argument(left)
+                || singular_argument(right)
+                || has_unresolved_oscillatory_singularity(left, var, at)
+                || has_unresolved_oscillatory_singularity(right, var, at)
+        }
+        Add(left, right)
+        | Sub(left, right)
+        | Mul(left, right)
+        | Div(left, right)
+        | Pow(left, right)
+        | Atan2(left, right)
+        | Min(left, right)
+        | Max(left, right)
+        | Beta(left, right)
+        | BesselJ(left, right)
+        | BesselY(left, right)
+        | BesselI(left, right)
+        | Lt(left, right)
+        | Gt(left, right)
+        | Le(left, right)
+        | Ge(left, right)
+        | Eq(left, right)
+        | Ne(left, right) => {
+            has_unresolved_oscillatory_singularity(left, var, at)
+                || has_unresolved_oscillatory_singularity(right, var, at)
+        }
+        Clamp(value, lower, upper) => {
+            has_unresolved_oscillatory_singularity(value, var, at)
+                || has_unresolved_oscillatory_singularity(lower, var, at)
+                || has_unresolved_oscillatory_singularity(upper, var, at)
+        }
+        Sum(body, _, start, end) | Product(body, _, start, end) => {
+            has_unresolved_oscillatory_singularity(body, var, at)
+                || has_unresolved_oscillatory_singularity(start, var, at)
+                || has_unresolved_oscillatory_singularity(end, var, at)
+        }
+        Piecewise(branches, default) => {
+            branches.iter().any(|(condition, value)| {
+                has_unresolved_oscillatory_singularity(condition, var, at)
+                    || has_unresolved_oscillatory_singularity(value, var, at)
+            }) || has_unresolved_oscillatory_singularity(default, var, at)
+        }
+        Const(_) | Var(_) => false,
+    }
+}
+
+fn richardson_limit(ast: &Expr, var: &str, at: f64) -> Option<LimitEstimate> {
+    const STEP_SCALES: [f64; 3] = [0.125, 0.1, 0.075];
+
+    let local_scale = at.abs().max(1.0);
+    let mut estimates = Vec::with_capacity(STEP_SCALES.len() * 2);
+    for scale in STEP_SCALES {
+        let initial_step = scale * local_scale;
+        let left = stable_side_limit(ast, var, at, -1.0, initial_step)?;
+        let right = stable_side_limit(ast, var, at, 1.0, initial_step)?;
+        if !limit_estimates_agree(&left, &right) {
+            return None;
+        }
+        estimates.push(left);
+        estimates.push(right);
+    }
+
+    let mut value = estimates[0].value;
+    for (index, estimate) in estimates.iter().enumerate().skip(1) {
+        let difference = estimate.value - value;
+        if !difference.is_finite() {
+            return None;
+        }
+        value += difference / (index + 1) as f64;
+    }
+    if !value.is_finite() {
+        return None;
+    }
+
+    let mut error_estimate = 0.0_f64;
+    for estimate in &estimates {
+        let deviation = (estimate.value - value).abs();
+        let local_error = estimate.error_estimate + deviation;
+        if !local_error.is_finite() {
+            return None;
+        }
+        error_estimate = error_estimate.max(local_error);
+    }
+    let tolerance = limit_tolerance(value);
+    (error_estimate <= tolerance).then_some(LimitEstimate {
+        value,
+        error_estimate,
+    })
+}
+
+fn richardson_one_side_limit(ast: &Expr, var: &str, at: f64, sign: f64) -> Option<LimitEstimate> {
+    const STEP_SCALES: [f64; 3] = [0.125, 0.1, 0.075];
+    let local_scale = at.abs().max(1.0);
+    let mut estimates = Vec::with_capacity(STEP_SCALES.len());
+    for scale in STEP_SCALES {
+        let initial_step = scale * local_scale;
+        let estimate = stable_side_limit(ast, var, at, sign, initial_step)?;
+        estimates.push(estimate);
+    }
+    // Promedia las estimas con pesos decrecientes, igual que `richardson_limit`.
+    let mut value = estimates[0].value;
+    for (index, estimate) in estimates.iter().enumerate().skip(1) {
+        let difference = estimate.value - value;
+        if !difference.is_finite() {
+            return None;
+        }
+        value += difference / (index + 1) as f64;
+    }
+    if !value.is_finite() {
+        return None;
+    }
+    let mut error_estimate = 0.0_f64;
+    for estimate in &estimates {
+        let deviation = (estimate.value - value).abs();
+        let local_error = estimate.error_estimate + deviation;
+        if !local_error.is_finite() {
+            return None;
+        }
+        error_estimate = error_estimate.max(local_error);
+    }
+    let tolerance = limit_tolerance(value);
+    (error_estimate <= tolerance).then_some(LimitEstimate {
+        value,
+        error_estimate,
+    })
+}
+
+fn stable_side_limit(
+    ast: &Expr,
+    var: &str,
+    at: f64,
+    sign: f64,
+    initial_step: f64,
+) -> Option<LimitEstimate> {
+    const SAMPLE_COUNT: usize = 12;
+    const TAIL_DIFFERENCES: usize = 4;
+    const MAX_CONTRACTION: f64 = 0.8;
+
+    let mut values = [0.0; SAMPLE_COUNT];
+    for (index, value) in values.iter_mut().enumerate() {
+        let step = initial_step / 2.0f64.powi(index as i32);
+        let point = at + sign * step;
+        if !point.is_finite() || point == at {
+            return None;
+        }
+        *value = ast.eval_at(var, point);
+        if !value.is_finite() {
+            return None;
+        }
+    }
+
+    let value_scale = values
+        .iter()
+        .map(|value| value.abs())
+        .fold(1.0_f64, f64::max);
+    // Keep arithmetic headroom for differences and error estimates.
+    if value_scale > f64::MAX / 16.0 {
+        return None;
+    }
+    let roundoff = 128.0 * f64::EPSILON * value_scale;
+    let mut differences = [0.0; TAIL_DIFFERENCES];
+    let first = SAMPLE_COUNT - TAIL_DIFFERENCES;
+    for (offset, difference) in differences.iter_mut().enumerate() {
+        let index = first + offset;
+        *difference = values[index] - values[index - 1];
+        if !difference.is_finite() {
+            return None;
+        }
+    }
+
+    if differences
+        .iter()
+        .all(|difference| difference.abs() <= roundoff)
+    {
+        let tail = &values[SAMPLE_COUNT - 3..];
+        let value = tail.iter().sum::<f64>() / tail.len() as f64;
+        let spread = tail
+            .iter()
+            .map(|sample| (sample - value).abs())
+            .fold(0.0_f64, f64::max);
+        return (value.is_finite() && spread.is_finite()).then_some(LimitEstimate {
+            value,
+            error_estimate: spread.max(roundoff),
+        });
+    }
+
+    let mut ratios = [0.0; TAIL_DIFFERENCES - 1];
+    for index in 1..differences.len() {
+        let previous = differences[index - 1];
+        let current = differences[index];
+        if previous.abs() <= roundoff
+            || current.abs() <= roundoff
+            || previous.is_sign_positive() != current.is_sign_positive()
+        {
+            return None;
+        }
+        let ratio = (current / previous).abs();
+        if !ratio.is_finite() || ratio >= MAX_CONTRACTION {
+            return None;
+        }
+        ratios[index - 1] = ratio;
+    }
+
+    let ratio_spread = ratios.iter().copied().fold(f64::NEG_INFINITY, f64::max)
+        - ratios.iter().copied().fold(f64::INFINITY, f64::min);
+    if !ratio_spread.is_finite() || ratio_spread > 0.25 {
+        return None;
+    }
+
+    let ratio = ratios[ratios.len() - 1];
+    let last = values[SAMPLE_COUNT - 1];
+    let last_difference = differences[differences.len() - 1];
+    let correction = last_difference * ratio / (1.0 - ratio);
+    let value = last + correction;
+
+    let previous_ratio = ratios[ratios.len() - 2];
+    let previous = values[SAMPLE_COUNT - 2];
+    let previous_difference = differences[differences.len() - 2];
+    let previous_value = previous + previous_difference * previous_ratio / (1.0 - previous_ratio);
+    let ratio_uncertainty = correction.abs() * ratio_spread / (1.0 - ratio);
+    let error_estimate = (value - previous_value)
+        .abs()
+        .max(ratio_uncertainty)
+        .max(roundoff);
+
+    (value.is_finite() && error_estimate.is_finite() && error_estimate <= limit_tolerance(value))
+        .then_some(LimitEstimate {
+            value,
+            error_estimate,
+        })
+}
+
+fn limit_estimates_agree(left: &LimitEstimate, right: &LimitEstimate) -> bool {
+    let disagreement = (left.value - right.value).abs();
+    let error_allowance = 8.0 * left.error_estimate.max(right.error_estimate);
+    disagreement.is_finite()
+        && error_allowance.is_finite()
+        && disagreement
+            <= limit_tolerance(left.value.abs().max(right.value.abs())) + error_allowance
+}
+
+fn limit_tolerance(value: f64) -> f64 {
+    1e-9 + 1e-6 * value.abs().max(1.0)
+}
+
+// ============================================================================
+// Utilidades: expansión, sustitución, variables, raíces numéricas
+// ============================================================================
+
+#[derive(Clone, Copy)]
+struct ExpandMetrics {
+    nodes: usize,
+    output_bytes: usize,
+}
+
+#[derive(Clone)]
+struct ExpandedTerm {
+    negative: bool,
+    expression: Expr,
+    metrics: ExpandMetrics,
+}
+
+#[derive(Default)]
+struct ExpandBudget {
+    work_units: usize,
+}
+
+impl ExpandBudget {
+    fn charge(&mut self, units: usize) -> Result<(), String> {
+        let projected = self
+            .work_units
+            .checked_add(units)
+            .ok_or_else(|| expand_budget_error("work", usize::MAX, MAX_EXPAND_WORK_UNITS))?;
+        if projected > MAX_EXPAND_WORK_UNITS {
+            return Err(expand_budget_error(
+                "work",
+                projected,
+                MAX_EXPAND_WORK_UNITS,
+            ));
+        }
+        self.work_units = projected;
+        Ok(())
+    }
+}
+
+fn expand_budget_error(kind: &str, provided: usize, maximum: usize) -> String {
+    format!("Expand {kind} budget exceeded: {provided}, maximum {maximum}")
+}
+
+fn checked_expand_add(
+    kind: &str,
+    left: usize,
+    right: usize,
+    maximum: usize,
+) -> Result<usize, String> {
+    let value = left
+        .checked_add(right)
+        .ok_or_else(|| expand_budget_error(kind, usize::MAX, maximum))?;
+    if value > maximum {
+        return Err(expand_budget_error(kind, value, maximum));
+    }
+    Ok(value)
+}
+
+fn checked_expand_mul(
+    kind: &str,
+    left: usize,
+    right: usize,
+    maximum: usize,
+) -> Result<usize, String> {
+    let value = left
+        .checked_mul(right)
+        .ok_or_else(|| expand_budget_error(kind, usize::MAX, maximum))?;
+    if value > maximum {
+        return Err(expand_budget_error(kind, value, maximum));
+    }
+    Ok(value)
+}
+
+fn merge_expand_metrics(
+    children: &[ExpandMetrics],
+    node_overhead: usize,
+    output_overhead: usize,
+) -> Result<ExpandMetrics, String> {
+    let mut nodes = node_overhead;
+    let mut output_bytes = output_overhead;
+    for child in children {
+        nodes = checked_expand_add("AST node", nodes, child.nodes, MAX_EXPAND_AST_NODES)?;
+        output_bytes = checked_expand_add(
+            "output",
+            output_bytes,
+            child.output_bytes,
+            MAX_EXPAND_OUTPUT_BYTES,
+        )?;
+    }
+    Ok(ExpandMetrics {
+        nodes,
+        output_bytes,
+    })
+}
+
+fn expand_expression_metrics(expression: &Expr) -> Result<ExpandMetrics, String> {
+    use Expr::*;
+    match expression {
+        Const(_) => Ok(ExpandMetrics {
+            nodes: 1,
+            output_bytes: 32,
+        }),
+        Var(name) => Ok(ExpandMetrics {
+            nodes: 1,
+            output_bytes: name.len(),
+        }),
+        Neg(value) | Sin(value) | Cos(value) | Tan(value) | Asin(value) | Acos(value)
+        | Atan(value) | Exp(value) | Ln(value) | Log(value) | Sqrt(value) | Abs(value)
+        | Sinh(value) | Cosh(value) | Tanh(value) | Floor(value) | Ceil(value) | Round(value)
+        | Sec(value) | Csc(value) | Cot(value) | Asinh(value) | Acosh(value) | Atanh(value)
+        | Sign(value) | Heaviside(value) | Cbrt(value) | Re(value) | Im(value) | Arg(value)
+        | Conj(value) | Erf(value) | Erfc(value) | Gamma(value) | LnGamma(value)
+        | Digamma(value) | Trigamma(value) => {
+            merge_expand_metrics(&[expand_expression_metrics(value)?], 1, 16)
+        }
+        Add(left, right)
+        | Sub(left, right)
+        | Mul(left, right)
+        | Div(left, right)
+        | Pow(left, right)
+        | Atan2(left, right)
+        | Modulo(left, right)
+        | Min(left, right)
+        | Max(left, right)
+        | Beta(left, right)
+        | BesselJ(left, right)
+        | BesselY(left, right)
+        | BesselI(left, right)
+        | Lt(left, right)
+        | Gt(left, right)
+        | Le(left, right)
+        | Ge(left, right)
+        | Eq(left, right)
+        | Ne(left, right) => merge_expand_metrics(
+            &[
+                expand_expression_metrics(left)?,
+                expand_expression_metrics(right)?,
+            ],
+            1,
+            16,
+        ),
+        Clamp(value, lower, upper) => merge_expand_metrics(
+            &[
+                expand_expression_metrics(value)?,
+                expand_expression_metrics(lower)?,
+                expand_expression_metrics(upper)?,
+            ],
+            1,
+            16,
+        ),
+        Sum(body, variable, start, end) | Product(body, variable, start, end) => {
+            merge_expand_metrics(
+                &[
+                    expand_expression_metrics(body)?,
+                    expand_expression_metrics(start)?,
+                    expand_expression_metrics(end)?,
+                ],
+                1,
+                checked_expand_add("output", 20, variable.len(), MAX_EXPAND_OUTPUT_BYTES)?,
+            )
+        }
+        Piecewise(branches, default) => {
+            let mut metrics = merge_expand_metrics(
+                &[expand_expression_metrics(default)?],
+                1,
+                checked_expand_add(
+                    "output",
+                    16,
+                    checked_expand_mul("output", 4, branches.len(), MAX_EXPAND_OUTPUT_BYTES)?,
+                    MAX_EXPAND_OUTPUT_BYTES,
+                )?,
+            )?;
+            for (condition, value) in branches {
+                metrics = merge_expand_metrics(
+                    &[
+                        metrics,
+                        expand_expression_metrics(condition)?,
+                        expand_expression_metrics(value)?,
+                    ],
+                    0,
+                    0,
+                )?;
+            }
+            Ok(metrics)
+        }
+    }
+}
+
+fn validate_expand_expression(expression: &Expr) -> Result<ExpandMetrics, String> {
+    expand_expression_metrics(expression)
+}
+
+fn expanded_terms_metrics(terms: &[ExpandedTerm]) -> Result<ExpandMetrics, String> {
+    if terms.is_empty() {
+        return Err("Expand produced no terms".to_string());
+    }
+    let mut nodes = usize::from(terms[0].negative);
+    let mut output_bytes = if terms[0].negative { 3 } else { 0 };
+    for term in terms {
+        nodes = checked_expand_add("AST node", nodes, term.metrics.nodes, MAX_EXPAND_AST_NODES)?;
+        output_bytes = checked_expand_add(
+            "output",
+            output_bytes,
+            term.metrics.output_bytes,
+            MAX_EXPAND_OUTPUT_BYTES,
+        )?;
+    }
+    if terms.len() > 1 {
+        nodes = checked_expand_add("AST node", nodes, terms.len() - 1, MAX_EXPAND_AST_NODES)?;
+        output_bytes = checked_expand_add(
+            "output",
+            output_bytes,
+            checked_expand_mul("output", 7, terms.len() - 1, MAX_EXPAND_OUTPUT_BYTES)?,
+            MAX_EXPAND_OUTPUT_BYTES,
+        )?;
+    }
+    Ok(ExpandMetrics {
+        nodes,
+        output_bytes,
+    })
+}
+
+fn clone_expanded_terms(
+    terms: &[ExpandedTerm],
+    budget: &mut ExpandBudget,
+) -> Result<Vec<ExpandedTerm>, String> {
+    let nodes = terms.iter().try_fold(0usize, |nodes, term| {
+        checked_expand_add("AST node", nodes, term.metrics.nodes, MAX_EXPAND_AST_NODES)
+    })?;
+    budget.charge(nodes)?;
+    let mut cloned = Vec::new();
+    cloned
+        .try_reserve_exact(terms.len())
+        .map_err(|error| format!("Expand allocation failed within budget: {error}"))?;
+    cloned.extend(terms.iter().cloned());
+    Ok(cloned)
+}
+
+fn multiply_expanded_terms(
+    left: Vec<ExpandedTerm>,
+    right: &[ExpandedTerm],
+    budget: &mut ExpandBudget,
+) -> Result<Vec<ExpandedTerm>, String> {
+    let term_count = checked_expand_mul("AST node", left.len(), right.len(), MAX_EXPAND_AST_NODES)?;
+    let left_nodes = left.iter().try_fold(0usize, |nodes, term| {
+        checked_expand_add("AST node", nodes, term.metrics.nodes, MAX_EXPAND_AST_NODES)
+    })?;
+    let right_nodes = right.iter().try_fold(0usize, |nodes, term| {
+        checked_expand_add("AST node", nodes, term.metrics.nodes, MAX_EXPAND_AST_NODES)
+    })?;
+    let product_nodes = checked_expand_add(
+        "AST node",
+        checked_expand_mul("AST node", left_nodes, right.len(), MAX_EXPAND_AST_NODES)?,
+        checked_expand_mul("AST node", right_nodes, left.len(), MAX_EXPAND_AST_NODES)?,
+        MAX_EXPAND_AST_NODES,
+    )?;
+    let product_nodes =
+        checked_expand_add("AST node", product_nodes, term_count, MAX_EXPAND_AST_NODES)?;
+    let projected_ast_nodes = checked_expand_add(
+        "AST node",
+        product_nodes,
+        term_count.saturating_sub(1),
+        MAX_EXPAND_AST_NODES,
+    )?;
+
+    let left_output = left.iter().try_fold(0usize, |bytes, term| {
+        checked_expand_add(
+            "output",
+            bytes,
+            term.metrics.output_bytes,
+            MAX_EXPAND_OUTPUT_BYTES,
+        )
+    })?;
+    let right_output = right.iter().try_fold(0usize, |bytes, term| {
+        checked_expand_add(
+            "output",
+            bytes,
+            term.metrics.output_bytes,
+            MAX_EXPAND_OUTPUT_BYTES,
+        )
+    })?;
+    let product_output = checked_expand_add(
+        "output",
+        checked_expand_mul("output", left_output, right.len(), MAX_EXPAND_OUTPUT_BYTES)?,
+        checked_expand_mul("output", right_output, left.len(), MAX_EXPAND_OUTPUT_BYTES)?,
+        MAX_EXPAND_OUTPUT_BYTES,
+    )?;
+    let product_output = checked_expand_add(
+        "output",
+        product_output,
+        checked_expand_mul("output", 7, term_count, MAX_EXPAND_OUTPUT_BYTES)?,
+        MAX_EXPAND_OUTPUT_BYTES,
+    )?;
+    checked_expand_add(
+        "output",
+        product_output,
+        checked_expand_mul(
+            "output",
+            7,
+            term_count.saturating_sub(1),
+            MAX_EXPAND_OUTPUT_BYTES,
+        )?,
+        MAX_EXPAND_OUTPUT_BYTES,
+    )?;
+
+    budget.charge(projected_ast_nodes)?;
+    let mut products = Vec::new();
+    products
+        .try_reserve_exact(term_count)
+        .map_err(|error| format!("Expand allocation failed within budget: {error}"))?;
+    for left_term in left {
+        for right_term in right {
+            products.push(ExpandedTerm {
+                negative: left_term.negative != right_term.negative,
+                expression: Expr::Mul(
+                    Box::new(left_term.expression.clone()),
+                    Box::new(right_term.expression.clone()),
+                ),
+                metrics: ExpandMetrics {
+                    nodes: left_term.metrics.nodes + right_term.metrics.nodes + 1,
+                    output_bytes: left_term.metrics.output_bytes
+                        + right_term.metrics.output_bytes
+                        + 7,
+                },
+            });
+        }
+    }
+    Ok(products)
+}
+
+/// Distributividad de productos sobre sumas/restas y potencias enteras positivas.
+/// Memo de subexpansiones (DAG-lite): subárboles estructuralmente idénticos
+/// comparten cómputo en vez de re-expandirse.
+///
+/// La clave es una huella `u64` + sonda `structurally_eq` (a prueba de
+/// colisiones: ante duda se recomputa). Cada entrada guarda los términos y
+/// el `delta` de presupuesto consumido, que se vuelve a cargar en cada
+/// acierto: la trayectoria de presupuesto es idéntica a la corrida sin
+/// memo (mismos éxitos, mismos errores, mismos mensajes). La cota
+/// `MAX_EXPAND_MEMO_ENTRIES` solo afecta velocidad, jamás el resultado.
+struct ExpandMemo {
+    map: std::collections::HashMap<u64, Vec<(Expr, Vec<ExpandedTerm>, usize)>>,
+    hits: usize,
+}
+
+/// Máximo de subexpansiones memoizadas por `expand()` (solo velocidad).
+const MAX_EXPAND_MEMO_ENTRIES: usize = 1024;
+
+impl ExpandMemo {
+    fn new() -> Self {
+        Self {
+            map: std::collections::HashMap::new(),
+            hits: 0,
+        }
+    }
+
+    fn lookup(
+        &mut self,
+        key: u64,
+        probe: &Expr,
+        budget: &mut ExpandBudget,
+    ) -> Option<Vec<ExpandedTerm>> {
+        let bucket = self.map.get(&key)?;
+        for (stored, terms, delta) in bucket {
+            if stored.structurally_eq(probe) {
+                budget.charge(*delta).ok()?;
+                self.hits += 1;
+                return Some(terms.clone());
+            }
+        }
+        None
+    }
+
+    fn store(&mut self, key: u64, probe: &Expr, terms: &[ExpandedTerm], delta: usize) {
+        if self.map.len() >= MAX_EXPAND_MEMO_ENTRIES {
+            return;
+        }
+        self.map
+            .entry(key)
+            .or_default()
+            .push((probe.clone(), terms.to_vec(), delta));
+    }
+}
+
+/// Huella estructural de un `Expr` para el memo (el desempate real lo hace
+/// `structurally_eq`; acá solo se busca distribuir).
+fn expr_fingerprint(expression: &Expr) -> u64 {
+    use std::hash::{Hash, Hasher};
+    fn feed(expression: &Expr, state: &mut impl Hasher) {
+        use Expr::*;
+        match expression {
+            Const(value) => {
+                0_u8.hash(state);
+                value.to_bits().hash(state);
+            }
+            Var(name) => {
+                1_u8.hash(state);
+                name.hash(state);
+            }
+            Neg(value) | Sin(value) | Cos(value) | Tan(value) | Asin(value) | Acos(value)
+            | Atan(value) | Exp(value) | Ln(value) | Log(value) | Sqrt(value) | Abs(value)
+            | Sinh(value) | Cosh(value) | Tanh(value) | Floor(value) | Ceil(value)
+            | Round(value) | Sec(value) | Csc(value) | Cot(value) | Asinh(value) | Acosh(value)
+            | Atanh(value) | Sign(value) | Heaviside(value) | Cbrt(value) | Re(value)
+            | Im(value) | Arg(value) | Conj(value) | Erf(value) | Erfc(value) | Gamma(value)
+            | LnGamma(value) | Digamma(value) | Trigamma(value) => {
+                std::mem::discriminant(expression).hash(state);
+                feed(value, state);
+            }
+            Add(left, right)
+            | Sub(left, right)
+            | Mul(left, right)
+            | Div(left, right)
+            | Pow(left, right)
+            | Atan2(left, right)
+            | Modulo(left, right)
+            | Min(left, right)
+            | Max(left, right)
+            | Beta(left, right)
+            | BesselJ(left, right)
+            | BesselY(left, right)
+            | BesselI(left, right)
+            | Lt(left, right)
+            | Gt(left, right)
+            | Le(left, right)
+            | Ge(left, right)
+            | Eq(left, right)
+            | Ne(left, right) => {
+                std::mem::discriminant(expression).hash(state);
+                feed(left, state);
+                feed(right, state);
+            }
+            Clamp(x, lo, hi) => {
+                std::mem::discriminant(expression).hash(state);
+                feed(x, state);
+                feed(lo, state);
+                feed(hi, state);
+            }
+            Sum(body, var, start, end) | Product(body, var, start, end) => {
+                std::mem::discriminant(expression).hash(state);
+                var.hash(state);
+                feed(body, state);
+                feed(start, state);
+                feed(end, state);
+            }
+            Piecewise(pieces, default) => {
+                std::mem::discriminant(expression).hash(state);
+                pieces.len().hash(state);
+                for (condition, value) in pieces {
+                    feed(condition, state);
+                    feed(value, state);
+                }
+                feed(default, state);
+            }
+        }
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    feed(expression, &mut hasher);
+    hasher.finish()
+}
+
+fn expand_expr(expression: &Expr, budget: &mut ExpandBudget) -> Result<Vec<ExpandedTerm>, String> {
+    let mut memo = ExpandMemo::new();
+    expand_expr_memo(expression, budget, &mut memo)
+}
+
+fn expand_expr_memo(
+    expression: &Expr,
+    budget: &mut ExpandBudget,
+    memo: &mut ExpandMemo,
+) -> Result<Vec<ExpandedTerm>, String> {
+    let key = expr_fingerprint(expression);
+    if let Some(terms) = memo.lookup(key, expression, budget) {
+        return Ok(terms);
+    }
+    let before = budget.work_units;
+    let terms = expand_expr_inner(expression, budget, memo)?;
+    let delta = budget.work_units.saturating_sub(before);
+    memo.store(key, expression, &terms, delta);
+    Ok(terms)
+}
+
+fn expand_expr_inner(
+    expression: &Expr,
+    budget: &mut ExpandBudget,
+    memo: &mut ExpandMemo,
+) -> Result<Vec<ExpandedTerm>, String> {
+    use Expr::*;
+    budget.charge(1)?;
+    let terms = match expression {
+        Add(left, right) | Sub(left, right) => {
+            let mut left_terms = expand_expr_memo(left, budget, memo)?;
+            let mut right_terms = expand_expr_memo(right, budget, memo)?;
+            if matches!(expression, Sub(_, _)) {
+                budget.charge(right_terms.len())?;
+                for term in &mut right_terms {
+                    term.negative = !term.negative;
+                }
+            }
+            left_terms
+                .try_reserve_exact(right_terms.len())
+                .map_err(|error| format!("Expand allocation failed within budget: {error}"))?;
+            left_terms.append(&mut right_terms);
+            left_terms
+        }
+        Neg(value) => {
+            let mut terms = expand_expr_memo(value, budget, memo)?;
+            budget.charge(terms.len())?;
+            for term in &mut terms {
+                term.negative = !term.negative;
+            }
+            terms
+        }
+        Mul(left, right) => {
+            let left = expand_expr_memo(left, budget, memo)?;
+            let right = expand_expr_memo(right, budget, memo)?;
+            multiply_expanded_terms(left, &right, budget)?
+        }
+        Pow(base, exponent) => {
+            let Const(exponent) = exponent.as_ref() else {
+                return single_expand_term(expression, budget);
+            };
+            if !exponent.is_finite()
+                || *exponent < 1.0
+                || exponent.fract() != 0.0
+                || *exponent > MAX_EXPAND_WORK_UNITS as f64
+            {
+                return if exponent.is_finite()
+                    && *exponent > MAX_EXPAND_WORK_UNITS as f64
+                    && exponent.fract() == 0.0
+                {
+                    Err(expand_budget_error(
+                        "work",
+                        *exponent as usize,
+                        MAX_EXPAND_WORK_UNITS,
+                    ))
+                } else {
+                    single_expand_term(expression, budget)
+                };
+            }
+            let exponent = *exponent as usize;
+            let factor = expand_expr_memo(base, budget, memo)?;
+            if exponent == 1 {
+                factor
+            } else {
+                let mut result = clone_expanded_terms(&factor, budget)?;
+                for _ in 1..exponent {
+                    result = multiply_expanded_terms(result, &factor, budget)?;
+                }
+                result
+            }
+        }
+        _ => return single_expand_term(expression, budget),
+    };
+    expanded_terms_metrics(&terms)?;
+    Ok(terms)
+}
+
+fn single_expand_term(
+    expression: &Expr,
+    budget: &mut ExpandBudget,
+) -> Result<Vec<ExpandedTerm>, String> {
+    let metrics = validate_expand_expression(expression)?;
+    budget.charge(metrics.nodes)?;
+    Ok(vec![ExpandedTerm {
+        negative: false,
+        expression: expression.clone(),
+        metrics,
+    }])
+}
+
+fn expanded_terms_into_expr(
+    terms: Vec<ExpandedTerm>,
+    budget: &mut ExpandBudget,
+) -> Result<Expr, String> {
+    let metrics = expanded_terms_metrics(&terms)?;
+    budget.charge(metrics.nodes)?;
+    let mut terms: Vec<Option<ExpandedTerm>> = terms.into_iter().map(Some).collect();
+
+    fn build_balanced(terms: &mut [Option<ExpandedTerm>], invert: bool) -> Expr {
+        if terms.len() == 1 {
+            let Some(term) = terms[0].take() else {
+                debug_assert!(false, "validated expansion term missing");
+                return Expr::Const(0.0);
+            };
+            return if term.negative != invert {
+                Expr::Neg(Box::new(term.expression))
+            } else {
+                term.expression
+            };
+        }
+
+        let middle = terms.len() / 2;
+        let Some(middle_term) = terms[middle].as_ref() else {
+            debug_assert!(false, "validated expansion term missing");
+            return Expr::Const(0.0);
+        };
+        let right_is_negative = middle_term.negative != invert;
+        let (left_terms, right_terms) = terms.split_at_mut(middle);
+        let left = build_balanced(left_terms, invert);
+        if right_is_negative {
+            Expr::Sub(
+                Box::new(left),
+                Box::new(build_balanced(right_terms, !invert)),
+            )
+        } else {
+            Expr::Add(
+                Box::new(left),
+                Box::new(build_balanced(right_terms, invert)),
+            )
+        }
+    }
+
+    Ok(build_balanced(&mut terms, false))
+}
+
+fn simplify_expanded_expr(mut expression: Expr, budget: &mut ExpandBudget) -> Result<Expr, String> {
+    for _ in 0..30 {
+        let current_metrics = validate_expand_expression(&expression)?;
+        budget.charge(current_metrics.nodes)?;
+        let next = simplify_once(&expression);
+        validate_expand_expression(&next)?;
+        if next.structurally_eq(&expression) {
+            return Ok(next);
+        }
+        expression = next;
+    }
+    Ok(expression)
+}
+
+/// Reemplaza ocurrencias standalone del identificador `var` por `(replacement)`.
+fn replace_var_token(expr: &str, var: &str, replacement: &str) -> String {
+    let chars: Vec<char> = expr.chars().collect();
+    let var_chars: Vec<char> = var.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if i + var_chars.len() <= chars.len() && chars[i..i + var_chars.len()] == var_chars[..] {
+            let prev = if i > 0 { Some(chars[i - 1]) } else { None };
+            let next = if i + var_chars.len() < chars.len() {
+                Some(chars[i + var_chars.len()])
+            } else {
+                None
+            };
+            let prev_ident = prev
+                .map(|c| c.is_alphanumeric() || c == '_')
+                .unwrap_or(false);
+            let next_ident = next
+                .map(|c| c.is_alphanumeric() || c == '_')
+                .unwrap_or(false);
+            if !prev_ident && !next_ident {
+                out.push_str(&format!("({replacement})"));
+                i += var_chars.len();
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+fn contains_var(e: &Expr, var: &str) -> bool {
+    let mut vars = HashSet::new();
+    e.get_variables(&mut vars);
+    vars.contains(var)
+}
+
+fn constant_scalar_value(expr: &Expr) -> Option<f64> {
+    match expr {
+        Expr::Const(value) if value.is_finite() => Some(*value),
+        Expr::Neg(inner) => Some(-constant_scalar_value(inner)?),
+        Expr::Add(left, right) => {
+            Some(constant_scalar_value(left)? + constant_scalar_value(right)?)
+        }
+        Expr::Sub(left, right) => {
+            Some(constant_scalar_value(left)? - constant_scalar_value(right)?)
+        }
+        Expr::Mul(left, right) => {
+            Some(constant_scalar_value(left)? * constant_scalar_value(right)?)
+        }
+        Expr::Div(numerator, denominator) => {
+            let denominator = constant_scalar_value(denominator)?;
+            (denominator != 0.0).then(|| {
+                constant_scalar_value(numerator).map(|numerator| numerator / denominator)
+            })?
+        }
+        Expr::Pow(base, exponent) => {
+            Some(constant_scalar_value(base)?.powf(constant_scalar_value(exponent)?))
+        }
+        _ => None,
+    }
+    .filter(|value| value.is_finite())
+}
+
+fn is_finite_nonzero_scalar(expr: &Expr) -> bool {
+    match expr {
+        Expr::Const(value) => value.is_finite() && *value != 0.0,
+        Expr::Neg(inner) => is_finite_nonzero_scalar(inner),
+        Expr::Mul(left, right) => is_finite_nonzero_scalar(left) && is_finite_nonzero_scalar(right),
+        Expr::Div(numerator, denominator) => {
+            is_finite_nonzero_scalar(numerator) && is_finite_nonzero_scalar(denominator)
+        }
+        _ => constant_scalar_value(expr).is_some_and(|value| value != 0.0),
+    }
+}
+
+fn is_zero_scalar(expr: &Expr) -> bool {
+    match expr {
+        Expr::Const(value) => *value == 0.0,
+        Expr::Neg(inner) | Expr::Abs(inner) => is_zero_scalar(inner),
+        Expr::Mul(left, right) => is_zero_scalar(left) || is_zero_scalar(right),
+        Expr::Div(numerator, denominator) => {
+            is_zero_scalar(numerator) && is_finite_nonzero_scalar(denominator)
+        }
+        Expr::Pow(base, exponent) => {
+            is_zero_scalar(base) && constant_scalar_value(exponent).is_some_and(|value| value > 0.0)
+        }
+        Expr::Add(_, _) | Expr::Sub(_, _) => constant_scalar_value(expr) == Some(0.0),
+        _ => false,
+    }
+}
+
+/// Indica si la estructura de la expresión representa la función cero.
+pub fn is_identically_zero(expr: &Expr) -> bool {
+    if !has_total_real_domain(expr) {
+        return false;
+    }
+    if is_zero_scalar(expr) {
+        return true;
+    }
+    let mut variables = HashSet::new();
+    expr.get_variables(&mut variables);
+    if variables.len() <= 1 {
+        let variable = variables.iter().next().map(String::as_str).unwrap_or("x");
+        if collect_polynomial_coeffs(expr, variable, 20)
+            .is_some_and(|coefficients| coefficients.iter().all(|coefficient| *coefficient == 0.0))
+        {
+            return true;
+        }
+    }
+    match expr {
+        Expr::Neg(inner) | Expr::Abs(inner) => is_identically_zero(inner),
+        Expr::Add(left, right) => is_identically_zero(left) && is_identically_zero(right),
+        Expr::Sub(left, right) => {
+            (is_identically_zero(left) && is_identically_zero(right))
+                || (left.structurally_eq(right) && left.is_guaranteed_finite())
+        }
+        Expr::Mul(left, right) => is_identically_zero(left) || is_identically_zero(right),
+        Expr::Pow(base, exponent) => {
+            is_identically_zero(base)
+                && constant_scalar_value(exponent).is_some_and(|value| value > 0.0)
+        }
+        _ => false,
+    }
+}
+
+fn has_total_real_domain(expr: &Expr) -> bool {
+    match expr {
+        Expr::Const(value) => value.is_finite(),
+        Expr::Var(_) => true,
+        Expr::Neg(inner)
+        | Expr::Sin(inner)
+        | Expr::Cos(inner)
+        | Expr::Atan(inner)
+        | Expr::Abs(inner)
+        | Expr::Tanh(inner)
+        | Expr::Floor(inner)
+        | Expr::Ceil(inner)
+        | Expr::Round(inner)
+        | Expr::Sign(inner)
+        | Expr::Heaviside(inner)
+        | Expr::Cbrt(inner)
+        | Expr::Asinh(inner) => has_total_real_domain(inner),
+        Expr::Add(left, right) | Expr::Sub(left, right) | Expr::Mul(left, right) => {
+            has_total_real_domain(left) && has_total_real_domain(right)
+        }
+        Expr::Div(numerator, denominator) => {
+            has_total_real_domain(numerator) && is_finite_nonzero_scalar(denominator)
+        }
+        Expr::Pow(base, exponent) => {
+            has_total_real_domain(base)
+                && matches!(
+                    exponent.as_ref(),
+                    Expr::Const(value) if value.is_finite() && *value >= 0.0 && value.fract() == 0.0
+                )
+        }
+        Expr::Min(left, right) | Expr::Max(left, right) => {
+            has_total_real_domain(left) && has_total_real_domain(right)
+        }
+        _ => false,
+    }
+}
+
+fn root_equivalent_ast(mut ast: &Expr) -> &Expr {
+    loop {
+        ast = match ast {
+            Expr::Neg(inner) => inner,
+            Expr::Mul(left, right) if is_finite_nonzero_scalar(left) => right,
+            Expr::Mul(left, right) if is_finite_nonzero_scalar(right) => left,
+            Expr::Div(numerator, denominator) if is_finite_nonzero_scalar(denominator) => numerator,
+            Expr::Add(left, right) if is_zero_scalar(left) => right,
+            Expr::Add(left, right) if is_zero_scalar(right) => left,
+            Expr::Sub(left, right) if is_zero_scalar(left) => right,
+            Expr::Sub(left, right) if is_zero_scalar(right) => left,
+            Expr::Pow(base, exponent)
+                if constant_scalar_value(exponent).is_some_and(|value| value > 0.0) =>
+            {
+                base
+            }
+            Expr::Abs(inner) => inner,
+            _ => return ast,
+        };
+    }
+}
+
+/// Busca raíces reales de `ast(var)` en [lo, hi] por escaneo + bisección.
+/// Busca raíces reales aisladas en `[lo, hi]` con residuos relativos a la
+/// escala observada de la función. Los cambios de signo se comparan sin
+/// multiplicar valores, evitando underflow en ecuaciones globalmente pequeñas.
+pub fn find_real_roots_numeric(ast: &Expr, var: &str, lo: f64, hi: f64) -> Vec<f64> {
+    const STEPS: usize = 4000;
+    const MAX_ROOTS: usize = 256;
+    const RELATIVE_RESIDUAL_TOLERANCE: f64 = 1e-10;
+    const X_TOLERANCE: f64 = 1e-12;
+
+    if !lo.is_finite() || !hi.is_finite() || lo == hi || !(hi - lo).is_finite() {
+        return Vec::new();
+    }
+    if is_identically_zero(ast) {
+        return Vec::new();
+    }
+    let ast = root_equivalent_ast(ast);
+    if let Expr::Mul(left, right) = ast {
+        let mut roots = find_real_roots_numeric(left, var, lo, hi);
+        for root in find_real_roots_numeric(right, var, lo, hi) {
+            push_unique(&mut roots, root);
+        }
+        roots.sort_by(f64::total_cmp);
+        return roots;
+    }
+    let f = |x: f64| ast.eval_at(var, x);
+    let dx = (hi - lo) / STEPS as f64;
+    if !dx.is_finite() || dx == 0.0 {
+        return Vec::new();
+    }
+
+    let samples: Vec<(f64, f64)> = (0..=STEPS)
+        .map(|index| {
+            let x = lo + index as f64 * dx;
+            (x, f(x))
+        })
+        .collect();
+    let scale = samples
+        .iter()
+        .filter_map(|(_, value)| value.is_finite().then_some(value.abs()))
+        .fold(0.0_f64, f64::max);
+    if scale == 0.0 || !scale.is_finite() {
+        return Vec::new();
+    }
+
+    let residual_is_small = |value: f64| {
+        value.is_finite() && (value == 0.0 || value.abs() / scale <= RELATIVE_RESIDUAL_TOLERANCE)
+    };
+    let opposite_signs =
+        |left: f64, right: f64| (left < 0.0 && right > 0.0) || (left > 0.0 && right < 0.0);
+    let mut roots = Vec::new();
+    let endpoint_is_root = |endpoint: usize, neighbor: usize, second_neighbor: usize| {
+        let (x, value) = samples[endpoint];
+        let neighbor_value = samples[neighbor].1;
+        let second_neighbor_value = samples[second_neighbor].1;
+        if !value.is_finite() || !neighbor_value.is_finite() || !second_neighbor_value.is_finite() {
+            return false;
+        }
+        let near_slope = (neighbor_value - value) / (samples[neighbor].0 - x);
+        let next_slope = (second_neighbor_value - neighbor_value)
+            / (samples[second_neighbor].0 - samples[neighbor].0);
+        let slope_scale = near_slope.abs().max(next_slope.abs());
+        let local_scale = neighbor_value.abs().max(second_neighbor_value.abs());
+        near_slope != 0.0
+            && slope_scale.is_finite()
+            && local_scale > 0.0
+            && value.abs() <= RELATIVE_RESIDUAL_TOLERANCE * local_scale
+            && (near_slope - next_slope).abs() <= 0.1 * slope_scale
+            && (value / near_slope).abs() <= 1e-10 * (1.0 + x.abs())
+            && {
+                let estimate = x - value / near_slope;
+                (lo.min(hi)..=lo.max(hi)).contains(&estimate)
+            }
+    };
+    if endpoint_is_root(0, 1, 2) {
+        push_unique(&mut roots, samples[0].0);
+    }
+    let last = samples.len() - 1;
+    if endpoint_is_root(last, last - 1, last - 2) {
+        push_unique(&mut roots, samples[last].0);
+    }
+    let mut previous_nonzero = None;
+    for (index, &(x, value)) in samples.iter().enumerate() {
+        if roots.len() == MAX_ROOTS {
+            break;
+        }
+        if !value.is_finite() {
+            previous_nonzero = None;
+            continue;
+        }
+
+        if value == 0.0 {
+            let interior = index
+                .checked_sub(1)
+                .and_then(|left| samples.get(left))
+                .zip(samples.get(index + 1))
+                .is_some_and(|((_, left), (_, right))| {
+                    left.is_finite() && *left != 0.0 && right.is_finite() && *right != 0.0
+                });
+            let boundary = (index == 0
+                && samples
+                    .get(1)
+                    .is_some_and(|(_, right)| right.is_finite() && *right != 0.0))
+                || (index + 1 == samples.len()
+                    && samples
+                        .get(index - 1)
+                        .is_some_and(|(_, left)| left.is_finite() && *left != 0.0));
+            if interior || boundary {
+                push_unique(&mut roots, x);
+            }
+            continue;
+        }
+
+        let Some((previous_x, previous_value)) = previous_nonzero.replace((x, value)) else {
+            continue;
+        };
+        if !opposite_signs(previous_value, value) {
+            continue;
+        }
+
+        let mut left_x = previous_x;
+        let mut left_value = previous_value;
+        let mut right_x = x;
+        let mut candidate = None;
+        for _ in 0..80 {
+            let mid = (left_x + right_x) * 0.5;
+            let mid_value = f(mid);
+            if !mid_value.is_finite() {
+                candidate = None;
+                break;
+            }
+            if mid_value == 0.0 {
+                candidate = Some(mid);
+                break;
+            }
+            if opposite_signs(left_value, mid_value) {
+                right_x = mid;
+            } else {
+                left_x = mid;
+                left_value = mid_value;
+            }
+            let midpoint = (left_x + right_x) * 0.5;
+            if (right_x - left_x).abs() <= X_TOLERANCE * (1.0 + midpoint.abs()) {
+                candidate = Some(midpoint);
+                break;
+            }
+            candidate = Some(midpoint);
+        }
+        if let Some(root) = candidate.filter(|root| residual_is_small(f(*root))) {
+            push_unique(&mut roots, root);
+        }
+    }
+    roots.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    roots
+}
+
+fn push_unique(roots: &mut Vec<f64>, x: f64) {
+    if !roots.iter().any(|r| (r - x).abs() < 1e-6) {
+        roots.push(x);
+    }
+}
+
+// ============================================================================
+// Resolución de ecuaciones polinómicas
+// ============================================================================
+
+fn solve_polynomial_ast(ast: &Expr, var: &str) -> Option<Vec<f64>> {
+    if is_identically_zero(ast) {
+        return Some(Vec::new());
+    }
+    let mut roots = match ast {
+        Expr::Neg(inner) | Expr::Abs(inner) => solve_polynomial_ast(inner, var)?,
+        Expr::Add(left, right) if is_zero_scalar(left) => solve_polynomial_ast(right, var)?,
+        Expr::Add(left, right) if is_zero_scalar(right) => solve_polynomial_ast(left, var)?,
+        Expr::Sub(left, right) if is_zero_scalar(left) => solve_polynomial_ast(right, var)?,
+        Expr::Sub(left, right) if is_zero_scalar(right) => solve_polynomial_ast(left, var)?,
+        Expr::Mul(left, right) if is_finite_nonzero_scalar(left) => {
+            solve_polynomial_ast(right, var)?
+        }
+        Expr::Mul(left, right) if is_finite_nonzero_scalar(right) => {
+            solve_polynomial_ast(left, var)?
+        }
+        Expr::Mul(left, right) => {
+            let mut roots = solve_polynomial_ast(left, var)?;
+            roots.extend(solve_polynomial_ast(right, var)?);
+            roots
+        }
+        Expr::Div(numerator, denominator) if is_finite_nonzero_scalar(denominator) => {
+            solve_polynomial_ast(numerator, var)?
+        }
+        Expr::Pow(base, exponent)
+            if matches!(
+                exponent.as_ref(),
+                Expr::Const(value) if value.is_finite() && *value > 0.0 && value.fract() == 0.0
+            ) =>
+        {
+            solve_polynomial_ast(base, var)?
+        }
+        _ => {
+            let coeffs = collect_polynomial_coeffs(ast, var, 4)?;
+            solve_polynomial_real(&coeffs)
+                .into_iter()
+                .filter(|root| polynomial_ast_candidate_is_valid(ast, var, (*root, 0.0)))
+                .collect()
+        }
+    };
+    roots.sort_by(f64::total_cmp);
+    roots.dedup_by(|left, right| (*left - *right).abs() <= 1e-10 * (1.0 + left.abs()));
+    Some(roots)
+}
+
+/// Resolución de polinomios con raíces complejas (Durand–Kerner).
+pub fn solve_polynomial_complex(ast: &Expr, var: &str) -> Option<Vec<(f64, f64)>> {
+    if is_identically_zero(ast) {
+        return Some(Vec::new());
+    }
+    let mut roots = match ast {
+        Expr::Neg(inner) | Expr::Abs(inner) => solve_polynomial_complex(inner, var)?,
+        Expr::Add(left, right) if is_zero_scalar(left) => solve_polynomial_complex(right, var)?,
+        Expr::Add(left, right) if is_zero_scalar(right) => solve_polynomial_complex(left, var)?,
+        Expr::Sub(left, right) if is_zero_scalar(left) => solve_polynomial_complex(right, var)?,
+        Expr::Sub(left, right) if is_zero_scalar(right) => solve_polynomial_complex(left, var)?,
+        Expr::Mul(left, right) if is_finite_nonzero_scalar(left) => {
+            solve_polynomial_complex(right, var)?
+        }
+        Expr::Mul(left, right) if is_finite_nonzero_scalar(right) => {
+            solve_polynomial_complex(left, var)?
+        }
+        Expr::Mul(left, right) => {
+            let mut roots = solve_polynomial_complex(left, var)?;
+            roots.extend(solve_polynomial_complex(right, var)?);
+            roots
+        }
+        Expr::Div(numerator, denominator) if is_finite_nonzero_scalar(denominator) => {
+            solve_polynomial_complex(numerator, var)?
+        }
+        Expr::Pow(base, exponent) => {
+            let Expr::Const(exponent) = exponent.as_ref() else {
+                return None;
+            };
+            if !exponent.is_finite()
+                || *exponent <= 0.0
+                || exponent.fract() != 0.0
+                || *exponent > 20.0
+            {
+                return None;
+            }
+            let base_roots = solve_polynomial_complex(base, var)?;
+            let mut roots = Vec::with_capacity(base_roots.len() * *exponent as usize);
+            for _ in 0..*exponent as usize {
+                roots.extend(base_roots.iter().copied());
+            }
+            roots
+        }
+        _ => {
+            let raw_coeffs = collect_polynomial_coeffs(ast, var, 20)?;
+            let Some(coeffs) = normalize_polynomial_coefficients(&raw_coeffs) else {
+                return Some(Vec::new());
+            };
+            solve_polynomial_complex_coefficients(&coeffs)
+                .into_iter()
+                .filter(|root| polynomial_ast_candidate_is_valid(ast, var, *root))
+                .collect()
+        }
+    };
+    roots.sort_by(|left, right| {
+        left.0
+            .total_cmp(&right.0)
+            .then_with(|| left.1.total_cmp(&right.1))
+    });
+    Some(roots)
+}
+
+fn polynomial_ast_candidate_is_valid(ast: &Expr, var: &str, root: (f64, f64)) -> bool {
+    let Some((value, scale)) = evaluate_polynomial_complex(ast, var, root) else {
+        return false;
+    };
+    let residual = value.0.hypot(value.1);
+    if residual.is_finite() && scale.is_finite() {
+        return residual == 0.0 || (scale > 0.0 && residual / scale <= 1e-10);
+    }
+    collect_polynomial_coeffs(ast, var, 20)
+        .is_some_and(|coeffs| polynomial_coefficients_candidate_is_valid(&coeffs, root))
+}
+
+fn polynomial_coefficients_candidate_is_valid(coeffs: &[f64], root: (f64, f64)) -> bool {
+    let Some(coeffs) = normalize_polynomial_coefficients(coeffs) else {
+        return false;
+    };
+    let magnitude = root.0.hypot(root.1);
+    if !magnitude.is_finite() {
+        return false;
+    }
+    let multiply = |left: (f64, f64), right: (f64, f64)| {
+        (
+            left.0 * right.0 - left.1 * right.1,
+            left.0 * right.1 + left.1 * right.0,
+        )
+    };
+    let (variable, coefficients): ((f64, f64), Box<dyn Iterator<Item = &f64>>) = if magnitude <= 1.0
+    {
+        (root, Box::new(coeffs.iter().rev()))
+    } else {
+        let reciprocal = if root.0.abs() >= root.1.abs() {
+            let ratio = root.1 / root.0;
+            let denominator = root.0 + root.1 * ratio;
+            (1.0 / denominator, -ratio / denominator)
+        } else {
+            let ratio = root.0 / root.1;
+            let denominator = root.1 + root.0 * ratio;
+            (ratio / denominator, -1.0 / denominator)
+        };
+        (reciprocal, Box::new(coeffs.iter()))
+    };
+    let mut coefficients = coefficients;
+    let Some(first) = coefficients.next() else {
+        return false;
+    };
+    let mut value = (*first, 0.0);
+    let mut scale = first.abs();
+    for coefficient in coefficients {
+        value = multiply(value, variable);
+        value.0 += coefficient;
+        scale = scale.mul_add(variable.0.hypot(variable.1), coefficient.abs());
+    }
+    let residual = value.0.hypot(value.1);
+    residual.is_finite()
+        && scale.is_finite()
+        && (residual == 0.0 || (scale > 0.0 && residual / scale <= 1e-10))
+}
+
+fn evaluate_polynomial_complex(
+    ast: &Expr,
+    var: &str,
+    variable: (f64, f64),
+) -> Option<((f64, f64), f64)> {
+    let multiply = |left: (f64, f64), right: (f64, f64)| {
+        (
+            left.0 * right.0 - left.1 * right.1,
+            left.0 * right.1 + left.1 * right.0,
+        )
+    };
+    match ast {
+        Expr::Const(value) if value.is_finite() => Some(((*value, 0.0), value.abs())),
+        Expr::Var(name) if name == var => Some((variable, variable.0.hypot(variable.1))),
+        Expr::Neg(inner) => {
+            let (value, scale) = evaluate_polynomial_complex(inner, var, variable)?;
+            Some(((-value.0, -value.1), scale))
+        }
+        Expr::Add(left, right) | Expr::Sub(left, right) => {
+            let (left_value, left_scale) = evaluate_polynomial_complex(left, var, variable)?;
+            let (right_value, right_scale) = evaluate_polynomial_complex(right, var, variable)?;
+            let right_sign = if matches!(ast, Expr::Add(_, _)) {
+                1.0
+            } else {
+                -1.0
+            };
+            Some((
+                (
+                    left_value.0 + right_sign * right_value.0,
+                    left_value.1 + right_sign * right_value.1,
+                ),
+                left_scale + right_scale,
+            ))
+        }
+        Expr::Mul(left, right) => {
+            let (left_value, left_scale) = evaluate_polynomial_complex(left, var, variable)?;
+            let (right_value, right_scale) = evaluate_polynomial_complex(right, var, variable)?;
+            Some((multiply(left_value, right_value), left_scale * right_scale))
+        }
+        Expr::Div(numerator, denominator) => {
+            let (numerator, numerator_scale) =
+                evaluate_polynomial_complex(numerator, var, variable)?;
+            let (denominator, denominator_scale) =
+                evaluate_polynomial_complex(denominator, var, variable)?;
+            let norm = denominator.0 * denominator.0 + denominator.1 * denominator.1;
+            if norm == 0.0 || !norm.is_finite() {
+                return None;
+            }
+            Some((
+                (
+                    (numerator.0 * denominator.0 + numerator.1 * denominator.1) / norm,
+                    (numerator.1 * denominator.0 - numerator.0 * denominator.1) / norm,
+                ),
+                numerator_scale / denominator_scale,
+            ))
+        }
+        Expr::Pow(base, exponent) => {
+            let Expr::Const(exponent) = exponent.as_ref() else {
+                return None;
+            };
+            if !exponent.is_finite()
+                || *exponent < 0.0
+                || exponent.fract() != 0.0
+                || *exponent > 20.0
+            {
+                return None;
+            }
+            let (base, base_scale) = evaluate_polynomial_complex(base, var, variable)?;
+            let mut value = (1.0, 0.0);
+            let mut scale = 1.0;
+            for _ in 0..*exponent as usize {
+                value = multiply(value, base);
+                scale *= base_scale;
+            }
+            Some((value, scale))
+        }
+        _ => None,
+    }
+}
+
+fn normalize_polynomial_coefficients(coeffs: &[f64]) -> Option<Vec<f64>> {
+    let maximum = coeffs.iter().try_fold(0.0_f64, |scale, coefficient| {
+        coefficient
+            .is_finite()
+            .then_some(scale.max(coefficient.abs()))
+    })?;
+    (maximum > 0.0).then(|| {
+        let bits = maximum.to_bits();
+        let exponent = (bits >> 52) & 0x7ff;
+        let scale = if exponent == 0 {
+            1.0_f64 * f64::from_bits(1_u64 << (63 - bits.leading_zeros()))
+        } else {
+            f64::from_bits(exponent << 52)
+        };
+        coeffs
+            .iter()
+            .map(|coefficient| coefficient / scale)
+            .collect()
+    })
+}
+
+fn solve_polynomial_complex_coefficients(coeffs: &[f64]) -> Vec<(f64, f64)> {
+    let Some(degree) = coeffs.iter().rposition(|coefficient| *coefficient != 0.0) else {
+        return Vec::new();
+    };
+    if degree == 0 {
+        return Vec::new();
+    }
+    if degree >= 3 && coeffs[degree].abs() < coeffs[0].abs() {
+        let reversed: Vec<_> = coeffs[..=degree].iter().rev().copied().collect();
+        let mut roots = Vec::new();
+        for mut reciprocal in solve_polynomial_complex_coefficients(&reversed) {
+            if reciprocal == (0.0, 0.0) && reversed[0] != 0.0 && reversed[1] != 0.0 {
+                let estimate = (-reversed[0] / reversed[1], 0.0);
+                if polynomial_coefficients_candidate_is_valid(&reversed, estimate) {
+                    reciprocal = estimate;
+                }
+            }
+            let inverse = if reciprocal.0.abs() >= reciprocal.1.abs() {
+                if reciprocal.0 == 0.0 {
+                    continue;
+                }
+                let ratio = reciprocal.1 / reciprocal.0;
+                let denominator = reciprocal.0 + reciprocal.1 * ratio;
+                (1.0 / denominator, -ratio / denominator)
+            } else {
+                let ratio = reciprocal.0 / reciprocal.1;
+                let denominator = reciprocal.1 + reciprocal.0 * ratio;
+                (ratio / denominator, -1.0 / denominator)
+            };
+            if inverse.0.is_finite() && inverse.1.is_finite() {
+                roots.push(inverse);
+            }
+        }
+        roots.sort_by(|left, right| {
+            left.0
+                .total_cmp(&right.0)
+                .then_with(|| left.1.total_cmp(&right.1))
+        });
+        return roots;
+    }
+    let zero_multiplicity = coeffs[..degree]
+        .iter()
+        .take_while(|coefficient| **coefficient == 0.0)
+        .count();
+    let mut roots = if zero_multiplicity > 0 {
+        let mut roots = vec![(0.0, 0.0); zero_multiplicity];
+        roots.extend(durand_kerner(&coeffs[zero_multiplicity..=degree]));
+        roots
+    } else if degree >= 3 {
+        if let Some((depressed, center)) = depress_polynomial(coeffs, degree) {
+            solve_polynomial_complex_coefficients(&depressed)
+                .into_iter()
+                .map(|root| (root.0 + center, root.1))
+                .collect()
+        } else {
+            durand_kerner(&coeffs[..=degree])
+        }
+    } else {
+        durand_kerner(&coeffs[..=degree])
+    };
+    roots.sort_by(|left, right| {
+        left.0
+            .total_cmp(&right.0)
+            .then_with(|| left.1.total_cmp(&right.1))
+    });
+    roots
+}
+
+fn depress_polynomial(coeffs: &[f64], degree: usize) -> Option<(Vec<f64>, f64)> {
+    let center = -coeffs[degree - 1] / (degree as f64 * coeffs[degree]);
+    if !center.is_finite() || center == 0.0 {
+        return None;
+    }
+
+    let mut translated = vec![0.0; degree + 1];
+    for (target_degree, translated_coefficient) in translated.iter_mut().enumerate() {
+        let mut binomial = 1.0;
+        let mut sum = 0.0;
+        for (source_degree, coefficient) in coeffs
+            .iter()
+            .copied()
+            .enumerate()
+            .take(degree + 1)
+            .skip(target_degree)
+        {
+            if source_degree > target_degree {
+                binomial *= source_degree as f64 / (source_degree - target_degree) as f64;
+            }
+            let term = coefficient * binomial * center.powi((source_degree - target_degree) as i32);
+            if !term.is_finite() {
+                return None;
+            }
+            sum += term;
+        }
+        if !sum.is_finite() {
+            return None;
+        }
+        *translated_coefficient = sum;
+    }
+    translated[degree - 1] = 0.0;
+    normalize_polynomial_coefficients(&translated).map(|translated| (translated, center))
+}
+
+fn durand_kerner(coeffs: &[f64]) -> Vec<(f64, f64)> {
+    let degree = coeffs
+        .iter()
+        .rposition(|&coefficient| coefficient != 0.0)
+        .unwrap_or(0);
+    if degree == 0 {
+        return vec![];
+    }
+
+    if degree == 1 {
+        return solve_linear(&coeffs[..=1])
+            .into_iter()
+            .map(|root| (root, 0.0))
+            .collect();
+    }
+    if degree == 2 {
+        let a = coeffs[2];
+        let b = coeffs[1];
+        let c = coeffs[0];
+        let discriminant = b.mul_add(b, -4.0 * a * c);
+        if !discriminant.is_finite() {
+            return Vec::new();
+        }
+        if discriminant < 0.0 {
+            let real = -b / (2.0 * a);
+            let imaginary = (-discriminant).sqrt() / (2.0 * a.abs());
+            return if real.is_finite() && imaginary.is_finite() {
+                vec![(real, -imaginary), (real, imaginary)]
+            } else {
+                Vec::new()
+            };
+        }
+        return solve_quadratic(&[c, b, a])
+            .into_iter()
+            .map(|root| (root, 0.0))
+            .collect();
+    }
+
+    let lead = coeffs[degree];
+    let norm_coeffs: Vec<_> = coeffs[..=degree]
+        .iter()
+        .map(|coefficient| coefficient / lead)
+        .collect();
+    if norm_coeffs
+        .iter()
+        .any(|coefficient| !coefficient.is_finite())
+    {
+        return Vec::new();
+    }
+
+    let mut roots = Vec::with_capacity(degree);
+    let mut angle: f64 = 0.4;
+    let radius = 2.0
+        * norm_coeffs[..degree]
+            .iter()
+            .enumerate()
+            .map(|(index, coefficient)| coefficient.abs().powf(1.0 / (degree - index) as f64))
+            .fold(0.0_f64, f64::max);
+    if !radius.is_finite() || radius == 0.0 {
+        return Vec::new();
+    }
+    for _ in 0..degree {
+        roots.push((radius * angle.cos(), radius * angle.sin()));
+        angle += std::f64::consts::TAU / (degree as f64) + 0.1;
+    }
+
+    let cmul = |a: (f64, f64), b: (f64, f64)| -> (f64, f64) {
+        (a.0 * b.0 - a.1 * b.1, a.0 * b.1 + a.1 * b.0)
+    };
+    let cadd = |a: (f64, f64), b: (f64, f64)| -> (f64, f64) { (a.0 + b.0, a.1 + b.1) };
+    let csub = |a: (f64, f64), b: (f64, f64)| -> (f64, f64) { (a.0 - b.0, a.1 - b.1) };
+    let cdiv = |a: (f64, f64), b: (f64, f64)| -> (f64, f64) {
+        let den = b.0 * b.0 + b.1 * b.1;
+        if den == 0.0 {
+            return (0.0, 0.0);
+        }
+        ((a.0 * b.0 + a.1 * b.1) / den, (a.1 * b.0 - a.0 * b.1) / den)
+    };
+
+    let poly_eval = |z: (f64, f64)| -> (f64, f64) {
+        let mut res = (norm_coeffs[0], 0.0);
+        let mut zn = z;
+        for &coef in norm_coeffs.iter().skip(1) {
+            res = cadd(res, cmul((coef, 0.0), zn));
+            zn = cmul(zn, z);
+        }
+        res
+    };
+
+    let mut converged = false;
+    for _ in 0..1000 {
+        let mut max_err = 0.0_f64;
+        let mut next_roots = roots.clone();
+        for i in 0..degree {
+            let pz = poly_eval(roots[i]);
+            let mut denom = (1.0, 0.0);
+            for j in 0..degree {
+                if i != j {
+                    denom = cmul(denom, csub(roots[i], roots[j]));
+                }
+            }
+            let diff = cdiv(pz, denom);
+            if !diff.0.is_finite() || !diff.1.is_finite() {
+                return Vec::new();
+            }
+            next_roots[i] = csub(roots[i], diff);
+            let err = diff.0.hypot(diff.1);
+            if err > max_err {
+                max_err = err;
+            }
+        }
+        roots = next_roots;
+        if roots
+            .iter()
+            .any(|root| !root.0.is_finite() || !root.1.is_finite())
+        {
+            return Vec::new();
+        }
+        let root_scale = roots
+            .iter()
+            .map(|root| root.0.hypot(root.1))
+            .fold(1.0_f64, f64::max);
+        if max_err <= 1e-12 * root_scale {
+            converged = true;
+            break;
+        }
+    }
+
+    let residual_is_small = |root: (f64, f64)| {
+        let residual = poly_eval(root);
+        let magnitude = root.0.hypot(root.1);
+        let mut scale = 0.0;
+        let mut power = 1.0;
+        for coefficient in &norm_coeffs {
+            scale += coefficient.abs() * power;
+            power *= magnitude;
+        }
+        residual.0.is_finite()
+            && residual.1.is_finite()
+            && scale.is_finite()
+            && residual.0.hypot(residual.1) <= 1e-10 * scale
+    };
+    if !converged && !roots.iter().copied().all(residual_is_small) {
+        return Vec::new();
+    }
+
+    let real_roots = solve_polynomial_real(coeffs);
+    let mut assigned = vec![false; roots.len()];
+    for real in real_roots {
+        let multiplicity = polynomial_root_multiplicity(coeffs, real).max(1);
+        for _ in 0..multiplicity {
+            let Some((index, _)) = roots
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !assigned[*index])
+                .min_by(|(_, left), (_, right)| {
+                    (left.0 - real)
+                        .hypot(left.1)
+                        .total_cmp(&(right.0 - real).hypot(right.1))
+                })
+            else {
+                break;
+            };
+            roots[index] = (real, 0.0);
+            assigned[index] = true;
+        }
+    }
+
+    roots.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    roots
+}
+
+fn polynomial_root_multiplicity(coeffs: &[f64], root: f64) -> usize {
+    let mut polynomial = coeffs.to_vec();
+    let mut multiplicity = 0;
+    while polynomial.len() > 1 {
+        let degree = polynomial.len() - 1;
+        let mut quotient = vec![0.0; degree];
+        quotient[degree - 1] = polynomial[degree];
+        for index in (1..degree).rev() {
+            quotient[index - 1] = polynomial[index] + root * quotient[index];
+        }
+        let remainder = polynomial[0] + root * quotient[0];
+        if !remainder.is_finite() || remainder != 0.0 {
+            break;
+        }
+        multiplicity += 1;
+        polynomial = quotient;
+    }
+    multiplicity
+}
+
+fn collect_polynomial_coeffs(ast: &Expr, var: &str, max_deg: usize) -> Option<Vec<f64>> {
+    fn add(left: Vec<f64>, right: Vec<f64>, sign: f64) -> Option<Vec<f64>> {
+        left.into_iter()
+            .zip(right)
+            .map(|(left, right)| {
+                let sum = left + sign * right;
+                sum.is_finite().then_some(sum)
+            })
+            .collect()
+    }
+
+    fn multiply(left: &[f64], right: &[f64], max_deg: usize) -> Option<Vec<f64>> {
+        let mut product = vec![0.0; max_deg + 1];
+        for (left_degree, left_coefficient) in left.iter().copied().enumerate() {
+            if left_coefficient == 0.0 {
+                continue;
+            }
+            for (right_degree, right_coefficient) in right.iter().copied().enumerate() {
+                if right_coefficient == 0.0 {
+                    continue;
+                }
+                let degree = left_degree + right_degree;
+                if degree > max_deg {
+                    return None;
+                }
+                let term = left_coefficient * right_coefficient;
+                if !term.is_finite() || term == 0.0 {
+                    return None;
+                }
+                let coefficient = product[degree] + term;
+                if !coefficient.is_finite() {
+                    return None;
+                }
+                product[degree] = coefficient;
+            }
+        }
+        Some(product)
+    }
+
+    fn collect(expr: &Expr, var: &str, max_deg: usize) -> Option<Vec<f64>> {
+        use Expr::*;
+        match expr {
+            Const(value) if value.is_finite() => {
+                let mut coefficients = vec![0.0; max_deg + 1];
+                coefficients[0] = *value;
+                Some(coefficients)
+            }
+            Var(name) if name == var && max_deg >= 1 => {
+                let mut coefficients = vec![0.0; max_deg + 1];
+                coefficients[1] = 1.0;
+                Some(coefficients)
+            }
+            Neg(inner) => collect(inner, var, max_deg)?
+                .into_iter()
+                .map(|coefficient| (-coefficient).is_finite().then_some(-coefficient))
+                .collect(),
+            Add(left, right) => add(
+                collect(left, var, max_deg)?,
+                collect(right, var, max_deg)?,
+                1.0,
+            ),
+            Sub(left, right) => add(
+                collect(left, var, max_deg)?,
+                collect(right, var, max_deg)?,
+                -1.0,
+            ),
+            Mul(left, right) => multiply(
+                &collect(left, var, max_deg)?,
+                &collect(right, var, max_deg)?,
+                max_deg,
+            ),
+            Div(numerator, denominator) => {
+                let numerator = collect(numerator, var, max_deg)?;
+                let denominator = collect(denominator, var, max_deg)?;
+                if denominator[0] == 0.0
+                    || denominator
+                        .iter()
+                        .skip(1)
+                        .any(|coefficient| *coefficient != 0.0)
+                {
+                    return None;
+                }
+                numerator
+                    .into_iter()
+                    .map(|coefficient| {
+                        let quotient = coefficient / denominator[0];
+                        quotient.is_finite().then_some(quotient)
+                    })
+                    .collect()
+            }
+            Pow(base, exponent) => {
+                let Expr::Const(exponent) = exponent.as_ref() else {
+                    return None;
+                };
+                if !exponent.is_finite()
+                    || *exponent < 0.0
+                    || exponent.fract() != 0.0
+                    || *exponent > max_deg as f64
+                {
+                    return None;
+                }
+                let base = collect(base, var, max_deg)?;
+                let mut result = vec![0.0; max_deg + 1];
+                result[0] = 1.0;
+                for _ in 0..*exponent as usize {
+                    result = multiply(&result, &base, max_deg)?;
+                }
+                Some(result)
+            }
+            _ => None,
+        }
+    }
+
+    collect(ast, var, max_deg)
+}
+
+fn solve_polynomial_real(coeffs: &[f64]) -> Vec<f64> {
+    let Some(coeffs) = normalize_polynomial_coefficients(coeffs) else {
+        return Vec::new();
+    };
+    let degree = coeffs
+        .iter()
+        .rposition(|&coefficient| coefficient != 0.0)
+        .unwrap_or(0);
+    if degree == 0 {
+        return Vec::new();
+    }
+    let zero_multiplicity = coeffs[..degree]
+        .iter()
+        .take_while(|coefficient| **coefficient == 0.0)
+        .count();
+    if zero_multiplicity > 0 {
+        let mut roots = solve_polynomial_real(&coeffs[zero_multiplicity..=degree]);
+        roots.push(0.0);
+        roots.sort_by(f64::total_cmp);
+        roots.dedup_by(|left, right| *left == *right);
+        return roots;
+    }
+    let mut roots = match degree {
+        1 => solve_linear(&coeffs),
+        2 => solve_quadratic(&coeffs),
+        3 => solve_cubic(&coeffs),
+        4 => solve_quartic(&coeffs),
+        _ => solve_polynomial_newton(&coeffs),
+    };
+    roots
+        .retain(|root| root.is_finite() && polynomial_residual_is_small(&coeffs[..=degree], *root));
+    roots.sort_by(f64::total_cmp);
+    roots.dedup_by(|left, right| *left == *right);
+    roots
+}
+
+fn polynomial_residual_is_small(coeffs: &[f64], x: f64) -> bool {
+    let mut residual = 0.0_f64;
+    let mut scale = 0.0_f64;
+    for coefficient in coeffs.iter().rev() {
+        residual = residual.mul_add(x, *coefficient);
+        scale = scale.mul_add(x.abs(), coefficient.abs());
+    }
+    residual.is_finite() && scale.is_finite() && residual.abs() <= 128.0 * f64::EPSILON * scale
+}
+
+fn solve_linear(coeffs: &[f64]) -> Vec<f64> {
+    let a = coeffs[1];
+    let b = coeffs[0];
+    if a == 0.0 {
+        vec![]
+    } else {
+        let root = -b / a;
+        root.is_finite().then_some(root).into_iter().collect()
+    }
+}
+
+fn solve_quadratic(coeffs: &[f64]) -> Vec<f64> {
+    let a = coeffs[2];
+    let b = coeffs[1];
+    let c = coeffs[0];
+    if a == 0.0 {
+        return solve_linear(&[c, b]);
+    }
+    let squared_linear = b * b;
+    let constant_term = 4.0 * a * c;
+    let discriminant = b.mul_add(b, -constant_term);
+    let roundoff = 16.0 * f64::EPSILON * (squared_linear.abs() + constant_term.abs());
+    if discriminant < -roundoff {
+        vec![]
+    } else if discriminant.abs() <= roundoff {
+        vec![-b / (2.0 * a)]
+    } else {
+        let sqrt_d = discriminant.sqrt();
+        let q = -0.5 * (b + sqrt_d.copysign(b));
+        let mut roots = if q == 0.0 {
+            vec![0.0]
+        } else {
+            vec![q / a, c / q]
+        };
+        roots.retain(|root| root.is_finite());
+        roots.sort_by(f64::total_cmp);
+        roots.dedup_by(|left, right| *left == *right);
+        roots
+    }
+}
+
+fn solve_cubic(coeffs: &[f64]) -> Vec<f64> {
+    let a = coeffs[3];
+    let b = coeffs[2];
+    let c = coeffs[1];
+    let d = coeffs[0];
+    if a == 0.0 {
+        return solve_quadratic(&[d, c, b]);
+    }
+    let b = b / a;
+    let c = c / a;
+    let d = d / a;
+    let p = c - b * b / 3.0;
+    let q = d - b * c / 3.0 + 2.0 * b * b * b / 27.0;
+    let discriminant = q * q / 4.0 + p * p * p / 27.0;
+    let shift = -b / 3.0;
+    let discriminant_scale = (q * q / 4.0).abs() + (p * p * p / 27.0).abs();
+    let discriminant_tolerance = 32.0 * f64::EPSILON * discriminant_scale;
+    if discriminant > discriminant_tolerance {
+        let sqrt_d = discriminant.sqrt();
+        let u = (-q / 2.0 + sqrt_d).cbrt();
+        let v = (-q / 2.0 - sqrt_d).cbrt();
+        vec![u + v + shift]
+    } else if discriminant.abs() <= discriminant_tolerance {
+        let u = (-q / 2.0).cbrt();
+        let r1 = 2.0 * u + shift;
+        let r2 = -u + shift;
+        if (r1 - r2).abs() < 1e-12 {
+            vec![r1]
+        } else {
+            vec![r1, r2]
+        }
+    } else {
+        let r = (-p / 3.0).sqrt();
+        let phi = (-q / (2.0 * r * r * r)).acos();
+        let r1 = 2.0 * r * (phi / 3.0).cos() + shift;
+        let r2 = 2.0 * r * ((phi + 2.0 * std::f64::consts::PI) / 3.0).cos() + shift;
+        let r3 = 2.0 * r * ((phi + 4.0 * std::f64::consts::PI) / 3.0).cos() + shift;
+        vec![r1, r2, r3]
+    }
+}
+
+/// Resolución de cuártica vía Ferrari (raíces reales). Degenera a cúbica si el
+/// coeficiente principal es cero, y cae a Newton numérico en casos patológicos.
+fn solve_quartic(coeffs: &[f64]) -> Vec<f64> {
+    let a = coeffs[4];
+    let b = coeffs[3];
+    let c = coeffs[2];
+    let d = coeffs[1];
+    let e = coeffs[0];
+    if a == 0.0 {
+        return solve_cubic(&[e, d, c, b]);
+    }
+    // Normalizar: x^4 + B x^3 + C x^2 + D x + E
+    let b = b / a;
+    let c = c / a;
+    let d = d / a;
+    let e = e / a;
+    // Depresión x = y - b/4
+    let p = c - 3.0 * b * b / 8.0;
+    let q = d - b * c / 2.0 + b * b * b / 8.0;
+    let r = e - b * d / 4.0 + b * b * c / 16.0 - 3.0 * b * b * b * b / 256.0;
+    let shift = -b / 4.0;
+
+    if q == 0.0 {
+        // Bicuadrática: y^4 + p y^2 + r = 0  →  z^2 + p z + r = 0 (z = y^2)
+        let zroots = solve_quadratic(&[r, p, 1.0]);
+        let mut out = Vec::new();
+        for z in zroots {
+            if z > 0.0 {
+                let s = z.sqrt();
+                out.push(s + shift);
+                out.push(-s + shift);
+            } else if z == 0.0 {
+                out.push(shift);
+            }
+        }
+        out.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+        return out;
+    }
+
+    // Cúbica resolvente: 8 z^3 + 8 p z^2 + (2 p^2 - 8 r) z - q^2 = 0
+    let res_coeffs = [-q * q, 2.0 * p * p - 8.0 * r, 8.0 * p, 8.0];
+    let z_roots = solve_cubic(&res_coeffs);
+    let z0 = match z_roots.iter().max_by(|x, y| {
+        (2.0 * *x - p)
+            .partial_cmp(&(2.0 * *y - p))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }) {
+        Some(z) => *z,
+        None => return solve_polynomial_newton(coeffs),
+    };
+    let alpha2 = 2.0 * z0 - p;
+    if alpha2 < 0.0 {
+        return solve_polynomial_newton(coeffs);
+    }
+    let alpha = alpha2.sqrt();
+    if alpha == 0.0 {
+        return solve_polynomial_newton(coeffs);
+    }
+    let beta = -q / (2.0 * alpha);
+    let disc1 = -(2.0 * z0 + p + 2.0 * beta);
+    let disc2 = -(2.0 * z0 + p - 2.0 * beta);
+
+    let mut out = Vec::new();
+    if disc1 >= 0.0 {
+        let s = disc1.sqrt();
+        out.push((alpha + s) / 2.0 + shift);
+        out.push((alpha - s) / 2.0 + shift);
+    }
+    if disc2 >= 0.0 {
+        let s = disc2.sqrt();
+        out.push((-alpha + s) / 2.0 + shift);
+        out.push((-alpha - s) / 2.0 + shift);
+    }
+    if out.is_empty() {
+        return solve_polynomial_newton(coeffs);
+    }
+    out.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+    let mut dedup = Vec::new();
+    for v in out {
+        if !dedup.iter().any(|r: &f64| (r - v).abs() < 1e-6) {
+            dedup.push(v);
+        }
+    }
+    dedup
+}
+
+fn solve_polynomial_newton(coeffs: &[f64]) -> Vec<f64> {
+    let mut roots = Vec::new();
+    let f = |x: f64| {
+        let mut result = 0.0;
+        let mut xn = 1.0;
+        for c in coeffs {
+            result += c * xn;
+            xn *= x;
+        }
+        result
+    };
+    let df = |x: f64| {
+        let mut result = 0.0;
+        let mut xn = 1.0;
+        for (i, c) in coeffs.iter().enumerate() {
+            if i > 0 {
+                result += (i as f64) * c * xn;
+            }
+            xn *= x;
+        }
+        result
+    };
+    for start in -10..=10 {
+        let mut x = start as f64;
+        for _ in 0..50 {
+            let fx = f(x);
+            if fx.abs() < 1e-10 {
+                let is_dup = roots.iter().any(|r: &f64| (r - x).abs() < 1e-6);
+                if !is_dup {
+                    roots.push(x);
+                }
+                break;
+            }
+            let dfx = df(x);
+            if dfx.abs() < 1e-15 {
+                break;
+            }
+            x -= fx / dfx;
+        }
+    }
+    roots.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    roots
+}
+
+// ============================================================================
+// Sumas en forma cerrada (frente G1: `symbolic::sum_closed`).
+//
+// Subconjunto soportado, siempre por fórmula (nunca bucle numérico):
+// constante y polinomios en `var` hasta grado 10 (Faulhaber/Bernoulli),
+// geométricas `a·r^k` con exponente lineal, telescópicas `1/((k−r1)(k−r2))`
+// con raíces enteras consecutivas y diferencias `F(k+1)−F(k)`.
+// Lo demás (armónicas como `1/k`, `1/k^2`, `k·2^k`, trigonométricas) es
+// `Unsupported` honesto: no hay forma elemental en este motor.
+// Presupuestos: entrada ≤ 2000 bytes, `|lo|,|hi| ≤ 1_000_000`, hi ≥ lo.
+// ============================================================================
+
+/// Cota de entrada (igual que `MAX_EXPR_LENGTH` 2000, defensa en profundidad).
+const MAX_SUM_CLOSED_BYTES: usize = 2000;
+/// Grado polinómico máximo (Faulhaber usa Bernoulli hasta B10).
+const MAX_SUM_POLY_DEGREE: usize = 10;
+/// Cota de los límites (igual que el comando `SumClosed`: ±1 000 000).
+const MAX_SUM_ABS_BOUND: i64 = 1_000_000;
+
+/// Números de Bernoulli B0..=B10 para Faulhaber (los impares mayores
+/// que 1 son cero). OJO: acá B1 = +1/2, que es el signo que lleva la
+/// fórmula de la suma Σ_{k=1..n} (con B1 = −1/2 daría Σ_{k=0..n−1}).
+const SUM_BERNOULLI: [f64; 11] = [
+    1.0,
+    0.5,
+    1.0 / 6.0,
+    0.0,
+    -1.0 / 30.0,
+    0.0,
+    1.0 / 42.0,
+    0.0,
+    -1.0 / 30.0,
+    0.0,
+    5.0 / 66.0,
+];
+
+/// Suma en forma cerrada Σ_{var=lo..hi} expr.
+///
+/// Devuelve el valor como string (entero sin decimales cuando es entero
+/// exacto menor que 1e15, si no el `Debug` del f64). El cálculo usa la
+/// fórmula cerrada correspondiente, nunca un bucle término a término:
+/// `Exact` con el valor, `DomainError` si los límites son inválidos o la
+/// suma pasa por un polo, `ResourceLimit` si se excede un presupuesto y
+/// `Unsupported` honesto cuando no hay forma elemental (p. ej. armónicas).
+pub fn sum_closed(expr: &str, var: &str, lo: i64, hi: i64) -> MathResult<String> {
+    if expr.len() > MAX_SUM_CLOSED_BYTES {
+        return MathResult::ResourceLimit(MathError::InputTooLarge {
+            operation: MathOperation::Summation,
+            provided_bytes: expr.len(),
+            maximum_bytes: MAX_SUM_CLOSED_BYTES,
+        });
+    }
+    if !is_math_identifier(var) {
+        return MathResult::DomainError(MathError::InvalidExpression {
+            operation: MathOperation::Summation,
+            expression: var.into(),
+            reason: "variable no es un identificador válido".into(),
+        });
+    }
+    if expr.trim().is_empty() {
+        return MathResult::DomainError(MathError::InvalidExpression {
+            operation: MathOperation::Summation,
+            expression: expr.into(),
+            reason: "expresión vacía".into(),
+        });
+    }
+    if lo < -MAX_SUM_ABS_BOUND || lo > MAX_SUM_ABS_BOUND {
+        return MathResult::ResourceLimit(MathError::InputTooLarge {
+            operation: MathOperation::Summation,
+            provided_bytes: lo.unsigned_abs() as usize,
+            maximum_bytes: MAX_SUM_ABS_BOUND as usize,
+        });
+    }
+    if hi < -MAX_SUM_ABS_BOUND || hi > MAX_SUM_ABS_BOUND {
+        return MathResult::ResourceLimit(MathError::InputTooLarge {
+            operation: MathOperation::Summation,
+            provided_bytes: hi.unsigned_abs() as usize,
+            maximum_bytes: MAX_SUM_ABS_BOUND as usize,
+        });
+    }
+    if hi < lo {
+        return MathResult::DomainError(MathError::IntervalDomainViolation {
+            expression: expr.into(),
+            variable: var.into(),
+            lower: lo as f64,
+            upper: hi as f64,
+        });
+    }
+    let ast = match parse_math_expression(expr, MathOperation::Summation) {
+        Ok(ast) => ast.simplify(),
+        Err(error) => return math_failure(error),
+    };
+    // Constante (numérica o simbólica en otra variable): c·n.
+    if !contains_var(&ast, var) {
+        let n_terms = hi - lo + 1;
+        if let Some(c) = constant_scalar_value(&ast) {
+            if !c.is_finite() {
+                return MathResult::ResourceLimit(MathError::InputTooLarge {
+                    operation: MathOperation::Summation,
+                    provided_bytes: expr.len(),
+                    maximum_bytes: MAX_SUM_CLOSED_BYTES,
+                });
+            }
+            let value = c * n_terms as f64;
+            return sum_format_value(value).map_or_else(
+                || {
+                    MathResult::ResourceLimit(MathError::InputTooLarge {
+                        operation: MathOperation::Summation,
+                        provided_bytes: expr.len(),
+                        maximum_bytes: MAX_SUM_CLOSED_BYTES,
+                    })
+                },
+                MathResult::Exact,
+            );
+        }
+        let text = format!("({})*{n_terms}", ast.to_expr_string());
+        if text.len() > MAX_SUM_CLOSED_BYTES {
+            return MathResult::ResourceLimit(MathError::InputTooLarge {
+                operation: MathOperation::Summation,
+                provided_bytes: text.len(),
+                maximum_bytes: MAX_SUM_CLOSED_BYTES,
+            });
+        }
+        return MathResult::Exact(text);
+    }
+    if let Some(coeffs) = collect_polynomial_coeffs(&ast, var, MAX_SUM_POLY_DEGREE) {
+        return sum_closed_polynomial(&coeffs, lo, hi, expr);
+    }
+    if let Some(result) = sum_closed_geometric(&ast, var, lo, hi, expr) {
+        return result;
+    }
+    if let Some(result) = sum_closed_unit_fraction(&ast, var, lo, hi, expr) {
+        return result;
+    }
+    if let Some(result) = sum_closed_difference(&ast, var, lo, hi, expr) {
+        return result;
+    }
+    MathResult::Unsupported(MathError::InvalidExpression {
+        operation: MathOperation::Summation,
+        expression: expr.into(),
+        reason: sum_closed_no_form_hint(&ast, var),
+    })
+}
+
+/// Polinomio Σ c_p·k^p por Faulhaber término a término.
+fn sum_closed_polynomial(coeffs: &[f64], lo: i64, hi: i64, expr_label: &str) -> MathResult<String> {
+    let n_hi = hi as f64;
+    let n_lo_prev = lo as f64 - 1.0;
+    let mut total = 0.0;
+    for (p, c) in coeffs.iter().enumerate() {
+        if *c == 0.0 {
+            continue;
+        }
+        if !c.is_finite() {
+            return MathResult::ResourceLimit(MathError::InputTooLarge {
+                operation: MathOperation::Summation,
+                provided_bytes: expr_label.len(),
+                maximum_bytes: MAX_SUM_CLOSED_BYTES,
+            });
+        }
+        let (Some(s_hi), Some(s_lo)) = (
+            sum_faulhaber_prefix(p, n_hi),
+            sum_faulhaber_prefix(p, n_lo_prev),
+        ) else {
+            return MathResult::ResourceLimit(MathError::InputTooLarge {
+                operation: MathOperation::Summation,
+                provided_bytes: expr_label.len(),
+                maximum_bytes: MAX_SUM_CLOSED_BYTES,
+            });
+        };
+        total += c * (s_hi - s_lo);
+        if !total.is_finite() {
+            return MathResult::ResourceLimit(MathError::InputTooLarge {
+                operation: MathOperation::Summation,
+                provided_bytes: expr_label.len(),
+                maximum_bytes: MAX_SUM_CLOSED_BYTES,
+            });
+        }
+    }
+    match sum_format_value(total) {
+        Some(text) => MathResult::Exact(text),
+        None => MathResult::ResourceLimit(MathError::InputTooLarge {
+            operation: MathOperation::Summation,
+            provided_bytes: expr_label.len(),
+            maximum_bytes: MAX_SUM_CLOSED_BYTES,
+        }),
+    }
+}
+
+/// Prefijo S_p(n) = Σ_{k=1..n} k^p por Faulhaber con Bernoulli.
+///
+/// Como polinomio vale también para `n` negativo (S_p(0) = 0), así que
+/// Σ_{lo..hi} = S_p(hi) − S_p(lo−1) cubre rangos con negativos.
+fn sum_faulhaber_prefix(p: usize, n: f64) -> Option<f64> {
+    if p >= SUM_BERNOULLI.len() || !n.is_finite() {
+        return None;
+    }
+    let mut acc = 0.0;
+    for j in 0..=p {
+        let b = SUM_BERNOULLI[j];
+        if b == 0.0 {
+            continue;
+        }
+        let c = sum_binom_small(p + 1, j)?;
+        let pw = n.powi((p + 1 - j) as i32);
+        if !pw.is_finite() {
+            return None;
+        }
+        let term = c * b * pw;
+        if !term.is_finite() {
+            return None;
+        }
+        acc += term;
+    }
+    let out = acc / (p + 1) as f64;
+    out.is_finite().then_some(out)
+}
+
+/// Coeficiente binomial para `n` chico (acá `n ≤ 11`), exacto en f64.
+fn sum_binom_small(n: usize, k: usize) -> Option<f64> {
+    if k > n {
+        return None;
+    }
+    let k = k.min(n - k);
+    let mut acc = 1.0;
+    for i in 0..k {
+        acc = acc * (n - i) as f64 / (i + 1) as f64;
+        if !acc.is_finite() {
+            return None;
+        }
+    }
+    Some(acc)
+}
+
+/// Formato numérico coherente con `to_expr_string`: entero sin decimales
+/// si es entero exacto menor que 1e15, si no el `Debug` del f64.
+fn sum_format_value(v: f64) -> Option<String> {
+    if !v.is_finite() {
+        return None;
+    }
+    if v.fract() == 0.0 && v.abs() < 1e15 {
+        Some(format!("{v:.0}"))
+    } else {
+        Some(format!("{v:?}"))
+    }
+}
+
+/// Separa `factor_constante · núcleo(var)`: aplana `Mul`/`Div`/`Neg` y
+/// pliega las constantes. `None` si hay una constante no finita.
+fn sum_split_const_factor(e: &Expr, var: &str) -> Option<(f64, Expr)> {
+    use Expr::*;
+    match e {
+        Const(c) if c.is_finite() => Some((*c, Const(1.0))),
+        Neg(a) => {
+            let (c, core) = sum_split_const_factor(a, var)?;
+            Some((-c, core))
+        }
+        Mul(a, b) => {
+            let (ca, ra) = sum_split_const_factor(a, var)?;
+            let (cb, rb) = sum_split_const_factor(b, var)?;
+            let c = ca * cb;
+            if !c.is_finite() {
+                return None;
+            }
+            let core = match (ra, rb) {
+                (Const(x), other) if x == 1.0 => other,
+                (other, Const(x)) if x == 1.0 => other,
+                (l, r) => Mul(Box::new(l), Box::new(r)),
+            };
+            Some((c, core))
+        }
+        Div(a, b) => {
+            if contains_var(b, var) {
+                // Denominador con variable: el núcleo es el cociente entero
+                // (cada detector mira el numerador por su cuenta).
+                if contains_var(a, var) {
+                    Some((1.0, e.clone()))
+                } else {
+                    let c = constant_scalar_value(a)?;
+                    if !c.is_finite() {
+                        return None;
+                    }
+                    Some((c, e.clone()))
+                }
+            } else {
+                let (ca, ra) = sum_split_const_factor(a, var)?;
+                let cb = constant_scalar_value(b)?;
+                if cb == 0.0 || !cb.is_finite() {
+                    return None;
+                }
+                Some((ca / cb, ra))
+            }
+        }
+        _ => {
+            if contains_var(e, var) {
+                Some((1.0, e.clone()))
+            } else {
+                constant_scalar_value(e).map(|c| (c, Const(1.0)))
+            }
+        }
+    }
+}
+
+/// Potencia entera de base real: `powi` exacto si la base es entera.
+fn sum_pow_int_base(r: f64, k: i64) -> f64 {
+    if r.fract() == 0.0 && k >= i64::from(i32::MIN) && k <= i64::from(i32::MAX) {
+        // `as` acotado por el chequeo de arriba: no trunca.
+        r.powi(k as i32)
+    } else {
+        r.powf(k as f64)
+    }
+}
+
+/// Geométrica `a·r^k` con exponente lineal en `var`.
+///
+/// `None` si no tiene esa forma; `Some` con el valor o el error honesto
+/// (polo con base cero y `lo < 0`, desborde) si la tiene.
+fn sum_closed_geometric(
+    body: &Expr,
+    var: &str,
+    lo: i64,
+    hi: i64,
+    expr_label: &str,
+) -> Option<MathResult<String>> {
+    let (factor, core) = sum_split_const_factor(body, var)?;
+    if !factor.is_finite() {
+        return None;
+    }
+    let (base_val, a_coef, b_coef) = match &core {
+        Expr::Const(c) if *c == 1.0 => return None,
+        Expr::Exp(arg) => {
+            let (a, b) = expr_linear_coeff(arg, var)?;
+            (std::f64::consts::E, a, b)
+        }
+        Expr::Pow(base, exp) => {
+            if contains_var(base, var) {
+                return None;
+            }
+            let r = constant_scalar_value(base)?;
+            let (a, b) = expr_linear_coeff(exp, var)?;
+            (r, a, b)
+        }
+        _ => return None,
+    };
+    if !base_val.is_finite() || a_coef.abs() < 1e-12 {
+        return None;
+    }
+    let r = base_val.powf(a_coef);
+    let c = base_val.powf(b_coef);
+    if !r.is_finite() || !c.is_finite() {
+        return None;
+    }
+    let count = hi as f64 - lo as f64 + 1.0;
+    // Base cero: solo exponente `var` exacto; si no, no es geométrica sana.
+    if r == 0.0 {
+        if (a_coef - 1.0).abs() > 1e-9 || b_coef.abs() > 1e-9 {
+            return None;
+        }
+        if lo < 0 {
+            return Some(MathResult::DomainError(MathError::NonFiniteValue {
+                expression: expr_label.into(),
+                variable: var.into(),
+                at: lo as f64,
+            }));
+        }
+        let value = if lo == 0 { factor } else { 0.0 };
+        return sum_format_value(value).map_or_else(
+            || {
+                Some(MathResult::ResourceLimit(MathError::InputTooLarge {
+                    operation: MathOperation::Summation,
+                    provided_bytes: expr_label.len(),
+                    maximum_bytes: MAX_SUM_CLOSED_BYTES,
+                }))
+            },
+            |text| Some(MathResult::Exact(text)),
+        );
+    }
+    // Razón uno: serie constante.
+    if (r - 1.0).abs() < 1e-12 {
+        let value = factor * c * count;
+        return sum_format_value(value).map_or_else(
+            || {
+                Some(MathResult::ResourceLimit(MathError::InputTooLarge {
+                    operation: MathOperation::Summation,
+                    provided_bytes: expr_label.len(),
+                    maximum_bytes: MAX_SUM_CLOSED_BYTES,
+                }))
+            },
+            |text| Some(MathResult::Exact(text)),
+        );
+    }
+    let r_lo = sum_pow_int_base(r, lo);
+    let r_hi1 = sum_pow_int_base(r, hi + 1);
+    if !r_lo.is_finite() || !r_hi1.is_finite() {
+        return Some(MathResult::ResourceLimit(MathError::InputTooLarge {
+            operation: MathOperation::Summation,
+            provided_bytes: expr_label.len(),
+            maximum_bytes: MAX_SUM_CLOSED_BYTES,
+        }));
+    }
+    let value = factor * c * (r_lo - r_hi1) / (1.0 - r);
+    sum_format_value(value).map_or_else(
+        || {
+            Some(MathResult::ResourceLimit(MathError::InputTooLarge {
+                operation: MathOperation::Summation,
+                provided_bytes: expr_label.len(),
+                maximum_bytes: MAX_SUM_CLOSED_BYTES,
+            }))
+        },
+        |text| Some(MathResult::Exact(text)),
+    )
+}
+
+/// Telescópica unitaria `c/((k−r1)(k−r2))` con raíces enteras consecutivas.
+///
+/// Acepta el denominador factorizado (`k·(k+1)`) o expandido (`k^2+k`).
+/// `None` si no tiene esa forma; `Some` con el valor o el polo honesto.
+fn sum_closed_unit_fraction(
+    body: &Expr,
+    var: &str,
+    lo: i64,
+    hi: i64,
+    expr_label: &str,
+) -> Option<MathResult<String>> {
+    let (factor, core) = sum_split_const_factor(body, var)?;
+    if !factor.is_finite() {
+        return None;
+    }
+    let (num, den) = match &core {
+        Expr::Div(n, d) => (n.as_ref(), d.as_ref()),
+        _ => return None,
+    };
+    if contains_var(num, var) {
+        return None;
+    }
+    let n0 = constant_scalar_value(num)?;
+    if !n0.is_finite() {
+        return None;
+    }
+    // Junta el denominador como (k−r1)(k−r2): factorizado o cuadrático.
+    let (r_small, r_big, lead) = sum_unit_fraction_roots(den, var)?;
+    if (r_big - r_small - 1.0).abs() > 1e-6 {
+        return None;
+    }
+    for root in [r_small, r_big] {
+        if (root - root.round()).abs() > 1e-6 {
+            return None;
+        }
+        if (lo as f64) <= root && root <= (hi as f64) {
+            return Some(MathResult::DomainError(MathError::NonFiniteValue {
+                expression: expr_label.into(),
+                variable: var.into(),
+                at: root,
+            }));
+        }
+    }
+    if lead.abs() < 1e-300 || !lead.is_finite() {
+        return None;
+    }
+    // Σ = c·(1/(lo−r2) − 1/(hi+1−r2)) / lead.
+    let scale = factor * n0 / lead;
+    let t1 = 1.0 / (lo as f64 - r_big);
+    let t2 = 1.0 / (hi as f64 + 1.0 - r_big);
+    if !t1.is_finite() || !t2.is_finite() {
+        return Some(MathResult::DomainError(MathError::NonFiniteValue {
+            expression: expr_label.into(),
+            variable: var.into(),
+            at: if !t1.is_finite() {
+                lo as f64
+            } else {
+                hi as f64 + 1.0
+            },
+        }));
+    }
+    let value = scale * (t1 - t2);
+    sum_format_value(value).map_or_else(
+        || {
+            Some(MathResult::ResourceLimit(MathError::InputTooLarge {
+                operation: MathOperation::Summation,
+                provided_bytes: expr_label.len(),
+                maximum_bytes: MAX_SUM_CLOSED_BYTES,
+            }))
+        },
+        |text| Some(MathResult::Exact(text)),
+    )
+}
+
+/// Raíces `(r_chica, r_grande, lead)` del denominador cuadrático en `var`.
+///
+/// `lead` es el coeficiente principal (`a1·a2` si viene factorizado).
+/// `None` si no es cuadrático real en la variable.
+fn sum_unit_fraction_roots(den: &Expr, var: &str) -> Option<(f64, f64, f64)> {
+    if let Expr::Mul(f1, f2) = den {
+        let (a1, b1) = expr_linear_coeff(f1, var)?;
+        let (a2, b2) = expr_linear_coeff(f2, var)?;
+        if a1.abs() < 1e-300 || a2.abs() < 1e-300 {
+            return None;
+        }
+        if !a1.is_finite() || !a2.is_finite() || !b1.is_finite() || !b2.is_finite() {
+            return None;
+        }
+        let (r1, r2) = (-b1 / a1, -b2 / a2);
+        if !r1.is_finite() || !r2.is_finite() {
+            return None;
+        }
+        let (small, big) = if r1 <= r2 { (r1, r2) } else { (r2, r1) };
+        return Some((small, big, a1 * a2));
+    }
+    let coeffs = collect_polynomial_coeffs(den, var, 2)?;
+    let (c0, c1, c2) = (
+        coeffs.first().copied()?,
+        coeffs.get(1).copied()?,
+        coeffs.get(2).copied()?,
+    );
+    if c2.abs() < 1e-300 || !c0.is_finite() || !c1.is_finite() || !c2.is_finite() {
+        return None;
+    }
+    let disc = c1 * c1 - 4.0 * c2 * c0;
+    if !disc.is_finite() || disc < 0.0 {
+        return None;
+    }
+    let s = disc.sqrt();
+    let (r1, r2) = ((-c1 + s) / (2.0 * c2), (-c1 - s) / (2.0 * c2));
+    if !r1.is_finite() || !r2.is_finite() {
+        return None;
+    }
+    let (small, big) = if r1 <= r2 { (r1, r2) } else { (r2, r1) };
+    Some((small, big, c2))
+}
+
+/// Sustituye `var` por `rep` en una copia (respeta `sum`/`product` ligado).
+fn sum_subst_var(node: &Expr, var: &str, rep: &Expr) -> Expr {
+    use Expr::*;
+    match node {
+        Const(_) => node.clone(),
+        Var(name) if name == var => rep.clone(),
+        Var(_) => node.clone(),
+        Neg(a) => Neg(Box::new(sum_subst_var(a, var, rep))),
+        Add(a, b) => Add(
+            Box::new(sum_subst_var(a, var, rep)),
+            Box::new(sum_subst_var(b, var, rep)),
+        ),
+        Sub(a, b) => Sub(
+            Box::new(sum_subst_var(a, var, rep)),
+            Box::new(sum_subst_var(b, var, rep)),
+        ),
+        Mul(a, b) => Mul(
+            Box::new(sum_subst_var(a, var, rep)),
+            Box::new(sum_subst_var(b, var, rep)),
+        ),
+        Div(a, b) => Div(
+            Box::new(sum_subst_var(a, var, rep)),
+            Box::new(sum_subst_var(b, var, rep)),
+        ),
+        Pow(a, b) => Pow(
+            Box::new(sum_subst_var(a, var, rep)),
+            Box::new(sum_subst_var(b, var, rep)),
+        ),
+        Sin(a) => Sin(Box::new(sum_subst_var(a, var, rep))),
+        Cos(a) => Cos(Box::new(sum_subst_var(a, var, rep))),
+        Tan(a) => Tan(Box::new(sum_subst_var(a, var, rep))),
+        Asin(a) => Asin(Box::new(sum_subst_var(a, var, rep))),
+        Acos(a) => Acos(Box::new(sum_subst_var(a, var, rep))),
+        Atan(a) => Atan(Box::new(sum_subst_var(a, var, rep))),
+        Exp(a) => Exp(Box::new(sum_subst_var(a, var, rep))),
+        Ln(a) => Ln(Box::new(sum_subst_var(a, var, rep))),
+        Log(a) => Log(Box::new(sum_subst_var(a, var, rep))),
+        Sqrt(a) => Sqrt(Box::new(sum_subst_var(a, var, rep))),
+        Abs(a) => Abs(Box::new(sum_subst_var(a, var, rep))),
+        Sinh(a) => Sinh(Box::new(sum_subst_var(a, var, rep))),
+        Cosh(a) => Cosh(Box::new(sum_subst_var(a, var, rep))),
+        Tanh(a) => Tanh(Box::new(sum_subst_var(a, var, rep))),
+        Floor(a) => Floor(Box::new(sum_subst_var(a, var, rep))),
+        Ceil(a) => Ceil(Box::new(sum_subst_var(a, var, rep))),
+        Round(a) => Round(Box::new(sum_subst_var(a, var, rep))),
+        Sec(a) => Sec(Box::new(sum_subst_var(a, var, rep))),
+        Csc(a) => Csc(Box::new(sum_subst_var(a, var, rep))),
+        Cot(a) => Cot(Box::new(sum_subst_var(a, var, rep))),
+        Asinh(a) => Asinh(Box::new(sum_subst_var(a, var, rep))),
+        Acosh(a) => Acosh(Box::new(sum_subst_var(a, var, rep))),
+        Atanh(a) => Atanh(Box::new(sum_subst_var(a, var, rep))),
+        Sign(a) => Sign(Box::new(sum_subst_var(a, var, rep))),
+        Heaviside(a) => Heaviside(Box::new(sum_subst_var(a, var, rep))),
+        Cbrt(a) => Cbrt(Box::new(sum_subst_var(a, var, rep))),
+        Re(a) => Re(Box::new(sum_subst_var(a, var, rep))),
+        Im(a) => Im(Box::new(sum_subst_var(a, var, rep))),
+        Arg(a) => Arg(Box::new(sum_subst_var(a, var, rep))),
+        Conj(a) => Conj(Box::new(sum_subst_var(a, var, rep))),
+        Erf(a) => Erf(Box::new(sum_subst_var(a, var, rep))),
+        Erfc(a) => Erfc(Box::new(sum_subst_var(a, var, rep))),
+        Gamma(a) => Gamma(Box::new(sum_subst_var(a, var, rep))),
+        LnGamma(a) => LnGamma(Box::new(sum_subst_var(a, var, rep))),
+        Digamma(a) => Digamma(Box::new(sum_subst_var(a, var, rep))),
+        Trigamma(a) => Trigamma(Box::new(sum_subst_var(a, var, rep))),
+        Atan2(a, b) => Atan2(
+            Box::new(sum_subst_var(a, var, rep)),
+            Box::new(sum_subst_var(b, var, rep)),
+        ),
+        Modulo(a, b) => Modulo(
+            Box::new(sum_subst_var(a, var, rep)),
+            Box::new(sum_subst_var(b, var, rep)),
+        ),
+        Min(a, b) => Min(
+            Box::new(sum_subst_var(a, var, rep)),
+            Box::new(sum_subst_var(b, var, rep)),
+        ),
+        Max(a, b) => Max(
+            Box::new(sum_subst_var(a, var, rep)),
+            Box::new(sum_subst_var(b, var, rep)),
+        ),
+        Beta(a, b) => Beta(
+            Box::new(sum_subst_var(a, var, rep)),
+            Box::new(sum_subst_var(b, var, rep)),
+        ),
+        BesselJ(a, b) => BesselJ(
+            Box::new(sum_subst_var(a, var, rep)),
+            Box::new(sum_subst_var(b, var, rep)),
+        ),
+        BesselY(a, b) => BesselY(
+            Box::new(sum_subst_var(a, var, rep)),
+            Box::new(sum_subst_var(b, var, rep)),
+        ),
+        BesselI(a, b) => BesselI(
+            Box::new(sum_subst_var(a, var, rep)),
+            Box::new(sum_subst_var(b, var, rep)),
+        ),
+        Lt(a, b) => Lt(
+            Box::new(sum_subst_var(a, var, rep)),
+            Box::new(sum_subst_var(b, var, rep)),
+        ),
+        Gt(a, b) => Gt(
+            Box::new(sum_subst_var(a, var, rep)),
+            Box::new(sum_subst_var(b, var, rep)),
+        ),
+        Le(a, b) => Le(
+            Box::new(sum_subst_var(a, var, rep)),
+            Box::new(sum_subst_var(b, var, rep)),
+        ),
+        Ge(a, b) => Ge(
+            Box::new(sum_subst_var(a, var, rep)),
+            Box::new(sum_subst_var(b, var, rep)),
+        ),
+        Eq(a, b) => Eq(
+            Box::new(sum_subst_var(a, var, rep)),
+            Box::new(sum_subst_var(b, var, rep)),
+        ),
+        Ne(a, b) => Ne(
+            Box::new(sum_subst_var(a, var, rep)),
+            Box::new(sum_subst_var(b, var, rep)),
+        ),
+        Clamp(x, lo, hi) => Clamp(
+            Box::new(sum_subst_var(x, var, rep)),
+            Box::new(sum_subst_var(lo, var, rep)),
+            Box::new(sum_subst_var(hi, var, rep)),
+        ),
+        Sum(body, loop_var, start, end) => {
+            let body_out = if loop_var == var {
+                (**body).clone()
+            } else {
+                sum_subst_var(body, var, rep)
+            };
+            Sum(
+                Box::new(body_out),
+                loop_var.clone(),
+                Box::new(sum_subst_var(start, var, rep)),
+                Box::new(sum_subst_var(end, var, rep)),
+            )
+        }
+        Product(body, loop_var, start, end) => {
+            let body_out = if loop_var == var {
+                (**body).clone()
+            } else {
+                sum_subst_var(body, var, rep)
+            };
+            Product(
+                Box::new(body_out),
+                loop_var.clone(),
+                Box::new(sum_subst_var(start, var, rep)),
+                Box::new(sum_subst_var(end, var, rep)),
+            )
+        }
+        Piecewise(branches, default) => Piecewise(
+            branches
+                .iter()
+                .map(|(c, v)| {
+                    (
+                        Box::new(sum_subst_var(c, var, rep)),
+                        Box::new(sum_subst_var(v, var, rep)),
+                    )
+                })
+                .collect(),
+            Box::new(sum_subst_var(default, var, rep)),
+        ),
+    }
+}
+
+/// Telescópica general `F(k+1)−F(k)`: Σ = F(hi+1) − F(lo).
+///
+/// Detecta el corrimiento estructural (en ambos sentidos del signo).
+/// `None` si no tiene esa forma.
+fn sum_closed_difference(
+    body: &Expr,
+    var: &str,
+    lo: i64,
+    hi: i64,
+    expr_label: &str,
+) -> Option<MathResult<String>> {
+    let (left, right) = match body {
+        Expr::Sub(a, b) => (a.as_ref(), b.as_ref()),
+        _ => return None,
+    };
+    let shifted_arg = Expr::Add(
+        Box::new(Expr::Var(var.to_string())),
+        Box::new(Expr::Const(1.0)),
+    );
+    // Caso `F(k+1) − F(k)` con `F = right`.
+    if sum_subst_var(right, var, &shifted_arg)
+        .simplify()
+        .structurally_eq(left)
+    {
+        return Some(sum_telescoping_value(right, var, lo, hi, expr_label, true));
+    }
+    // Caso `F(k) − F(k+1)` con `F = left`.
+    if sum_subst_var(left, var, &shifted_arg)
+        .simplify()
+        .structurally_eq(right)
+    {
+        return Some(sum_telescoping_value(left, var, lo, hi, expr_label, false));
+    }
+    None
+}
+
+/// Evalúa `±(F(hi+1) − F(lo))`; polo en el borde → `DomainError` honesto.
+fn sum_telescoping_value(
+    f: &Expr,
+    var: &str,
+    lo: i64,
+    hi: i64,
+    expr_label: &str,
+    forward: bool,
+) -> MathResult<String> {
+    let end_at = hi as f64 + 1.0;
+    let start_at = lo as f64;
+    let (f_end, f_start) = (f.eval_at(var, end_at), f.eval_at(var, start_at));
+    if !f_end.is_finite() {
+        return MathResult::DomainError(MathError::NonFiniteValue {
+            expression: expr_label.into(),
+            variable: var.into(),
+            at: end_at,
+        });
+    }
+    if !f_start.is_finite() {
+        return MathResult::DomainError(MathError::NonFiniteValue {
+            expression: expr_label.into(),
+            variable: var.into(),
+            at: start_at,
+        });
+    }
+    let value = if forward {
+        f_end - f_start
+    } else {
+        f_start - f_end
+    };
+    sum_format_value(value).map_or_else(
+        || {
+            MathResult::ResourceLimit(MathError::InputTooLarge {
+                operation: MathOperation::Summation,
+                provided_bytes: expr_label.len(),
+                maximum_bytes: MAX_SUM_CLOSED_BYTES,
+            })
+        },
+        MathResult::Exact,
+    )
+}
+
+/// Pista honesta cuando no hay forma cerrada: distingue la armónica.
+fn sum_closed_no_form_hint(body: &Expr, var: &str) -> String {
+    if sum_looks_harmonic(body, var) {
+        return "sin forma cerrada elemental: la suma armónica necesita digamma/polygamma, fuera del subconjunto (constantes, polinomios, geométricas y telescópicas)".into();
+    }
+    "sin forma cerrada elemental en el subconjunto soportado (constantes, polinomios hasta grado 10, geométricas a·r^k y telescópicas 1/((k−r1)(k−r2)) o F(k+1)−F(k))".into()
+}
+
+/// ¿Tiene pinta de armónica (`1/k`, `k^-1`, cociente con `var` abajo)?
+fn sum_looks_harmonic(body: &Expr, var: &str) -> bool {
+    let (_, core) = sum_split_const_factor(body, var).unwrap_or((1.0, body.clone()));
+    match &core {
+        Expr::Div(num, den) => !contains_var(num, var) && contains_var(den, var),
+        Expr::Pow(base, exp) => {
+            contains_var(base, var)
+                && matches!(exp.as_ref(), Expr::Const(e) if e.is_finite() && *e < 0.0)
+        }
+        _ => false,
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn eval_result(s: &str, var: &str, x: f64) -> f64 {
+        parse_ast(&s.replace(' ', "")).unwrap().eval_at(var, x)
+    }
+
+    #[test]
+    fn test_derivative_x_squared() {
+        let r = derivative("x^2", "x").unwrap();
+        // d/dx x^2 = 2x → en x=3 vale 6
+        assert!((eval_result(&r, "x", 3.0) - 6.0).abs() < 1e-9, "got {r}");
+    }
+
+    #[test]
+    fn test_derivative_sin() {
+        let r = derivative("sin(x)", "x").unwrap();
+        // d/dx sin(x) = cos(x) → en x=0 vale 1
+        assert!((eval_result(&r, "x", 0.0) - 1.0).abs() < 1e-9, "got {r}");
+    }
+
+    #[test]
+    fn test_derivative_x_cubed() {
+        let r = derivative("x^3", "x").unwrap();
+        // d/dx x^3 = 3x^2 → en x=2 vale 12
+        assert!((eval_result(&r, "x", 2.0) - 12.0).abs() < 1e-9, "got {r}");
+    }
+
+    #[test]
+    fn test_derivative_exp() {
+        let r = derivative("exp(x)", "x").unwrap();
+        // d/dx exp(x) = exp(x) → en x=1 vale e
+        let e = std::f64::consts::E;
+        assert!((eval_result(&r, "x", 1.0) - e).abs() < 1e-6, "got {r}");
+    }
+
+    #[test]
+    fn test_derivative_ln() {
+        let r = derivative("ln(x)", "x").unwrap();
+        // d/dx ln(x) = 1/x → en x=2 vale 0.5
+        assert!((eval_result(&r, "x", 2.0) - 0.5).abs() < 1e-9, "got {r}");
+    }
+
+    #[test]
+    fn test_simplify_x_plus_zero() {
+        let r = simplify("x + 0").unwrap();
+        assert_eq!(r, "x");
+    }
+
+    #[test]
+    fn test_simplify_const_fold() {
+        let r = simplify("2 + 3").unwrap();
+        assert_eq!(r, "5");
+    }
+
+    #[test]
+    fn test_simplify_double_neg() {
+        let r = simplify("-(-(x))").unwrap();
+        assert_eq!(r, "x");
+    }
+
+    #[test]
+    fn test_simplify_x_minus_x() {
+        let r = simplify("x - x").unwrap();
+        assert_eq!(r, "0");
+    }
+
+    #[test]
+    fn test_simplify_x_over_x() {
+        let r = simplify("x / x").unwrap();
+        assert_eq!(r, "x / x");
+    }
+
+    #[test]
+    fn simplification_preserves_possible_domain_failures() {
+        assert_eq!(simplify("x / x").unwrap(), "x / x");
+        assert_eq!(simplify("0 / x").unwrap(), "0 / x");
+        assert_eq!(simplify("x ^ 0").unwrap(), "x ^ 0");
+    }
+
+    #[test]
+    fn test_solve_quadratic_pm2() {
+        let r = solve("x^2 - 4", "x").unwrap();
+        assert!(r.contains("-2"), "got {r}");
+        assert!(r.contains("2.000"), "got {r}");
+    }
+
+    #[test]
+    fn factor_preserves_leading_coefficient_and_multiplicity() {
+        for (source, points) in [("2*x - 2", [-1.0, 0.0, 2.0]), ("x^2", [-2.0, 0.0, 3.0])] {
+            let factored = factor(source, "x").unwrap();
+            for x in points {
+                let original = eval_result(source, "x", x);
+                let rebuilt = eval_result(&factored, "x", x);
+                assert!(
+                    (original - rebuilt).abs() < 1e-9,
+                    "{source} != {factored} at x={x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn factor_preserves_tiny_finite_coefficients_and_roots() {
+        let source = "0.000000000000001*x - 0.000000000000000000000000000001";
+        let factored = factor(source, "x").unwrap();
+
+        for x in [0.0, 0.000000000000001, 2.0] {
+            let original = eval_result(source, "x", x);
+            let rebuilt = eval_result(&factored, "x", x);
+            let tolerance = 1e-12 * original.abs().max(1e-30);
+            assert!(
+                (original - rebuilt).abs() <= tolerance,
+                "{source} != {factored} at x={x}: {original} != {rebuilt}"
+            );
+        }
+    }
+
+    #[test]
+    fn factor_does_not_drop_a_subnormal_linear_coefficient() {
+        let coefficient = f64::from_bits(1);
+        let source = format!("x^2-{coefficient}*x");
+        let factored = factor(&source, "x").unwrap();
+
+        // El subnormal minimo debe conservarse; `x*x` no factoriza el polinomio.
+        assert_eq!(factored, source);
+        for x in [0.0, coefficient, 2.0 * coefficient, 1.0] {
+            assert_eq!(
+                eval_result(&factored, "x", x).to_bits(),
+                eval_result(&source, "x", x).to_bits(),
+                "{source} != {factored} at x={x}"
+            );
+        }
+    }
+
+    #[test]
+    fn factor_keeps_tiny_coefficients_when_real_factors_are_unavailable() {
+        let source = "0.000000000000001*x^2+0.000000000000001";
+        assert_eq!(factor(source, "x").unwrap(), source);
+    }
+
+    #[test]
+    fn test_taylor_exp() {
+        let r = taylor_series("exp(x)", "x", 0.0, 3).unwrap();
+        assert!(r.starts_with('1'), "got {r}");
+        // Evaluar la serie en x=0.5 debe aproximarse a exp(0.5)
+        let v = eval_result(&r, "x", 0.5);
+        assert!(
+            (v - std::f64::consts::E.powf(0.5)).abs() < 0.05,
+            "got {r} → {v}"
+        );
+    }
+
+    #[test]
+    fn taylor_series_rejects_orders_above_the_public_limit() {
+        assert!(taylor_series("x", "x", 0.0, 65).is_err());
+    }
+
+    #[test]
+    fn taylor_series_rejects_accepted_orders_that_exceed_the_ast_budget() {
+        let expression = std::iter::repeat_n("sin(x)", 16)
+            .collect::<Vec<_>>()
+            .join("*");
+
+        let error = taylor_series(&expression, "x", 0.0, 64)
+            .expect_err("accepted orders still require a bounded derivative workload");
+        assert!(error.contains("budget"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn test_limit_sinc() {
+        let r = limit("sin(x)/x", "x", 0.0).unwrap();
+        assert!(r.contains("1.0"), "got {r}");
+    }
+
+    #[test]
+    fn typed_limit_reports_a_finite_approximation_and_error_estimate() {
+        match limit_typed("sin(x)/x", "x", 0.0) {
+            MathResult::Approximate {
+                value,
+                error_estimate,
+            } => {
+                assert!((value - 1.0).abs() < 1e-8);
+                assert!(error_estimate.is_finite() && error_estimate >= 0.0);
+            }
+            result => panic!("expected a finite typed limit, got {result:?}"),
+        }
+    }
+
+    #[test]
+    fn typed_limit_reports_non_existence_without_a_success_string() {
+        assert!(matches!(
+            limit_typed("1/x", "x", 0.0),
+            MathResult::DomainError(MathError::LimitDoesNotExist { .. })
+        ));
+    }
+
+    #[test]
+    fn typed_limit_rejects_invalid_and_unbounded_requests_structurally() {
+        assert!(matches!(
+            limit_typed("sin(", "x", 0.0),
+            MathResult::DomainError(MathError::InvalidExpression {
+                operation: MathOperation::Limit,
+                ..
+            })
+        ));
+        assert!(matches!(
+            limit_typed("x", "x", f64::INFINITY),
+            MathResult::Unsupported(MathError::NonFiniteLimitPoint { .. })
+        ));
+    }
+
+    #[test]
+    fn typed_limit_enforces_the_shared_expression_budget() {
+        let expression = "x".repeat(MAX_MATH_INPUT_BYTES + 1);
+        assert!(matches!(
+            limit_typed(&expression, "x", 0.0),
+            MathResult::ResourceLimit(MathError::InputTooLarge {
+                operation: MathOperation::Limit,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn typed_limit_never_reports_a_non_finite_multiscale_estimate() {
+        assert!(matches!(
+            limit_typed("exp(708)", "x", 0.0),
+            MathResult::DomainError(MathError::LimitDoesNotExist { .. })
+        ));
+    }
+
+    #[test]
+    fn test_solve_linear() {
+        let result = solve("2*x - 4", "x").unwrap();
+        assert!(result.contains("2"));
+    }
+
+    #[test]
+    fn test_solve_cubic() {
+        let result = solve("x^3 - x", "x").unwrap();
+        assert!(result.contains('0') || result.contains("-1") || result.contains('1'));
+    }
+
+    #[test]
+    fn test_integrate_sin() {
+        let result = integrate("sin(x)", "x").unwrap();
+        assert!(result.contains("cos"));
+    }
+
+    #[test]
+    fn test_integrate_power() {
+        let result = integrate("x^2", "x").unwrap();
+        assert!(
+            result.contains("x ^ 3") || result.contains("x^3"),
+            "Got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn integrate_expression_constant_in_the_integration_variable() {
+        let y_squared = integrate("y^2", "x").unwrap();
+        assert!(
+            y_squared.contains("y ^ 2") && y_squared.contains('x'),
+            "got {y_squared}"
+        );
+
+        let sine_constant = integrate("sin(y)", "x").unwrap();
+        assert!(
+            sine_constant.contains("sin(y)") && sine_constant.contains('x'),
+            "got {sine_constant}"
+        );
+        assert!(!sine_constant.contains("inf"), "got {sine_constant}");
+    }
+
+    #[test]
+    fn fractional_powers_are_not_collected_as_integer_polynomials() {
+        let ast = parse_ast("x^1.4 - 2").unwrap();
+        assert!(collect_polynomial_coeffs(&ast, "x", 4).is_none());
+    }
+
+    #[test]
+    fn indefinite_integral_without_antiderivative_returns_error() {
+        let result = integrate("abs(x)", "x");
+        assert!(
+            result.is_err(),
+            "an unsupported indefinite integral must not become a numeric value: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_integrate_definite_linear() {
+        let result = integrate_definite("2*x", "x", 0.0, 3.0).unwrap();
+        assert!(result.contains('9'));
+    }
+
+    #[test]
+    fn definite_integral_rejects_interior_poles_and_preserves_finite_bounds() {
+        assert!(integrate_definite("1/x", "x", -1.0, 1.0).is_err());
+        assert!(integrate_definite("1/(x-0.5)", "x", 0.0, 1.0).is_err());
+        assert!(integrate_definite("1/(x-0.1)", "x", 0.0, 1.0).is_err());
+
+        let forward = integrate_definite("x^2", "x", 0.0, 1.0).unwrap();
+        assert!(forward.contains("0.33333333"), "{forward}");
+        let reversed = integrate_definite("x^2", "x", 1.0, 0.0).unwrap();
+        assert!(reversed.contains("-0.33333333"), "{reversed}");
+    }
+
+    #[test]
+    fn derivative_of_trigamma_is_explicitly_unsupported() {
+        assert!(derivative("trigamma(x)", "x").is_err());
+    }
+
+    #[test]
+    fn typed_derivative_returns_an_exact_symbolic_result() {
+        let result = derivative_typed("x^2", "x");
+        assert!(matches!(result, MathResult::Exact(value) if value.contains('x')));
+    }
+
+    #[test]
+    fn typed_indefinite_integral_returns_an_exact_symbolic_result() {
+        let result = integrate_typed("x^2", "x");
+        assert!(
+            matches!(result, MathResult::Exact(value) if value.contains("x ^ 3") || value.contains("x^3"))
+        );
+    }
+
+    #[test]
+    fn typed_indefinite_integral_reports_unsupported_antiderivatives() {
+        assert!(matches!(
+            integrate_typed("abs(x)", "x"),
+            MathResult::Unsupported(MathError::AntiderivativeUnavailable { .. })
+        ));
+    }
+
+    #[test]
+    fn typed_definite_integral_reports_domain_errors() {
+        assert!(matches!(
+            integrate_definite_typed("1/x", "x", -1.0, 1.0),
+            MathResult::DomainError(MathError::IntervalDomainViolation { .. })
+        ));
+    }
+
+    #[test]
+    fn typed_numerical_integral_is_approximate_with_an_error_estimate() {
+        match integrate_definite_typed("abs(x)", "x", -1.0, 1.0) {
+            MathResult::Approximate {
+                value,
+                error_estimate,
+            } => {
+                assert!((value - 1.0).abs() < 1e-9);
+                assert!(error_estimate.is_finite() && error_estimate >= 0.0);
+            }
+            result => panic!("expected an approximate numerical result, got {result:?}"),
+        }
+    }
+
+    #[test]
+    fn typed_numerical_integral_reports_depth_exhaustion() {
+        assert!(matches!(
+            integrate_numerical_with_limits("x^4", "x", 0.0, 1.0, 1e-15, 0),
+            MathResult::NotConverged(MathError::RecursionLimit { max_depth: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn typed_apis_report_input_budget_exhaustion() {
+        let expression = "x".repeat(MAX_MATH_INPUT_BYTES + 1);
+        assert!(matches!(
+            derivative_typed(&expression, "x"),
+            MathResult::ResourceLimit(MathError::InputTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn legacy_adapters_preserve_symbolic_and_numerical_messages() {
+        assert_eq!(derivative("x", "x").unwrap(), "1");
+        assert!(integrate("abs(x)", "x")
+            .unwrap_err()
+            .contains("No hay una antiderivada simbólica soportada"));
+        assert!(integrate_definite("abs(x)", "x", -1.0, 1.0)
+            .unwrap()
+            .contains('\u{2248}'));
+    }
+
+    // ——— Misión 3-en-1: tests que fallarían antes del fix honesto ———
+
+    #[test]
+    fn factor_rejects_degree_greater_than_two_honestly() {
+        // Ola 2.4: un cúbico irreducible sobre Q ya no es error: GeoGebra
+        // devuelve el polinomio tal cual.
+        let irreducible = factor("x^3 + 2*x + 1", "x").expect("cúbico irreducible sobre Q");
+        assert!(irreducible.contains("x^3"), "se conserva: {irreducible}");
+        assert!(matches!(
+            factor_typed("x^3 + 2*x + 1", "x"),
+            MathResult::Exact(_)
+        ));
+        // Fuera de la cota de Kronecker (grado 7): sigue el error honesto.
+        let err = factor("x^7 + 2*x + 1", "x").expect_err("grado>6 fuera de cota");
+        assert!(
+            err.contains("grado>2"),
+            "mensaje debe contener grado>2, got {err}"
+        );
+        assert!(matches!(
+            factor_typed("x^7 + 2*x + 1", "x"),
+            MathResult::Unsupported(MathError::DerivativeUnavailable { reason, .. }) if reason.contains("grado>2")
+        ));
+        assert!(factor("x^2 - 4", "x").is_ok());
+        assert!(factor("x + 2", "x").is_ok());
+        assert!(matches!(factor_typed("x^2 - 4", "x"), MathResult::Exact(_)));
+    }
+
+    /// Ola 2.4: Kronecker factoriza cuárticos sin raíces racionales y
+    /// detecta multiplicidades; los irreducibles vuelven tal cual.
+    #[test]
+    fn ola24_kronecker_factors_degree_above_two() {
+        // x⁴ − 4 = (x² − 2)(x² + 2): sin raíces racionales.
+        let quartic = factor("x^4 - 4", "x").expect("cuártico factorizable");
+        assert!(quartic.contains("x^2 - 2"), "factor 1: {quartic}");
+        assert!(quartic.contains("x^2 + 2"), "factor 2: {quartic}");
+        assert_eq!(quartic.matches('*').count(), 1, "dos factores: {quartic}");
+        // x⁴ + 2x² + 1 = (x² + 1)².
+        let squared = factor("x^4 + 2*x^2 + 1", "x").expect("cuadrado perfecto");
+        assert!(squared.contains("x^2 + 1"), "factor: {squared}");
+        assert!(squared.contains("^2"), "multiplicidad: {squared}");
+        // Irreducible sobre Q (x⁴ + 1): se conserva sin error.
+        let irreducible = factor("x^4 + 1", "x").expect("irreducible");
+        assert!(irreducible.contains("x^4"), "{irreducible}");
+    }
+
+    #[test]
+    fn integrate_sin_linear_and_exp_linear() {
+        let prim_sin = integrate("sin(2*x+1)", "x").expect("sin(2*x+1) debe integrar");
+        let d_sin = derivative(&prim_sin, "x").expect("derivada de prim sin");
+        for &xv in &[0.0, 0.5, 1.2] {
+            let orig = eval_result("sin(2*x+1)", "x", xv);
+            let got = eval_result(&d_sin, "x", xv);
+            assert!(
+                (orig - got).abs() < 1e-8,
+                "sin(2*x+1) prim deriv mismatch at {xv}: {orig} vs {got} prim={prim_sin} d={d_sin}"
+            );
+        }
+        let prim_exp = integrate("exp(3*x)", "x").expect("exp(3*x) debe integrar");
+        let d_exp = derivative(&prim_exp, "x").expect("derivada de prim exp");
+        for &xv in &[0.0, 0.5, 1.2] {
+            let orig = eval_result("exp(3*x)", "x", xv);
+            let got = eval_result(&d_exp, "x", xv);
+            assert!(
+                (orig - got).abs() < 1e-6,
+                "exp(3*x) prim deriv mismatch at {xv}: {orig} vs {got}"
+            );
+        }
+        assert!(matches!(
+            integrate_typed("sin(2*x+1)", "x"),
+            MathResult::Exact(_)
+        ));
+        assert!(matches!(
+            integrate_typed("exp(3*x)", "x"),
+            MathResult::Exact(_)
+        ));
+    }
+
+    #[test]
+    fn integrate_sec_squared_and_atan_forms() {
+        let prim_sec = integrate("sec(x)^2", "x").expect("sec^2 -> tan");
+        assert!(prim_sec.contains("tan"), "got {prim_sec}");
+        let d_sec = derivative(&prim_sec, "x").unwrap();
+        for &xv in &[0.2, 0.5] {
+            let orig = eval_result("sec(x)^2", "x", xv);
+            let got = eval_result(&d_sec, "x", xv);
+            assert!((orig - got).abs() < 1e-7, "sec^2 mismatch at {xv}");
+        }
+        let prim_atan = integrate("1/(x^2+1)", "x").expect("1/(x^2+1) -> atan");
+        assert!(prim_atan.contains("atan"), "got {prim_atan}");
+        let d_atan = derivative(&prim_atan, "x").unwrap();
+        for &xv in &[0.0, 0.5, 1.2] {
+            let orig = eval_result("1/(x^2+1)", "x", xv);
+            let got = eval_result(&d_atan, "x", xv);
+            assert!((orig - got).abs() < 1e-9, "atan form mismatch at {xv}");
+        }
+        assert!(matches!(
+            integrate_typed("sin(x)/x", "x"),
+            MathResult::Unsupported(MathError::AntiderivativeUnavailable { .. })
+        ));
+    }
+
+    #[test]
+    fn limit_infinite_via_asymptote_and_substitution() {
+        match limit_infinite_typed("(2*x+1)/(x-1)", "x", true) {
+            MathResult::Approximate { value, .. } => {
+                assert!((value - 2.0).abs() < 1e-4, "expected 2, got {value}")
+            }
+            r => panic!("expected approximate 2, got {r:?}"),
+        }
+        assert!(matches!(
+            limit_infinite_typed("sin(x)", "x", true),
+            MathResult::DomainError(MathError::LimitDoesNotExist { at, .. }) if at.is_infinite()
+        ));
+        assert!(matches!(
+            limit_infinite_typed("cos(x)", "x", true),
+            MathResult::DomainError(MathError::LimitDoesNotExist { .. })
+        ));
+        match limit_infinite_typed("sin(x)/x", "x", true) {
+            MathResult::Approximate { value, .. } => {
+                assert!(value.abs() < 1e-6, "squeezed sin/x -> 0, got {value}")
+            }
+            r => panic!("expected squeezed 0, got {r:?}"),
+        }
+        match limit_infinite_typed("1/x", "x", true) {
+            MathResult::Approximate { value, .. } => {
+                assert!(value.abs() < 1e-6, "1/x at +∞ -> 0, got {value}")
+            }
+            r => panic!("expected 0, got {r:?}"),
+        }
+        assert!(matches!(
+            limit_infinite_typed("x", "x", true),
+            MathResult::DomainError(MathError::LimitDoesNotExist { .. })
+        ));
+    }
+
+    // Frente trigonométricas + racionalización (subset honesto S): cada regla
+    // con test de equivalencia NUMÉRICA (ambos lados en 5 puntos).
+    fn assert_trig_equiv(original: &str, rewritten: &str, var: &str, points: &[f64]) {
+        assert_eq!(points.len(), 5, "el subset exige 5 puntos");
+        for point in points {
+            let left = eval_result(original, var, *point);
+            let right = eval_result(rewritten, var, *point);
+            assert!(
+                left.is_finite() && right.is_finite(),
+                "punto no finito en {original} = {rewritten} ({var}={point}): {left} vs {right}"
+            );
+            let tol = 1e-9 * 1.0_f64.max(left.abs()).max(right.abs());
+            assert!(
+                (left - right).abs() <= tol,
+                "difieren en {original} = {rewritten} ({var}={point}): {left} vs {right}"
+            );
+        }
+    }
+
+    #[test]
+    fn trig_expand_sum_sin_and_cos() {
+        let out = trig_expand("sin(x+y)").unwrap();
+        assert_eq!(out, "sin(x) * cos(y) + cos(x) * sin(y)");
+        // Con una variable libre (y=1 fijo) la equivalencia se evalúa en x.
+        let left = parse_ast("sin(x+1)").unwrap();
+        let right = parse_ast(&trig_expand("sin(x+1)").unwrap()).unwrap();
+        for point in [0.1, 0.7, 1.3, 2.1, 3.0] {
+            let (l, r) = (left.eval_at("x", point), right.eval_at("x", point));
+            assert!((l - r).abs() < 1e-9, "sin(x+1) en {point}: {l} vs {r}");
+        }
+        let out = trig_expand("cos(x-y)").unwrap();
+        assert_eq!(out, "cos(x) * cos(y) + sin(x) * sin(y)");
+        assert_trig_equiv(
+            "cos(2*x)",
+            &trig_expand("cos(2*x)").unwrap(),
+            "x",
+            &[0.1, 0.7, 1.3, 2.1, 3.0],
+        );
+    }
+
+    #[test]
+    fn trig_expand_double_angle() {
+        let out = trig_expand("sin(2*x)").unwrap();
+        assert_eq!(out, "2 * (sin(x) * cos(x))");
+        assert_trig_equiv("sin(2*x)", &out, "x", &[0.1, 0.7, 1.3, 2.1, 3.0]);
+        let out = trig_expand("cos(2*x)").unwrap();
+        assert_eq!(out, "cos(x) * cos(x) - sin(x) * sin(x)");
+        assert_trig_equiv("cos(2*x)", &out, "x", &[0.1, 0.7, 1.3, 2.1, 3.0]);
+    }
+
+    #[test]
+    fn trig_expand_square_powers() {
+        let out = trig_expand("sin(x)^2").unwrap();
+        assert_eq!(out, "(1 - cos(2 * x)) * 0.5");
+        assert_trig_equiv("sin(x)^2", &out, "x", &[0.1, 0.7, 1.3, 2.1, 3.0]);
+        let out = trig_expand("cos(x)^2").unwrap();
+        assert_eq!(out, "(1 + cos(2 * x)) * 0.5");
+        assert_trig_equiv("cos(x)^2", &out, "x", &[0.1, 0.7, 1.3, 2.1, 3.0]);
+    }
+
+    #[test]
+    fn trig_expand_rejects_outside_subset() {
+        for expr in ["tan(x+y)", "sin(x)^3", "sec(2*x)", "x+1"] {
+            let err = trig_expand(expr).expect_err(&format!("{expr} debe ser Err honesto"));
+            assert!(err.contains("TrigExpand"), "fue: {err}");
+        }
+    }
+
+    #[test]
+    fn trig_combine_products_to_sums() {
+        let out = trig_combine("sin(x)*cos(x)").unwrap();
+        assert_eq!(out, "sin(2 * x) / 2");
+        assert_trig_equiv("sin(x)*cos(x)", &out, "x", &[0.1, 0.7, 1.3, 2.1, 3.0]);
+        let out = trig_combine("cos(x)*cos(y)").unwrap();
+        assert_eq!(out, "(cos(x - y) + cos(x + y)) / 2");
+        let left = parse_ast("cos(x)*cos(2)").unwrap();
+        let right = parse_ast(&trig_combine("cos(x)*cos(2)").unwrap()).unwrap();
+        for point in [0.1, 0.7, 1.3, 2.1, 3.0] {
+            let (l, r) = (left.eval_at("x", point), right.eval_at("x", point));
+            assert!((l - r).abs() < 1e-9, "cos(x)*cos(2) en {point}: {l} vs {r}");
+        }
+        let out = trig_combine("sin(x)*sin(x)").unwrap();
+        assert_eq!(out, "(1 - cos(2 * x)) / 2");
+        assert_trig_equiv("sin(x)*sin(x)", &out, "x", &[0.1, 0.7, 1.3, 2.1, 3.0]);
+        // Factor constante externo: 2·sin·cos → sin(2x) directo.
+        let out = trig_combine("2*sin(x)*cos(x)").unwrap();
+        assert_eq!(out, "sin(2 * x)");
+        assert_trig_equiv("2*sin(x)*cos(x)", &out, "x", &[0.1, 0.7, 1.3, 2.1, 3.0]);
+    }
+
+    #[test]
+    fn trig_combine_rejects_outside_subset() {
+        for expr in ["sin(x)+cos(x)", "tan(x)*cos(x)", "sin(x)", "x*y"] {
+            let err = trig_combine(expr).expect_err(&format!("{expr} debe ser Err honesto"));
+            assert!(err.contains("TrigCombine"), "fue: {err}");
+        }
+    }
+
+    #[test]
+    fn trig_simplify_pythagoras_and_tan() {
+        let out = trig_simplify("sin(x)^2+cos(x)^2").unwrap();
+        assert_eq!(out, "1");
+        let out = trig_simplify("cos(x)^2+sin(x)^2").unwrap();
+        assert_eq!(out, "1");
+        let out = trig_simplify("1+tan(x)^2").unwrap();
+        assert_eq!(out, "sec(x) ^ 2");
+        assert_trig_equiv("1+tan(x)^2", &out, "x", &[0.1, 0.7, 1.3, 2.1, 3.0]);
+        // Potencia sola también reduce por el loop (estable, sin oscilar).
+        let out = trig_simplify("sin(x)^2").unwrap();
+        assert_trig_equiv("sin(x)^2", &out, "x", &[0.1, 0.7, 1.3, 2.1, 3.0]);
+    }
+
+    #[test]
+    fn trig_simplify_fixpoint_is_bounded() {
+        // La pitagórica pura converge a 1 por la vía pública.
+        assert_eq!(trig_simplify("sin(x)^2+cos(x)^2").unwrap(), "1");
+        // El caso oscilante (combinar crea lo que expandir deshace) termina
+        // por cota, determinista y equivalente numéricamente.
+        let first = trig_simplify("sin(x)*cos(x)").unwrap();
+        let second = trig_simplify("sin(x)*cos(x)").unwrap();
+        assert_eq!(first, second, "el corte por cota debe ser determinista");
+        assert_trig_equiv("sin(x)*cos(x)", &first, "x", &[0.1, 0.7, 1.3, 2.1, 3.0]);
+        // La maquinaria interna converge en casos estables.
+        let ast = parse_ast("sin(x)^2+cos(x)^2").unwrap();
+        let all = |node: &Expr| -> Result<Option<Expr>, String> {
+            if let Some(next) = trig_pythag_step(node) {
+                return Ok(Some(next));
+            }
+            if let Some(next) = trig_combine_step(node) {
+                return Ok(Some(next));
+            }
+            Ok(trig_expand_step(node))
+        };
+        let (out, converged) = trig_fixpoint_best(&ast, &all, MAX_TRIG_REWRITE_STEPS).unwrap();
+        assert!(converged, "pitagórica pura debe converger");
+        assert_eq!(out.to_expr_string(), "1");
+        let err = trig_simplify("x+1").expect_err("sin identidad debe ser Err honesto");
+        assert!(err.contains("TrigSimplify"), "fue: {err}");
+    }
+
+    #[test]
+    fn rationalize_denominators() {
+        let out = rationalize("1/sqrt(2)").unwrap();
+        assert_eq!(out, "sqrt(2) / 2");
+        let out = rationalize("1/sqrt(x)").unwrap();
+        assert_eq!(out, "sqrt(x) / x");
+        assert_trig_equiv("1/sqrt(x)", &out, "x", &[0.5, 1.0, 2.0, 3.7, 10.0]);
+        let out = rationalize("3/(2+sqrt(x))").unwrap();
+        assert_trig_equiv("3/(2+sqrt(x))", &out, "x", &[0.5, 1.0, 2.0, 3.7, 10.0]);
+        assert!(
+            out.contains("2 - sqrt(x)"),
+            "conjugada esperada, fue: {out}"
+        );
+        let out = rationalize("1/(2*sqrt(3))").unwrap();
+        assert_trig_equiv("1/(2*sqrt(3))", &out, "x", &[0.5, 1.0, 2.0, 3.7, 10.0]);
+    }
+
+    #[test]
+    fn rationalize_rejects_outside_subset() {
+        let err = rationalize("x+1").expect_err("sin radical debe ser Err");
+        assert!(err.contains("Rationalize"), "fue: {err}");
+        let err = rationalize("cbrt(8)").expect_err("cúbica debe ser Err");
+        assert!(err.contains("Rationalize"), "fue: {err}");
+        let err = rationalize("1/sqrt(0)").expect_err("nulo debe ser Err");
+        assert!(err.contains("nulo"), "fue: {err}");
+        let err = rationalize("1/(2-sqrt(4))").expect_err("b²=c debe ser Err");
+        assert!(err.contains("nulo"), "fue: {err}");
+    }
+
+    #[test]
+    fn trig_front_respects_input_budget() {
+        let big = "x".repeat(MAX_TRIG_INPUT_CHARS + 1);
+        for result in [
+            trig_expand(&big),
+            trig_combine(&big),
+            trig_simplify(&big),
+            rationalize(&big),
+        ] {
+            let err = result.expect_err("sobre-presupuesto debe ser Err");
+            assert!(err.contains("MAX_EXPR_LENGTH"), "fue: {err}");
+        }
+    }
+
+    #[test]
+    fn trig_legacy_simplify_keeps_working() {
+        // El refactor delega sin cambiar el legacy: pitagórica y potencias.
+        assert_eq!(simplify("sin(x)^2+cos(x)^2").unwrap(), "1");
+        assert!(simplify("sin(x+1)").unwrap().contains("sin(x)"));
+    }
+}
+#[cfg(test)]
+mod coverage_sweep_symbolic {
+    use super::*;
+    fn typed_ok<T: std::fmt::Debug>(r: &MathResult<T>) -> bool {
+        matches!(r, MathResult::Exact(_) | MathResult::Approximate { .. })
+    }
+    #[test]
+    fn barrido_derivadas_pinnea_resultados() {
+        assert!(
+            derivative("x^2", "x").expect("d").contains("2"),
+            "derivada cuadratica"
+        );
+        assert!(derivative("sin(x)", "x").expect("d").contains("cos"));
+        assert!(typed_ok(&derivative_typed("x^2", "x")));
+        assert!(derivative("", "x").is_err());
+        let _ = derivative("x^2", "");
+    }
+    #[test]
+    fn barrido_integrales_y_definidas() {
+        assert!(integrate("x", "x").is_ok());
+        assert!(typed_ok(&integrate_typed("x", "x")));
+        assert!(integrate("[[[", "x").is_err());
+        let v = integrate_definite("x", "x", 0.0, 1.0).expect("def");
+        assert!(!v.is_empty(), "integral definida no vacía: {v}");
+        let _ = integrate_definite("x", "x", 1.0, 0.0);
+        assert!(typed_ok(&integrate_numerical("x", "x", 0.0, 1.0)));
+        assert!(typed_ok(&integrate_numerical_with_limits(
+            "x", "x", 0.0, 1.0, 1e-10, 20
+        )));
+    }
+    #[test]
+    fn barrido_limites() {
+        assert!(limit("1/x", "x", 1.0).is_ok());
+        assert!(typed_ok(&limit_typed("1/x", "x", 1.0)));
+        let _ = limit_above("1/x", "x", 0.0);
+        let _ = limit_below("1/x", "x", 0.0);
+        assert!(typed_ok(&limit_above_typed("x", "x", 0.0)));
+        assert!(typed_ok(&limit_below_typed("x", "x", 0.0)));
+        assert!(typed_ok(&limit_infinite_typed("1/x", "x", true)));
+        let _ = limit_pos_infinity_typed("x", "x");
+        let _ = limit_neg_infinity_typed("x", "x");
+    }
+    #[test]
+    fn barrido_algebra_expand_factor_simplify() {
+        assert!(
+            expand("(x+1)^2").expect("exp").contains("x"),
+            "expansion menciona x"
+        );
+        assert!(factor("x^2-1", "x").expect("fac").contains("x"));
+        assert!(typed_ok(&factor_typed("x^2-1", "x")));
+        assert_eq!(simplify("2+2").expect("s"), "4");
+        let _ = simplify("[[[");
+        let _ = structurally_equal("x+1", "1+x");
+        assert!(substitute("x^2", "x", "2").expect("sub").contains("4"));
+        assert!(solve("x-1", "x").is_ok());
+        assert!(solve("[[[", "x").is_err());
+    }
+    #[test]
+    fn barrido_taylor_asintotas_fracciones() {
+        let t = taylor_series("sin(x)", "x", 0.0, 3).expect("taylor");
+        assert!(t.contains("x"), "taylor menciona x: {t}");
+        assert!(complete_square("x^2+2*x+1", "x").is_ok());
+        assert!(typed_ok(&complete_square_typed("x^2+2*x+1", "x")));
+        let _ = partial_fractions("1/(x*(x+1))", "x");
+        let _ = partial_fractions_typed("1/(x*(x+1))", "x");
+        let _ = asymptote("1/x", "x");
+        let _ = asymptote_typed("1/x", "x");
+        let _ = parametric_derivative("t", "t^2", "t");
+        let _ = parametric_derivative_typed("t", "t^2", "t");
+    }
+    #[test]
+    fn barrido_trig_primos_groebner_honestos() {
+        assert!(trig_expand("sin(x+y)").is_ok());
+        let _ = trig_combine("sin(x)*cos(x)");
+        assert!(trig_simplify("sin(x)^2+cos(x)^2").is_ok());
+        assert!(rationalize("1/sqrt(2)").is_ok());
+        assert!(prime_factors("12").expect("pf").contains("2"));
+        assert!(typed_ok(&prime_factors_typed("12")));
+        assert!(prime_factors("no_num").is_err());
+        let _ = groebner_single_typed("x");
+        let _ = groebner_stub("x");
+        let _ = groebner_basis_typed(&["x".to_string()], &["x".to_string()]);
+        let _ = ifactor("x^2+1", "x");
+        let _ = c_factor("x^2+1", "x");
+        let _ = cfactor("x^2+1", "x");
+        let _ = cifactor("x^2+1", "x");
+        assert!(is_everywhere_differentiable("x^2").is_ok());
+        assert!(evaluate_exact_rational("1/2+1/2").is_ok());
+    }
+
+    #[test]
+    fn groebner_no_lineal_usa_buchberger_real() {
+        // Tasks.md línea 73: el stub 2×2 murió; el círculo ∩ recta da base
+        // real (elimina x, queda cuadrática en y), sin texto "no implementado".
+        let base = groebner_basis_typed(
+            &["x^2+y^2-1".to_string(), "x-y".to_string()],
+            &["x".to_string(), "y".to_string()],
+        );
+        match base {
+            MathResult::Exact(texto) => {
+                assert!(!texto.contains("no implementado"), "sin stub: {texto}");
+                assert!(
+                    texto.contains('y'),
+                    "la base habla de y (elimina x): {texto}"
+                );
+            }
+            otro => panic!("esperaba base exacta, llegó {otro:?}"),
+        }
+    }
+
+    #[test]
+    fn groebner_lineal_2x2_sigue_exacta() {
+        // La vía rápida lineal no se tocó: sigue triangular en x e y.
+        let base = groebner_basis_typed(
+            &["x+y-1".to_string(), "x-y".to_string()],
+            &["x".to_string(), "y".to_string()],
+        );
+        match base {
+            MathResult::Exact(texto) => {
+                assert!(
+                    texto.contains('x') && texto.contains('y'),
+                    "triangular en x e y: {texto}"
+                );
+            }
+            otro => panic!("esperaba base exacta, llegó {otro:?}"),
+        }
+    }
+
+    #[test]
+    fn groebner_no_polinomio_da_error_honesto() {
+        // `sin` no es polinomio: Buchberger lo rechaza con error tipado,
+        // jamás con una pseudo-base ni con el stub viejo.
+        let base = groebner_basis_typed(
+            &["sin(x)+y".to_string(), "x-y".to_string()],
+            &["x".to_string(), "y".to_string()],
+        );
+        assert!(
+            matches!(
+                base,
+                MathResult::Unsupported(_) | MathResult::DomainError(_)
+            ),
+            "trig no es polinomio: {base:?}"
+        );
+    }
+
+    #[test]
+    fn groebner_sin_variables_da_error_honesto() {
+        // Sin variables declaradas no hay ideal: error tipado, no stub.
+        let base = groebner_single_typed("x");
+        assert!(
+            !matches!(base, MathResult::Exact(_)),
+            "sin variables no hay base: {base:?}"
+        );
+    }
+
+    #[test]
+    fn expand_memo_shares_repeated_subtrees() {
+        // `(x+1)*(x+1)`: los dos factores son el mismo subárbol.
+        let ast = parse_ast("(x+1)*(x+1)").expect("parse");
+        let mut budget = ExpandBudget::default();
+        let mut memo = ExpandMemo::new();
+        let terms = expand_expr_memo(&ast, &mut budget, &mut memo).expect("expande");
+        assert!(!terms.is_empty());
+        assert!(memo.hits >= 1, "sin aciertos de memo: {}", memo.hits);
+        // La vía pública da lo correcto: (3+1)^2 = 16.
+        let public = expand("(x+1)*(x+1)").expect("vía pública");
+        let value = parse_ast(&public.replace(' ', ""))
+            .expect("re-parse")
+            .eval_at("x", 3.0);
+        assert!((value - 16.0).abs() < 1e-9, "got {public}");
+    }
+
+    #[test]
+    fn expand_memo_preserves_budget_errors() {
+        // Sobre-presupuesto sigue siendo error honesto con memo activo.
+        assert!(expand("(x+1)^200000").is_err());
+        // Huellas distintas no colisionan en la práctica: sondas intactas.
+        let a = parse_ast("x+1").expect("a");
+        let b = parse_ast("x+2").expect("b");
+        assert!(!a.structurally_eq(&b));
+        assert_ne!(expr_fingerprint(&a), expr_fingerprint(&b));
+    }
+
+    // --- Frente G1: sumas en forma cerrada ---
+
+    fn sum_valor(expr: &str, var: &str, lo: i64, hi: i64) -> f64 {
+        match sum_closed(expr, var, lo, hi) {
+            MathResult::Exact(text) => text.parse::<f64>().expect("suma numérica"),
+            otro => panic!("se esperaba Exact, llegó {otro:?}"),
+        }
+    }
+
+    #[test]
+    fn sum_constante_y_variable() {
+        // Σ_{k=1..5} 3 = 15
+        assert!((sum_valor("3", "k", 1, 5) - 15.0).abs() < 1e-9);
+        // Σ_{k=1..10} k = 55
+        assert!((sum_valor("k", "k", 1, 10) - 55.0).abs() < 1e-9);
+        // Σ_{k=-2..2} k = 0
+        assert!((sum_valor("k", "k", -2, 2) - 0.0).abs() < 1e-9);
+        // Constante simbólica en otra variable: c·n.
+        match sum_closed("y", "k", 1, 5) {
+            MathResult::Exact(text) => assert_eq!(text, "(y)*5"),
+            otro => panic!("se esperaba Exact, llegó {otro:?}"),
+        }
+    }
+
+    #[test]
+    fn sum_polinomios_faulhaber() {
+        // Σ k² 1..10 = 385 (verificado a mano: 1+4+9+16+25+36+49+64+81+100)
+        assert!((sum_valor("k^2", "k", 1, 10) - 385.0).abs() < 1e-9);
+        // Σ k³ 1..5 = 225 (1+8+27+64+125)
+        assert!((sum_valor("k^3", "k", 1, 5) - 225.0).abs() < 1e-9);
+        // Σ (2k+1) 1..4 = 3+5+7+9 = 24
+        assert!((sum_valor("2*k+1", "k", 1, 4) - 24.0).abs() < 1e-9);
+        // Σ (k+1)^2 0..3 = 1+4+9+16 = 30
+        assert!((sum_valor("(k+1)^2", "k", 0, 3) - 30.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn sum_geometricas() {
+        // Σ 2^k 0..10 = 2047
+        assert!((sum_valor("2^k", "k", 0, 10) - 2047.0).abs() < 1e-9);
+        // Σ 2^k 1..4 = 2+4+8+16 = 30
+        assert!((sum_valor("2^k", "k", 1, 4) - 30.0).abs() < 1e-9);
+        // Σ 3·2^k 0..3 = 3·15 = 45
+        assert!((sum_valor("3*2^k", "k", 0, 3) - 45.0).abs() < 1e-9);
+        // Σ (1/2)^k 0..2 = 1+0.5+0.25 = 1.75
+        assert!((sum_valor("(1/2)^k", "k", 0, 2) - 1.75).abs() < 1e-9);
+        // Σ (-1)^k 0..4 = 1-1+1-1+1 = 1
+        assert!((sum_valor("(-1)^k", "k", 0, 4) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn sum_telescopicas() {
+        // Σ 1/(k(k+1)) 1..10 = 1 − 1/11 = 10/11
+        let v = sum_valor("1/(k*(k+1))", "k", 1, 10);
+        assert!((v - 10.0 / 11.0).abs() < 1e-9, "vino {v}");
+        // Denominador expandido: 1/(k^2+k) 1..3 = 1−1/4 = 3/4
+        let v2 = sum_valor("1/(k^2+k)", "k", 1, 3);
+        assert!((v2 - 0.75).abs() < 1e-9, "vino {v2}");
+        // Diferencia: Σ ((k+1)^2 − k^2) 1..4 = 25−1 = 24
+        let v3 = sum_valor("(k+1)^2-k^2", "k", 1, 4);
+        assert!((v3 - 24.0).abs() < 1e-9, "vino {v3}");
+    }
+
+    #[test]
+    fn sum_harmonica_es_honesta() {
+        // Σ 1/k no tiene forma elemental: Unsupported, no número inventado.
+        match sum_closed("1/k", "k", 1, 5) {
+            MathResult::Unsupported(_) => {}
+            otro => panic!("se esperaba Unsupported, llegó {otro:?}"),
+        }
+        match sum_closed("1/k^2", "k", 1, 5) {
+            MathResult::Unsupported(_) => {}
+            otro => panic!("se esperaba Unsupported, llegó {otro:?}"),
+        }
+        match sum_closed("sin(k)", "k", 1, 5) {
+            MathResult::Unsupported(_) => {}
+            otro => panic!("se esperaba Unsupported, llegó {otro:?}"),
+        }
+    }
+
+    #[test]
+    fn sum_bordes_honestos() {
+        // hi < lo: dominio.
+        assert!(matches!(
+            sum_closed("k", "k", 5, 1),
+            MathResult::DomainError(MathError::IntervalDomainViolation { .. })
+        ));
+        // Polo telescópico en el rango: 1/(k(k+1)) con k=0 adentro.
+        assert!(matches!(
+            sum_closed("1/(k*(k+1))", "k", 0, 3),
+            MathResult::DomainError(MathError::NonFiniteValue { .. })
+        ));
+        // Variable inválida.
+        assert!(matches!(
+            sum_closed("k", "9k", 1, 3),
+            MathResult::DomainError(MathError::InvalidExpression { .. })
+        ));
+        // Entrada gigante: presupuesto.
+        let larga = "k+".repeat(2000);
+        assert!(matches!(
+            sum_closed(&larga, "k", 1, 3),
+            MathResult::ResourceLimit(MathError::InputTooLarge { .. })
+        ));
+        // Límite fuera de cota.
+        assert!(matches!(
+            sum_closed("k", "k", 0, 2_000_000),
+            MathResult::ResourceLimit(_)
+        ));
+    }
+}

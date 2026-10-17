@@ -1,0 +1,63 @@
+[package]
+name = "grafito-render"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+grafito-core.workspace = true
+grafito-geometry.workspace = true
+grafito-complex = { path = "../grafito-complex" }
+
+wgpu.workspace = true
+glam.workspace = true
+lyon.workspace = true
+bytemuck.workspace = true
+log.workspace = true
+lru.workspace = true
+anyhow.workspace = true
+rayon.workspace = true
+num-complex.workspace = true
+pollster.workspace = true
+
+[dev-dependencies]
+# Sin `html_reports` (ver grafito-anim: plotters fuera de `cargo test`).
+criterion = "0.5"
+wgpu.workspace = true
+# S3 ui-polish: solo para el bench s3_dashed_* de render_scenarios.rs
+# (Shape/Strike reales del loop dashed). Crate ya en el lock vía workspace.
+egui.workspace = true
+
+[[bench]]
+name = "geometry_bench"
+harness = false
+
+[[bench]]
+name = "render_scenarios"
+harness = false
+
+[[bench]]
+name = "ast_cache_acceptance"
+harness = false
+
+[[bench]]
+name = "lighting_cache"
+harness = false
+
+[[bench]]
+name = "cache_keys"
+harness = false
+
+[lints]
+workspace = true
+
+
+[features]
+# GPU timestamp queries (wgpu TIMESTAMP_QUERY) para medir compute passes con
+# wgpu-profiler/puffin. Sin costo en release: con la feature desactivada cada
+# helper de `gpu_timing` compila a no-op y los passes mantienen
+# `timestamp_writes: None`.
+profiling = []

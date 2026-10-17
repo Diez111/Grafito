@@ -1,0 +1,16 @@
+[package]
+name = "grafito-complex"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Mathematical engine for complex variables and conformal mappings in Grafito."
+
+[dependencies]
+serde.workspace = true
+num-complex.workspace = true
+
+[lints]
+workspace = true

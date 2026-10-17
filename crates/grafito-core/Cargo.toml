@@ -1,0 +1,49 @@
+[package]
+name = "grafito-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+grafito-geometry = { path = "../grafito-geometry" }
+grafito-complex = { path = "../grafito-complex" }
+grafito-whiteboard = { path = "../grafito-whiteboard" }
+
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+log.workspace = true
+rstar.workspace = true
+rayon.workspace = true
+num-complex.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+# Sin `html_reports` (ver grafito-anim: plotters fuera de `cargo test`).
+criterion = "0.5"
+geo.workspace = true
+proptest = "1"
+
+[[bench]]
+name = "solver_bench"
+harness = false
+
+[[bench]]
+name = "document_scenarios"
+harness = false
+
+[[bench]]
+name = "p3_implicit_mesh"
+harness = false
+
+[lints]
+workspace = true

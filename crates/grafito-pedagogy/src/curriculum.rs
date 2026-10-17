@@ -1,0 +1,1534 @@
+//! Currículum — mapea niveles a objetivos de aprendizaje (UTN y secundaria).
+
+use crate::level::UTNProgram;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::OnceLock;
+
+/// Objetivo de aprendizaje atómico.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LearningObjective {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    pub program: Option<UTNProgram>,
+    /// Nivel mínimo requerido (ver `PedagogicalLevel::level_value`).
+    #[serde(default = "default_level_min")]
+    pub level_min: u32,
+    /// IDs de LOs prerequisito.
+    #[serde(default)]
+    pub requires: Vec<String>,
+    /// Etiquetas para búsqueda y recomendación.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Horas estimadas de trabajo.
+    #[serde(default = "default_hours")]
+    pub estimated_hours: f32,
+}
+
+fn default_level_min() -> u32 {
+    1
+}
+fn default_hours() -> f32 {
+    2.0
+}
+
+/// LO + campos en minúsculas para búsqueda (caché de `find_for_concept`).
+#[derive(Debug, Clone)]
+struct LoMinusculas {
+    lo: LearningObjective,
+    id_l: String,
+    title_l: String,
+    desc_l: String,
+    tags_l: Vec<String>,
+}
+
+impl LearningObjective {
+    /// Constructor compatible con versión anterior (level_min 1, sin prereqs/tags).
+    pub fn new(
+        id: impl Into<String>,
+        title: impl Into<String>,
+        description: impl Into<String>,
+        program: Option<UTNProgram>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            title: title.into(),
+            description: description.into(),
+            program,
+            level_min: 1,
+            requires: Vec::new(),
+            tags: Vec::new(),
+            estimated_hours: 2.0,
+        }
+    }
+
+    /// Constructor completo.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_full(
+        id: impl Into<String>,
+        title: impl Into<String>,
+        description: impl Into<String>,
+        program: Option<UTNProgram>,
+        level_min: u32,
+        requires: Vec<String>,
+        tags: Vec<String>,
+        estimated_hours: f32,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            title: title.into(),
+            description: description.into(),
+            program,
+            level_min,
+            requires,
+            tags,
+            estimated_hours,
+        }
+    }
+
+    /// Builder: nivel mínimo.
+    pub fn with_level_min(mut self, v: u32) -> Self {
+        self.level_min = v;
+        self
+    }
+    /// Builder: prerequisitos.
+    pub fn with_requires(mut self, r: Vec<String>) -> Self {
+        self.requires = r;
+        self
+    }
+    /// Builder: etiquetas.
+    pub fn with_tags(mut self, t: Vec<String>) -> Self {
+        self.tags = t;
+        self
+    }
+    /// Builder: horas estimadas.
+    pub fn with_hours(mut self, h: f32) -> Self {
+        self.estimated_hours = h;
+        self
+    }
+}
+
+/// Currículum estático — primaria, secundaria y UTN (AM1/AM2/Álgebra/Probabilidad).
+#[derive(Debug, Clone)]
+pub struct Curriculum;
+
+impl Curriculum {
+    // ---- helpers internos para no repetir verbosidad ----
+    #[allow(clippy::too_many_arguments)]
+    fn lo(
+        id: &str,
+        title: &str,
+        desc: &str,
+        program: Option<UTNProgram>,
+        level_min: u32,
+        requires: &[&str],
+        tags: &[&str],
+        hours: f32,
+    ) -> LearningObjective {
+        LearningObjective {
+            id: id.into(),
+            title: title.into(),
+            description: desc.into(),
+            program,
+            level_min,
+            requires: requires.iter().map(|s| (*s).into()).collect(),
+            tags: tags.iter().map(|s| (*s).into()).collect(),
+            estimated_hours: hours,
+        }
+    }
+
+    /// Primaria — 5 LOs.
+    pub fn primary() -> Vec<LearningObjective> {
+        vec![
+            Self::lo(
+                "pri-conteo",
+                "Conteo",
+                "Conteo, números naturales, orden y comparación",
+                None,
+                1,
+                &[],
+                &["conteo", "numeros", "orden", "primaria"],
+                2.0,
+            ),
+            Self::lo(
+                "pri-fracc-vis",
+                "Fracciones visuales",
+                "Fracciones con dibujos, mitad y cuarto, representación pictórica",
+                None,
+                1,
+                &["pri-conteo"],
+                &["fraccion", "visual", "mitad", "primaria"],
+                2.5,
+            ),
+            Self::lo(
+                "pri-perim-area",
+                "Perímetro y área",
+                "Perímetro y área de figuras simples, cuadrados y rectángulos",
+                None,
+                2,
+                &["pri-conteo"],
+                &["perimetro", "area", "geometria", "primaria"],
+                3.0,
+            ),
+            Self::lo(
+                "pri-proporciones",
+                "Proporciones simples",
+                "Doble, mitad, proporcionalidad simple con ejemplos concretos",
+                None,
+                2,
+                &["pri-fracc-vis"],
+                &["proporcion", "doble", "mitad", "primaria"],
+                2.0,
+            ),
+            Self::lo(
+                "pri-datos",
+                "Datos simples",
+                "Tablas, gráficos de barras, promedio simple y recolección de datos",
+                None,
+                2,
+                &["pri-conteo"],
+                &["datos", "tablas", "barras", "primaria", "estadistica"],
+                2.0,
+            ),
+        ]
+    }
+
+    /// Todos los LOs de UTN AM1 (8).
+    pub fn utn_am1() -> Vec<LearningObjective> {
+        vec![
+            Self::lo(
+                "am1-func",
+                "Funciones",
+                "Dominio, imagen, composición, inversa, clasificación",
+                Some(UTNProgram::AM1),
+                10,
+                &[],
+                &["funcion", "dominio", "imagen", "composicion", "inversa"],
+                6.0,
+            ),
+            Self::lo(
+                "am1-lim",
+                "Límites",
+                "Límites laterales, indeterminaciones, asintotas, límites infinitos",
+                Some(UTNProgram::AM1),
+                11,
+                &["am1-func"],
+                &["limite", "asintota", "indeterminacion", "continuidad"],
+                5.0,
+            ),
+            Self::lo(
+                "am1-cont",
+                "Continuidad",
+                "Continuidad, teorema de Bolzano, clasificación de discontinuidades",
+                Some(UTNProgram::AM1),
+                11,
+                &["am1-lim"],
+                &["continuidad", "bolzano", "discontinuidad", "limite"],
+                4.0,
+            ),
+            Self::lo(
+                "am1-der",
+                "Derivadas",
+                "Definición, reglas, recta tangente, extremos, derivada",
+                Some(UTNProgram::AM1),
+                12,
+                &["am1-cont"],
+                &["derivada", "tangente", "extremos", "reglas"],
+                7.0,
+            ),
+            Self::lo(
+                "am1-der-aplic",
+                "Aplicaciones de derivadas",
+                "Crecimiento, concavidad, máximos y mínimos, L'Hôpital, optimización",
+                Some(UTNProgram::AM1),
+                12,
+                &["am1-der"],
+                &[
+                    "derivada",
+                    "optimizacion",
+                    "extremos",
+                    "concavidad",
+                    "lhopital",
+                ],
+                6.0,
+            ),
+            Self::lo(
+                "am1-int",
+                "Integrales",
+                "Primitivas, área, Barrow, impropias, integral definida",
+                Some(UTNProgram::AM1),
+                12,
+                &["am1-der"],
+                &["integral", "primitiva", "barrow", "area", "impropia"],
+                7.0,
+            ),
+            Self::lo(
+                "am1-int-aplic",
+                "Aplicaciones de integrales",
+                "Área entre curvas, volumen de revolución, longitud de arco",
+                Some(UTNProgram::AM1),
+                12,
+                &["am1-int"],
+                &["integral", "area", "volumen", "revolucion", "arco"],
+                5.0,
+            ),
+            Self::lo(
+                "am1-sucesiones",
+                "Sucesiones",
+                "Sucesiones numéricas, convergencia, criterio, límite de sucesión",
+                Some(UTNProgram::AM1),
+                11,
+                &["am1-lim"],
+                &["sucesion", "convergencia", "limite", "numerica"],
+                4.0,
+            ),
+        ]
+    }
+
+    /// UTN AM2 — 9 LOs (incluye EDP y Fourier: huecos que el CAS ya cubre).
+    pub fn utn_am2() -> Vec<LearningObjective> {
+        vec![
+            Self::lo(
+                "am2-edo",
+                "EDO",
+                "Variables separables, lineales, aplicaciones, ecuaciones diferenciales",
+                Some(UTNProgram::AM2),
+                13,
+                &["am1-der", "am1-int"],
+                &["edo", "diferencial", "separable", "lineal"],
+                8.0,
+            ),
+            Self::lo(
+                "am2-series",
+                "Series numéricas",
+                "Criterios de convergencia, series alternadas, geométricas",
+                Some(UTNProgram::AM2),
+                13,
+                &["am1-sucesiones"],
+                &["serie", "convergencia", "numerica", "criterio"],
+                6.0,
+            ),
+            Self::lo(
+                "am2-taylor",
+                "Taylor y Fourier",
+                "Series de Taylor, Fourier, aproximación, convergencia",
+                Some(UTNProgram::AM2),
+                14,
+                &["am2-series"],
+                &["taylor", "fourier", "serie", "aproximacion"],
+                6.0,
+            ),
+            Self::lo(
+                "am2-multivariable",
+                "Cálculo multivariable",
+                "Funciones de varias variables, derivadas parciales, gradiente",
+                Some(UTNProgram::AM2),
+                13,
+                &["am1-der"],
+                &["multivariable", "parcial", "gradiente", "varias variables"],
+                7.0,
+            ),
+            Self::lo(
+                "am2-int-multi",
+                "Integrales dobles y triples",
+                "Integrales dobles, triples, cambio de variables, Jacobiano",
+                Some(UTNProgram::AM2),
+                14,
+                &["am2-multivariable"],
+                &[
+                    "integral",
+                    "doble",
+                    "triple",
+                    "jacobiano",
+                    "cambio variable",
+                ],
+                7.0,
+            ),
+            Self::lo(
+                "am2-campos",
+                "Campos vectoriales",
+                "Campos vectoriales, rotacional, divergencia, potencial",
+                Some(UTNProgram::AM2),
+                14,
+                &["am2-multivariable", "alg-vectores"],
+                &[
+                    "campo",
+                    "vectorial",
+                    "rotacional",
+                    "divergencia",
+                    "gradiente",
+                ],
+                6.0,
+            ),
+            Self::lo(
+                "am2-teoremas",
+                "Teoremas integrales",
+                "Green, Stokes, Gauss (divergencia), aplicaciones",
+                Some(UTNProgram::AM2),
+                14,
+                &["am2-campos", "am2-int-multi"],
+                &["green", "stokes", "gauss", "teorema", "integral"],
+                6.0,
+            ),
+            Self::lo(
+                "am2-edp",
+                "EDP",
+                "Ecuaciones en derivadas parciales, clasificación y separación de variables",
+                Some(UTNProgram::AM2),
+                14,
+                &["am2-edo", "am2-multivariable"],
+                &[
+                    "edp",
+                    "derivadas parciales",
+                    "pde",
+                    "clasificacion",
+                    "separable",
+                ],
+                8.0,
+            ),
+            Self::lo(
+                "am2-fourier",
+                "Series de Fourier",
+                "Series ortogonales, coeficientes y aproximación",
+                Some(UTNProgram::AM2),
+                14,
+                &["am2-series"],
+                &["fourier", "serie de fourier", "ortogonal", "aproximacion"],
+                6.0,
+            ),
+        ]
+    }
+
+    /// UTN Álgebra — 7 LOs.
+    pub fn utn_algebra() -> Vec<LearningObjective> {
+        vec![
+            Self::lo(
+                "alg-vectores",
+                "Vectores",
+                "Vectores en R2/R3, producto escalar y vectorial, norma",
+                Some(UTNProgram::Algebra),
+                11,
+                &["sec-vect"],
+                &["vector", "escalar", "vectorial", "norma", "r2", "r3"],
+                5.0,
+            ),
+            Self::lo(
+                "alg-rectas-planos",
+                "Rectas y planos",
+                "Ecuaciones de rectas y planos, posiciones relativas, distancias",
+                Some(UTNProgram::Algebra),
+                12,
+                &["alg-vectores"],
+                &["recta", "plano", "ecuacion", "posicion", "distancia"],
+                5.0,
+            ),
+            Self::lo(
+                "alg-matrices",
+                "Matrices",
+                "Operaciones, rango, sistemas lineales, Gauss-Jordan",
+                Some(UTNProgram::Algebra),
+                11,
+                &["sec-ec"],
+                &["matriz", "rango", "sistema", "gauss", "lineal"],
+                6.0,
+            ),
+            Self::lo(
+                "alg-determinantes",
+                "Determinantes",
+                "Propiedades, cálculo, matriz inversa, regla de Cramer",
+                Some(UTNProgram::Algebra),
+                12,
+                &["alg-matrices"],
+                &["determinante", "inversa", "cramer", "matriz"],
+                4.0,
+            ),
+            Self::lo(
+                "alg-conicas",
+                "Cónicas",
+                "Circunferencia, elipse, parábola, hipérbola, ecuaciones canónicas",
+                Some(UTNProgram::Algebra),
+                12,
+                &["alg-rectas-planos"],
+                &[
+                    "conica",
+                    "elipse",
+                    "parabola",
+                    "hiperbola",
+                    "circunferencia",
+                ],
+                5.0,
+            ),
+            Self::lo(
+                "alg-transformaciones",
+                "Transformaciones lineales",
+                "Núcleo, imagen, matriz asociada, autovalores y autovectores",
+                Some(UTNProgram::Algebra),
+                13,
+                &["alg-matrices", "alg-determinantes"],
+                &["transformacion", "lineal", "nucleo", "imagen", "autovalor"],
+                6.0,
+            ),
+            Self::lo(
+                "alg-subespacios",
+                "Subespacios",
+                "Subespacios, span, combinación lineal, independencia, base y dimensión",
+                Some(UTNProgram::Algebra),
+                13,
+                &["alg-vectores", "alg-transformaciones"],
+                &[
+                    "subespacio",
+                    "span",
+                    "combinacion lineal",
+                    "base",
+                    "dimension",
+                    "independencia",
+                ],
+                5.0,
+            ),
+        ]
+    }
+
+    /// UTN Probabilidad — 6 LOs.
+    pub fn utn_probabilidad() -> Vec<LearningObjective> {
+        // Alias en inglés para compatibilidad si se usa utn_probability
+        Self::utn_probability()
+    }
+    /// UTN Probabilidad (alias inglés).
+    pub fn utn_probability() -> Vec<LearningObjective> {
+        vec![
+            Self::lo(
+                "prob-basica",
+                "Probabilidad básica",
+                "Espacio muestral, eventos, probabilidad condicional, Bayes",
+                Some(UTNProgram::Probabilidad),
+                11,
+                &["sec-prob"],
+                &["probabilidad", "muestral", "bayes", "condicional", "evento"],
+                5.0,
+            ),
+            Self::lo(
+                "prob-var",
+                "Variables aleatorias",
+                "Variables aleatorias discretas y continuas, esperanza, varianza",
+                Some(UTNProgram::Probabilidad),
+                12,
+                &["prob-basica"],
+                &["variable", "aleatoria", "esperanza", "varianza", "discreta"],
+                5.0,
+            ),
+            Self::lo(
+                "prob-distribuciones",
+                "Distribuciones",
+                "Binomial, Poisson, Normal, exponencial, propiedades",
+                Some(UTNProgram::Probabilidad),
+                12,
+                &["prob-var"],
+                &[
+                    "distribucion",
+                    "binomial",
+                    "poisson",
+                    "normal",
+                    "exponencial",
+                ],
+                6.0,
+            ),
+            Self::lo(
+                "prob-inferencia",
+                "Inferencia estadística",
+                "Estimación puntual, intervalos de confianza, test de hipótesis",
+                Some(UTNProgram::Probabilidad),
+                13,
+                &["prob-distribuciones"],
+                &[
+                    "inferencia",
+                    "estimacion",
+                    "confianza",
+                    "hipotesis",
+                    "intervalo",
+                ],
+                6.0,
+            ),
+            Self::lo(
+                "prob-regresion",
+                "Regresión",
+                "Regresión lineal, correlación, mínimos cuadrados, predicción",
+                Some(UTNProgram::Probabilidad),
+                13,
+                &["prob-distribuciones"],
+                &["regresion", "correlacion", "lineal", "minimos cuadrados"],
+                5.0,
+            ),
+            Self::lo(
+                "prob-muestreo",
+                "Muestreo",
+                "Técnicas de muestreo, teorema central del límite, distribuciones muestrales",
+                Some(UTNProgram::Probabilidad),
+                13,
+                &["prob-inferencia"],
+                &["muestreo", "central limite", "muestral", "tecnica"],
+                4.0,
+            ),
+        ]
+    }
+
+    /// Secundaria — 12 LOs (incluye `sec-pitagoras`).
+    pub fn secondary() -> Vec<LearningObjective> {
+        vec![
+            Self::lo(
+                "sec-fracc",
+                "Fracciones",
+                "Operaciones con fracciones, simplificación, fracciones equivalentes",
+                None,
+                4,
+                &["pri-fracc-vis"],
+                &["fraccion", "simplificacion", "equivalente", "secundaria"],
+                3.0,
+            ),
+            Self::lo(
+                "sec-prop",
+                "Proporciones",
+                "Razones, proporciones, regla de tres, porcentaje",
+                None,
+                5,
+                &["sec-fracc"],
+                &["proporcion", "razon", "regla de tres", "porcentaje"],
+                3.0,
+            ),
+            Self::lo(
+                "sec-ec",
+                "Ecuaciones",
+                "Ecuaciones lineales y cuadráticas, sistemas de ecuaciones",
+                None,
+                6,
+                &["sec-prop"],
+                &["ecuacion", "lineal", "cuadratica", "sistema"],
+                4.0,
+            ),
+            Self::lo(
+                "sec-lineal",
+                "Funciones lineales",
+                "Recta, pendiente, ordenada al origen, gráfica de función lineal",
+                None,
+                6,
+                &["sec-ec"],
+                &["funcion", "lineal", "recta", "pendiente", "grafica"],
+                4.0,
+            ),
+            Self::lo(
+                "sec-cuad",
+                "Funciones cuadráticas",
+                "Parábola, vértice, raíces, discriminante, gráfica cuadrática",
+                None,
+                7,
+                &["sec-lineal"],
+                &["funcion", "cuadratica", "parabola", "vertice", "raiz"],
+                4.0,
+            ),
+            Self::lo(
+                "sec-pend",
+                "Pendiente",
+                "Pendiente de recta, tangente intuitiva, inclinación",
+                None,
+                6,
+                &["sec-lineal"],
+                &["pendiente", "recta", "tangente", "inclinacion"],
+                2.0,
+            ),
+            Self::lo(
+                "sec-area",
+                "Área",
+                "Área bajo curva, aproximación, área de figuras",
+                None,
+                6,
+                &["pri-perim-area"],
+                &["area", "curva", "aproximacion", "figura"],
+                2.5,
+            ),
+            Self::lo(
+                "sec-trig",
+                "Trigonometría",
+                "Seno, coseno, círculo unitario, identidades trigonométricas",
+                None,
+                7,
+                &["sec-lineal"],
+                &["trigonometria", "seno", "coseno", "circulo", "identidad"],
+                4.0,
+            ),
+            Self::lo(
+                "sec-vect",
+                "Vectores intro",
+                "Vectores, componentes, suma, noción geométrica",
+                None,
+                6,
+                &["sec-pend"],
+                &["vector", "componente", "suma", "geometrico"],
+                3.0,
+            ),
+            Self::lo(
+                "sec-prob",
+                "Probabilidad básica secundaria",
+                "Eventos, probabilidad simple, diagramas, frecuencia",
+                None,
+                5,
+                &["sec-prop", "pri-datos"],
+                &[
+                    "probabilidad",
+                    "evento",
+                    "diagrama",
+                    "frecuencia",
+                    "secundaria",
+                ],
+                3.0,
+            ),
+            Self::lo(
+                "sec-pitagoras",
+                "Teorema de Pitágoras",
+                "Triángulo rectángulo, catetos e hipotenusa, c²=a²+b², demostración y aplicaciones",
+                None,
+                8,
+                &["sec-area"],
+                &[
+                    "pitagoras",
+                    "triangulo",
+                    "hipotenusa",
+                    "cateto",
+                    "secundaria",
+                    "geometria",
+                ],
+                3.0,
+            ),
+            Self::lo(
+                "sec-fractales",
+                "Fractales",
+                "Autosimilitud, iteración, copo de Koch y dimensión fractal intuitiva",
+                None,
+                8,
+                &["sec-area"],
+                &[
+                    "fractal",
+                    "autosimilitud",
+                    "iteracion",
+                    "koch",
+                    "dimension fractal",
+                    "secundaria",
+                    "geometria",
+                ],
+                3.0,
+            ),
+        ]
+    }
+
+    /// UTN avanzado (análisis complejo / computación simbólica) — 3 LOs.
+    ///
+    /// Huecos del currículum que el CAS ya resuelve (`grafito-geometry`:
+    /// `Residue`, `GroebnerOrdered`/`Eliminate`, `LaplaceDerivative`/
+    /// `LaplaceIntegral` vía `steps_for_op`) y que hasta ahora ningún LO
+    /// referenciaba. `program: None` **honesto**: son transversales AM2/Álgebra,
+    /// no atados a un único programa (Física/Discreta ya tienen sus propios LOs
+    /// en `utn_fisica1/2` y `utn_discreta`).
+    pub fn avanzados() -> Vec<LearningObjective> {
+        vec![
+            Self::lo(
+                "am3-residuos",
+                "Teorema de los residuos",
+                "Función compleja, singularidades, teorema de los residuos y de la argumentación",
+                None,
+                15,
+                &["am2-series", "am1-int"],
+                &[
+                    "residuo",
+                    "residuos",
+                    "contorno",
+                    "complejo",
+                    "singularidad",
+                ],
+                6.0,
+            ),
+            Self::lo(
+                "comp-groebner",
+                "Bases de Gröbner",
+                "Ideal polinomial, criterio de eliminación y órdenes monomiales",
+                None,
+                15,
+                &["alg-matrices"],
+                &["groebner", "gröbner", "buchberger", "eliminacion", "ideal"],
+                6.0,
+            ),
+            Self::lo(
+                "comp-laplace",
+                "Transformada de Laplace",
+                "Transformada directa e inversa, corrimientos y cálculo operacional",
+                None,
+                15,
+                &["am2-edo"],
+                &[
+                    "laplace",
+                    "transformada de laplace",
+                    "transformada",
+                    "operacional",
+                ],
+                6.0,
+            ),
+        ]
+    }
+
+    /// UTN Física I — 6 LOs (cinemática, dinámica, energía, rotación, fluidos).
+    pub fn utn_fisica1() -> Vec<LearningObjective> {
+        vec![
+            Self::lo(
+                "fis1-cinematica",
+                "Cinemática",
+                "MRU, MRUV, tiro oblicuo, movimiento circular",
+                Some(UTNProgram::Fisica1),
+                12,
+                &["am1-der"],
+                &["cinematica", "mru", "mruv", "tiro", "circular"],
+                6.0,
+            ),
+            Self::lo(
+                "fis1-dinamica",
+                "Dinámica",
+                "Leyes de Newton, rozamiento, plano inclinado",
+                Some(UTNProgram::Fisica1),
+                12,
+                &["fis1-cinematica"],
+                &["newton", "fuerza", "rozamiento", "dinamica"],
+                6.0,
+            ),
+            Self::lo(
+                "fis1-energia",
+                "Trabajo y energía",
+                "Trabajo, potencia, energía cinética/potencial, conservación",
+                Some(UTNProgram::Fisica1),
+                12,
+                &["fis1-dinamica", "am1-int"],
+                &["energia", "trabajo", "potencia", "conservacion"],
+                5.0,
+            ),
+            Self::lo(
+                "fis1-momento",
+                "Momento lineal y choques",
+                "Impulso, cantidad de movimiento, choques elásticos/inelásticos",
+                Some(UTNProgram::Fisica1),
+                12,
+                &["fis1-energia"],
+                &["momento", "choque", "impulso", "colision"],
+                5.0,
+            ),
+            Self::lo(
+                "fis1-rotacion",
+                "Rotación y equilibrio",
+                "Cinemática angular, torque, momento de inercia, equilibrio del sólido",
+                Some(UTNProgram::Fisica1),
+                13,
+                &["fis1-dinamica", "alg-vectores"],
+                &["rotacion", "torque", "inercia", "equilibrio", "angular"],
+                6.0,
+            ),
+            Self::lo(
+                "fis1-fluidos",
+                "Fluidos y oscilaciones",
+                "Hidrostática, Bernoulli, MAS, péndulo, ondas mecánicas",
+                Some(UTNProgram::Fisica1),
+                12,
+                &["fis1-energia"],
+                &["fluido", "bernoulli", "mas", "pendulo", "onda"],
+                5.0,
+            ),
+        ]
+    }
+
+    /// UTN Física II — 6 LOs (electro, magnetismo, ondas, óptica, termo).
+    pub fn utn_fisica2() -> Vec<LearningObjective> {
+        vec![
+            Self::lo(
+                "fis2-electro",
+                "Electrostática",
+                "Ley de Coulomb, campo y potencial eléctrico, Gauss, capacitores",
+                Some(UTNProgram::Fisica2),
+                14,
+                &["fis1-energia", "am2-int-multi"],
+                &[
+                    "coulomb",
+                    "campo electrico",
+                    "gauss",
+                    "potencial",
+                    "capacitor",
+                ],
+                6.0,
+            ),
+            Self::lo(
+                "fis2-circuitos",
+                "Circuitos CC",
+                "Corriente, resistencia, Kirchhoff, RC transitorio",
+                Some(UTNProgram::Fisica2),
+                14,
+                &["fis2-electro", "am2-edo"],
+                &["circuito", "kirchhoff", "corriente", "resistencia"],
+                5.0,
+            ),
+            Self::lo(
+                "fis2-magnetismo",
+                "Magnetismo e inducción",
+                "Campo B, Lorentz, Ampère, Faraday, Lenz, inductancia",
+                Some(UTNProgram::Fisica2),
+                14,
+                &["fis2-electro", "am2-campos"],
+                &["magnetismo", "faraday", "lorentz", "induccion", "ampere"],
+                6.0,
+            ),
+            Self::lo(
+                "fis2-ondas",
+                "Ondas y óptica",
+                "Ondas EM, interferencia, difracción, óptica geométrica",
+                Some(UTNProgram::Fisica2),
+                14,
+                &["fis1-fluidos", "am2-fourier"],
+                &[
+                    "onda",
+                    "interferencia",
+                    "difraccion",
+                    "optica",
+                    "electromagnetica",
+                ],
+                5.0,
+            ),
+            Self::lo(
+                "fis2-termo",
+                "Termodinámica",
+                "Temperatura, calor, primer/segundo principio, entropía, máquinas",
+                Some(UTNProgram::Fisica2),
+                13,
+                &["fis1-energia", "am1-int"],
+                &["termodinamica", "entropia", "calor", "carnot", "gas"],
+                6.0,
+            ),
+            Self::lo(
+                "fis2-moderna",
+                "Física moderna intro",
+                "Relatividad especial, fotones, átomo de Bohr, noción cuántica",
+                Some(UTNProgram::Fisica2),
+                14,
+                &["fis2-ondas"],
+                &["relatividad", "foton", "bohr", "cuantica", "moderna"],
+                4.0,
+            ),
+        ]
+    }
+
+    /// UTN Matemática Discreta — 6 LOs (lógica, combinatoria, grafos, recurrencias).
+    pub fn utn_discreta() -> Vec<LearningObjective> {
+        vec![
+            Self::lo(
+                "dis-logica",
+                "Lógica proposicional",
+                "Proposiciones, conectivos, tablas de verdad, equivalencias, predicados",
+                Some(UTNProgram::Discreta),
+                11,
+                &[],
+                &[
+                    "logica",
+                    "proposicion",
+                    "verdad",
+                    "equivalencia",
+                    "predicado",
+                ],
+                5.0,
+            ),
+            Self::lo(
+                "dis-conjuntos",
+                "Conjuntos y relaciones",
+                "Operaciones, relaciones de equivalencia/orden, funciones, cardinalidad",
+                Some(UTNProgram::Discreta),
+                11,
+                &["dis-logica"],
+                &[
+                    "conjunto",
+                    "relacion",
+                    "equivalencia",
+                    "funcion",
+                    "cardinalidad",
+                ],
+                5.0,
+            ),
+            Self::lo(
+                "dis-combinatoria",
+                "Combinatoria",
+                "Permutaciones, combinaciones, binomio de Newton, inclusión-exclusión",
+                Some(UTNProgram::Discreta),
+                12,
+                &["dis-conjuntos", "prob-basica"],
+                &[
+                    "combinatoria",
+                    "permutacion",
+                    "combinacion",
+                    "binomio",
+                    "conteo",
+                ],
+                6.0,
+            ),
+            Self::lo(
+                "dis-grafos",
+                "Grafos",
+                "Representación, caminos, Euler/Hamilton, árboles, planaridad",
+                Some(UTNProgram::Discreta),
+                12,
+                &["dis-conjuntos"],
+                &["grafo", "euler", "hamilton", "arbol", "camino"],
+                6.0,
+            ),
+            Self::lo(
+                "dis-recurrencia",
+                "Recurrencias e inducción",
+                "Inducción matemática, relaciones de recurrencia, funciones generatrices",
+                Some(UTNProgram::Discreta),
+                13,
+                &["dis-combinatoria", "am1-sucesiones"],
+                &["recurrencia", "induccion", "generatriz", "sucesion"],
+                6.0,
+            ),
+            Self::lo(
+                "dis-algebra",
+                "Estructuras algebraicas",
+                "Aritmética modular, congruencias, grupos/anillos intro, RSA noción",
+                Some(UTNProgram::Discreta),
+                13,
+                &["dis-logica", "alg-matrices"],
+                &["modular", "congruencia", "grupo", "anillo", "rsa"],
+                5.0,
+            ),
+        ]
+    }
+
+    /// Todos los LOs (primaria + secundaria + UTN + avanzados).
+    ///
+    /// Clon del caché estático (`OnceLock`): misma semántica que construir los
+    /// 7 grupos, sin reconstruir los `String` literales en cada llamada
+    /// (hot path de `get`/`find_for_concept`/`topological_order`/scheduling).
+    pub fn all() -> Vec<LearningObjective> {
+        Self::todo_cache().clone()
+    }
+
+    /// Caché estático del currículum completo (68 LOs, determinista).
+    fn todo_cache() -> &'static Vec<LearningObjective> {
+        static CACHE: OnceLock<Vec<LearningObjective>> = OnceLock::new();
+        CACHE.get_or_init(|| {
+            let mut v = Vec::new();
+            v.extend(Curriculum::primary());
+            v.extend(Curriculum::secondary());
+            v.extend(Curriculum::utn_am1());
+            v.extend(Curriculum::utn_am2());
+            v.extend(Curriculum::utn_algebra());
+            v.extend(Curriculum::utn_probabilidad());
+            v.extend(Curriculum::utn_fisica1());
+            v.extend(Curriculum::utn_fisica2());
+            v.extend(Curriculum::utn_discreta());
+            v.extend(Curriculum::avanzados());
+            v
+        })
+    }
+
+    /// Índice en minúsculas para `find_for_concept` (hot path de búsqueda):
+    /// evita `to_lowercase()` por campo y por LO en cada llamada. Los
+    /// `*_l` son exactamente `campo.to_lowercase()` precomputado, así el
+    /// scoring (`contains` + conteo de tags) es idéntico al original.
+    fn indice_minusculas() -> &'static Vec<LoMinusculas> {
+        static CACHE: OnceLock<Vec<LoMinusculas>> = OnceLock::new();
+        CACHE.get_or_init(|| {
+            Curriculum::todo_cache()
+                .iter()
+                .map(|lo| LoMinusculas {
+                    lo: lo.clone(),
+                    id_l: lo.id.to_lowercase(),
+                    title_l: lo.title.to_lowercase(),
+                    desc_l: lo.description.to_lowercase(),
+                    tags_l: lo.tags.iter().map(|t| t.to_lowercase()).collect(),
+                })
+                .collect()
+        })
+    }
+
+    /// Obtiene un LO por id (sin reconstruir los 68 LOs: busca en el caché).
+    pub fn get(id: &str) -> Option<LearningObjective> {
+        Self::todo_cache().iter().find(|lo| lo.id == id).cloned()
+    }
+
+    /// Prerequisitos directos de un LO (solo los que existen en el currículum).
+    pub fn prerequisites_for(id: &str) -> Vec<LearningObjective> {
+        match Self::get(id) {
+            Some(lo) => lo
+                .requires
+                .iter()
+                .filter_map(|req| Self::get(req))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// LOs desbloqueados para un nivel numérico dado.
+    pub fn all_unlocked_for_level(level: u32) -> Vec<LearningObjective> {
+        Self::todo_cache()
+            .iter()
+            .filter(|lo| lo.level_min <= level)
+            .cloned()
+            .collect()
+    }
+
+    /// Orden topológico (Kahn). Error si hay ciclo.
+    /// Ola 1: mapas `BTreeMap` deterministas — el orden no depende del hash
+    /// aleatorio del proceso (los niveles cero ya se ordenaban; ahora también
+    /// las adyacencias e índices).
+    ///
+    /// El currículum es estático: se ordena el slice cacheado sin clonar
+    /// `all()` primero (mismo resultado que antes, sin el `Vec` intermedio).
+    pub fn topological_order() -> Result<Vec<LearningObjective>, String> {
+        Self::orden_topologico_de(Self::todo_cache())
+    }
+
+    /// Kahn sobre un slice arbitrario (el corazón testeable de
+    /// [`Self::topological_order`]): ciclos y self-loops dan `Err`, los
+    /// prerequisitos ausentes del slice se ignoran (arista solo si ambos
+    /// extremos existen, igual que en el currículum real).
+    pub fn orden_topologico_de(
+        los: &[LearningObjective],
+    ) -> Result<Vec<LearningObjective>, String> {
+        let mut id_to_lo: BTreeMap<String, LearningObjective> = BTreeMap::new();
+        for lo in los {
+            id_to_lo.insert(lo.id.clone(), lo.clone());
+        }
+        let mut indegree: BTreeMap<String, usize> = BTreeMap::new();
+        let mut adj: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for lo in los {
+            indegree.entry(lo.id.clone()).or_insert(0);
+        }
+        for lo in los {
+            for req in &lo.requires {
+                if id_to_lo.contains_key(req) {
+                    // arista req -> lo.id
+                    if let Some(d) = indegree.get_mut(&lo.id) {
+                        *d += 1;
+                    }
+                    adj.entry(req.clone()).or_default().push(lo.id.clone());
+                }
+            }
+        }
+        let mut queue: VecDeque<String> = VecDeque::new();
+        let mut zero: Vec<String> = indegree
+            .iter()
+            .filter_map(|(k, &v)| if v == 0 { Some(k.clone()) } else { None })
+            .collect();
+        zero.sort();
+        for z in zero {
+            queue.push_back(z);
+        }
+        let mut result = Vec::new();
+        let mut visited = 0usize;
+        while let Some(id) = queue.pop_front() {
+            visited += 1;
+            if let Some(lo) = id_to_lo.get(&id) {
+                result.push(lo.clone());
+            }
+            if let Some(neigh) = adj.get(&id) {
+                let mut newly_zero = Vec::new();
+                for n in neigh {
+                    if let Some(d) = indegree.get_mut(n) {
+                        if *d > 0 {
+                            *d -= 1;
+                        }
+                        if *d == 0 {
+                            newly_zero.push(n.clone());
+                        }
+                    }
+                }
+                newly_zero.sort();
+                for nz in newly_zero {
+                    queue.push_back(nz);
+                }
+            }
+        }
+        if visited != los.len() {
+            return Err("ciclo detectado en prerequisitos del currículum".into());
+        }
+        Ok(result)
+    }
+
+    /// Busca LOs que contengan el concepto (case-insensitive, substring en tags+título+descripción+id).
+    /// Retorna ordenado por relevancia (cantidad de campos/tags que matchean).
+    ///
+    /// Usa el índice en minúsculas (mismo scoring que antes, sin
+    /// `to_lowercase()` por LO en cada llamada).
+    pub fn find_for_concept(concept: &str) -> Vec<LearningObjective> {
+        let q = concept.to_lowercase();
+        let q = q.trim().to_string();
+        if q.is_empty() {
+            return Vec::new();
+        }
+        let mut scored: Vec<(usize, LearningObjective)> = Self::indice_minusculas()
+            .iter()
+            .filter_map(|e| {
+                let mut score = 0usize;
+                if e.title_l.contains(&q) {
+                    score += 1;
+                }
+                if e.desc_l.contains(&q) {
+                    score += 1;
+                }
+                if e.id_l.contains(&q) {
+                    score += 1;
+                }
+                let tag_matches = e.tags_l.iter().filter(|t| t.contains(&q)).count();
+                score += tag_matches;
+                if score > 0 {
+                    Some((score, e.lo.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.title.cmp(&b.1.title)));
+        scored.into_iter().map(|(_, lo)| lo).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn find_deriva_returns_am1_der() {
+        let los = Curriculum::find_for_concept("deriv");
+        assert!(los.iter().any(|lo| lo.id == "am1-der"));
+    }
+    #[test]
+    fn find_tags_taylor() {
+        let los = Curriculum::find_for_concept("taylor");
+        assert!(los.iter().any(|lo| lo.id == "am2-taylor"));
+        // debe venir primero el que tiene tag taylor
+        assert_eq!(los[0].id, "am2-taylor");
+    }
+    #[test]
+    fn find_case_insensitive() {
+        let los = Curriculum::find_for_concept("DERIVADA");
+        assert!(!los.is_empty());
+    }
+    #[test]
+    fn all_has_at_least_30() {
+        assert!(Curriculum::all().len() >= 30);
+    }
+    #[test]
+    fn all_counts() {
+        assert_eq!(Curriculum::primary().len(), 5);
+        assert_eq!(Curriculum::secondary().len(), 12);
+        assert_eq!(Curriculum::utn_am1().len(), 8);
+        assert_eq!(Curriculum::utn_am2().len(), 9);
+        assert_eq!(Curriculum::utn_algebra().len(), 7);
+        assert_eq!(Curriculum::utn_probabilidad().len(), 6);
+        assert_eq!(Curriculum::utn_fisica1().len(), 6);
+        assert_eq!(Curriculum::utn_fisica2().len(), 6);
+        assert_eq!(Curriculum::utn_discreta().len(), 6);
+        assert_eq!(Curriculum::avanzados().len(), 3);
+        assert_eq!(Curriculum::all().len(), 68);
+    }
+    #[test]
+    fn get_and_prereqs() {
+        let lo = Curriculum::get("am1-der").expect("debe existir");
+        assert_eq!(lo.id, "am1-der");
+        let prereqs = Curriculum::prerequisites_for("am1-der");
+        assert!(prereqs.iter().any(|p| p.id == "am1-cont"));
+        assert!(Curriculum::get("no-existe").is_none());
+        assert!(Curriculum::prerequisites_for("no-existe").is_empty());
+    }
+    #[test]
+    fn topological_no_cycle() {
+        let order = Curriculum::topological_order().expect("sin ciclo");
+        assert_eq!(order.len(), Curriculum::all().len());
+        // verificar orden: cada prereq aparece antes
+        let mut pos: BTreeMap<String, usize> = BTreeMap::new();
+        for (i, lo) in order.iter().enumerate() {
+            pos.insert(lo.id.clone(), i);
+        }
+        for lo in Curriculum::all() {
+            let p = pos[&lo.id];
+            for req in lo.requires {
+                if let Some(&rp) = pos.get(&req) {
+                    assert!(rp < p, "prereq {} debe estar antes que {}", req, lo.id);
+                }
+            }
+        }
+    }
+    #[test]
+    fn topological_order_es_determinista() {
+        // Ola 1: dos corridas deben dar el mismo orden byte a byte
+        // (BTreeMap en Kahn, sin dependencia del hash aleatorio).
+        let a = Curriculum::topological_order().expect("sin ciclo");
+        let b = Curriculum::topological_order().expect("sin ciclo");
+        let ids_a: Vec<&str> = a.iter().map(|lo| lo.id.as_str()).collect();
+        let ids_b: Vec<&str> = b.iter().map(|lo| lo.id.as_str()).collect();
+        assert_eq!(ids_a, ids_b, "el orden topológico debe ser estable");
+    }
+    #[test]
+    fn kahn_detecta_ciclo_self_loop_y_ordena_diamante() {
+        // Ciclo de 2: debe dar Err, no colgar ni devolver orden parcial.
+        let a =
+            LearningObjective::new("t-a", "A", "D", None).with_requires(vec!["t-b".to_string()]);
+        let b =
+            LearningObjective::new("t-b", "B", "D", None).with_requires(vec!["t-a".to_string()]);
+        let err = Curriculum::orden_topologico_de(&[a, b]).expect_err("ciclo de 2");
+        assert!(err.contains("ciclo"), "{err}");
+        // Self-loop: también es ciclo.
+        let s =
+            LearningObjective::new("t-s", "S", "D", None).with_requires(vec!["t-s".to_string()]);
+        let err_s =
+            Curriculum::orden_topologico_de(std::slice::from_ref(&s)).expect_err("self-loop");
+        assert!(err_s.contains("ciclo"), "{err_s}");
+        // Diamante válido: respeta aristas y es determinista.
+        let base = LearningObjective::new("t-base", "Base", "D", None);
+        let izq = LearningObjective::new("t-izq", "Izq", "D", None)
+            .with_requires(vec!["t-base".to_string()]);
+        let der = LearningObjective::new("t-der", "Der", "D", None)
+            .with_requires(vec!["t-base".to_string()]);
+        let cima = LearningObjective::new("t-cima", "Cima", "D", None)
+            .with_requires(vec!["t-izq".to_string(), "t-der".to_string()]);
+        let orden = Curriculum::orden_topologico_de(&[cima.clone(), der.clone(), izq, base])
+            .expect("diamante sin ciclo");
+        assert_eq!(orden.len(), 4);
+        let pos: BTreeMap<&str, usize> = orden
+            .iter()
+            .enumerate()
+            .map(|(i, lo)| (lo.id.as_str(), i))
+            .collect();
+        assert!(pos["t-base"] < pos["t-izq"]);
+        assert!(pos["t-base"] < pos["t-der"]);
+        assert!(pos["t-izq"] < pos["t-cima"]);
+        assert!(pos["t-der"] < pos["t-cima"]);
+        let orden2 = Curriculum::orden_topologico_de(&[cima, der]).expect("subgrafo");
+        assert_eq!(orden2.len(), 2);
+    }
+    #[test]
+    fn unlocked_for_level() {
+        let low = Curriculum::all_unlocked_for_level(2);
+        // primaria desbloqueada, pero no AM1
+        assert!(low.iter().any(|lo| lo.id == "pri-conteo"));
+        assert!(!low.iter().any(|lo| lo.id == "am1-der"));
+        let high = Curriculum::all_unlocked_for_level(15);
+        assert_eq!(high.len(), Curriculum::all().len());
+    }
+    #[test]
+    fn find_order_by_relevance() {
+        // "integral" aparece en varios, pero am1-int debe tener alta relevancia
+        let los = Curriculum::find_for_concept("integral");
+        assert!(los.len() >= 3);
+        // el primero debe tener al menos 2 matches (titulo+tag)
+        let first = &los[0];
+        assert!(
+            first.title.to_lowercase().contains("integral")
+                || first.tags.iter().any(|t| t.contains("integral"))
+        );
+    }
+    #[test]
+    fn new_compat_defaults() {
+        let lo = LearningObjective::new("test", "T", "D", None);
+        assert_eq!(lo.level_min, 1);
+        assert!(lo.requires.is_empty());
+        assert!(lo.tags.is_empty());
+        assert!((lo.estimated_hours - 2.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn los_por_grupo_coinciden_con_los_docs() {
+        // Regresión FIX 11: los docs decían "Secundaria — 11 LOs" y
+        // "UTN Álgebra — 6 LOs" con 12 y 7 reales. El test fija los conteos
+        // para que docs y código no vuelvan a divergir.
+        assert_eq!(Curriculum::primary().len(), 5, "doc: Primaria — 5 LOs");
+        assert_eq!(
+            Curriculum::secondary().len(),
+            12,
+            "doc: Secundaria — 12 LOs"
+        );
+        assert_eq!(Curriculum::utn_am1().len(), 8, "doc: UTN AM1 — 8 LOs");
+        assert_eq!(Curriculum::utn_am2().len(), 9, "doc: UTN AM2 — 9 LOs");
+        assert_eq!(
+            Curriculum::utn_algebra().len(),
+            7,
+            "doc: UTN Álgebra — 7 LOs"
+        );
+        assert_eq!(
+            Curriculum::utn_probabilidad().len(),
+            6,
+            "doc: UTN Probabilidad — 6 LOs"
+        );
+        assert_eq!(
+            Curriculum::utn_fisica1().len(),
+            6,
+            "doc: UTN Física I — 6 LOs"
+        );
+        assert_eq!(
+            Curriculum::utn_fisica2().len(),
+            6,
+            "doc: UTN Física II — 6 LOs"
+        );
+        assert_eq!(
+            Curriculum::utn_discreta().len(),
+            6,
+            "doc: UTN Discreta — 6 LOs"
+        );
+        assert_eq!(
+            Curriculum::avanzados().len(),
+            3,
+            "doc: UTN avanzado — 3 LOs"
+        );
+    }
+
+    #[test]
+    fn curriculum_dag_valido() {
+        // 68 LOs: 5 primaria + 12 secundaria + 8 AM1 + 9 AM2 + 7 Álgebra +
+        // 6 Prob. + 6 Fis1 + 6 Fis2 + 6 Discreta + 3 avanzados (EDP/Fourier/residuos/Gröbner/Laplace ya
+        // cubiertos por el CAS: ver `avanzados`).
+        let todos = Curriculum::all();
+        assert_eq!(todos.len(), 68, "el currículum debe tener 68 LOs");
+        // Sin IDs duplicados.
+        let mut vistos = std::collections::HashSet::new();
+        for lo in &todos {
+            assert!(vistos.insert(lo.id.clone()), "LO duplicado: {}", lo.id);
+            assert!(!lo.title.trim().is_empty(), "título vacío en {}", lo.id);
+            assert!(
+                !lo.description.trim().is_empty(),
+                "descripción vacía en {}",
+                lo.id
+            );
+        }
+        // Todo prerequisito existe (DAG sin dangling).
+        let ids: std::collections::HashSet<&str> = todos.iter().map(|lo| lo.id.as_str()).collect();
+        for lo in &todos {
+            for req in &lo.requires {
+                assert!(
+                    ids.contains(req.as_str()),
+                    "prerequisito '{}' de '{}' no existe",
+                    req,
+                    lo.id
+                );
+            }
+        }
+        // Orden topológico sin ciclos y respeta aristas.
+        let orden = Curriculum::topological_order().expect("sin ciclos");
+        assert_eq!(orden.len(), 68);
+        let mut pos: BTreeMap<String, usize> = BTreeMap::new();
+        for (i, lo) in orden.iter().enumerate() {
+            pos.insert(lo.id.clone(), i);
+        }
+        for lo in &todos {
+            let p = pos[&lo.id];
+            for req in &lo.requires {
+                let rp = pos.get(req).expect("prerequisito en orden");
+                assert!(*rp < p, "prerequisito {req} debe estar antes que {}", lo.id);
+            }
+        }
+    }
+
+    #[test]
+    fn level_min_coherente_con_prerequisitos() {
+        // Coherencia: level_min(dependiente) >= level_min(prerequisito).
+        let todos = Curriculum::all();
+        let por_id: BTreeMap<&str, &LearningObjective> =
+            todos.iter().map(|lo| (lo.id.as_str(), lo)).collect();
+        for lo in &todos {
+            for req in &lo.requires {
+                let pre = por_id.get(req.as_str()).expect("prerequisito debe existir");
+                assert!(
+                    lo.level_min >= pre.level_min,
+                    "level_min incoherente: {} ({}) < prerequisito {} ({})",
+                    lo.id,
+                    lo.level_min,
+                    req,
+                    pre.level_min
+                );
+            }
+            // level_min dentro de rango pedagógico 1..=15.
+            assert!(
+                (1..=15).contains(&lo.level_min),
+                "level_min fuera de rango en {}: {}",
+                lo.id,
+                lo.level_min
+            );
+        }
+        // Hitos por programa: primaria ≤2, secundaria ≤8, AM1 10..=12, AM2 13..=14.
+        let pri_max = Curriculum::primary()
+            .iter()
+            .map(|lo| lo.level_min)
+            .max()
+            .unwrap_or(0);
+        assert!(pri_max <= 2, "primaria level_min máximo {pri_max} > 2");
+        let sec_max = Curriculum::secondary()
+            .iter()
+            .map(|lo| lo.level_min)
+            .max()
+            .unwrap_or(0);
+        assert!(sec_max <= 8, "secundaria level_min máximo {sec_max} > 8");
+        for lo in Curriculum::utn_am1() {
+            assert!(
+                (10..=12).contains(&lo.level_min),
+                "AM1 {} level_min {} fuera de 10..=12",
+                lo.id,
+                lo.level_min
+            );
+        }
+        for lo in Curriculum::utn_am2() {
+            assert!(
+                (13..=14).contains(&lo.level_min),
+                "AM2 {} level_min {} fuera de 13..=14",
+                lo.id,
+                lo.level_min
+            );
+        }
+    }
+    #[test]
+    fn subespacios_y_fractales_en_curriculum() {
+        let sub = Curriculum::get("alg-subespacios").expect("debe existir");
+        assert_eq!(sub.level_min, 13);
+        assert!(sub.requires.contains(&"alg-vectores".to_string()));
+        let fra = Curriculum::get("sec-fractales").expect("debe existir");
+        assert_eq!(fra.level_min, 8);
+        assert!(fra.requires.contains(&"sec-area".to_string()));
+        assert!(Curriculum::find_for_concept("subespacio")
+            .iter()
+            .any(|lo| lo.id == "alg-subespacios"));
+        assert!(Curriculum::find_for_concept("koch")
+            .iter()
+            .any(|lo| lo.id == "sec-fractales"));
+        let prereqs = Curriculum::prerequisites_for("alg-subespacios");
+        assert!(prereqs.iter().any(|p| p.id == "alg-vectores"));
+    }
+
+    #[test]
+    fn los_nuevos_cubren_huecos_del_cas() {
+        // Huecos: el CAS ya resuelve EDP, Fourier, residuos, Gröbner y
+        // Laplace (`grafito-geometry::cas_steps::steps_for_op`) y hasta ahora
+        // ningún LO los referenciaba. Cada uno con level_min, prerequisitos
+        // (DAG) y tags.
+        for (concepto, id, level_min, prereq) in [
+            ("edp", "am2-edp", 14, "am2-edo"),
+            ("fourier", "am2-fourier", 14, "am2-series"),
+            ("residuos", "am3-residuos", 15, "am2-series"),
+            ("groebner", "comp-groebner", 15, "alg-matrices"),
+            ("laplace", "comp-laplace", 15, "am2-edo"),
+        ] {
+            let los = Curriculum::find_for_concept(concepto);
+            assert!(
+                los.iter().any(|lo| lo.id == id),
+                "find_for_concept({concepto:?}) no devuelve {id}"
+            );
+            let lo = Curriculum::get(id).expect("LO nuevo existe");
+            assert_eq!(lo.level_min, level_min, "{id} level_min");
+            assert!(!lo.requires.is_empty(), "{id} sin prerequisitos");
+            assert!(
+                lo.requires.iter().any(|r| r == prereq),
+                "{id} debería requerir {prereq}"
+            );
+            assert!(!lo.tags.is_empty(), "{id} sin tags");
+            assert!(!lo.description.trim().is_empty(), "{id} sin descripción");
+        }
+        // El DAG (Kahn) sigue cerrando con los 5 adentro.
+        let orden = Curriculum::topological_order().expect("sin ciclos");
+        assert_eq!(orden.len(), 68);
+    }
+}

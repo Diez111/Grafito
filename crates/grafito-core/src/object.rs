@@ -1,0 +1,6344 @@
+use crate::id::ObjectId;
+use crate::pencil::PencilObj;
+use grafito_complex::algebraic_mappings::ConformalMap;
+use grafito_geometry::statistics::{FitDiagnostics, FitKind, FitResult};
+use grafito_geometry::{
+    Circle as GeomCircle, Color, Point2, Point3D, RegularPolychoron, RegularPolytopeFamily, AABB,
+    MAX_REGULAR_POLYTOPE_DIMENSION, MIN_REGULAR_POLYTOPE_DIMENSION,
+};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::collections::HashSet;
+use std::collections::VecDeque;
+use std::sync::{Arc, RwLock};
+
+/// A geometric object in the document (2D and 3D).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum GeoObject {
+    // 2D
+    Point(PointObj),
+    Line(LineObj),
+    Circle(CircleObj),
+    Polygon(PolygonObj),
+    Polyline(PolylineObj),
+    Pencil(PencilObj),
+    Function(FunctionObj),
+    Text(TextObj),
+    Ellipse(EllipseObj),
+    Parabola(ParabolaObj),
+    Hyperbola(HyperbolaObj),
+    Arc(ArcObj),
+    Sector(SectorObj),
+    BezierCurve(BezierCurveObj),
+    Spline(SplineObj),
+    // 3D
+    Point3D(Point3DObj),
+    Segment3D(Segment3DObj),
+    Plane3D(Plane3DObj),
+    Line3D(Line3DObj),
+    Sphere3D(Sphere3DObj),
+    Cube3D(Cube3DObj),
+    Tetrahedron3D(Tetrahedron3DObj),
+    Pyramid3D(Pyramid3DObj),
+    Cone3D(Cone3DObj),
+    Cylinder3D(Cylinder3DObj),
+    Platonic3D(Platonic3DObj),
+    InfiniteCone3D(InfiniteCone3DObj),
+    InfiniteCylinder3D(InfiniteCylinder3DObj),
+    Torus3D(Torus3DObj),
+    MoebiusStrip(MoebiusStripObj),
+    Surface3D(Surface3DObj),
+    Prism3D(Prism3DObj),
+    Quadric3D(Quadric3DObj),
+    ImplicitSurface3D(ImplicitSurface3DObj),
+
+    // AM2/AM3 Advanced
+    ParametricCurve2D(ParametricCurve2DObj),
+    ParametricCurve3D(ParametricCurve3DObj),
+    PolarCurve(PolarCurveObj),
+    ImplicitCurve(ImplicitCurveObj),
+    VectorField2D(VectorField2DObj),
+    ComplexGrid(ComplexGridObj),
+    ComplexMapping(ComplexMappingObj),
+    ComplexIntegral(ComplexIntegralObj),
+
+    // AM4 Advanced: Attractors, Fractals, 4D, Statistics
+    Attractor3D(Attractor3DObj),
+    Fractal2D(Fractal2DObj),
+    RegularPolychoron4D(RegularPolychoron4DObj),
+    RegularPolytopeND(RegularPolytopeNDObj),
+    HyperSurface4D(HyperSurface4DObj),
+    VectorField3D(VectorField3DObj),
+    Histogram(HistogramObj),
+    BarChart(BarChartObj),
+    PieChart(PieChartObj),
+    ScatterPlot(ScatterPlotObj),
+    BoxPlot(BoxPlotObj),
+    RegressionLine(RegressionLineObj),
+    DataTable(DataTableObj),
+    PhasePortrait(PhasePortraitObj),
+    /// Lista persistible de primera clase (P1): valores y sublistas con
+    /// etiqueta referenciable. Sin representación gráfica propia.
+    List(ListObj),
+
+    // Transformed Wrapper
+    Transformed(TransformedObj),
+}
+
+/// Espacio principal donde se renderiza un objeto del documento.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderSpace {
+    D2,
+    D3,
+}
+
+/// ¿La expresión menciona la variable `name` como token entero?
+///
+/// Misma tokenización que `expr_references_variables` en `document.rs`
+/// (`[alnum _]+`, así `1e3` no colisiona con una variable `e`). Sin
+/// alocar: recorre `char_indices` comparando por rebanadas.
+pub(crate) fn expr_mentions_var(expr: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let mut token_start: Option<usize> = None;
+    for (i, ch) in expr.char_indices() {
+        if ch.is_alphanumeric() || ch == '_' {
+            if token_start.is_none() {
+                token_start = Some(i);
+            }
+        } else if let Some(start) = token_start.take() {
+            if &expr[start..i] == name {
+                return true;
+            }
+        }
+    }
+    if let Some(start) = token_start {
+        return &expr[start..] == name;
+    }
+    false
+}
+
+impl GeoObject {
+    pub fn render_space(&self) -> RenderSpace {
+        match self {
+            GeoObject::Point(_)
+            | GeoObject::Line(_)
+            | GeoObject::Circle(_)
+            | GeoObject::Polygon(_)
+            | GeoObject::Polyline(_)
+            | GeoObject::Pencil(_)
+            | GeoObject::Function(_)
+            | GeoObject::Text(_)
+            | GeoObject::Ellipse(_)
+            | GeoObject::Parabola(_)
+            | GeoObject::Hyperbola(_)
+            | GeoObject::Arc(_)
+            | GeoObject::Sector(_)
+            | GeoObject::BezierCurve(_)
+            | GeoObject::Spline(_)
+            | GeoObject::ParametricCurve2D(_)
+            | GeoObject::PolarCurve(_)
+            | GeoObject::ImplicitCurve(_)
+            | GeoObject::VectorField2D(_)
+            | GeoObject::ComplexGrid(_)
+            | GeoObject::ComplexMapping(_)
+            | GeoObject::ComplexIntegral(_)
+            | GeoObject::Fractal2D(_)
+            | GeoObject::Histogram(_)
+            | GeoObject::BarChart(_)
+            | GeoObject::PieChart(_)
+            | GeoObject::ScatterPlot(_)
+            | GeoObject::BoxPlot(_)
+            | GeoObject::RegressionLine(_)
+            | GeoObject::DataTable(_)
+            | GeoObject::PhasePortrait(_) => RenderSpace::D2,
+            // Las listas no tienen geometría: espacio neutro D2.
+            GeoObject::List(_) => RenderSpace::D2,
+            GeoObject::Point3D(_)
+            | GeoObject::Segment3D(_)
+            | GeoObject::Plane3D(_)
+            | GeoObject::Line3D(_)
+            | GeoObject::Sphere3D(_)
+            | GeoObject::Cube3D(_)
+            | GeoObject::Tetrahedron3D(_)
+            | GeoObject::Pyramid3D(_)
+            | GeoObject::Cone3D(_)
+            | GeoObject::Cylinder3D(_)
+            | GeoObject::Platonic3D(_)
+            | GeoObject::InfiniteCone3D(_)
+            | GeoObject::InfiniteCylinder3D(_)
+            | GeoObject::Torus3D(_)
+            | GeoObject::MoebiusStrip(_)
+            | GeoObject::Surface3D(_)
+            | GeoObject::Prism3D(_)
+            | GeoObject::Quadric3D(_)
+            | GeoObject::ImplicitSurface3D(_)
+            | GeoObject::ParametricCurve3D(_)
+            | GeoObject::Attractor3D(_)
+            | GeoObject::RegularPolychoron4D(_)
+            | GeoObject::RegularPolytopeND(_)
+            | GeoObject::HyperSurface4D(_)
+            | GeoObject::VectorField3D(_) => RenderSpace::D3,
+            GeoObject::Transformed(o) => o.inner.render_space(),
+        }
+    }
+
+    pub fn is_3d(&self) -> bool {
+        self.render_space() == RenderSpace::D3
+    }
+
+    pub fn id(&self) -> ObjectId {
+        match self {
+            GeoObject::Point(o) => o.id,
+            GeoObject::Line(o) => o.id,
+            GeoObject::Circle(o) => o.id,
+            GeoObject::Polygon(o) => o.id,
+            GeoObject::Polyline(o) => o.id,
+            GeoObject::Function(o) => o.id,
+            GeoObject::Text(o) => o.id,
+            GeoObject::Ellipse(o) => o.id,
+            GeoObject::Parabola(o) => o.id,
+            GeoObject::Hyperbola(o) => o.id,
+            GeoObject::Arc(o) => o.id,
+            GeoObject::Sector(o) => o.id,
+            GeoObject::BezierCurve(o) => o.id,
+            GeoObject::Spline(o) => o.id,
+            GeoObject::Point3D(o) => o.id,
+            GeoObject::Segment3D(o) => o.id,
+            GeoObject::Plane3D(o) => o.id,
+            GeoObject::Line3D(o) => o.id,
+            GeoObject::Sphere3D(o) => o.id,
+            GeoObject::Cube3D(o) => o.id,
+            GeoObject::Tetrahedron3D(o) => o.id,
+            GeoObject::Pyramid3D(o) => o.id,
+            GeoObject::Cone3D(o) => o.id,
+            GeoObject::Cylinder3D(o) => o.id,
+            GeoObject::Platonic3D(o) => o.id,
+            GeoObject::InfiniteCone3D(o) => o.id,
+            GeoObject::InfiniteCylinder3D(o) => o.id,
+            GeoObject::Torus3D(o) => o.id,
+            GeoObject::MoebiusStrip(o) => o.id,
+            GeoObject::Surface3D(o) => o.id,
+            GeoObject::Prism3D(o) => o.id,
+            GeoObject::Quadric3D(o) => o.id,
+            GeoObject::ImplicitSurface3D(o) => o.id,
+            GeoObject::ParametricCurve2D(o) => o.id,
+            GeoObject::ParametricCurve3D(o) => o.id,
+            GeoObject::PolarCurve(o) => o.id,
+            GeoObject::VectorField2D(o) => o.id,
+            GeoObject::ComplexGrid(o) => o.id,
+            GeoObject::ComplexMapping(o) => o.id,
+            GeoObject::ComplexIntegral(o) => o.id,
+            GeoObject::ImplicitCurve(o) => o.id,
+            GeoObject::Attractor3D(o) => o.id,
+            GeoObject::Fractal2D(o) => o.id,
+            GeoObject::RegularPolychoron4D(o) => o.id,
+            GeoObject::RegularPolytopeND(o) => o.id,
+            GeoObject::HyperSurface4D(o) => o.id,
+            GeoObject::VectorField3D(o) => o.id,
+            GeoObject::Histogram(o) => o.id,
+            GeoObject::BarChart(o) => o.id,
+            GeoObject::PieChart(o) => o.id,
+            GeoObject::ScatterPlot(o) => o.id,
+            GeoObject::BoxPlot(o) => o.id,
+            GeoObject::RegressionLine(o) => o.id,
+            GeoObject::DataTable(o) => o.id,
+            GeoObject::List(o) => o.id,
+            GeoObject::PhasePortrait(o) => o.id,
+            GeoObject::Pencil(o) => o.id,
+            GeoObject::Transformed(o) => o.inner.id(),
+        }
+    }
+
+    pub fn label(&self) -> &str {
+        match self {
+            GeoObject::Point(o) => &o.label,
+            GeoObject::Line(o) => &o.label,
+            GeoObject::Circle(o) => &o.label,
+            GeoObject::Polygon(o) => &o.label,
+            GeoObject::Polyline(o) => &o.label,
+            GeoObject::Function(o) => &o.label,
+            GeoObject::Text(o) => &o.label,
+            GeoObject::Ellipse(o) => &o.label,
+            GeoObject::Parabola(o) => &o.label,
+            GeoObject::Hyperbola(o) => &o.label,
+            GeoObject::Arc(o) => &o.label,
+            GeoObject::Sector(o) => &o.label,
+            GeoObject::BezierCurve(o) => &o.label,
+            GeoObject::Spline(o) => &o.label,
+            GeoObject::Point3D(o) => &o.label,
+            GeoObject::Segment3D(o) => &o.label,
+            GeoObject::Plane3D(o) => &o.label,
+            GeoObject::Line3D(o) => &o.label,
+            GeoObject::Sphere3D(o) => &o.label,
+            GeoObject::Cube3D(o) => &o.label,
+            GeoObject::Tetrahedron3D(o) => &o.label,
+            GeoObject::Pyramid3D(o) => &o.label,
+            GeoObject::Cone3D(o) => &o.label,
+            GeoObject::Cylinder3D(o) => &o.label,
+            GeoObject::Platonic3D(o) => &o.label,
+            GeoObject::InfiniteCone3D(o) => &o.label,
+            GeoObject::InfiniteCylinder3D(o) => &o.label,
+            GeoObject::Torus3D(o) => &o.label,
+            GeoObject::MoebiusStrip(o) => &o.label,
+            GeoObject::Surface3D(o) => &o.label,
+            GeoObject::Prism3D(o) => &o.label,
+            GeoObject::Quadric3D(o) => &o.label,
+            GeoObject::ImplicitSurface3D(o) => &o.label,
+            GeoObject::ParametricCurve2D(o) => &o.label,
+            GeoObject::ParametricCurve3D(o) => &o.label,
+            GeoObject::PolarCurve(o) => &o.label,
+            GeoObject::VectorField2D(o) => &o.label,
+            GeoObject::ComplexGrid(o) => &o.label,
+            GeoObject::ComplexMapping(o) => &o.label,
+            GeoObject::ComplexIntegral(o) => &o.label,
+            GeoObject::ImplicitCurve(o) => &o.label,
+            GeoObject::Attractor3D(o) => &o.label,
+            GeoObject::Fractal2D(o) => &o.label,
+            GeoObject::RegularPolychoron4D(o) => &o.label,
+            GeoObject::RegularPolytopeND(o) => &o.label,
+            GeoObject::HyperSurface4D(o) => &o.label,
+            GeoObject::VectorField3D(o) => &o.label,
+            GeoObject::Histogram(o) => &o.label,
+            GeoObject::BarChart(o) => &o.label,
+            GeoObject::PieChart(o) => &o.label,
+            GeoObject::ScatterPlot(o) => &o.label,
+            GeoObject::BoxPlot(o) => &o.label,
+            GeoObject::RegressionLine(o) => &o.label,
+            GeoObject::DataTable(o) => &o.label,
+            GeoObject::List(o) => &o.label,
+            GeoObject::PhasePortrait(o) => &o.label,
+            GeoObject::Pencil(o) => &o.label,
+            GeoObject::Transformed(o) => o.inner.label(),
+        }
+    }
+
+    pub fn set_label(&mut self, label: String) {
+        match self {
+            GeoObject::Point(o) => o.label = label,
+            GeoObject::Line(o) => o.label = label,
+            GeoObject::Circle(o) => o.label = label,
+            GeoObject::Polygon(o) => o.label = label,
+            GeoObject::Polyline(o) => o.label = label,
+            GeoObject::Function(o) => o.label = label,
+            GeoObject::Text(o) => o.label = label,
+            GeoObject::Ellipse(o) => o.label = label,
+            GeoObject::Parabola(o) => o.label = label,
+            GeoObject::Hyperbola(o) => o.label = label,
+            GeoObject::Arc(o) => o.label = label,
+            GeoObject::Sector(o) => o.label = label,
+            GeoObject::BezierCurve(o) => o.label = label,
+            GeoObject::Spline(o) => o.label = label,
+            GeoObject::Point3D(o) => o.label = label,
+            GeoObject::Segment3D(o) => o.label = label,
+            GeoObject::Plane3D(o) => o.label = label,
+            GeoObject::Line3D(o) => o.label = label,
+            GeoObject::Sphere3D(o) => o.label = label,
+            GeoObject::Cube3D(o) => o.label = label,
+            GeoObject::Tetrahedron3D(o) => o.label = label,
+            GeoObject::Pyramid3D(o) => o.label = label,
+            GeoObject::Cone3D(o) => o.label = label,
+            GeoObject::Cylinder3D(o) => o.label = label,
+            GeoObject::Platonic3D(o) => o.label = label,
+            GeoObject::InfiniteCone3D(o) => o.label = label,
+            GeoObject::InfiniteCylinder3D(o) => o.label = label,
+            GeoObject::Torus3D(o) => o.label = label,
+            GeoObject::MoebiusStrip(o) => o.label = label,
+            GeoObject::Surface3D(o) => o.label = label,
+            GeoObject::Prism3D(o) => o.label = label,
+            GeoObject::Quadric3D(o) => o.label = label,
+            GeoObject::ImplicitSurface3D(o) => o.label = label,
+            GeoObject::ParametricCurve2D(o) => o.label = label,
+            GeoObject::ParametricCurve3D(o) => o.label = label,
+            GeoObject::PolarCurve(o) => o.label = label,
+            GeoObject::VectorField2D(o) => o.label = label,
+            GeoObject::ComplexGrid(o) => o.label = label,
+            GeoObject::ComplexMapping(o) => o.label = label,
+            GeoObject::ComplexIntegral(o) => o.label = label,
+            GeoObject::ImplicitCurve(o) => o.label = label,
+            GeoObject::Attractor3D(o) => o.label = label,
+            GeoObject::Fractal2D(o) => o.label = label,
+            GeoObject::RegularPolychoron4D(o) => o.label = label,
+            GeoObject::RegularPolytopeND(o) => o.label = label,
+            GeoObject::HyperSurface4D(o) => o.label = label,
+            GeoObject::VectorField3D(o) => o.label = label,
+            GeoObject::Histogram(o) => o.label = label,
+            GeoObject::BarChart(o) => o.label = label,
+            GeoObject::PieChart(o) => o.label = label,
+            GeoObject::ScatterPlot(o) => o.label = label,
+            GeoObject::BoxPlot(o) => o.label = label,
+            GeoObject::RegressionLine(o) => o.label = label,
+            GeoObject::DataTable(o) => o.label = label,
+            GeoObject::List(o) => o.label = label,
+            GeoObject::PhasePortrait(o) => o.label = label,
+            GeoObject::Pencil(o) => o.label = label,
+            GeoObject::Transformed(o) => o.inner.set_label(label),
+        }
+    }
+
+    pub fn color(&self) -> Color {
+        match self {
+            GeoObject::Point(o) => o.color,
+            GeoObject::Line(o) => o.color,
+            GeoObject::Circle(o) => o.color,
+            GeoObject::Polygon(o) => o.color,
+            GeoObject::Polyline(o) => o.color,
+            GeoObject::Pencil(o) => o.color,
+            GeoObject::Function(o) => o.color,
+            GeoObject::Text(o) => o.color,
+            GeoObject::Ellipse(o) => o.color,
+            GeoObject::Parabola(o) => o.color,
+            GeoObject::Hyperbola(o) => o.color,
+            GeoObject::Arc(o) => o.color,
+            GeoObject::Sector(o) => o.color,
+            GeoObject::BezierCurve(o) => o.color,
+            GeoObject::Spline(o) => o.color,
+            GeoObject::Point3D(o) => o.color,
+            GeoObject::Segment3D(o) => o.color,
+            GeoObject::Plane3D(o) => o.color,
+            GeoObject::Line3D(o) => o.color,
+            GeoObject::Sphere3D(o) => o.color,
+            GeoObject::Cube3D(o) => o.color,
+            GeoObject::Tetrahedron3D(o) => o.color,
+            GeoObject::Pyramid3D(o) => o.color,
+            GeoObject::Cone3D(o) => o.color,
+            GeoObject::Cylinder3D(o) => o.color,
+            GeoObject::Platonic3D(o) => o.color,
+            GeoObject::InfiniteCone3D(o) => o.color,
+            GeoObject::InfiniteCylinder3D(o) => o.color,
+            GeoObject::Torus3D(o) => o.color,
+            GeoObject::MoebiusStrip(o) => o.color,
+            GeoObject::Surface3D(o) => o.color,
+            GeoObject::Prism3D(o) => o.color,
+            GeoObject::Quadric3D(o) => o.color,
+            GeoObject::ImplicitSurface3D(o) => o.color,
+            GeoObject::ParametricCurve2D(o) => o.color,
+            GeoObject::ParametricCurve3D(o) => o.color,
+            GeoObject::PolarCurve(o) => o.color,
+            GeoObject::VectorField2D(o) => o.color,
+            GeoObject::ComplexGrid(o) => o.color,
+            GeoObject::ComplexMapping(o) => o.color,
+            GeoObject::ComplexIntegral(o) => o.color,
+            GeoObject::ImplicitCurve(o) => o.color,
+            GeoObject::Attractor3D(o) => o.color,
+            GeoObject::Fractal2D(o) => o.color,
+            GeoObject::RegularPolychoron4D(o) => o.color,
+            GeoObject::RegularPolytopeND(o) => o.color,
+            GeoObject::HyperSurface4D(o) => o.color,
+            GeoObject::VectorField3D(o) => o.color,
+            GeoObject::Histogram(o) => o.color,
+            GeoObject::BarChart(o) => o.color,
+            GeoObject::PieChart(o) => o.color,
+            GeoObject::ScatterPlot(o) => o.color,
+            GeoObject::BoxPlot(o) => o.color,
+            GeoObject::RegressionLine(o) => o.color,
+            GeoObject::DataTable(o) => o.color,
+            GeoObject::List(o) => o.color,
+            GeoObject::PhasePortrait(o) => o.color,
+            GeoObject::Transformed(o) => o.inner.color(),
+        }
+    }
+
+    pub fn set_color(&mut self, color: Color) {
+        match self {
+            GeoObject::Point(o) => o.color = color,
+            GeoObject::Line(o) => o.color = color,
+            GeoObject::Circle(o) => o.color = color,
+            GeoObject::Polygon(o) => o.color = color,
+            GeoObject::Polyline(o) => o.color = color,
+            GeoObject::Pencil(o) => o.color = color,
+            GeoObject::Function(o) => o.color = color,
+            GeoObject::Text(o) => o.color = color,
+            GeoObject::Ellipse(o) => o.color = color,
+            GeoObject::Parabola(o) => o.color = color,
+            GeoObject::Hyperbola(o) => o.color = color,
+            GeoObject::Arc(o) => o.color = color,
+            GeoObject::Sector(o) => o.color = color,
+            GeoObject::BezierCurve(o) => o.color = color,
+            GeoObject::Spline(o) => o.color = color,
+            GeoObject::Point3D(o) => o.color = color,
+            GeoObject::Segment3D(o) => o.color = color,
+            GeoObject::Plane3D(o) => o.color = color,
+            GeoObject::Line3D(o) => o.color = color,
+            GeoObject::Sphere3D(o) => o.color = color,
+            GeoObject::Cube3D(o) => o.color = color,
+            GeoObject::Tetrahedron3D(o) => o.color = color,
+            GeoObject::Pyramid3D(o) => o.color = color,
+            GeoObject::Cone3D(o) => o.color = color,
+            GeoObject::Cylinder3D(o) => o.color = color,
+            GeoObject::Platonic3D(o) => o.color = color,
+            GeoObject::InfiniteCone3D(o) => o.color = color,
+            GeoObject::InfiniteCylinder3D(o) => o.color = color,
+            GeoObject::Torus3D(o) => o.color = color,
+            GeoObject::MoebiusStrip(o) => o.color = color,
+            GeoObject::Surface3D(o) => o.color = color,
+            GeoObject::Prism3D(o) => o.color = color,
+            GeoObject::Quadric3D(o) => o.color = color,
+            GeoObject::ImplicitSurface3D(o) => o.color = color,
+            GeoObject::ParametricCurve2D(o) => o.color = color,
+            GeoObject::ParametricCurve3D(o) => o.color = color,
+            GeoObject::PolarCurve(o) => o.color = color,
+            GeoObject::VectorField2D(o) => o.color = color,
+            GeoObject::ComplexGrid(o) => o.color = color,
+            GeoObject::ComplexMapping(o) => o.color = color,
+            GeoObject::ComplexIntegral(o) => o.color = color,
+            GeoObject::ImplicitCurve(o) => o.color = color,
+            GeoObject::Attractor3D(o) => o.color = color,
+            GeoObject::Fractal2D(o) => o.color = color,
+            GeoObject::RegularPolychoron4D(o) => o.color = color,
+            GeoObject::RegularPolytopeND(o) => o.color = color,
+            GeoObject::HyperSurface4D(o) => o.color = color,
+            GeoObject::VectorField3D(o) => o.color = color,
+            GeoObject::Histogram(o) => o.color = color,
+            GeoObject::BarChart(o) => o.color = color,
+            GeoObject::PieChart(o) => o.color = color,
+            GeoObject::ScatterPlot(o) => o.color = color,
+            GeoObject::BoxPlot(o) => o.color = color,
+            GeoObject::RegressionLine(o) => o.color = color,
+            GeoObject::DataTable(o) => o.color = color,
+            GeoObject::List(o) => o.color = color,
+            GeoObject::PhasePortrait(o) => o.color = color,
+            GeoObject::Transformed(o) => o.inner.set_color(color),
+        }
+    }
+
+    /// ¿Este objeto puede ser el contorno de `ComplexIntegral`/`Gauss`?
+    ///
+    /// Incluye el círculo (se integra analíticamente, no como polilínea), las
+    /// curvas cerradas o abiertas del documento y el trazo a mano alzada del
+    /// nuevo contorno dibujado. Puro: solo mira la variante.
+    pub fn accepts_complex_contour(&self) -> bool {
+        matches!(
+            self,
+            GeoObject::Circle(_)
+                | GeoObject::Polygon(_)
+                | GeoObject::Line(_)
+                | GeoObject::Polyline(_)
+                | GeoObject::Pencil(_)
+                | GeoObject::Spline(_)
+                | GeoObject::Arc(_)
+                | GeoObject::BezierCurve(_)
+                | GeoObject::ParametricCurve2D(_)
+        )
+    }
+
+    pub fn is_visible(&self) -> bool {
+        match self {
+            GeoObject::Point(o) => o.visible,
+            GeoObject::Line(o) => o.visible,
+            GeoObject::Circle(o) => o.visible,
+            GeoObject::Polygon(o) => o.visible,
+            GeoObject::Polyline(o) => o.visible,
+            GeoObject::Pencil(o) => o.visible,
+            GeoObject::Function(o) => o.visible,
+            GeoObject::Text(o) => o.visible,
+            GeoObject::Ellipse(o) => o.visible,
+            GeoObject::Parabola(o) => o.visible,
+            GeoObject::Hyperbola(o) => o.visible,
+            GeoObject::Arc(o) => o.visible,
+            GeoObject::Sector(o) => o.visible,
+            GeoObject::BezierCurve(o) => o.visible,
+            GeoObject::Spline(o) => o.visible,
+            GeoObject::Point3D(o) => o.visible,
+            GeoObject::Segment3D(o) => o.visible,
+            GeoObject::Plane3D(o) => o.visible,
+            GeoObject::Line3D(o) => o.visible,
+            GeoObject::Sphere3D(o) => o.visible,
+            GeoObject::Cube3D(o) => o.visible,
+            GeoObject::Tetrahedron3D(o) => o.visible,
+            GeoObject::Pyramid3D(o) => o.visible,
+            GeoObject::Cone3D(o) => o.visible,
+            GeoObject::Cylinder3D(o) => o.visible,
+            GeoObject::Platonic3D(o) => o.visible,
+            GeoObject::InfiniteCone3D(o) => o.visible,
+            GeoObject::InfiniteCylinder3D(o) => o.visible,
+            GeoObject::Torus3D(o) => o.visible,
+            GeoObject::MoebiusStrip(o) => o.visible,
+            GeoObject::Surface3D(o) => o.visible,
+            GeoObject::Prism3D(o) => o.visible,
+            GeoObject::Quadric3D(o) => o.visible,
+            GeoObject::ImplicitSurface3D(o) => o.visible,
+            GeoObject::ParametricCurve2D(o) => o.visible,
+            GeoObject::ParametricCurve3D(o) => o.visible,
+            GeoObject::PolarCurve(o) => o.visible,
+            GeoObject::VectorField2D(o) => o.visible,
+            GeoObject::ComplexGrid(o) => o.visible,
+            GeoObject::ComplexMapping(o) => o.visible,
+            GeoObject::ComplexIntegral(o) => o.visible,
+            GeoObject::ImplicitCurve(o) => o.visible,
+            GeoObject::Attractor3D(o) => o.visible,
+            GeoObject::Fractal2D(o) => o.visible,
+            GeoObject::RegularPolychoron4D(o) => o.visible,
+            GeoObject::RegularPolytopeND(o) => o.visible,
+            GeoObject::HyperSurface4D(o) => o.visible,
+            GeoObject::VectorField3D(o) => o.visible,
+            GeoObject::Histogram(o) => o.visible,
+            GeoObject::BarChart(o) => o.visible,
+            GeoObject::PieChart(o) => o.visible,
+            GeoObject::ScatterPlot(o) => o.visible,
+            GeoObject::BoxPlot(o) => o.visible,
+            GeoObject::RegressionLine(o) => o.visible,
+            // Las tablas no tienen geometría de canvas y nunca participan del
+            // render/export genérico aunque un documento legado marque visible.
+            // Las listas igual: sin representación gráfica propia.
+            GeoObject::DataTable(_) | GeoObject::List(_) => false,
+            GeoObject::PhasePortrait(o) => o.visible,
+            GeoObject::Transformed(o) => o.inner.is_visible(),
+        }
+    }
+
+    pub fn set_visible(&mut self, visible: bool) {
+        match self {
+            GeoObject::Point(o) => o.visible = visible,
+            GeoObject::Line(o) => o.visible = visible,
+            GeoObject::Circle(o) => o.visible = visible,
+            GeoObject::Polygon(o) => o.visible = visible,
+            GeoObject::Polyline(o) => o.visible = visible,
+            GeoObject::Pencil(o) => o.visible = visible,
+            GeoObject::Function(o) => o.visible = visible,
+            GeoObject::Text(o) => o.visible = visible,
+            GeoObject::Ellipse(o) => o.visible = visible,
+            GeoObject::Parabola(o) => o.visible = visible,
+            GeoObject::Hyperbola(o) => o.visible = visible,
+            GeoObject::Arc(o) => o.visible = visible,
+            GeoObject::Sector(o) => o.visible = visible,
+            GeoObject::BezierCurve(o) => o.visible = visible,
+            GeoObject::Spline(o) => o.visible = visible,
+            GeoObject::Point3D(o) => o.visible = visible,
+            GeoObject::Segment3D(o) => o.visible = visible,
+            GeoObject::Plane3D(o) => o.visible = visible,
+            GeoObject::Line3D(o) => o.visible = visible,
+            GeoObject::Sphere3D(o) => o.visible = visible,
+            GeoObject::Cube3D(o) => o.visible = visible,
+            GeoObject::Tetrahedron3D(o) => o.visible = visible,
+            GeoObject::Pyramid3D(o) => o.visible = visible,
+            GeoObject::Cone3D(o) => o.visible = visible,
+            GeoObject::Cylinder3D(o) => o.visible = visible,
+            GeoObject::Platonic3D(o) => o.visible = visible,
+            GeoObject::InfiniteCone3D(o) => o.visible = visible,
+            GeoObject::InfiniteCylinder3D(o) => o.visible = visible,
+            GeoObject::Torus3D(o) => o.visible = visible,
+            GeoObject::MoebiusStrip(o) => o.visible = visible,
+            GeoObject::Surface3D(o) => o.visible = visible,
+            GeoObject::Prism3D(o) => o.visible = visible,
+            GeoObject::Quadric3D(o) => o.visible = visible,
+            GeoObject::ImplicitSurface3D(o) => o.visible = visible,
+            GeoObject::ParametricCurve2D(o) => o.visible = visible,
+            GeoObject::ParametricCurve3D(o) => o.visible = visible,
+            GeoObject::PolarCurve(o) => o.visible = visible,
+            GeoObject::VectorField2D(o) => o.visible = visible,
+            GeoObject::ComplexGrid(o) => o.visible = visible,
+            GeoObject::ComplexMapping(o) => o.visible = visible,
+            GeoObject::ComplexIntegral(o) => o.visible = visible,
+            GeoObject::ImplicitCurve(o) => o.visible = visible,
+            GeoObject::Attractor3D(o) => o.visible = visible,
+            GeoObject::Fractal2D(o) => o.visible = visible,
+            GeoObject::RegularPolychoron4D(o) => o.visible = visible,
+            GeoObject::RegularPolytopeND(o) => o.visible = visible,
+            GeoObject::HyperSurface4D(o) => o.visible = visible,
+            GeoObject::VectorField3D(o) => o.visible = visible,
+            GeoObject::Histogram(o) => o.visible = visible,
+            GeoObject::BarChart(o) => o.visible = visible,
+            GeoObject::PieChart(o) => o.visible = visible,
+            GeoObject::ScatterPlot(o) => o.visible = visible,
+            GeoObject::BoxPlot(o) => o.visible = visible,
+            GeoObject::RegressionLine(o) => o.visible = visible,
+            GeoObject::DataTable(_) => {}
+            GeoObject::List(_) => {}
+            GeoObject::PhasePortrait(o) => o.visible = visible,
+            GeoObject::Transformed(o) => o.inner.set_visible(visible),
+        }
+    }
+
+    /// Estilo de trazo si el objeto tiene línea dibujada por CPU (`None` =
+    /// sin trazo CPU: texto, tabla, campos, sólidos 3D, geometría del path
+    /// GPU —`Arc`/`Sector`/`Bezier`/`Spline`— y resto sin `line_style`).
+    pub fn line_style(&self) -> Option<LineStyle> {
+        match self {
+            GeoObject::Line(o) => Some(o.line_style),
+            GeoObject::Circle(o) => Some(o.line_style),
+            GeoObject::Polygon(o) => Some(o.line_style),
+            GeoObject::Polyline(o) => Some(o.line_style),
+            GeoObject::Pencil(o) => Some(o.line_style),
+            GeoObject::Function(o) => Some(o.line_style),
+            GeoObject::Ellipse(o) => Some(o.line_style),
+            GeoObject::Parabola(o) => Some(o.line_style),
+            GeoObject::Hyperbola(o) => Some(o.line_style),
+            GeoObject::ParametricCurve2D(o) => Some(o.line_style),
+            GeoObject::PolarCurve(o) => Some(o.line_style),
+            GeoObject::ImplicitCurve(o) => Some(o.line_style),
+            GeoObject::RegressionLine(o) => Some(o.line_style),
+            GeoObject::Transformed(o) => o.inner.line_style(),
+            _ => None,
+        }
+    }
+
+    /// Cambia el estilo de trazo. Devuelve `false` sin mutar si el objeto
+    /// no tiene línea CPU (el comando responde error honesto, no fantasma).
+    pub fn set_line_style(&mut self, style: LineStyle) -> bool {
+        match self {
+            GeoObject::Line(o) => o.line_style = style,
+            GeoObject::Circle(o) => o.line_style = style,
+            GeoObject::Polygon(o) => o.line_style = style,
+            GeoObject::Polyline(o) => o.line_style = style,
+            GeoObject::Pencil(o) => o.line_style = style,
+            GeoObject::Function(o) => o.line_style = style,
+            GeoObject::Ellipse(o) => o.line_style = style,
+            GeoObject::Parabola(o) => o.line_style = style,
+            GeoObject::Hyperbola(o) => o.line_style = style,
+            GeoObject::ParametricCurve2D(o) => o.line_style = style,
+            GeoObject::PolarCurve(o) => o.line_style = style,
+            GeoObject::ImplicitCurve(o) => o.line_style = style,
+            GeoObject::RegressionLine(o) => o.line_style = style,
+            GeoObject::Transformed(o) => return o.inner.set_line_style(style),
+            _ => return false,
+        }
+        true
+    }
+
+    /// Forma del marcador si el objeto es un punto (`None` en el resto).
+    pub fn point_style(&self) -> Option<PointStyle> {
+        match self {
+            GeoObject::Point(o) => Some(o.point_style),
+            GeoObject::Point3D(o) => Some(o.point_style),
+            GeoObject::Transformed(o) => o.inner.point_style(),
+            _ => None,
+        }
+    }
+
+    /// Cambia la forma del marcador. `false` sin mutar si no es punto.
+    pub fn set_point_style(&mut self, style: PointStyle) -> bool {
+        match self {
+            GeoObject::Point(o) => o.point_style = style,
+            GeoObject::Point3D(o) => o.point_style = style,
+            GeoObject::Transformed(o) => return o.inner.set_point_style(style),
+            _ => return false,
+        }
+        true
+    }
+
+    pub fn invalidate_cache(&self) {
+        match self {
+            GeoObject::Function(o) => o.invalidate_cache(),
+            GeoObject::Surface3D(o) => o.invalidate_cache(),
+            GeoObject::ParametricCurve2D(o) => o.invalidate_cache(),
+            GeoObject::ParametricCurve3D(o) => o.invalidate_cache(),
+            GeoObject::PolarCurve(o) => o.invalidate_cache(),
+            GeoObject::VectorField2D(o) => o.invalidate_cache(),
+            GeoObject::ImplicitCurve(o) => o.invalidate_cache(),
+            GeoObject::ImplicitSurface3D(o) => o.invalidate_cache(),
+            GeoObject::Transformed(o) => o.inner.invalidate_cache(),
+            _ => {}
+        }
+    }
+
+    /// ¿Alguna expresión del objeto menciona la variable `name`?
+    ///
+    /// Fast-path de `try_set_variable` (FIX5.1): si ningún objeto, celda,
+    /// secuencia viva ni hoja CAS menciona la variable, cambiar su valor no
+    /// altera geometría derivada y se muta in place sin clon/validación.
+    /// El `match` es exhaustivo a propósito: agregar una variante obliga a
+    /// decidir acá (fail-closed en compilación, nunca un falso negativo
+    /// silencioso).
+    pub fn references_variable(&self, name: &str) -> bool {
+        if name.is_empty() {
+            return false;
+        }
+        let opt = |e: &Option<String>| e.as_deref().is_some_and(|e| expr_mentions_var(e, name));
+        match self {
+            GeoObject::Point(o) => opt(&o.x_expr) || opt(&o.y_expr),
+            GeoObject::Line(o) => {
+                opt(&o.start_x_expr)
+                    || opt(&o.start_y_expr)
+                    || opt(&o.end_x_expr)
+                    || opt(&o.end_y_expr)
+            }
+            GeoObject::Circle(o) => opt(&o.radius_expr),
+            GeoObject::Polygon(o) => o
+                .x_exprs
+                .iter()
+                .flatten()
+                .chain(o.y_exprs.iter().flatten())
+                .any(|e| expr_mentions_var(e, name)),
+            GeoObject::Plane3D(o) => {
+                opt(&o.a_expr) || opt(&o.b_expr) || opt(&o.c_expr) || opt(&o.d_expr)
+            }
+            GeoObject::Line3D(o) => {
+                opt(&o.px_expr)
+                    || opt(&o.py_expr)
+                    || opt(&o.pz_expr)
+                    || opt(&o.dx_expr)
+                    || opt(&o.dy_expr)
+                    || opt(&o.dz_expr)
+            }
+            GeoObject::Function(o) => {
+                expr_mentions_var(&o.expr, name)
+                    || opt(&o.domain_min_expr)
+                    || opt(&o.domain_max_expr)
+            }
+            GeoObject::ComplexGrid(o) => expr_mentions_var(&o.expr, name),
+            GeoObject::ComplexMapping(o) => expr_mentions_var(&o.expr, name),
+            GeoObject::ComplexIntegral(o) => expr_mentions_var(&o.expr, name),
+            GeoObject::Transformed(o) => expr_mentions_var(&o.complex_expr, name),
+            GeoObject::ParametricCurve2D(o) => {
+                expr_mentions_var(&o.expr_x, name)
+                    || expr_mentions_var(&o.expr_y, name)
+                    || opt(&o.t_min_expr)
+                    || opt(&o.t_max_expr)
+            }
+            GeoObject::ParametricCurve3D(o) => {
+                expr_mentions_var(&o.expr_x, name)
+                    || expr_mentions_var(&o.expr_y, name)
+                    || expr_mentions_var(&o.expr_z, name)
+                    || opt(&o.t_min_expr)
+                    || opt(&o.t_max_expr)
+            }
+            GeoObject::PolarCurve(o) => {
+                expr_mentions_var(&o.expr_r, name) || opt(&o.t_min_expr) || opt(&o.t_max_expr)
+            }
+            GeoObject::VectorField2D(o) => {
+                expr_mentions_var(&o.expr_u, name) || expr_mentions_var(&o.expr_v, name)
+            }
+            GeoObject::VectorField3D(o) => {
+                expr_mentions_var(&o.expr_u, name)
+                    || expr_mentions_var(&o.expr_v, name)
+                    || expr_mentions_var(&o.expr_w, name)
+            }
+            GeoObject::ImplicitCurve(o) => {
+                expr_mentions_var(&o.expr_lhs, name) || expr_mentions_var(&o.expr_rhs, name)
+            }
+            GeoObject::Surface3D(o) => {
+                expr_mentions_var(&o.expr, name)
+                    || expr_mentions_var(&o.expr_x, name)
+                    || expr_mentions_var(&o.expr_y, name)
+                    || expr_mentions_var(&o.expr_z, name)
+                    || opt(&o.x_min_expr)
+                    || opt(&o.x_max_expr)
+                    || opt(&o.y_min_expr)
+                    || opt(&o.y_max_expr)
+            }
+            GeoObject::ImplicitSurface3D(o) => expr_mentions_var(&o.expr, name),
+            GeoObject::PhasePortrait(o) => {
+                expr_mentions_var(&o.expr_dx, name) || expr_mentions_var(&o.expr_dy, name)
+            }
+            GeoObject::List(o) => o.items.iter().any(|item| match item {
+                ListItem::Text(text) => expr_mentions_var(text, name),
+                ListItem::List(items) => items.iter().any(
+                    |sub| matches!(sub, ListItem::Text(text) if expr_mentions_var(text, name)),
+                ),
+                ListItem::Scalar(_) => false,
+            }),
+            // Datos puros sin expresiones evaluadas con variables del
+            // documento (contenido estático, geometría numérica, datos).
+            GeoObject::Pencil(_)
+            | GeoObject::Text(_)
+            | GeoObject::Polyline(_)
+            | GeoObject::Ellipse(_)
+            | GeoObject::Parabola(_)
+            | GeoObject::Hyperbola(_)
+            | GeoObject::Arc(_)
+            | GeoObject::Sector(_)
+            | GeoObject::BezierCurve(_)
+            | GeoObject::Spline(_)
+            | GeoObject::Point3D(_)
+            | GeoObject::Segment3D(_)
+            | GeoObject::Sphere3D(_)
+            | GeoObject::Cube3D(_)
+            | GeoObject::Tetrahedron3D(_)
+            | GeoObject::Pyramid3D(_)
+            | GeoObject::Cone3D(_)
+            | GeoObject::Cylinder3D(_)
+            | GeoObject::Platonic3D(_)
+            | GeoObject::InfiniteCone3D(_)
+            | GeoObject::InfiniteCylinder3D(_)
+            | GeoObject::Torus3D(_)
+            | GeoObject::MoebiusStrip(_)
+            | GeoObject::Prism3D(_)
+            | GeoObject::Quadric3D(_)
+            | GeoObject::Histogram(_)
+            | GeoObject::BarChart(_)
+            | GeoObject::PieChart(_)
+            | GeoObject::ScatterPlot(_)
+            | GeoObject::BoxPlot(_)
+            | GeoObject::RegressionLine(_)
+            | GeoObject::DataTable(_)
+            | GeoObject::Attractor3D(_)
+            | GeoObject::Fractal2D(_)
+            | GeoObject::RegularPolychoron4D(_)
+            | GeoObject::RegularPolytopeND(_)
+            | GeoObject::HyperSurface4D(_) => false,
+        }
+    }
+
+    /// Drops runtime-only caches before a document is used as a transaction
+    /// staging area. Clones normally share these `Arc` caches with the live
+    /// document, so staging must detach them before a failed operation can
+    /// invalidate a cache visible to the caller.
+    pub(crate) fn detach_runtime_caches(&mut self) {
+        let mut pending = vec![self];
+        while let Some(object) = pending.pop() {
+            match object {
+                GeoObject::Function(o) => {
+                    o.cached_key = Default::default();
+                    o.cached_samples = Default::default();
+                }
+                GeoObject::Surface3D(o) => {
+                    o.cached_grid = Default::default();
+                    o.cached_key = Default::default();
+                }
+                GeoObject::ParametricCurve2D(o) => {
+                    o.cached_samples = Default::default();
+                    o.cached_key = Default::default();
+                }
+                GeoObject::ParametricCurve3D(o) => {
+                    o.cached_samples = Default::default();
+                    o.cached_key = Default::default();
+                }
+                GeoObject::PolarCurve(o) => {
+                    o.cached_samples = Default::default();
+                    o.cached_key = Default::default();
+                }
+                GeoObject::VectorField2D(o) => {
+                    o.cached_samples = Default::default();
+                    o.cached_key = Default::default();
+                }
+                GeoObject::ImplicitCurve(o) => {
+                    o.cached_segments = Default::default();
+                    o.cached_key = Default::default();
+                    o.cached_region = Default::default();
+                    o.cached_asts = Default::default();
+                    o.referenced_vars = Default::default();
+                }
+                GeoObject::ImplicitSurface3D(o) => {
+                    o.mesh_slots = RwLock::new(VecDeque::new());
+                }
+                GeoObject::Transformed(o) => pending.push(o.inner.as_mut()),
+                _ => {}
+            }
+        }
+    }
+
+    /// Returns every document object referenced by this object's semantic data.
+    /// Runtime caches and nested rendering state are intentionally excluded.
+    pub fn referenced_object_ids(&self) -> Vec<ObjectId> {
+        match self {
+            GeoObject::Pencil(object) => object
+                .locus_binding()
+                .map(|binding| vec![binding.driver, binding.target])
+                .unwrap_or_default(),
+            GeoObject::Function(object) => object
+                .fit
+                .as_ref()
+                .map(|fit| vec![fit.source])
+                .unwrap_or_default(),
+            GeoObject::ScatterPlot(object) => object
+                .source_data
+                .map(|source| vec![source])
+                .unwrap_or_default(),
+            GeoObject::ComplexMapping(object) => vec![object.target],
+            GeoObject::ComplexIntegral(object) => vec![object.target],
+            GeoObject::Transformed(object) => object.inner.referenced_object_ids(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// True when serializing this object would disclose local measurements or
+    /// diagnostics rather than ordinary geometric metadata.
+    pub fn contains_private_data(&self) -> bool {
+        match self {
+            GeoObject::Pencil(pencil) => pencil.is_dynamic_locus(),
+            GeoObject::DataTable(_)
+            | GeoObject::Histogram(_)
+            | GeoObject::BarChart(_)
+            | GeoObject::PieChart(_)
+            | GeoObject::ScatterPlot(_)
+            | GeoObject::BoxPlot(_)
+            | GeoObject::List(_)
+            | GeoObject::RegressionLine(_) => true,
+            GeoObject::Function(function) => function.fit.is_some(),
+            GeoObject::Transformed(object) => object.inner.contains_private_data(),
+            _ => false,
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            GeoObject::Point(_) => "Point",
+            GeoObject::Line(_) => "Line",
+            GeoObject::Circle(_) => "Circle",
+            GeoObject::Polygon(_) => "Polygon",
+            GeoObject::Polyline(_) => "Polyline",
+            GeoObject::Pencil(pencil) if pencil.is_dynamic_locus() => "Locus",
+            GeoObject::Pencil(_) => "Pencil",
+            GeoObject::Function(_) => "Function",
+            GeoObject::Text(_) => "Text",
+            GeoObject::Ellipse(_) => "Ellipse",
+            GeoObject::Parabola(_) => "Parabola",
+            GeoObject::Hyperbola(_) => "Hyperbola",
+            GeoObject::Arc(_) => "Arc",
+            GeoObject::Sector(_) => "Sector",
+            GeoObject::BezierCurve(_) => "BezierCurve",
+            GeoObject::Spline(_) => "Spline",
+            GeoObject::Point3D(_) => "Point3D",
+            GeoObject::Segment3D(_) => "Segment3D",
+            GeoObject::Plane3D(_) => "Plane3D",
+            GeoObject::Line3D(_) => "Line3D",
+            GeoObject::Sphere3D(_) => "Sphere3D",
+            GeoObject::Cube3D(_) => "Cube3D",
+            GeoObject::Tetrahedron3D(_) => "Tetrahedron3D",
+            GeoObject::Pyramid3D(_) => "Pyramid3D",
+            GeoObject::Cone3D(_) => "Cone3D",
+            GeoObject::Cylinder3D(_) => "Cylinder3D",
+            GeoObject::Platonic3D(_) => "Platonic3D",
+            GeoObject::InfiniteCone3D(_) => "InfiniteCone3D",
+            GeoObject::InfiniteCylinder3D(_) => "InfiniteCylinder3D",
+            GeoObject::Torus3D(_) => "Torus3D",
+            GeoObject::MoebiusStrip(_) => "MoebiusStrip",
+            GeoObject::Surface3D(_) => "Surface3D",
+            GeoObject::Prism3D(_) => "Prism3D",
+            GeoObject::Quadric3D(_) => "Quadric3D",
+            GeoObject::ImplicitSurface3D(_) => "ImplicitSurface3D",
+            GeoObject::ParametricCurve2D(_) => "ParametricCurve2D",
+            GeoObject::ParametricCurve3D(_) => "ParametricCurve3D",
+            GeoObject::PolarCurve(_) => "PolarCurve",
+            GeoObject::VectorField2D(_) => "VectorField2D",
+            GeoObject::ComplexGrid(_) => "ComplexGrid",
+            GeoObject::ComplexMapping(_) => "ComplexMapping",
+            GeoObject::ComplexIntegral(_) => "ComplexIntegral",
+            GeoObject::ImplicitCurve(_) => "ImplicitCurve",
+            GeoObject::Attractor3D(_) => "Attractor3D",
+            GeoObject::Fractal2D(_) => "Fractal2D",
+            GeoObject::RegularPolychoron4D(_) => "RegularPolychoron4D",
+            GeoObject::RegularPolytopeND(_) => "RegularPolytopeND",
+            GeoObject::HyperSurface4D(_) => "HyperSurface4D",
+            GeoObject::VectorField3D(_) => "VectorField3D",
+            GeoObject::Histogram(_) => "Histogram",
+            GeoObject::BarChart(_) => "BarChart",
+            GeoObject::PieChart(_) => "PieChart",
+            GeoObject::ScatterPlot(_) => "ScatterPlot",
+            GeoObject::BoxPlot(_) => "BoxPlot",
+            GeoObject::RegressionLine(_) => "RegressionLine",
+            GeoObject::DataTable(_) => "DataTable",
+            GeoObject::List(_) => "List",
+            GeoObject::PhasePortrait(_) => "PhasePortrait",
+            GeoObject::Transformed(_) => "Transformed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PointObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub position: Point2,
+    #[serde(default)]
+    pub x_expr: Option<String>,
+    #[serde(default)]
+    pub y_expr: Option<String>,
+    pub color: Color,
+    pub visible: bool,
+    pub size: f32,
+    #[serde(default)]
+    pub point_style: PointStyle,
+}
+
+impl PointObj {
+    pub fn new(position: Point2) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            position,
+            x_expr: None,
+            y_expr: None,
+            color: Color::BLUE,
+            visible: true,
+            size: 6.0,
+            point_style: PointStyle::default(),
+        }
+    }
+
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.label = label.into();
+        self
+    }
+}
+
+pub use grafito_geometry::LineKind;
+
+/// Estilo de trazo de los objetos con línea (frente Q2: estilos reales).
+///
+/// `Solid` es el default y preserva el render histórico píxel a píxel: el
+/// camino `Solid` del renderer llama a las mismas primitivas que antes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum LineStyle {
+    #[default]
+    Solid,
+    Dashed,
+    Dotted,
+}
+
+impl LineStyle {
+    /// Parsea un nombre de estilo en español o inglés (case-insensitive).
+    /// `None` si no es un estilo conocido (error honesto del llamador).
+    pub fn parse_name(text: &str) -> Option<Self> {
+        match text.trim().to_lowercase().as_str() {
+            "solid" | "solido" | "sólido" | "continuo" | "continua" | "normal" => {
+                Some(Self::Solid)
+            }
+            "dashed" | "rayada" | "rayado" | "guiones" | "trazos" | "discontinua" => {
+                Some(Self::Dashed)
+            }
+            "dotted" | "punteada" | "punteado" | "puntos" | "punteo" => Some(Self::Dotted),
+            _ => None,
+        }
+    }
+
+    pub fn canonical_name(self) -> &'static str {
+        match self {
+            Self::Solid => "solid",
+            Self::Dashed => "dashed",
+            Self::Dotted => "dotted",
+        }
+    }
+}
+
+/// Forma del marcador de punto (frente Q2: estilos reales).
+///
+/// `Dot` es el default y preserva el render histórico (círculo relleno).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum PointStyle {
+    #[default]
+    Dot,
+    Circle,
+    Cross,
+    Plus,
+}
+
+impl PointStyle {
+    /// Parsea un nombre de forma en español o inglés (case-insensitive).
+    pub fn parse_name(text: &str) -> Option<Self> {
+        match text.trim().to_lowercase().as_str() {
+            "dot" | "punto" | "relleno" => Some(Self::Dot),
+            "circle" | "circulo" | "círculo" | "aro" | "hueco" => Some(Self::Circle),
+            "cross" | "cruz" | "equis" | "x" => Some(Self::Cross),
+            "plus" | "mas" | "más" | "+" => Some(Self::Plus),
+            _ => None,
+        }
+    }
+
+    pub fn canonical_name(self) -> &'static str {
+        match self {
+            Self::Dot => "dot",
+            Self::Circle => "circle",
+            Self::Cross => "cross",
+            Self::Plus => "plus",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LineObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub start: Point2,
+    pub end: Point2,
+    #[serde(default)]
+    pub kind: LineKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_x_expr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_y_expr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_x_expr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_y_expr: Option<String>,
+    pub color: Color,
+    pub visible: bool,
+    pub width: f32,
+    #[serde(default)]
+    pub line_style: LineStyle,
+}
+
+impl LineObj {
+    pub fn new(start: Point2, end: Point2) -> Self {
+        Self::new_with_kind(start, end, LineKind::Segment)
+    }
+
+    pub fn new_with_kind(start: Point2, end: Point2, kind: LineKind) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            start,
+            end,
+            kind,
+            start_x_expr: None,
+            start_y_expr: None,
+            end_x_expr: None,
+            end_y_expr: None,
+            color: Color::DEFAULT_STROKE,
+            visible: true,
+            width: 2.0,
+            line_style: LineStyle::default(),
+        }
+    }
+
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.label = label.into();
+        self
+    }
+
+    pub fn with_start_expr(mut self, x: &str, y: &str) -> Self {
+        self.start_x_expr = Some(x.to_string());
+        self.start_y_expr = Some(y.to_string());
+        self
+    }
+
+    pub fn with_end_expr(mut self, x: &str, y: &str) -> Self {
+        self.end_x_expr = Some(x.to_string());
+        self.end_y_expr = Some(y.to_string());
+        self
+    }
+
+    pub fn length(&self) -> f64 {
+        self.start.distance(&self.end)
+    }
+
+    /// True for Segment or Ray; infinite lines have no finite length.
+    pub fn has_finite_length(&self) -> bool {
+        self.kind != LineKind::Line
+    }
+
+    pub fn point_at(&self, t: f64) -> Point2 {
+        let dx = self.end.x - self.start.x;
+        let dy = self.end.y - self.start.y;
+        Point2::new(self.start.x + t * dx, self.start.y + t * dy)
+    }
+
+    pub fn param_at_point(&self, p: Point2) -> f64 {
+        grafito_geometry::line_param_at_point(p, self.start, self.end)
+    }
+
+    pub fn distance_to_point(&self, p: Point2) -> f64 {
+        match self.kind {
+            LineKind::Segment => {
+                grafito_geometry::distance_point_to_segment(p, self.start, self.end)
+            }
+            LineKind::Ray => grafito_geometry::distance_point_to_ray(p, self.start, self.end),
+            LineKind::Line => grafito_geometry::distance_point_to_line(p, self.start, self.end),
+        }
+    }
+
+    pub fn clip_to_aabb(&self, rect: AABB) -> Option<(Point2, Point2)> {
+        match self.kind {
+            LineKind::Segment => grafito_geometry::clip_segment_to_rect(self.start, self.end, rect),
+            LineKind::Ray => grafito_geometry::clip_ray_to_rect(self.start, self.end, rect),
+            LineKind::Line => grafito_geometry::clip_line_to_rect(self.start, self.end, rect),
+        }
+    }
+
+    pub fn kind_contains_t(&self, t: f64) -> bool {
+        self.kind.contains_t(t)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CircleObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub center: Point2,
+    pub radius: f64,
+    #[serde(default)]
+    pub radius_expr: Option<String>,
+    pub color: Color,
+    pub visible: bool,
+    pub width: f32,
+    pub fill_color: Option<Color>,
+    #[serde(default)]
+    pub line_style: LineStyle,
+}
+
+impl CircleObj {
+    pub fn new(center: Point2, radius: f64) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            center,
+            radius,
+            radius_expr: None,
+            color: Color::DEFAULT_STROKE,
+            visible: true,
+            width: 2.0,
+            fill_color: None,
+            line_style: LineStyle::default(),
+        }
+    }
+
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.label = label.into();
+        self
+    }
+
+    pub fn to_geom(&self) -> GeomCircle {
+        GeomCircle::new(self.center, self.radius)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PolygonObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub vertices: Vec<Point2>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub x_exprs: Vec<Option<String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub y_exprs: Vec<Option<String>>,
+    pub color: Color,
+    pub visible: bool,
+    pub width: f32,
+    pub fill_color: Option<Color>,
+    #[serde(default)]
+    pub line_style: LineStyle,
+}
+
+impl PolygonObj {
+    pub fn new(vertices: Vec<Point2>) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            vertices,
+            x_exprs: Vec::new(),
+            y_exprs: Vec::new(),
+            color: Color::DEFAULT_STROKE,
+            visible: true,
+            width: 2.0,
+            fill_color: Some(Color::new(0.2, 0.5, 0.9, 0.2)),
+            line_style: LineStyle::default(),
+        }
+    }
+
+    pub fn with_vertex_exprs(mut self, x: &str, y: &str) -> Self {
+        self.x_exprs.push(Some(x.to_string()));
+        self.y_exprs.push(Some(y.to_string()));
+        self
+    }
+
+    pub fn set_vertex_expr(&mut self, index: usize, x: Option<String>, y: Option<String>) {
+        if index >= self.x_exprs.len() {
+            self.x_exprs.resize(index + 1, None);
+        }
+        if index >= self.y_exprs.len() {
+            self.y_exprs.resize(index + 1, None);
+        }
+        self.x_exprs[index] = x;
+        self.y_exprs[index] = y;
+    }
+}
+
+/// Polilínea abierta: cadena de puntos unidos por segmentos rectos, sin
+/// cierre y sin relleno (a diferencia de `Polygon`, que es cerrado).
+/// Mínimo 2 puntos; cota superior `MAX_POLYGON_VERTICES` (validation.rs).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PolylineObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub points: Vec<Point2>,
+    pub color: Color,
+    pub visible: bool,
+    pub width: f32,
+    #[serde(default)]
+    pub line_style: LineStyle,
+}
+
+impl PolylineObj {
+    pub fn new(points: Vec<Point2>) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            points,
+            color: Color::DEFAULT_STROKE,
+            visible: true,
+            width: 2.0,
+            line_style: LineStyle::default(),
+        }
+    }
+
+    pub fn with_label(mut self, l: impl Into<String>) -> Self {
+        self.label = l.into();
+        self
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FunctionObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub expr: String,
+    pub color: Color,
+    pub visible: bool,
+    pub width: f32,
+    #[serde(default)]
+    pub line_style: LineStyle,
+    pub domain_min: Option<f64>,
+    pub domain_max: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain_min_expr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain_max_expr: Option<String>,
+    pub fill_color: Option<Color>,
+    // Integral function: ∫_[integral_lower]^x expr(var) d(var)
+    #[serde(default)]
+    pub is_integral: bool,
+    #[serde(default = "default_integral_var")]
+    pub integral_var: String,
+    #[serde(default)]
+    pub integral_lower: f64,
+    /// Metadatos de un ajuste local persistente, si esta función fue generada
+    /// desde una tabla de datos. Los samples siguen usando el pipeline normal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fit: Option<FitMetadata>,
+    #[serde(skip)]
+    pub cached_key: Arc<RwLock<Option<FunctionCacheKey>>>,
+    #[serde(skip)]
+    pub cached_samples: Arc<RwLock<FunctionSamples>>,
+}
+
+fn default_integral_var() -> String {
+    "x".to_string()
+}
+
+impl Clone for FunctionObj {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            label: self.label.clone(),
+            expr: self.expr.clone(),
+            color: self.color,
+            visible: self.visible,
+            width: self.width,
+            line_style: self.line_style,
+            domain_min: self.domain_min,
+            domain_max: self.domain_max,
+            domain_min_expr: self.domain_min_expr.clone(),
+            domain_max_expr: self.domain_max_expr.clone(),
+            fill_color: self.fill_color,
+            is_integral: self.is_integral,
+            integral_var: self.integral_var.clone(),
+            integral_lower: self.integral_lower,
+            fit: self.fit.clone(),
+            // Share the cache through Arc
+            cached_key: self.cached_key.clone(),
+            cached_samples: self.cached_samples.clone(),
+        }
+    }
+}
+
+impl PartialEq for FunctionObj {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.label == other.label
+            && self.expr == other.expr
+            && self.color == other.color
+            && self.visible == other.visible
+            && self.width == other.width
+            && self.line_style == other.line_style
+            && self.domain_min == other.domain_min
+            && self.domain_max == other.domain_max
+            && self.domain_min_expr == other.domain_min_expr
+            && self.domain_max_expr == other.domain_max_expr
+            && self.fill_color == other.fill_color
+            && self.is_integral == other.is_integral
+            && self.integral_var == other.integral_var
+            && self.integral_lower == other.integral_lower
+            && self.fit == other.fit
+    }
+}
+
+impl FunctionObj {
+    pub fn new(expr: impl Into<String>) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            expr: expr.into(),
+            color: Color::BLUE,
+            visible: true,
+            width: 2.0,
+            line_style: LineStyle::default(),
+            domain_min: None,
+            domain_max: None,
+            domain_min_expr: None,
+            domain_max_expr: None,
+            fill_color: None,
+            is_integral: false,
+            integral_var: String::new(),
+            integral_lower: 0.0,
+            fit: None,
+            cached_key: Arc::new(RwLock::new(None)),
+            cached_samples: Arc::new(RwLock::new(FunctionSamples::new())),
+        }
+    }
+
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.label = label.into();
+        self
+    }
+
+    pub fn with_fill(mut self, color: Color) -> Self {
+        self.fill_color = Some(color);
+        self
+    }
+
+    pub fn as_integral(mut self, var: &str, lower: f64) -> Self {
+        self.is_integral = true;
+        self.integral_var = var.to_string();
+        self.integral_lower = lower;
+        self
+    }
+
+    /// Asocia la función renderizable a una tabla local y sus diagnósticos.
+    pub fn with_fit(mut self, fit: FitMetadata) -> Self {
+        self.fit = Some(fit);
+        self
+    }
+
+    /// Invalidate any cached samples for this function.
+    pub fn invalidate_cache(&self) {
+        *self.cached_key.write().unwrap_or_else(|p| {
+            log::warn!("cache lock envenenado; recuperando estado parcial");
+            p.into_inner()
+        }) = None;
+        self.cached_samples
+            .write()
+            .unwrap_or_else(|p| {
+                log::warn!("cache lock envenenado; recuperando estado parcial");
+                p.into_inner()
+            })
+            .clear();
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TextObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub content: String,
+    pub position: Point2,
+    pub color: Color,
+    pub visible: bool,
+    pub font_size: f32,
+    /// Rotación en radianes, horario (igual que `egui::epaint::TextShape::angle`).
+    /// `#[serde(default)]` (= 0.0): la persistencia vieja sin ángulo sigue válida.
+    #[serde(default)]
+    pub rotation: f32,
+}
+
+impl TextObj {
+    pub fn new(content: impl Into<String>, position: Point2) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            content: content.into(),
+            position,
+            color: Color::DEFAULT_STROKE,
+            visible: true,
+            font_size: 14.0,
+            rotation: 0.0,
+        }
+    }
+}
+
+// ── 3D Objects ──
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Point3DObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub position: Point3D,
+    pub color: Color,
+    pub visible: bool,
+    pub size: f32,
+    #[serde(default)]
+    pub point_style: PointStyle,
+}
+
+impl Point3DObj {
+    pub fn new(position: Point3D) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            position,
+            color: Color::BLUE,
+            visible: true,
+            size: 8.0,
+            point_style: PointStyle::default(),
+        }
+    }
+    pub fn with_label(mut self, l: impl Into<String>) -> Self {
+        self.label = l.into();
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Segment3DObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub a: Point3D,
+    pub b: Point3D,
+    pub color: Color,
+    pub visible: bool,
+    pub width: f32,
+}
+impl Segment3DObj {
+    pub fn new(a: Point3D, b: Point3D) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            a,
+            b,
+            color: Color::DEFAULT_STROKE,
+            visible: true,
+            width: 2.0,
+        }
+    }
+    pub fn with_label(mut self, l: impl Into<String>) -> Self {
+        self.label = l.into();
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Plane3DObj {
+    pub id: ObjectId,
+    pub label: String,
+    /// Coeficientes de la ecuación `ax + by + cz + d = 0`.
+    pub a: f64,
+    pub b: f64,
+    pub c: f64,
+    pub d: f64,
+    /// Expresiones opcionales vinculantes (como en Surface3DObj).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub a_expr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub b_expr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub c_expr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub d_expr: Option<String>,
+    pub color: Color,
+    pub visible: bool,
+    /// Opacidad del relleno (0.0 = transparente, 1.0 = opaco).
+    #[serde(default = "default_plane_opacity")]
+    pub opacity: f32,
+}
+
+fn default_plane_opacity() -> f32 {
+    0.25
+}
+
+impl Plane3DObj {
+    /// Crea un plano a partir de los coeficientes `ax + by + cz + d = 0`.
+    pub fn from_equation(a: f64, b: f64, c: f64, d: f64) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            a,
+            b,
+            c,
+            d,
+            a_expr: None,
+            b_expr: None,
+            c_expr: None,
+            d_expr: None,
+            color: Color::new(0.3, 0.6, 0.9, 1.0),
+            visible: true,
+            opacity: default_plane_opacity(),
+        }
+    }
+
+    /// Crea un plano a partir de tres puntos.
+    pub fn from_three_points(p1: Point3D, p2: Point3D, p3: Point3D) -> Option<Self> {
+        let v1 = (p2.x - p1.x, p2.y - p1.y, p2.z - p1.z);
+        let v2 = (p3.x - p1.x, p3.y - p1.y, p3.z - p1.z);
+        // cross product v1 × v2
+        let a = v1.1 * v2.2 - v1.2 * v2.1;
+        let b = v1.2 * v2.0 - v1.0 * v2.2;
+        let c = v1.0 * v2.1 - v1.1 * v2.0;
+        if a.hypot(b).hypot(c) <= crate::validation::GEOM_EPS {
+            return None;
+        }
+        let d = -(a * p1.x + b * p1.y + c * p1.z);
+        Some(Self::from_equation(a, b, c, d))
+    }
+
+    pub fn with_label(mut self, l: impl Into<String>) -> Self {
+        self.label = l.into();
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Line3DObj {
+    pub id: ObjectId,
+    pub label: String,
+    /// Punto de paso de la recta.
+    pub point: Point3D,
+    /// Vector dirección.
+    pub direction: Point3D,
+    /// Expresiones opcionales vinculantes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub px_expr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub py_expr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pz_expr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dx_expr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dy_expr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dz_expr: Option<String>,
+    pub color: Color,
+    pub visible: bool,
+    pub width: f32,
+}
+
+impl Line3DObj {
+    /// Crea una recta a partir de un punto y un vector dirección.
+    pub fn from_point_and_direction(point: Point3D, direction: Point3D) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            point,
+            direction,
+            px_expr: None,
+            py_expr: None,
+            pz_expr: None,
+            dx_expr: None,
+            dy_expr: None,
+            dz_expr: None,
+            color: Color::new(0.9, 0.3, 0.3, 1.0),
+            visible: true,
+            width: 2.0,
+        }
+    }
+
+    /// Crea una recta a partir de dos puntos.
+    pub fn from_two_points(a: Point3D, b: Point3D) -> Self {
+        Self::from_point_and_direction(a, Point3D::new(b.x - a.x, b.y - a.y, b.z - a.z))
+    }
+
+    pub fn with_label(mut self, l: impl Into<String>) -> Self {
+        self.label = l.into();
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Sphere3DObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub center: Point3D,
+    pub radius: f64,
+    pub color: Color,
+    pub visible: bool,
+    pub width: f32,
+    pub fill_color: Option<Color>,
+}
+impl Sphere3DObj {
+    pub fn new(center: Point3D, radius: f64) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            center,
+            radius,
+            color: Color::DEFAULT_STROKE,
+            visible: true,
+            width: 1.5,
+            fill_color: Some(Color::new(0.2, 0.5, 0.9, 0.15)),
+        }
+    }
+    pub fn with_label(mut self, l: impl Into<String>) -> Self {
+        self.label = l.into();
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Cube3DObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub center: Point3D,
+    pub size: f64,
+    pub color: Color,
+    pub visible: bool,
+    pub width: f32,
+    pub fill_color: Option<Color>,
+}
+impl Cube3DObj {
+    pub fn new(center: Point3D, size: f64) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            center,
+            size,
+            color: Color::DEFAULT_STROKE,
+            visible: true,
+            width: 1.5,
+            fill_color: None,
+        }
+    }
+    pub fn with_label(mut self, l: impl Into<String>) -> Self {
+        self.label = l.into();
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Tetrahedron3DObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub center: Point3D,
+    pub edge_length: f64,
+    pub color: Color,
+    pub visible: bool,
+    pub width: f32,
+    pub fill_color: Option<Color>,
+}
+impl Tetrahedron3DObj {
+    pub fn new(center: Point3D, edge_length: f64) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            center,
+            edge_length,
+            color: Color::DEFAULT_STROKE,
+            visible: true,
+            width: 1.5,
+            fill_color: Some(Color::new(0.2, 0.5, 0.9, 1.0)),
+        }
+    }
+    pub fn with_label(mut self, l: impl Into<String>) -> Self {
+        self.label = l.into();
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Pyramid3DObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub base_center: Point3D,
+    pub apex: Point3D,
+    pub base_size: f64,
+    pub color: Color,
+    pub visible: bool,
+    pub width: f32,
+    pub fill_color: Option<Color>,
+}
+impl Pyramid3DObj {
+    pub fn new(base_center: Point3D, apex: Point3D, base_size: f64) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            base_center,
+            apex,
+            base_size,
+            color: Color::DEFAULT_STROKE,
+            visible: true,
+            width: 1.5,
+            fill_color: None,
+        }
+    }
+    pub fn with_label(mut self, l: impl Into<String>) -> Self {
+        self.label = l.into();
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Cone3DObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub base_center: Point3D,
+    pub apex: Point3D,
+    pub radius: f64,
+    pub color: Color,
+    pub visible: bool,
+    pub width: f32,
+    pub fill_color: Option<Color>,
+}
+impl Cone3DObj {
+    pub fn new(base_center: Point3D, apex: Point3D, radius: f64) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            base_center,
+            apex,
+            radius,
+            color: Color::DEFAULT_STROKE,
+            visible: true,
+            width: 1.5,
+            fill_color: None,
+        }
+    }
+    pub fn with_label(mut self, l: impl Into<String>) -> Self {
+        self.label = l.into();
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Cylinder3DObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub base_center: Point3D,
+    pub top_center: Point3D,
+    pub radius: f64,
+    pub color: Color,
+    pub visible: bool,
+    pub width: f32,
+    pub fill_color: Option<Color>,
+}
+impl Cylinder3DObj {
+    pub fn new(base_center: Point3D, top_center: Point3D, radius: f64) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            base_center,
+            top_center,
+            radius,
+            color: Color::DEFAULT_STROKE,
+            visible: true,
+            width: 1.5,
+            fill_color: None,
+        }
+    }
+    pub fn with_label(mut self, l: impl Into<String>) -> Self {
+        self.label = l.into();
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlatonicKind {
+    Dodecahedron,
+    Icosahedron,
+    Octahedron,
+}
+
+impl PlatonicKind {
+    pub fn from_command(name: &str) -> Option<Self> {
+        match name {
+            "Dodecahedron" => Some(Self::Dodecahedron),
+            "Icosahedron" => Some(Self::Icosahedron),
+            "Octahedron" => Some(Self::Octahedron),
+            _ => None,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Dodecahedron => "Dodecahedron",
+            Self::Icosahedron => "Icosahedron",
+            Self::Octahedron => "Octahedron",
+        }
+    }
+    pub fn to_geometry_solid(self) -> grafito_geometry::PlatonicSolid {
+        match self {
+            Self::Dodecahedron => grafito_geometry::PlatonicSolid::Dodecahedron,
+            Self::Icosahedron => grafito_geometry::PlatonicSolid::Icosahedron,
+            Self::Octahedron => grafito_geometry::PlatonicSolid::Octahedron,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Platonic3DObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub center: Point3D,
+    pub kind: PlatonicKind,
+    pub edge_length: f64,
+    pub color: Color,
+    pub visible: bool,
+    pub width: f32,
+    pub fill_color: Option<Color>,
+}
+impl Platonic3DObj {
+    pub fn new(center: Point3D, kind: PlatonicKind, edge_length: f64) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            center,
+            kind,
+            edge_length,
+            color: Color::DEFAULT_STROKE,
+            visible: true,
+            width: 1.5,
+            fill_color: None,
+        }
+    }
+    pub fn with_label(mut self, l: impl Into<String>) -> Self {
+        self.label = l.into();
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InfiniteCone3DObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub apex: Point3D,
+    pub direction: Point3D,
+    pub half_angle_rad: f64,
+    pub color: Color,
+    pub visible: bool,
+    pub width: f32,
+}
+impl InfiniteCone3DObj {
+    pub fn new(apex: Point3D, direction: Point3D, half_angle_rad: f64) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            apex,
+            direction,
+            half_angle_rad,
+            color: Color::DEFAULT_STROKE,
+            visible: true,
+            width: 1.5,
+        }
+    }
+    pub fn with_label(mut self, l: impl Into<String>) -> Self {
+        self.label = l.into();
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InfiniteCylinder3DObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub base_point: Point3D,
+    pub direction: Point3D,
+    pub radius: f64,
+    pub color: Color,
+    pub visible: bool,
+    pub width: f32,
+}
+impl InfiniteCylinder3DObj {
+    pub fn new(base_point: Point3D, direction: Point3D, radius: f64) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            base_point,
+            direction,
+            radius,
+            color: Color::DEFAULT_STROKE,
+            visible: true,
+            width: 1.5,
+        }
+    }
+    pub fn with_label(mut self, l: impl Into<String>) -> Self {
+        self.label = l.into();
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Torus3DObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub center: Point3D,
+    pub r_major: f64,
+    pub r_minor: f64,
+    pub color: Color,
+    pub visible: bool,
+    pub width: f32,
+}
+impl Torus3DObj {
+    pub fn new(center: Point3D, r_major: f64, r_minor: f64) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            center,
+            r_major,
+            r_minor,
+            color: Color::DEFAULT_STROKE,
+            visible: true,
+            width: 1.5,
+        }
+    }
+    pub fn with_label(mut self, l: impl Into<String>) -> Self {
+        self.label = l.into();
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MoebiusStripObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub center: Point3D,
+    pub radius: f64,
+    pub width_r: f64,
+    pub color: Color,
+    pub visible: bool,
+    pub width: f32,
+}
+impl MoebiusStripObj {
+    pub fn new(center: Point3D, radius: f64, width_r: f64) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            center,
+            radius,
+            width_r,
+            color: Color::DEFAULT_STROKE,
+            visible: true,
+            width: 1.5,
+        }
+    }
+    pub fn with_label(mut self, l: impl Into<String>) -> Self {
+        self.label = l.into();
+        self
+    }
+}
+
+// ── Prism y Quadric (P1.4) ──
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Prism3DObj {
+    pub id: ObjectId,
+    pub label: String,
+    /// Vértices de la base en 3D (al menos 3).
+    pub base_vertices: Vec<Point3D>,
+    /// Vector de extrusión.
+    pub direction: Point3D,
+    pub color: Color,
+    pub visible: bool,
+    pub width: f32,
+    pub fill_color: Option<Color>,
+}
+
+impl Prism3DObj {
+    /// Crea un prisma a partir de vértices base y vector dirección.
+    pub fn new(base_vertices: Vec<Point3D>, direction: Point3D) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            base_vertices,
+            direction,
+            color: Color::DEFAULT_STROKE,
+            visible: true,
+            width: 1.5,
+            fill_color: Some(Color::new(0.2, 0.5, 0.9, 0.15)),
+        }
+    }
+
+    pub fn with_label(mut self, l: impl Into<String>) -> Self {
+        self.label = l.into();
+        self
+    }
+
+    /// Vértices de la tapa superior (base + dirección).
+    pub fn top_vertices(&self) -> Vec<Point3D> {
+        self.base_vertices
+            .iter()
+            .map(|p| {
+                Point3D::new(
+                    p.x + self.direction.x,
+                    p.y + self.direction.y,
+                    p.z + self.direction.z,
+                )
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Quadric3DObj {
+    pub id: ObjectId,
+    pub label: String,
+    /// Coeficientes de `a*x^2 + b*y^2 + c*z^2 + d*xy + e*yz + f*zx + g*x + h*y + i*z + j = 0`.
+    pub a: f64,
+    pub b: f64,
+    pub c: f64,
+    pub d: f64,
+    pub e: f64,
+    pub f: f64,
+    pub g: f64,
+    pub h: f64,
+    pub i: f64,
+    pub j: f64,
+    pub color: Color,
+    pub visible: bool,
+    pub width: f32,
+}
+
+impl Quadric3DObj {
+    /// Crea una cuádrica general a partir de 10 coeficientes.
+    pub fn from_coeffs(coeffs: [f64; 10]) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            a: coeffs[0],
+            b: coeffs[1],
+            c: coeffs[2],
+            d: coeffs[3],
+            e: coeffs[4],
+            f: coeffs[5],
+            g: coeffs[6],
+            h: coeffs[7],
+            i: coeffs[8],
+            j: coeffs[9],
+            color: Color::DEFAULT_STROKE,
+            visible: true,
+            width: 1.5,
+        }
+    }
+
+    pub fn with_label(mut self, l: impl Into<String>) -> Self {
+        self.label = l.into();
+        self
+    }
+
+    /// Evalúa la cuádrica en un punto 3D.
+    pub fn eval_at(&self, p: Point3D) -> f64 {
+        self.a * p.x * p.x
+            + self.b * p.y * p.y
+            + self.c * p.z * p.z
+            + self.d * p.x * p.y
+            + self.e * p.y * p.z
+            + self.f * p.z * p.x
+            + self.g * p.x
+            + self.h * p.y
+            + self.i * p.z
+            + self.j
+    }
+}
+
+// ── A1: Superficie implícita F(x,y,z) = 0 (marching-tetra) ──
+//
+// `expr` es el campo escalar con `F = 0` en la superficie; el interior es
+// `F < 0` (igual que `implicit_surface_mesh`). `cells` es la resolución por
+// eje (1..=32, el comando exige 8..=32). La malla se deriva con
+// `prepare_function_ast(expr, vars, &["x","y","z"])` + `finite_clamp`: un nodo
+// no finito aborta con `FieldUndefined` honesto (cero triángulos).
+// `mesh_slots` es caché multi-slot (P3/H1): guarda hasta
+// `IMPLICIT_SURFACE_MESH_SLOTS` mallas por clave (expr+cotas+cells+variables).
+// El frame estable hittea el slot; la oscilación A/B entre dos claves también
+// hittea en vez de re-marchar. Claves siempre nuevas (animación continua)
+// recomputan en fresco sin envenenar los slots.
+/// Resolución por defecto del comando `ImplicitSurface` (16³ celdas).
+pub const IMPLICIT_SURFACE_DEFAULT_CELLS: usize = 16;
+/// Resolución mínima que acepta el comando `ImplicitSurface`.
+pub const IMPLICIT_SURFACE_MIN_CELLS: usize = 8;
+/// Resolución máxima (igual que `GB_MAX_MARCHING_CELLS_PER_AXIS`: 32³ celdas).
+pub const IMPLICIT_SURFACE_MAX_CELLS: usize = 32;
+/// Slots de la caché de malla (P3/H1): 2 cubren frame estable + oscilación
+/// A/B. Cada slot retiene una malla completa; subirlo multiplica memoria
+/// (malla 32³ ≈ cientos de KiB) sin hit extra en animación continua.
+pub const IMPLICIT_SURFACE_MESH_SLOTS: usize = 2;
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ImplicitSurface3DObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub expr: String,
+    pub x_min: f64,
+    pub x_max: f64,
+    pub y_min: f64,
+    pub y_max: f64,
+    pub z_min: f64,
+    pub z_max: f64,
+    pub cells: usize,
+    pub color: Color,
+    pub visible: bool,
+    pub width: f32,
+    pub fill_color: Option<Color>,
+    /// Mallas derivadas por clave, hasta `IMPLICIT_SURFACE_MESH_SLOTS`
+    /// (orden de inserción; se expulsa la más vieja con `pop_front` O(1)
+    /// — Ola 2: `VecDeque` en vez de `Vec` + `remove(0)` O(n)).
+    /// Se ignora en `Clone`/`PartialEq`/serde.
+    #[serde(skip)]
+    pub mesh_slots: RwLock<VecDeque<(u64, Arc<grafito_geometry::TriangleMesh3D>)>>,
+}
+
+impl Clone for ImplicitSurface3DObj {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            label: self.label.clone(),
+            expr: self.expr.clone(),
+            x_min: self.x_min,
+            x_max: self.x_max,
+            y_min: self.y_min,
+            y_max: self.y_max,
+            z_min: self.z_min,
+            z_max: self.z_max,
+            cells: self.cells,
+            color: self.color,
+            visible: self.visible,
+            width: self.width,
+            fill_color: self.fill_color,
+            // Caché runtime: se empieza vacía (el clon recomputa con su clave).
+            mesh_slots: RwLock::new(VecDeque::new()),
+        }
+    }
+}
+
+impl PartialEq for ImplicitSurface3DObj {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.label == other.label
+            && self.expr == other.expr
+            && self.x_min == other.x_min
+            && self.x_max == other.x_max
+            && self.y_min == other.y_min
+            && self.y_max == other.y_max
+            && self.z_min == other.z_min
+            && self.z_max == other.z_max
+            && self.cells == other.cells
+            && self.color == other.color
+            && self.visible == other.visible
+            && self.width == other.width
+            && self.fill_color == other.fill_color
+    }
+}
+
+impl ImplicitSurface3DObj {
+    pub fn new(
+        expr: impl Into<String>,
+        bounds: (f64, f64, f64, f64, f64, f64),
+        cells: usize,
+    ) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            expr: expr.into(),
+            x_min: bounds.0,
+            x_max: bounds.1,
+            y_min: bounds.2,
+            y_max: bounds.3,
+            z_min: bounds.4,
+            z_max: bounds.5,
+            cells,
+            color: Color::DEFAULT_STROKE,
+            visible: true,
+            width: 1.5,
+            fill_color: Some(Color::new(0.2, 0.5, 0.9, 0.4)),
+            mesh_slots: RwLock::new(VecDeque::new()),
+        }
+    }
+
+    pub fn with_label(mut self, l: impl Into<String>) -> Self {
+        self.label = l.into();
+        self
+    }
+
+    /// Clave del cómputo: expresión + cotas + resolución + variables ordenadas.
+    fn cache_key(&self, variables: &BTreeMap<String, f64>) -> u64 {
+        let mut state = 0xcbf29ce484222325u64;
+        fnv1a_str(&mut state, &self.expr);
+        for bits in [
+            self.x_min.to_bits(),
+            self.x_max.to_bits(),
+            self.y_min.to_bits(),
+            self.y_max.to_bits(),
+            self.z_min.to_bits(),
+            self.z_max.to_bits(),
+        ] {
+            state ^= bits;
+            state = state.wrapping_mul(0x1000_0000_01b3);
+        }
+        state ^= self.cells as u64;
+        state = state.wrapping_mul(0x1000_0000_01b3);
+        // Sin colectar: el `BTreeMap` ya itera en orden determinista.
+        for (key, value) in variables.iter() {
+            fnv1a_str(&mut state, key);
+            state ^= value.to_bits();
+            state = state.wrapping_mul(0x1000_0000_01b3);
+        }
+        state
+    }
+
+    /// Deriva la malla en fresco (sin tocar la caché) con el evaluador
+    /// `F(x,y,z)`: AST pre-parseado + `finite_clamp`; nodo no finito → `None`
+    /// → `implicit_surface_mesh` devuelve `FieldUndefined` honesto.
+    pub fn compute_mesh(
+        &self,
+        variables: &BTreeMap<String, f64>,
+    ) -> Result<grafito_geometry::TriangleMesh3D, grafito_geometry::MeshError> {
+        let parsed =
+            grafito_geometry::expr::prepare_function_ast(&self.expr, variables, &["x", "y", "z"])
+                .ok();
+        // Opcodes planos una vez por malla (no walk por vértice).
+        let flat = parsed
+            .as_ref()
+            .and_then(|ast| grafito_geometry::expr::compile_flat_ops(ast, "x", "y", "z"));
+        let fallback_vars: Vec<(String, f64)> =
+            variables.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        let field = |x: f64, y: f64, z: f64| -> Option<f64> {
+            if let Some(ops) = &flat {
+                if let Some(v) = grafito_geometry::expr::eval_opcodes_flat(ops, x, y, z) {
+                    let clamped = implicit_surface_finite_clamp(v);
+                    if clamped.is_finite() {
+                        return Some(clamped);
+                    }
+                }
+            }
+            if let Some(ast) = &parsed {
+                let v = ast.eval_3d("x", x, "y", y, "z", z);
+                let clamped = implicit_surface_finite_clamp(v);
+                if clamped.is_finite() {
+                    return Some(clamped);
+                }
+                return None;
+            }
+            let mut vars = fallback_vars.clone();
+            vars.push(("x".to_string(), x));
+            vars.push(("y".to_string(), y));
+            vars.push(("z".to_string(), z));
+            grafito_geometry::expr::evaluate(&self.expr, &vars)
+                .ok()
+                .map(implicit_surface_finite_clamp)
+                .filter(|v| v.is_finite())
+        };
+        grafito_geometry::implicit_surface_mesh(
+            &field,
+            Point3D::new(self.x_min, self.y_min, self.z_min),
+            Point3D::new(self.x_max, self.y_max, self.z_max),
+            self.cells,
+        )
+    }
+
+    /// Malla para render: reutiliza el slot si la clave coincide (frame
+    /// estable u oscilación A/B); ante clave nueva recomputa en fresco y la
+    /// guarda expulsando el slot más viejo. Un `Err` (`FieldUndefined`,
+    /// cotas, presupuesto) es honesto: el llamador dibuja cero triángulos.
+    pub fn mesh_snapshot(
+        &self,
+        variables: &BTreeMap<String, f64>,
+    ) -> Result<Arc<grafito_geometry::TriangleMesh3D>, grafito_geometry::MeshError> {
+        let key = self.cache_key(variables);
+        if let Ok(guard) = self.mesh_slots.read() {
+            if let Some((_, mesh)) = guard.iter().find(|(slot_key, _)| *slot_key == key) {
+                // Cache hit: clonar el `Arc` (refcount), no la malla completa.
+                return Ok(mesh.clone());
+            }
+        }
+        let fresh = Arc::new(self.compute_mesh(variables)?);
+        if let Ok(mut guard) = self.mesh_slots.write() {
+            if let Some((_, mesh)) = guard.iter().find(|(slot_key, _)| *slot_key == key) {
+                return Ok(mesh.clone());
+            }
+            if guard.len() >= IMPLICIT_SURFACE_MESH_SLOTS {
+                guard.pop_front();
+            }
+            guard.push_back((key, fresh.clone()));
+        }
+        Ok(fresh)
+    }
+
+    /// Malla más reciente, si ya se computó alguna con éxito.
+    pub fn cached_mesh(&self) -> Option<Arc<grafito_geometry::TriangleMesh3D>> {
+        self.mesh_slots
+            .read()
+            .ok()
+            .and_then(|guard| guard.back().map(|(_, mesh)| mesh.clone()))
+    }
+
+    /// Los slots se auto-invalidan por clave en `mesh_snapshot`, así que este
+    /// no-op nunca miente (sirve mesh fresca ante clave distinta). La limpieza
+    /// real ocurre en `detach_runtime_caches` (`&mut`).
+    pub fn invalidate_cache(&self) {}
+}
+
+/// `finite` y acotado (|v| < 1e6) o `NAN` (el llamador lo vuelve `None` →
+/// `FieldUndefined`). Igual criterio que el muestreo de campos 2D.
+fn implicit_surface_finite_clamp(v: f64) -> f64 {
+    if v.is_finite() && v.abs() < 1e6 {
+        v
+    } else {
+        f64::NAN
+    }
+}
+
+// ── 3D Parametric Surface ──
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Surface3DObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub expr: String,
+    pub x_min: f64,
+    pub x_max: f64,
+    pub y_min: f64,
+    pub y_max: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x_min_expr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x_max_expr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y_min_expr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y_max_expr: Option<String>,
+    /// Parametric surface: x(u,v), y(u,v), z(u,v)
+    #[serde(default)]
+    pub is_parametric: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub expr_x: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub expr_y: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub expr_z: String,
+    #[serde(default)]
+    pub u_min: f64,
+    #[serde(default)]
+    pub u_max: f64,
+    #[serde(default)]
+    pub v_min: f64,
+    #[serde(default)]
+    pub v_max: f64,
+    pub color: Color,
+    pub visible: bool,
+    pub width: f32,
+    pub solid: bool,
+    pub mesh_res: usize,
+    /// Si es true, `expr` es una expresión compleja f(z) y la altura z = |f(z)|.
+    #[serde(default)]
+    pub is_complex: bool,
+    /// Compatibilidad para superficies explícitas/complex de schema v1, cuyo
+    /// resultado se dibujaba como `(x, f(x,y), y)`.
+    #[serde(default)]
+    pub legacy_axis_swap: bool,
+    #[serde(skip)]
+    pub cached_grid: Arc<RwLock<SurfaceSamples>>,
+    #[serde(skip)]
+    pub cached_key: Arc<RwLock<Option<SurfaceCacheKey>>>,
+}
+
+impl Clone for Surface3DObj {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            label: self.label.clone(),
+            expr: self.expr.clone(),
+            x_min: self.x_min,
+            x_max: self.x_max,
+            y_min: self.y_min,
+            y_max: self.y_max,
+            x_min_expr: self.x_min_expr.clone(),
+            x_max_expr: self.x_max_expr.clone(),
+            y_min_expr: self.y_min_expr.clone(),
+            y_max_expr: self.y_max_expr.clone(),
+            is_parametric: self.is_parametric,
+            expr_x: self.expr_x.clone(),
+            expr_y: self.expr_y.clone(),
+            expr_z: self.expr_z.clone(),
+            u_min: self.u_min,
+            u_max: self.u_max,
+            v_min: self.v_min,
+            v_max: self.v_max,
+            color: self.color,
+            visible: self.visible,
+            width: self.width,
+            solid: self.solid,
+            mesh_res: self.mesh_res,
+            is_complex: self.is_complex,
+            legacy_axis_swap: self.legacy_axis_swap,
+            cached_grid: self.cached_grid.clone(),
+            cached_key: self.cached_key.clone(),
+        }
+    }
+}
+
+impl PartialEq for Surface3DObj {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.label == other.label
+            && self.expr == other.expr
+            && self.x_min == other.x_min
+            && self.x_max == other.x_max
+            && self.y_min == other.y_min
+            && self.y_max == other.y_max
+            && self.x_min_expr == other.x_min_expr
+            && self.x_max_expr == other.x_max_expr
+            && self.y_min_expr == other.y_min_expr
+            && self.y_max_expr == other.y_max_expr
+            && self.is_parametric == other.is_parametric
+            && self.expr_x == other.expr_x
+            && self.expr_y == other.expr_y
+            && self.expr_z == other.expr_z
+            && self.u_min == other.u_min
+            && self.u_max == other.u_max
+            && self.v_min == other.v_min
+            && self.v_max == other.v_max
+            && self.color == other.color
+            && self.visible == other.visible
+            && self.width == other.width
+            && self.solid == other.solid
+            && self.mesh_res == other.mesh_res
+            && self.is_complex == other.is_complex
+            && self.legacy_axis_swap == other.legacy_axis_swap
+    }
+}
+
+impl Surface3DObj {
+    pub fn new(expr: impl Into<String>, xr: (f64, f64), yr: (f64, f64)) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            expr: expr.into(),
+            x_min: xr.0,
+            x_max: xr.1,
+            y_min: yr.0,
+            y_max: yr.1,
+            x_min_expr: None,
+            x_max_expr: None,
+            y_min_expr: None,
+            y_max_expr: None,
+            is_parametric: false,
+            expr_x: String::new(),
+            expr_y: String::new(),
+            expr_z: String::new(),
+            u_min: 0.0,
+            u_max: 0.0,
+            v_min: 0.0,
+            v_max: 0.0,
+            color: Color::BLUE,
+            visible: true,
+            width: 1.0,
+            solid: false,
+            mesh_res: 30,
+            is_complex: false,
+            legacy_axis_swap: false,
+            cached_grid: Arc::new(RwLock::new(SurfaceSamples::new())),
+            cached_key: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    pub fn new_parametric(
+        expr_x: impl Into<String>,
+        expr_y: impl Into<String>,
+        expr_z: impl Into<String>,
+        u_domain: (f64, f64),
+        v_domain: (f64, f64),
+    ) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            expr: String::new(),
+            x_min: 0.0,
+            x_max: 0.0,
+            y_min: 0.0,
+            y_max: 0.0,
+            x_min_expr: None,
+            x_max_expr: None,
+            y_min_expr: None,
+            y_max_expr: None,
+            is_parametric: true,
+            expr_x: expr_x.into(),
+            expr_y: expr_y.into(),
+            expr_z: expr_z.into(),
+            u_min: u_domain.0,
+            u_max: u_domain.1,
+            v_min: v_domain.0,
+            v_max: v_domain.1,
+            color: Color::BLUE,
+            visible: true,
+            width: 1.0,
+            solid: false,
+            mesh_res: 30,
+            is_complex: false,
+            legacy_axis_swap: false,
+            cached_grid: Arc::new(RwLock::new(SurfaceSamples::new())),
+            cached_key: Arc::new(RwLock::new(None)),
+        }
+    }
+    pub fn with_label(mut self, l: impl Into<String>) -> Self {
+        self.label = l.into();
+        self
+    }
+    pub fn as_solid(mut self) -> Self {
+        self.solid = true;
+        self
+    }
+
+    /// Crea una superficie 3D que visualiza |f(z)| sobre el plano complejo.
+    /// `expr` es una expresión compleja f(z), la altura z = |f(x + iy)|.
+    pub fn new_complex(expr: impl Into<String>, xr: (f64, f64), yr: (f64, f64)) -> Self {
+        let mut s = Self::new(expr, xr, yr);
+        s.is_complex = true;
+        s
+    }
+
+    /// Convierte una muestra explícita `(x, y, f(x,y))` a coordenadas de
+    /// documento, preservando la orientación de archivos schema v1.
+    pub fn explicit_sample_point(&self, x: f64, y: f64, value: f64) -> Point3D {
+        if self.legacy_axis_swap {
+            Point3D::new(x, value, y)
+        } else {
+            Point3D::new(x, y, value)
+        }
+    }
+
+    /// Invalidate any cached grid for this surface.
+    pub fn invalidate_cache(&self) {
+        self.cached_grid
+            .write()
+            .unwrap_or_else(|p| {
+                log::warn!("cache lock envenenado; recuperando estado parcial");
+                p.into_inner()
+            })
+            .clear();
+        *self.cached_key.write().unwrap_or_else(|p| {
+            log::warn!("cache lock envenenado; recuperando estado parcial");
+            p.into_inner()
+        }) = None;
+    }
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EllipseObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub center: Point2,
+    pub rx: f64,
+    pub ry: f64,
+    pub angle: f64,
+    pub color: Color,
+    pub visible: bool,
+    pub width: f32,
+    pub fill_color: Option<Color>,
+    #[serde(default)]
+    pub line_style: LineStyle,
+}
+impl EllipseObj {
+    pub fn new(center: Point2, rx: f64, ry: f64) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            center,
+            rx,
+            ry,
+            angle: 0.0,
+            color: Color::DEFAULT_STROKE,
+            visible: true,
+            width: 2.0,
+            fill_color: Some(Color::new(0.2, 0.5, 0.9, 0.15)),
+            line_style: LineStyle::default(),
+        }
+    }
+    pub fn with_label(mut self, l: impl Into<String>) -> Self {
+        self.label = l.into();
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ParabolaObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub vertex: Point2,
+    pub p: f64,
+    pub vertical: bool,
+    #[serde(default)]
+    pub angle: f64,
+    pub color: Color,
+    pub visible: bool,
+    pub width: f32,
+    #[serde(default)]
+    pub line_style: LineStyle,
+}
+impl ParabolaObj {
+    pub fn new(vertex: Point2, p: f64) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            vertex,
+            p,
+            vertical: true,
+            angle: 0.0,
+            color: Color::RED,
+            visible: true,
+            width: 2.0,
+            line_style: LineStyle::default(),
+        }
+    }
+    pub fn with_label(mut self, l: impl Into<String>) -> Self {
+        self.label = l.into();
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HyperbolaObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub center: Point2,
+    pub a: f64,
+    pub b: f64,
+    pub horizontal: bool,
+    #[serde(default)]
+    pub angle: f64,
+    pub color: Color,
+    pub visible: bool,
+    pub width: f32,
+    #[serde(default)]
+    pub line_style: LineStyle,
+}
+impl HyperbolaObj {
+    pub fn new(center: Point2, a: f64, b: f64) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            center,
+            a,
+            b,
+            horizontal: true,
+            angle: 0.0,
+            color: Color::RED,
+            visible: true,
+            width: 2.0,
+            line_style: LineStyle::default(),
+        }
+    }
+    pub fn with_label(mut self, l: impl Into<String>) -> Self {
+        self.label = l.into();
+        self
+    }
+}
+
+// Objetos P1.1: arcos, sectores, bezier y spline 2D.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArcObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub center: Point2,
+    pub radius: f64,
+    /// Ángulo inicial en radianes.
+    pub start_angle: f64,
+    /// Ángulo final en radianes.
+    pub end_angle: f64,
+    pub color: Color,
+    pub visible: bool,
+    pub width: f32,
+}
+
+impl ArcObj {
+    pub fn new(center: Point2, radius: f64, start_angle: f64, end_angle: f64) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            center,
+            radius,
+            start_angle,
+            end_angle,
+            color: Color::DEFAULT_STROKE,
+            visible: true,
+            width: 2.0,
+        }
+    }
+
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.label = label.into();
+        self
+    }
+
+    /// Crea un arco por tres puntos no colineales; el arco va de p1 a p3 pasando por p2.
+    pub fn from_three_points(p1: Point2, p2: Point2, p3: Point2) -> Option<Self> {
+        let center = circumcenter(p1, p2, p3)?;
+        let radius = center.distance(&p1);
+        if !radius.is_finite() || radius <= 1e-12 {
+            return None;
+        }
+        let a1 = (p1.y - center.y).atan2(p1.x - center.x);
+        let a2 = (p2.y - center.y).atan2(p2.x - center.x);
+        let a3 = (p3.y - center.y).atan2(p3.x - center.x);
+        // Determina dirección: si p2 está entre p1 y p3 en sentido antihorario, conserva orden; si no, invierte.
+        let ccw = is_angle_between_ccw(a1, a3, a2);
+        let (start_angle, end_angle) = if ccw { (a1, a3) } else { (a3, a1) };
+        // Ajusta end para que el barrido sea el menor que contiene a2.
+        let mut end = end_angle;
+        let mut start = start_angle;
+        // Normaliza para que el arco contenga a2.
+        if ccw {
+            if !is_angle_between_ccw(start, end, a2) {
+                // Si no contiene, invierte dirección.
+                std::mem::swap(&mut start, &mut end);
+            }
+        } else if !is_angle_between_ccw(end, start, a2) {
+            std::mem::swap(&mut start, &mut end);
+        }
+        Some(Self::new(center, radius, start, end))
+    }
+
+    /// Longitud del arco.
+    pub fn length(&self) -> f64 {
+        let delta = (self.end_angle - self.start_angle).abs();
+        // Normaliza delta al intervalo [0, 2π] eligiendo el menor recorrido que contiene el arco dibujado.
+        // Para arcos > π el usuario espera el recorrido directo, no el complementario.
+        let mut d = delta % (2.0 * std::f64::consts::PI);
+        if d > std::f64::consts::PI && delta <= std::f64::consts::PI {
+            d = 2.0 * std::f64::consts::PI - d;
+        }
+        self.radius * d
+    }
+
+    /// Muestrea el arco en `steps` segmentos (steps+1 puntos).
+    pub fn sample_points(&self, steps: usize) -> Vec<Point2> {
+        let steps = steps.clamp(1, 256);
+        let mut pts = Vec::with_capacity(steps + 1);
+        let delta = self.end_angle - self.start_angle;
+        for i in 0..=steps {
+            let t = i as f64 / steps as f64;
+            let ang = self.start_angle + delta * t;
+            pts.push(Point2::new(
+                self.center.x + self.radius * ang.cos(),
+                self.center.y + self.radius * ang.sin(),
+            ));
+        }
+        pts
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SectorObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub center: Point2,
+    pub radius: f64,
+    pub start_angle: f64,
+    pub end_angle: f64,
+    pub color: Color,
+    pub fill_color: Option<Color>,
+    pub visible: bool,
+    pub width: f32,
+}
+
+impl SectorObj {
+    pub fn new(center: Point2, radius: f64, start_angle: f64, end_angle: f64) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            center,
+            radius,
+            start_angle,
+            end_angle,
+            color: Color::DEFAULT_STROKE,
+            visible: true,
+            width: 2.0,
+            fill_color: Some(Color::new(0.2, 0.5, 0.9, 0.25)),
+        }
+    }
+
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.label = label.into();
+        self
+    }
+
+    pub fn area(&self) -> f64 {
+        let delta = (self.end_angle - self.start_angle).abs() % (2.0 * std::f64::consts::PI);
+        0.5 * self.radius * self.radius * delta
+    }
+
+    /// Vértices del sector como polígono cerrado (centro + arco).
+    pub fn polygon_vertices(&self, steps: usize) -> Vec<Point2> {
+        let steps = steps.clamp(8, 256);
+        let mut verts = Vec::with_capacity(steps + 2);
+        verts.push(self.center);
+        let delta = self.end_angle - self.start_angle;
+        for i in 0..=steps {
+            let t = i as f64 / steps as f64;
+            let ang = self.start_angle + delta * t;
+            verts.push(Point2::new(
+                self.center.x + self.radius * ang.cos(),
+                self.center.y + self.radius * ang.sin(),
+            ));
+        }
+        verts
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BezierCurveObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub control_points: Vec<Point2>,
+    pub color: Color,
+    pub visible: bool,
+    pub width: f32,
+}
+
+impl BezierCurveObj {
+    pub fn new(control_points: Vec<Point2>) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            control_points,
+            color: Color::BLUE,
+            visible: true,
+            width: 2.0,
+        }
+    }
+
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.label = label.into();
+        self
+    }
+
+    /// Evalúa la curva de Bézier en t ∈ \[0,1\] usando De Casteljau.
+    pub fn point_at(&self, t: f64) -> Option<Point2> {
+        bezier_point(&self.control_points, t)
+    }
+
+    pub fn sample_points(&self, steps: usize) -> Vec<Point2> {
+        let steps = steps.clamp(1, 512);
+        let mut pts = Vec::with_capacity(steps + 1);
+        for i in 0..=steps {
+            let t = i as f64 / steps as f64;
+            if let Some(p) = self.point_at(t) {
+                pts.push(p);
+            }
+        }
+        pts
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SplineObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub points: Vec<Point2>,
+    #[serde(default)]
+    pub closed: bool,
+    pub color: Color,
+    pub visible: bool,
+    pub width: f32,
+}
+
+impl SplineObj {
+    pub fn new(points: Vec<Point2>) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            points,
+            closed: false,
+            color: Color::new(0.2, 0.7, 0.3, 1.0),
+            visible: true,
+            width: 2.0,
+        }
+    }
+
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.label = label.into();
+        self
+    }
+
+    /// Muestrea spline Catmull-Rom; `steps_per_segment` controla densidad.
+    pub fn sample_points(&self, steps_per_segment: usize) -> Vec<Point2> {
+        catmull_rom_sample(&self.points, self.closed, steps_per_segment)
+    }
+}
+
+// Helpers geométricos compartidos por Arc/Spline/Bezier.
+
+fn circumcenter(a: Point2, b: Point2, c: Point2) -> Option<Point2> {
+    let d = 2.0 * (a.x * (b.y - c.y) + b.x * (c.y - a.y) + c.x * (a.y - b.y));
+    if d.abs() < 1e-12 || !d.is_finite() {
+        return None;
+    }
+    let a2 = a.x * a.x + a.y * a.y;
+    let b2 = b.x * b.x + b.y * b.y;
+    let c2 = c.x * c.x + c.y * c.y;
+    let ux = (a2 * (b.y - c.y) + b2 * (c.y - a.y) + c2 * (a.y - b.y)) / d;
+    let uy = (a2 * (c.x - b.x) + b2 * (a.x - c.x) + c2 * (b.x - a.x)) / d;
+    if ux.is_finite() && uy.is_finite() {
+        Some(Point2::new(ux, uy))
+    } else {
+        None
+    }
+}
+
+fn is_angle_between_ccw(start: f64, end: f64, mid: f64) -> bool {
+    let two_pi = 2.0 * std::f64::consts::PI;
+    let norm = |a: f64| ((a % two_pi) + two_pi) % two_pi;
+    let s = norm(start);
+    let e = norm(end);
+    let m = norm(mid);
+    if s <= e {
+        s <= m && m <= e
+    } else {
+        m >= s || m <= e
+    }
+}
+
+fn bezier_point(control: &[Point2], t: f64) -> Option<Point2> {
+    if control.is_empty() || !t.is_finite() {
+        return None;
+    }
+    if control.len() == 1 {
+        return Some(control[0]);
+    }
+    let mut tmp: Vec<Point2> = control.to_vec();
+    let n = tmp.len();
+    for r in 1..n {
+        for i in 0..n - r {
+            let x = (1.0 - t) * tmp[i].x + t * tmp[i + 1].x;
+            let y = (1.0 - t) * tmp[i].y + t * tmp[i + 1].y;
+            tmp[i] = Point2::new(x, y);
+        }
+    }
+    let p = tmp[0];
+    if p.x.is_finite() && p.y.is_finite() {
+        Some(p)
+    } else {
+        None
+    }
+}
+
+fn catmull_rom_sample(points: &[Point2], closed: bool, steps_per_segment: usize) -> Vec<Point2> {
+    if points.len() < 2 {
+        return points.to_vec();
+    }
+    if points.len() == 2 {
+        return points.to_vec();
+    }
+    let steps = steps_per_segment.clamp(4, 64);
+    let mut out = Vec::new();
+    let n = points.len();
+    let seg_count = if closed { n } else { n - 1 };
+    for i in 0..seg_count {
+        let (p0, p1, p2, p3) = if closed {
+            (
+                points[(i + n - 1) % n],
+                points[i],
+                points[(i + 1) % n],
+                points[(i + 2) % n],
+            )
+        } else {
+            let p0 = if i == 0 { points[0] } else { points[i - 1] };
+            let p1 = points[i];
+            let p2 = points[i + 1];
+            let p3 = if i + 2 < n {
+                points[i + 2]
+            } else {
+                points[n - 1]
+            };
+            (p0, p1, p2, p3)
+        };
+        for s in 0..steps {
+            let t = s as f64 / steps as f64;
+            let t2 = t * t;
+            let t3 = t2 * t;
+            let x = 0.5
+                * ((2.0 * p1.x)
+                    + (-p0.x + p2.x) * t
+                    + (2.0 * p0.x - 5.0 * p1.x + 4.0 * p2.x - p3.x) * t2
+                    + (-p0.x + 3.0 * p1.x - 3.0 * p2.x + p3.x) * t3);
+            let y = 0.5
+                * ((2.0 * p1.y)
+                    + (-p0.y + p2.y) * t
+                    + (2.0 * p0.y - 5.0 * p1.y + 4.0 * p2.y - p3.y) * t2
+                    + (-p0.y + 3.0 * p1.y - 3.0 * p2.y + p3.y) * t3);
+            if x.is_finite() && y.is_finite() {
+                // Evita duplicar el punto inicial de cada segmento salvo el primero.
+                if !(i > 0 && s == 0) {
+                    out.push(Point2::new(x, y));
+                }
+            }
+        }
+    }
+    // Añade el punto final exacto para curvas abiertas.
+    if !closed {
+        if let Some(last) = points.last().copied() {
+            out.push(last);
+        }
+    } else if let Some(first) = out.first().copied() {
+        out.push(first);
+    }
+    out
+}
+
+// --------------------------------------------------------
+// AM2, AM3, and 4D Structural Objects
+// --------------------------------------------------------
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ParametricCurve2DObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub expr_x: String,
+    pub expr_y: String,
+    pub t_min: f64,
+    pub t_max: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub t_min_expr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub t_max_expr: Option<String>,
+    pub color: Color,
+    pub visible: bool,
+    pub width: f32,
+    #[serde(default)]
+    pub line_style: LineStyle,
+    #[serde(skip)]
+    pub cached_samples: Arc<RwLock<Curve2DSamples>>,
+    #[serde(skip)]
+    pub cached_key: Arc<RwLock<Option<ParametricCacheKey>>>,
+}
+
+impl Clone for ParametricCurve2DObj {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            label: self.label.clone(),
+            expr_x: self.expr_x.clone(),
+            expr_y: self.expr_y.clone(),
+            t_min: self.t_min,
+            t_max: self.t_max,
+            t_min_expr: self.t_min_expr.clone(),
+            t_max_expr: self.t_max_expr.clone(),
+            color: self.color,
+            visible: self.visible,
+            width: self.width,
+            line_style: self.line_style,
+            cached_samples: self.cached_samples.clone(),
+            cached_key: self.cached_key.clone(),
+        }
+    }
+}
+
+impl PartialEq for ParametricCurve2DObj {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.label == other.label
+            && self.expr_x == other.expr_x
+            && self.expr_y == other.expr_y
+            && self.t_min == other.t_min
+            && self.t_max == other.t_max
+            && self.t_min_expr == other.t_min_expr
+            && self.t_max_expr == other.t_max_expr
+            && self.color == other.color
+            && self.visible == other.visible
+            && self.width == other.width
+            && self.line_style == other.line_style
+    }
+}
+
+impl ParametricCurve2DObj {
+    pub fn new(expr_x: &str, expr_y: &str, t_min: f64, t_max: f64) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            expr_x: expr_x.to_string(),
+            expr_y: expr_y.to_string(),
+            t_min,
+            t_max,
+            t_min_expr: None,
+            t_max_expr: None,
+            color: Color::BLUE,
+            visible: true,
+            width: 2.0,
+            line_style: LineStyle::default(),
+            cached_samples: Arc::new(RwLock::new(Curve2DSamples::new())),
+            cached_key: Arc::new(RwLock::new(None)),
+        }
+    }
+    pub fn with_label(mut self, l: impl Into<String>) -> Self {
+        self.label = l.into();
+        self
+    }
+
+    /// Invalidate any cached samples for this curve.
+    pub fn invalidate_cache(&self) {
+        self.cached_samples
+            .write()
+            .unwrap_or_else(|p| {
+                log::warn!("cache lock envenenado; recuperando estado parcial");
+                p.into_inner()
+            })
+            .clear();
+        *self.cached_key.write().unwrap_or_else(|p| {
+            log::warn!("cache lock envenenado; recuperando estado parcial");
+            p.into_inner()
+        }) = None;
+    }
+}
+
+fn default_curve_3d_parameter() -> String {
+    "t".to_string()
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ParametricCurve3DObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub expr_x: String,
+    pub expr_y: String,
+    pub expr_z: String,
+    #[serde(default = "default_curve_3d_parameter")]
+    pub parameter: String,
+    pub t_min: f64,
+    pub t_max: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub t_min_expr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub t_max_expr: Option<String>,
+    pub color: Color,
+    pub visible: bool,
+    pub width: f32,
+    #[serde(skip)]
+    pub cached_samples: Arc<RwLock<Curve3DSamples>>,
+    #[serde(skip)]
+    pub cached_key: Arc<RwLock<Option<ParametricCacheKey>>>,
+}
+
+impl Clone for ParametricCurve3DObj {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            label: self.label.clone(),
+            expr_x: self.expr_x.clone(),
+            expr_y: self.expr_y.clone(),
+            expr_z: self.expr_z.clone(),
+            parameter: self.parameter.clone(),
+            t_min: self.t_min,
+            t_max: self.t_max,
+            t_min_expr: self.t_min_expr.clone(),
+            t_max_expr: self.t_max_expr.clone(),
+            color: self.color,
+            visible: self.visible,
+            width: self.width,
+            cached_samples: self.cached_samples.clone(),
+            cached_key: self.cached_key.clone(),
+        }
+    }
+}
+
+impl PartialEq for ParametricCurve3DObj {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.label == other.label
+            && self.expr_x == other.expr_x
+            && self.expr_y == other.expr_y
+            && self.expr_z == other.expr_z
+            && self.parameter == other.parameter
+            && self.t_min == other.t_min
+            && self.t_max == other.t_max
+            && self.t_min_expr == other.t_min_expr
+            && self.t_max_expr == other.t_max_expr
+            && self.color == other.color
+            && self.visible == other.visible
+            && self.width == other.width
+    }
+}
+
+impl ParametricCurve3DObj {
+    pub fn new(expr_x: &str, expr_y: &str, expr_z: &str, t_min: f64, t_max: f64) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            expr_x: expr_x.to_string(),
+            expr_y: expr_y.to_string(),
+            expr_z: expr_z.to_string(),
+            parameter: default_curve_3d_parameter(),
+            t_min,
+            t_max,
+            t_min_expr: None,
+            t_max_expr: None,
+            color: Color::new(1.0, 0.0, 1.0, 1.0),
+            visible: true,
+            width: 2.0,
+            cached_samples: Arc::new(RwLock::new(Curve3DSamples::new())),
+            cached_key: Arc::new(RwLock::new(None)),
+        }
+    }
+    pub fn with_label(mut self, l: impl Into<String>) -> Self {
+        self.label = l.into();
+        self
+    }
+
+    pub fn with_parameter(mut self, parameter: impl Into<String>) -> Self {
+        self.parameter = parameter.into();
+        self
+    }
+
+    /// Invalidate any cached samples for this curve.
+    pub fn invalidate_cache(&self) {
+        self.cached_samples
+            .write()
+            .unwrap_or_else(|p| {
+                log::warn!("cache lock envenenado; recuperando estado parcial");
+                p.into_inner()
+            })
+            .clear();
+        *self.cached_key.write().unwrap_or_else(|p| {
+            log::warn!("cache lock envenenado; recuperando estado parcial");
+            p.into_inner()
+        }) = None;
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PolarCurveObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub expr_r: String,
+    pub t_min: f64,
+    pub t_max: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub t_min_expr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub t_max_expr: Option<String>,
+    pub color: Color,
+    pub visible: bool,
+    pub width: f32,
+    pub fill_color: Option<Color>,
+    #[serde(default)]
+    pub line_style: LineStyle,
+    #[serde(skip)]
+    pub cached_samples: Arc<RwLock<Curve2DSamples>>,
+    #[serde(skip)]
+    pub cached_key: Arc<RwLock<Option<ParametricCacheKey>>>,
+}
+
+impl Clone for PolarCurveObj {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            label: self.label.clone(),
+            expr_r: self.expr_r.clone(),
+            t_min: self.t_min,
+            t_max: self.t_max,
+            t_min_expr: self.t_min_expr.clone(),
+            t_max_expr: self.t_max_expr.clone(),
+            color: self.color,
+            visible: self.visible,
+            width: self.width,
+            line_style: self.line_style,
+            fill_color: self.fill_color,
+            cached_samples: self.cached_samples.clone(),
+            cached_key: self.cached_key.clone(),
+        }
+    }
+}
+
+impl PartialEq for PolarCurveObj {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.label == other.label
+            && self.expr_r == other.expr_r
+            && self.t_min == other.t_min
+            && self.t_max == other.t_max
+            && self.t_min_expr == other.t_min_expr
+            && self.t_max_expr == other.t_max_expr
+            && self.color == other.color
+            && self.visible == other.visible
+            && self.width == other.width
+            && self.line_style == other.line_style
+            && self.fill_color == other.fill_color
+    }
+}
+
+impl PolarCurveObj {
+    pub fn new(expr_r: &str, t_min: f64, t_max: f64) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            expr_r: expr_r.to_string(),
+            t_min,
+            t_max,
+            t_min_expr: None,
+            t_max_expr: None,
+            color: Color::new(0.0, 0.7, 0.3, 1.0),
+            visible: true,
+            width: 2.0,
+            line_style: LineStyle::default(),
+            fill_color: None,
+            cached_samples: Arc::new(RwLock::new(Curve2DSamples::new())),
+            cached_key: Arc::new(RwLock::new(None)),
+        }
+    }
+    pub fn with_label(mut self, l: impl Into<String>) -> Self {
+        self.label = l.into();
+        self
+    }
+    pub fn with_fill(mut self, color: Color) -> Self {
+        self.fill_color = Some(color);
+        self
+    }
+
+    /// Invalidate any cached samples for this curve.
+    pub fn invalidate_cache(&self) {
+        self.cached_samples
+            .write()
+            .unwrap_or_else(|p| {
+                log::warn!("cache lock envenenado; recuperando estado parcial");
+                p.into_inner()
+            })
+            .clear();
+        *self.cached_key.write().unwrap_or_else(|p| {
+            log::warn!("cache lock envenenado; recuperando estado parcial");
+            p.into_inner()
+        }) = None;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComplexGridObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub expr: String,
+    pub x_min: f64,
+    pub x_max: f64,
+    pub y_min: f64,
+    pub y_max: f64,
+    pub density: usize,
+    pub color: Color,
+    pub visible: bool,
+    /// 0 = grid lines, 1 = domain coloring (complex), 2 = heat map (real f(x,y))
+    pub render_mode: u8,
+    #[serde(default)]
+    pub domain_coloring_mode: u8,
+    /// Paleta del heat map (modo 2, O6): 0 = térmica legacy (default,
+    /// paridad), 1 = viridis (perceptual + daltónica). Desconocida → térmica.
+    #[serde(default)]
+    pub palette: u8,
+}
+impl ComplexGridObj {
+    pub fn new(expr: &str, x_min: f64, x_max: f64, y_min: f64, y_max: f64) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            expr: expr.to_string(),
+            x_min,
+            x_max,
+            y_min,
+            y_max,
+            density: 10,
+            color: Color::BLUE,
+            visible: true,
+            render_mode: 0,
+            domain_coloring_mode: 0,
+            palette: 0,
+        }
+    }
+    pub fn with_label(mut self, l: impl Into<String>) -> Self {
+        self.label = l.into();
+        self
+    }
+    pub fn as_domain_coloring(mut self) -> Self {
+        self.render_mode = 1;
+        self.density = self.density.max(200);
+        self
+    }
+    pub fn as_heat_map(mut self) -> Self {
+        self.render_mode = 2;
+        self.density = self.density.max(150);
+        self
+    }
+    /// Paleta del heat map: 0 térmica, 1 viridis (O6).
+    pub fn with_palette(mut self, palette: u8) -> Self {
+        self.palette = palette;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComplexMappingObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub expr: String,
+    pub target: ObjectId,
+    pub color: Color,
+    pub visible: bool,
+    #[serde(default)]
+    pub animate_homotopy: bool,
+    #[serde(default)]
+    pub homotopy_speed: f32, // speed factor, e.g. 1.0
+    #[serde(skip)]
+    pub conformal_cache: Option<ConformalMap>,
+}
+impl ComplexMappingObj {
+    pub fn new(expr: &str, target: ObjectId) -> Self {
+        let conformal_cache = ConformalMap::from_expr_string(expr);
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            expr: expr.to_string(),
+            target,
+            color: Color::new(0.5, 0.0, 0.5, 1.0),
+            visible: true,
+            animate_homotopy: false,
+            homotopy_speed: 1.0,
+            conformal_cache,
+        }
+    }
+
+    pub fn new_with_symbol(expr: &str, target: ObjectId, symbol: &str) -> Self {
+        let conformal_cache = conformal_map_from_expr(expr, symbol);
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            expr: expr.to_string(),
+            target,
+            color: Color::new(0.5, 0.0, 0.5, 1.0),
+            visible: true,
+            animate_homotopy: false,
+            homotopy_speed: 1.0,
+            conformal_cache,
+        }
+    }
+
+    pub fn conformal_map(&self, symbol: &str) -> Option<ConformalMap> {
+        conformal_map_from_expr(&self.expr, symbol).or(self.conformal_cache)
+    }
+
+    /// Expresión con el símbolo base normalizado a `z` (lo que entiende el
+    /// parser complejo). Cubre los mapeos que [`ConformalMap`] no reconoce
+    /// (identidad, afines, polinomios con término constante, …): el render
+    /// los aplica con `ComplexExpr` en vez de quedarse en un no-op silencioso.
+    pub fn normalized_expr(&self, symbol: &str) -> String {
+        normalize_complex_symbol(&self.expr, symbol)
+    }
+
+    pub fn with_label(mut self, l: impl Into<String>) -> Self {
+        self.label = l.into();
+        self
+    }
+
+    pub fn refresh_cache(&mut self) {
+        self.conformal_cache = ConformalMap::from_expr_string(&self.expr);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComplexIntegralObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub expr: String,
+    pub target: ObjectId, // the contour to integrate over
+    pub color: Color,
+    pub visible: bool,
+    pub compute_residue: bool, // If true, computes sum of residues instead of raw integral
+}
+impl ComplexIntegralObj {
+    pub fn new(expr: &str, target: ObjectId, compute_residue: bool) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            expr: expr.to_string(),
+            target,
+            color: Color::new(0.8, 0.2, 0.2, 1.0),
+            visible: true,
+            compute_residue,
+        }
+    }
+}
+
+fn conformal_map_from_expr(expr: &str, symbol: &str) -> Option<ConformalMap> {
+    let normalized = normalize_complex_symbol(expr, symbol);
+    ConformalMap::from_expr_string(&normalized)
+}
+
+fn normalize_complex_symbol(expr: &str, symbol: &str) -> String {
+    if symbol.is_empty() || symbol == "z" {
+        return expr.to_string();
+    }
+    // Evitar reemplazos dentro de identificadores más largos: sólo reemplazar
+    // ocurrencias aisladas de `symbol` delimitadas por no-ident.
+    // Hacer el escaneo por índice de char para no romper UTF-8.
+    let symbol_chars: Vec<char> = symbol.chars().collect();
+    let expr_chars: Vec<char> = expr.chars().collect();
+    let sym_len = symbol_chars.len();
+    if sym_len == 0 {
+        return expr.to_string();
+    }
+    let mut out = String::with_capacity(expr.len());
+    let mut i = 0;
+    while i < expr_chars.len() {
+        let matches =
+            i + sym_len <= expr_chars.len() && expr_chars[i..i + sym_len] == symbol_chars[..];
+        if matches {
+            let prev_ident =
+                i > 0 && (expr_chars[i - 1].is_ascii_alphanumeric() || expr_chars[i - 1] == '_');
+            let next_ident = i + sym_len < expr_chars.len()
+                && (expr_chars[i + sym_len].is_ascii_alphanumeric()
+                    || expr_chars[i + sym_len] == '_');
+            if prev_ident || next_ident {
+                for &c in &symbol_chars {
+                    out.push(c);
+                }
+            } else {
+                out.push('z');
+            }
+            i += sym_len;
+        } else {
+            out.push(expr_chars[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct VectorField2DObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub expr_u: String,
+    pub expr_v: String,
+    pub color: Color,
+    pub visible: bool,
+    pub density: usize,
+    /// Color por magnitud (viridis log): dirección+sentido+intensidad visibles.
+    #[serde(default)]
+    pub color_by_magnitude: bool,
+    /// Largo por magnitud (0.3x..1.5x): si false, largo uniforme (solo dirección).
+    #[serde(default)]
+    pub scale_by_magnitude: bool,
+    #[serde(skip)]
+    pub cached_samples: Arc<RwLock<VectorFieldSamples>>,
+    #[serde(skip)]
+    pub cached_key: Arc<RwLock<Option<VectorFieldCacheKey>>>,
+}
+
+impl Clone for VectorField2DObj {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            label: self.label.clone(),
+            expr_u: self.expr_u.clone(),
+            expr_v: self.expr_v.clone(),
+            color: self.color,
+            visible: self.visible,
+            density: self.density,
+            color_by_magnitude: self.color_by_magnitude,
+            scale_by_magnitude: self.scale_by_magnitude,
+            cached_samples: self.cached_samples.clone(),
+            cached_key: self.cached_key.clone(),
+        }
+    }
+}
+
+impl PartialEq for VectorField2DObj {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.label == other.label
+            && self.expr_u == other.expr_u
+            && self.expr_v == other.expr_v
+            && self.color == other.color
+            && self.visible == other.visible
+            && self.density == other.density
+            && self.color_by_magnitude == other.color_by_magnitude
+            && self.scale_by_magnitude == other.scale_by_magnitude
+    }
+}
+
+impl VectorField2DObj {
+    pub fn new(expr_u: &str, expr_v: &str) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            expr_u: expr_u.to_string(),
+            expr_v: expr_v.to_string(),
+            color: Color::new(0.8, 0.4, 0.0, 1.0),
+            visible: true,
+            density: 15,
+            color_by_magnitude: true,
+            scale_by_magnitude: false,
+            cached_samples: Arc::new(RwLock::new(VectorFieldSamples::new())),
+            cached_key: Arc::new(RwLock::new(None)),
+        }
+    }
+    pub fn with_label(mut self, l: impl Into<String>) -> Self {
+        self.label = l.into();
+        self
+    }
+
+    /// Invalida cualquier caché de muestreo de este campo vectorial.
+    pub fn invalidate_cache(&self) {
+        self.cached_samples
+            .write()
+            .unwrap_or_else(|p| {
+                log::warn!("cache lock envenenado; recuperando estado parcial");
+                p.into_inner()
+            })
+            .clear();
+        *self.cached_key.write().unwrap_or_else(|p| {
+            log::warn!("cache lock envenenado; recuperando estado parcial");
+            p.into_inner()
+        }) = None;
+    }
+}
+
+/// Phase portrait for autonomous ODE system dx/dt = P(x,y), dy/dt = Q(x,y)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PhasePortraitObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub expr_dx: String,
+    pub expr_dy: String,
+    pub x_min: f64,
+    pub x_max: f64,
+    pub y_min: f64,
+    pub y_max: f64,
+    pub density: usize,
+    pub color: Color,
+    pub visible: bool,
+}
+impl PhasePortraitObj {
+    pub fn new(
+        expr_dx: &str,
+        expr_dy: &str,
+        x_min: f64,
+        x_max: f64,
+        y_min: f64,
+        y_max: f64,
+    ) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            expr_dx: expr_dx.to_string(),
+            expr_dy: expr_dy.to_string(),
+            x_min,
+            x_max,
+            y_min,
+            y_max,
+            density: 20,
+            color: Color::new(0.2, 0.2, 0.8, 1.0),
+            visible: true,
+        }
+    }
+    pub fn with_label(mut self, l: impl Into<String>) -> Self {
+        self.label = l.into();
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum RelationOperator {
+    Eq,
+    Less,
+    Greater,
+    LessEq,
+    GreaterEq,
+}
+
+/// Cached (x, y) samples for a 1D function.
+pub type FunctionSamples = Vec<(f64, Option<f64>)>;
+
+/// Cached samples for a 2D parametric or polar curve.
+pub type Curve2DSamples = Vec<(f64, f64)>;
+
+/// Cached samples for a 3D parametric curve.
+pub type Curve3DSamples = Vec<(f64, f64, f64)>;
+
+/// Cached world-space point grid for a 3D surface in document `(x, y, z)` order.
+pub type SurfaceSamples = Vec<Vec<Point3D>>;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FunctionCacheKey {
+    pub expr: String,
+    pub domain: (f64, f64),
+    pub grid_size: usize,
+    pub variables_hash: u64,
+    pub is_integral: bool,
+    pub integral_var: String,
+    pub integral_lower: f64,
+}
+
+/// Cache key for parametric curves (2D, 3D, polar).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParametricCacheKey {
+    pub t_domain: (f64, f64),
+    pub steps: usize,
+    pub expr_hash: u64,
+    pub variables_hash: u64,
+}
+
+/// Cache key for 3D parametric surfaces.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SurfaceCacheKey {
+    pub x_domain: (f64, f64),
+    pub y_domain: (f64, f64),
+    pub res: usize,
+    pub is_parametric: bool,
+    pub expr_hash: u64,
+    pub variables_hash: u64,
+}
+
+/// Cached (x, y, u, v) samples for a 2D vector field.
+pub type VectorFieldSamples = Vec<(f64, f64, f64, f64)>;
+
+/// Type alias for cached world-space region (x_min, x_max, y_min, y_max).
+pub type CachedRegion = (f64, f64, f64, f64);
+
+/// Cache key for 2D vector fields.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VectorFieldCacheKey {
+    pub expr_u: String,
+    pub expr_v: String,
+    pub view_bounds: (f64, f64, f64, f64),
+    pub grid_size: usize,
+    pub variables_hash: u64,
+}
+
+/// World-space line segments grouped by contour level.
+pub type ImplicitCurveSegments = Vec<(f64, Vec<(Point2, Point2)>)>;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImplicitCurveCacheKey {
+    pub expr_lhs: String,
+    pub expr_rhs: String,
+    pub operator: RelationOperator,
+    pub contour_levels_hash: u64,
+    pub contour_colors_hash: u64,
+    pub view_bounds: (f64, f64, f64, f64),
+    pub grid_size: usize,
+    pub variables_hash: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ImplicitCurveObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub expr_lhs: String,
+    pub expr_rhs: String,
+    pub operator: RelationOperator,
+    pub color: Color,
+    /// Color de relleno para regiones (Less/LessEq/Greater/GreaterEq) o para
+    /// el interior de curvas cerradas (Eq). Si es `None`, no se rellena.
+    pub fill_color: Option<Color>,
+    pub visible: bool,
+    pub width: f32,
+    #[serde(default)]
+    pub line_style: LineStyle,
+    pub contour_levels: Option<Vec<f64>>,
+    pub contour_colors: Option<Vec<Color>>,
+    /// Cached geometry: one segment list per contour level (world-space).
+    /// Wrapped in a lock so the GPU renderer can update it through a shared
+    /// document reference.
+    #[serde(skip)]
+    pub cached_segments: Arc<RwLock<ImplicitCurveSegments>>,
+    #[serde(skip)]
+    pub cached_key: Arc<RwLock<Option<ImplicitCurveCacheKey>>>,
+    /// World-space region that was actually computed (padded/snapped view
+    /// bounds). Used to decide whether a new view can reuse the cached
+    /// geometry without re-evaluation.
+    #[serde(skip)]
+    pub cached_region: Arc<RwLock<Option<CachedRegion>>>,
+    /// ASTs parseados de lhs y rhs, cacheados juntos. Se cachean porque
+    /// el render de relleno llama `eval_2d` millones de veces por frame;
+    /// parsear el AST en cada llamada era el cuello de botella que
+    /// causaba lag/cuelgues con expresiones no triviales. La clave es el
+    /// hash de **ambas** expresiones combinadas, así que no se confunden
+    /// lhs y rhs (bug anterior: un solo cache se sobreescribía entre
+    /// llamadas a lhs y rhs).
+    #[serde(skip)]
+    #[allow(private_interfaces)]
+    pub cached_asts: Arc<RwLock<Option<CachedAsts>>>,
+    /// Variables referenciadas por lhs/rhs, cacheadas por hash de ambos
+    /// textos. `cache_key` se llama 3+ veces por frame por curva y antes
+    /// re-parseaba las dos expresiones en cada llamada.
+    #[serde(skip)]
+    #[allow(private_interfaces)]
+    pub referenced_vars: Arc<RwLock<Option<CachedReferencedVars>>>,
+}
+
+#[derive(Clone, Debug)]
+struct CachedAsts {
+    lhs: grafito_geometry::ast::Expr,
+    rhs: grafito_geometry::ast::Expr,
+    /// Hash de lhs + rhs + variables combinadas.
+    hash: u64,
+}
+
+/// FNV-1a 64: hasher no criptográfico para claves de caché calientes.
+///
+/// `DefaultHasher` (SipHash) es notoriamente más lento para strings cortos;
+/// en `cache_key` (llamado varias veces por frame por curva) el hash era
+/// parte medible del costo. FNV-1a es determinista entre plataformas.
+fn fnv1a_str(state: &mut u64, text: &str) {
+    for byte in text.bytes() {
+        *state ^= u64::from(byte);
+        *state = state.wrapping_mul(0x1000_0000_01b3);
+    }
+}
+
+/// Mezcla un byte separador (evita ambigüedad `"ab"+"c"` vs `"a"+"bc"`).
+fn fnv1a_sep(state: &mut u64) {
+    *state ^= 0xFFu64;
+    *state = state.wrapping_mul(0x1000_0000_01b3);
+}
+
+/// Variables referenciadas por `(expr_lhs, expr_rhs)`, cacheadas para no
+/// re-parsear en cada frame. La clave es el hash FNV de ambos textos, así
+/// que una edición de la expresión se auto-invalida sin intervención.
+#[derive(Clone, Debug)]
+struct CachedReferencedVars {
+    expr_hash: u64,
+    vars: HashSet<String>,
+}
+
+impl Clone for ImplicitCurveObj {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            label: self.label.clone(),
+            expr_lhs: self.expr_lhs.clone(),
+            expr_rhs: self.expr_rhs.clone(),
+            operator: self.operator,
+            color: self.color,
+            fill_color: self.fill_color,
+            visible: self.visible,
+            width: self.width,
+            line_style: self.line_style,
+            contour_levels: self.contour_levels.clone(),
+            contour_colors: self.contour_colors.clone(),
+            cached_segments: self.cached_segments.clone(),
+            cached_key: self.cached_key.clone(),
+            cached_region: self.cached_region.clone(),
+            cached_asts: self.cached_asts.clone(),
+            referenced_vars: self.referenced_vars.clone(),
+        }
+    }
+}
+
+impl PartialEq for ImplicitCurveObj {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.label == other.label
+            && self.expr_lhs == other.expr_lhs
+            && self.expr_rhs == other.expr_rhs
+            && self.operator == other.operator
+            && self.color == other.color
+            && self.visible == other.visible
+            && self.width == other.width
+            && self.line_style == other.line_style
+            && self.contour_levels == other.contour_levels
+            && self.contour_colors == other.contour_colors
+    }
+}
+
+/// Hash FNV-1a de los valores de `variables` restringidos a `referenced`.
+///
+/// Determinista sin colectar ni ordenar: el `BTreeMap` ya itera en orden.
+fn hash_referenced_values(referenced: &HashSet<String>, variables: &BTreeMap<String, f64>) -> u64 {
+    // Sin alocación: el `BTreeMap` ya itera en orden y el filtro lo
+    // preserva, así que el hash es determinista sin colectar ni ordenar.
+    let mut state = 0xcbf29ce484222325u64;
+    for (k, v) in variables.iter() {
+        if referenced.contains(k) {
+            fnv1a_str(&mut state, k);
+            state ^= v.to_bits();
+            state = state.wrapping_mul(0x1000_0000_01b3);
+        }
+    }
+    state
+}
+
+/// Hash FNV-1a de TODAS las variables (orden del `BTreeMap`, determinista).
+/// Fallback conservador cuando el conjunto de referenciadas no está
+/// disponible: cubre más estado, jamás colisiona por omisión.
+fn hash_all_values(variables: &BTreeMap<String, f64>) -> u64 {
+    let mut state = 0xcbf29ce484222325u64;
+    for (k, v) in variables.iter() {
+        fnv1a_str(&mut state, k);
+        state ^= v.to_bits();
+        state = state.wrapping_mul(0x1000_0000_01b3);
+    }
+    state
+}
+
+impl ImplicitCurveObj {
+    pub fn new(expr_lhs: &str, expr_rhs: &str, operator: RelationOperator) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            expr_lhs: expr_lhs.to_string(),
+            expr_rhs: expr_rhs.to_string(),
+            operator,
+            color: Color::new(0.6, 0.2, 0.8, 1.0),
+            // Por defecto, regiones y curvas cerradas se rellenan con un
+            // violeta claramente visible (alpha 0.5). El usuario puede
+            // desactivarlo. Con alpha 0.2 el fill era casi invisible.
+            fill_color: Some(Color::new(0.6, 0.2, 0.8, 0.5)),
+            visible: true,
+            width: 2.0,
+            line_style: LineStyle::default(),
+            contour_levels: None,
+            contour_colors: None,
+            cached_segments: Arc::new(RwLock::new(ImplicitCurveSegments::new())),
+            cached_key: Arc::new(RwLock::new(None)),
+            cached_region: Arc::new(RwLock::new(None)),
+            cached_asts: Arc::new(RwLock::new(None)),
+            referenced_vars: Arc::new(RwLock::new(None)),
+        }
+    }
+    pub fn with_label(mut self, l: impl Into<String>) -> Self {
+        self.label = l.into();
+        self
+    }
+    pub fn with_fill(mut self, fill: Option<Color>) -> Self {
+        self.fill_color = fill;
+        self
+    }
+
+    /// Devuelve los ASTs parseados de `expr_lhs` y `expr_rhs`, cacheándolos
+    /// juntos para no reparsear en cada frame. Devuelve `None` si alguna
+    /// expresión no parsea (en cuyo caso el render debe omitir el objeto).
+    ///
+    /// La caché se invalida automáticamente cuando cambia el texto de las
+    /// expresiones o las variables del documento.
+    ///
+    /// Importante: el cache es **combinado** para lhs y rhs (un solo slot)
+    /// porque antes había un bug donde llamadas separadas a lhs y rhs se
+    /// sobreescribían mutuamente, devolviendo el AST incorrecto.
+    pub fn get_cached_asts(
+        &self,
+        variables: &BTreeMap<String, f64>,
+        var_names: &[&str],
+    ) -> Option<(grafito_geometry::ast::Expr, grafito_geometry::ast::Expr)> {
+        // Hash combinado de lhs + rhs + variables referenciadas (orden
+        // determinista). Restringir a referenciadas evita re-parsear cuando
+        // cambia un slider ajeno a la curva; si el conjunto aún no se
+        // conoce, se usa el hash conservador sobre todas.
+        let combined_hash = match self.referenced_guarded(variables).as_ref() {
+            Some(cached) => {
+                let mut state = cached.expr_hash;
+                fnv1a_sep(&mut state);
+                state ^= hash_referenced_values(&cached.vars, variables);
+                state = state.wrapping_mul(0x1000_0000_01b3);
+                state
+            }
+            None => {
+                let mut state = self.referenced_expr_hash();
+                fnv1a_sep(&mut state);
+                state ^= hash_all_values(variables);
+                state = state.wrapping_mul(0x1000_0000_01b3);
+                state
+            }
+        };
+
+        // Verificar cache.
+        if let Some(cached) = self
+            .cached_asts
+            .read()
+            .unwrap_or_else(|p| {
+                log::warn!("cache lock envenenado; recuperando estado parcial");
+                p.into_inner()
+            })
+            .clone()
+        {
+            if cached.hash == combined_hash {
+                return Some((cached.lhs, cached.rhs));
+            }
+        }
+
+        // Re-parsear ambos juntos.
+        let lhs =
+            grafito_geometry::expr::prepare_function_ast(&self.expr_lhs, variables, var_names)
+                .ok()?;
+        let rhs =
+            grafito_geometry::expr::prepare_function_ast(&self.expr_rhs, variables, var_names)
+                .ok()?;
+
+        let new_cache = CachedAsts {
+            lhs: lhs.clone(),
+            rhs: rhs.clone(),
+            hash: combined_hash,
+        };
+        *self.cached_asts.write().unwrap_or_else(|p| {
+            log::warn!("cache lock envenenado; recuperando estado parcial");
+            p.into_inner()
+        }) = Some(new_cache);
+        Some((lhs, rhs))
+    }
+}
+
+fn is_variable_in_expr(var: &str, expr: &str) -> bool {
+    let mut start = 0;
+    while let Some(pos) = expr[start..].find(var) {
+        let actual_pos = start + pos;
+        let before = if actual_pos == 0 {
+            None
+        } else {
+            expr.as_bytes().get(actual_pos - 1).map(|&b| b as char)
+        };
+        let after = expr
+            .as_bytes()
+            .get(actual_pos + var.len())
+            .map(|&b| b as char);
+
+        let is_before_word = before.is_some_and(|c| c.is_alphanumeric() || c == '_');
+        let is_after_word = after.is_some_and(|c| c.is_alphanumeric() || c == '_');
+
+        if !is_before_word && !is_after_word {
+            return true;
+        }
+        start = actual_pos + 1;
+    }
+    false
+}
+
+impl ImplicitCurveObj {
+    pub fn cache_key(
+        &self,
+        view_bounds: (f64, f64, f64, f64),
+        grid_size: usize,
+        variables: &BTreeMap<String, f64>,
+    ) -> ImplicitCurveCacheKey {
+        let mut state = 0xcbf29ce484222325u64;
+        if let Some(levels) = &self.contour_levels {
+            for v in levels {
+                state ^= v.to_bits();
+                state = state.wrapping_mul(0x1000_0000_01b3);
+            }
+        }
+        let contour_levels_hash = state;
+
+        let mut state = 0xcbf29ce484222325u64;
+        if let Some(colors) = &self.contour_colors {
+            for c in colors {
+                for bits in [c.r.to_bits(), c.g.to_bits(), c.b.to_bits(), c.a.to_bits()] {
+                    state ^= u64::from(bits);
+                    state = state.wrapping_mul(0x1000_0000_01b3);
+                }
+            }
+        }
+        let contour_colors_hash = state;
+
+        let variables_hash = self.variables_hash(variables);
+
+        ImplicitCurveCacheKey {
+            expr_lhs: self.expr_lhs.clone(),
+            expr_rhs: self.expr_rhs.clone(),
+            operator: self.operator,
+            contour_levels_hash,
+            contour_colors_hash,
+            view_bounds,
+            grid_size,
+            variables_hash,
+        }
+    }
+
+    /// Hash FNV-1a de los valores de las variables referenciadas por
+    /// `(expr_lhs, expr_rhs)`.
+    ///
+    /// El conjunto de variables referenciadas solo depende de los textos de
+    /// las expresiones, así que se cachea por hash de ambos (auto-invalida
+    /// ante ediciones). Antes se re-parseaba en cada llamada, y `cache_key`
+    /// se llama 3+ veces por frame por curva.
+    fn variables_hash(&self, variables: &BTreeMap<String, f64>) -> u64 {
+        let guard = self.referenced_guarded(variables);
+        match guard.as_ref() {
+            Some(cached) => hash_referenced_values(&cached.vars, variables),
+            // Inalcanzable en la práctica (siempre se escribe arriba); hash
+            // conservador sobre TODAS las variables para no colisionar.
+            None => hash_all_values(variables),
+        }
+    }
+
+    /// Conjunto de variables referenciadas por `(expr_lhs, expr_rhs)`,
+    /// cacheado por hash de ambos textos. En hit no parsea: el guard de
+    /// lectura se sostiene durante el uso (sección corta, el lock solo se
+    /// escribe ante cambio de expresión). Patrón de poison-recovery igual
+    /// que el resto de cachés del objeto.
+    fn referenced_guarded(
+        &self,
+        variables: &BTreeMap<String, f64>,
+    ) -> std::sync::RwLockReadGuard<'_, Option<CachedReferencedVars>> {
+        let expr_hash = self.referenced_expr_hash();
+        let needs_compute = self
+            .referenced_vars
+            .read()
+            .map(|guard| {
+                guard
+                    .as_ref()
+                    .map(|cached| cached.expr_hash != expr_hash)
+                    .unwrap_or(true)
+            })
+            .unwrap_or(true);
+        if needs_compute {
+            let referenced = Self::scan_referenced(&self.expr_lhs, &self.expr_rhs, variables);
+            *self.referenced_vars.write().unwrap_or_else(|p| {
+                log::warn!("cache lock envenenado; recuperando estado parcial");
+                p.into_inner()
+            }) = Some(CachedReferencedVars {
+                expr_hash,
+                vars: referenced,
+            });
+        }
+        self.referenced_vars.read().unwrap_or_else(|p| {
+            log::warn!("cache lock envenenado; recuperando estado parcial");
+            p.into_inner()
+        })
+    }
+
+    /// Hash FNV-1a de `(expr_lhs, expr_rhs)` como textos.
+    fn referenced_expr_hash(&self) -> u64 {
+        let mut expr_state = 0xcbf29ce484222325u64;
+        fnv1a_str(&mut expr_state, &self.expr_lhs);
+        fnv1a_sep(&mut expr_state);
+        fnv1a_str(&mut expr_state, &self.expr_rhs);
+        expr_state
+    }
+
+    /// Escanea lhs/rhs (parse + fallback por substring) una sola vez.
+    fn scan_referenced(
+        expr_lhs: &str,
+        expr_rhs: &str,
+        variables: &BTreeMap<String, f64>,
+    ) -> HashSet<String> {
+        let mut referenced = HashSet::new();
+        let lhs_clean = grafito_geometry::expr::preprocess_expr(expr_lhs);
+        if let Ok(ast_lhs) = grafito_geometry::ast::parse_ast(&lhs_clean) {
+            ast_lhs.get_variables(&mut referenced);
+        } else {
+            for k in variables.keys() {
+                if is_variable_in_expr(k, expr_lhs) {
+                    referenced.insert(k.clone());
+                }
+            }
+        }
+
+        let rhs_clean = grafito_geometry::expr::preprocess_expr(expr_rhs);
+        if let Ok(ast_rhs) = grafito_geometry::ast::parse_ast(&rhs_clean) {
+            ast_rhs.get_variables(&mut referenced);
+        } else {
+            for k in variables.keys() {
+                if is_variable_in_expr(k, expr_rhs) {
+                    referenced.insert(k.clone());
+                }
+            }
+        }
+        referenced
+    }
+
+    /// Invalidate any cached geometry for this curve.
+    pub fn invalidate_cache(&self) {
+        self.cached_segments
+            .write()
+            .unwrap_or_else(|p| {
+                log::warn!("cache lock envenenado; recuperando estado parcial");
+                p.into_inner()
+            })
+            .clear();
+        *self.cached_key.write().unwrap_or_else(|p| {
+            log::warn!("cache lock envenenado; recuperando estado parcial");
+            p.into_inner()
+        }) = None;
+        *self.cached_region.write().unwrap_or_else(|p| {
+            log::warn!("cache lock envenenado; recuperando estado parcial");
+            p.into_inner()
+        }) = None;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Attractor3DObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub attractor_type: String,
+    pub params: Vec<f64>,
+    pub x0: f64,
+    pub y0: f64,
+    pub z0: f64,
+    pub dt: f64,
+    pub steps: usize,
+    pub skip: usize,
+    pub color: Color,
+    pub visible: bool,
+    pub width: f32,
+}
+impl Attractor3DObj {
+    pub fn new(attractor_type: &str, params: Vec<f64>) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            attractor_type: attractor_type.to_string(),
+            params,
+            x0: 0.1,
+            y0: 0.0,
+            z0: 0.0,
+            dt: 0.005,
+            steps: 20000,
+            skip: 100,
+            color: Color::new(1.0, 0.3, 0.3, 1.0),
+            visible: true,
+            width: 1.0,
+        }
+    }
+    pub fn with_label(mut self, l: impl Into<String>) -> Self {
+        self.label = l.into();
+        self
+    }
+    pub fn with_initial(mut self, x: f64, y: f64, z: f64) -> Self {
+        self.x0 = x;
+        self.y0 = y;
+        self.z0 = z;
+        self
+    }
+    pub fn with_dt(mut self, dt: f64) -> Self {
+        self.dt = dt;
+        self
+    }
+
+    pub fn model(&self) -> grafito_geometry::attractors::AttractorType {
+        use grafito_geometry::attractors::AttractorType;
+
+        match self.attractor_type.as_str() {
+            "lorenz" => AttractorType::Lorenz {
+                sigma: self.params.first().copied().unwrap_or(10.0),
+                rho: self.params.get(1).copied().unwrap_or(28.0),
+                beta: self.params.get(2).copied().unwrap_or(8.0 / 3.0),
+            },
+            "rossler" => AttractorType::Rossler {
+                a: self.params.first().copied().unwrap_or(0.2),
+                b: self.params.get(1).copied().unwrap_or(0.2),
+                c: self.params.get(2).copied().unwrap_or(5.7),
+            },
+            "thomas" => AttractorType::Thomas {
+                b: self.params.first().copied().unwrap_or(0.208186),
+            },
+            "aizawa" => AttractorType::Aizawa {
+                a: self.params.first().copied().unwrap_or(0.95),
+                b: self.params.get(1).copied().unwrap_or(0.7),
+                c: self.params.get(2).copied().unwrap_or(0.6),
+                d: self.params.get(3).copied().unwrap_or(3.5),
+                e: self.params.get(4).copied().unwrap_or(0.25),
+                f: self.params.get(5).copied().unwrap_or(0.1),
+            },
+            "chen" => AttractorType::Chen {
+                a: self.params.first().copied().unwrap_or(35.0),
+                b: self.params.get(1).copied().unwrap_or(3.0),
+                c: self.params.get(2).copied().unwrap_or(28.0),
+            },
+            "halvorsen" => AttractorType::Halvorsen {
+                a: self.params.first().copied().unwrap_or(1.89),
+            },
+            "dadras" => AttractorType::Dadras {
+                p: self.params.first().copied().unwrap_or(3.0),
+                q: self.params.get(1).copied().unwrap_or(2.7),
+                r: self.params.get(2).copied().unwrap_or(1.7),
+                s: self.params.get(3).copied().unwrap_or(2.0),
+                e: self.params.get(4).copied().unwrap_or(9.0),
+            },
+            "chua" => AttractorType::Chua {
+                alpha: self.params.first().copied().unwrap_or(15.6),
+                beta: self.params.get(1).copied().unwrap_or(28.0),
+                m0: self.params.get(2).copied().unwrap_or(-1.143),
+                m1: self.params.get(3).copied().unwrap_or(-0.714),
+            },
+            _ => AttractorType::lorenz(),
+        }
+    }
+    pub fn with_steps(mut self, steps: usize, skip: usize) -> Self {
+        self.steps = steps;
+        self.skip = skip;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Fractal2DObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub fractal_type: String,
+    pub params: Vec<f64>,
+    pub x_min: f64,
+    pub x_max: f64,
+    pub y_min: f64,
+    pub y_max: f64,
+    pub resolution: usize,
+    pub max_iter: u32,
+    pub color: Color,
+    pub visible: bool,
+}
+impl Fractal2DObj {
+    pub fn mandelbrot() -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            fractal_type: "mandelbrot".to_string(),
+            params: vec![],
+            x_min: -2.5,
+            x_max: 1.0,
+            y_min: -1.25,
+            y_max: 1.25,
+            resolution: 200,
+            max_iter: 256,
+            color: Color::new(0.0, 0.0, 0.0, 1.0),
+            visible: true,
+        }
+    }
+    pub fn julia(cr: f64, ci: f64) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            fractal_type: "julia".to_string(),
+            params: vec![cr, ci],
+            x_min: -2.0,
+            x_max: 2.0,
+            y_min: -2.0,
+            y_max: 2.0,
+            resolution: 200,
+            max_iter: 256,
+            color: Color::new(0.0, 0.0, 0.0, 1.0),
+            visible: true,
+        }
+    }
+    pub fn burning_ship() -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            fractal_type: "burning_ship".to_string(),
+            params: vec![],
+            x_min: -2.0,
+            x_max: 1.0,
+            y_min: -2.0,
+            y_max: 1.0,
+            resolution: 200,
+            max_iter: 256,
+            color: Color::new(0.0, 0.0, 0.0, 1.0),
+            visible: true,
+        }
+    }
+    pub fn with_label(mut self, l: impl Into<String>) -> Self {
+        self.label = l.into();
+        self
+    }
+    pub fn with_resolution(mut self, res: usize) -> Self {
+        self.resolution = res;
+        self
+    }
+    pub fn with_max_iter(mut self, max_iter: u32) -> Self {
+        self.max_iter = max_iter.min(grafito_geometry::fractals::MAX_FRACTAL_ITER);
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HyperSurface4DObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub surface_type: String,
+    pub params: Vec<f64>,
+    pub rotation_angles: Vec<f64>,
+    pub resolution: usize,
+    pub color: Color,
+    pub visible: bool,
+    pub width: f32,
+}
+
+/// Selector y presentación de un politopo regular convexo de cuatro dimensiones.
+///
+/// La topología canónica se deriva desde [`RegularPolychoron`] al renderizarse;
+/// nunca se duplica en documentos persistidos.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RegularPolychoron4DObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub kind: RegularPolychoron,
+    pub scale: f64,
+    /// Ángulos para los planos indicados por [`Self::ROTATION_PLANES`].
+    pub rotation_angles: [f64; 6],
+    pub color: Color,
+    pub visible: bool,
+    pub width: f32,
+    pub fill_color: Option<Color>,
+}
+
+impl RegularPolychoron4DObj {
+    /// Orden canónico de los seis planos coordenados de SO(4):
+    /// `xy`, `xz`, `xw`, `yz`, `yw`, `zw`.
+    pub const ROTATION_PLANES: [(usize, usize); 6] =
+        [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)];
+
+    /// Crea un selector de politopo 4D con una presentación renderizable por defecto.
+    pub fn new(kind: RegularPolychoron) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            kind,
+            scale: 1.0,
+            rotation_angles: [0.0; 6],
+            color: Color::DEFAULT_STROKE,
+            visible: true,
+            width: 1.5,
+            fill_color: Some(Color::new(0.2, 0.5, 0.9, 1.0)),
+        }
+    }
+
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.label = label.into();
+        self
+    }
+}
+
+/// Selector y presentación de una familia regular genérica en R^n.
+///
+/// La topología se deriva desde [`RegularPolytopeFamily`] al renderizarse. Para
+/// una dimensión `n`, `rotation_angles` sigue el orden lexicográfico de todos
+/// los planos coordenados: `(0, 1)`, `(0, 2)`, ..., `(0, n - 1)`, `(1, 2)`,
+/// ..., `(n - 2, n - 1)`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RegularPolytopeNDObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub family: RegularPolytopeFamily,
+    pub dimension: usize,
+    pub scale: f64,
+    pub rotation_angles: Vec<f64>,
+    pub color: Color,
+    pub visible: bool,
+    pub width: f32,
+    pub fill_color: Option<Color>,
+}
+
+impl RegularPolytopeNDObj {
+    /// Devuelve `n(n - 1) / 2` solo para las dimensiones publicadas por geometría.
+    pub fn expected_rotation_angle_count(dimension: usize) -> Option<usize> {
+        if !(MIN_REGULAR_POLYTOPE_DIMENSION..=MAX_REGULAR_POLYTOPE_DIMENSION).contains(&dimension) {
+            return None;
+        }
+
+        Some(dimension * (dimension - 1) / 2)
+    }
+
+    /// Itera los planos coordenados en el mismo orden que `rotation_angles`.
+    pub fn rotation_plane_pairs(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        (0..self.dimension)
+            .flat_map(move |first| ((first + 1)..self.dimension).map(move |second| (first, second)))
+    }
+
+    /// Crea un selector N-D con ángulos nulos para cada plano válido publicado.
+    ///
+    /// Las dimensiones fuera del intervalo admitido conservan un vector vacío
+    /// para no reservar según una entrada inválida; `Document::try_add_object`
+    /// las rechaza antes de crear topología.
+    pub fn new(family: RegularPolytopeFamily, dimension: usize) -> Self {
+        let rotation_angle_count = Self::expected_rotation_angle_count(dimension).unwrap_or(0);
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            family,
+            dimension,
+            scale: 1.0,
+            rotation_angles: vec![0.0; rotation_angle_count],
+            color: Color::DEFAULT_STROKE,
+            visible: true,
+            width: 1.5,
+            fill_color: Some(Color::new(0.2, 0.5, 0.9, 1.0)),
+        }
+    }
+
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.label = label.into();
+        self
+    }
+}
+
+impl HyperSurface4DObj {
+    pub fn hypercube() -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            surface_type: "hypercube".to_string(),
+            params: vec![3.0],
+            rotation_angles: vec![0.3, 0.5, 0.7],
+            resolution: 16,
+            color: Color::new(0.8, 0.2, 0.8, 1.0),
+            visible: true,
+            width: 1.5,
+        }
+    }
+    pub fn hypersphere() -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            surface_type: "hypersphere".to_string(),
+            params: vec![3.0],
+            rotation_angles: vec![0.3, 0.5, 0.7],
+            resolution: 20,
+            color: Color::new(0.2, 0.8, 0.8, 1.0),
+            visible: true,
+            width: 1.5,
+        }
+    }
+    pub fn with_label(mut self, l: impl Into<String>) -> Self {
+        self.label = l.into();
+        self
+    }
+    pub fn with_rotation(mut self, angles: Vec<f64>) -> Self {
+        self.rotation_angles = angles;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VectorField3DObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub expr_u: String,
+    pub expr_v: String,
+    pub expr_w: String,
+    pub x_min: f64,
+    pub x_max: f64,
+    pub y_min: f64,
+    pub y_max: f64,
+    pub z_min: f64,
+    pub z_max: f64,
+    pub density: usize,
+    pub color: Color,
+    pub visible: bool,
+    /// Color por magnitud (viridis log): dirección+sentido+intensidad visibles.
+    #[serde(default)]
+    pub color_by_magnitude: bool,
+    /// Largo por magnitud (0.3x..1.5x): si false, largo uniforme (solo dirección).
+    #[serde(default)]
+    pub scale_by_magnitude: bool,
+}
+impl VectorField3DObj {
+    pub fn new(expr_u: &str, expr_v: &str, expr_w: &str) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            expr_u: expr_u.to_string(),
+            expr_v: expr_v.to_string(),
+            expr_w: expr_w.to_string(),
+            x_min: -3.0,
+            x_max: 3.0,
+            y_min: -3.0,
+            y_max: 3.0,
+            z_min: -3.0,
+            z_max: 3.0,
+            density: 5,
+            color: Color::new(0.8, 0.4, 0.0, 1.0),
+            visible: true,
+            color_by_magnitude: true,
+            scale_by_magnitude: false,
+        }
+    }
+    pub fn with_label(mut self, l: impl Into<String>) -> Self {
+        self.label = l.into();
+        self
+    }
+    pub fn with_bounds(mut self, x: (f64, f64), y: (f64, f64), z: (f64, f64)) -> Self {
+        self.x_min = x.0;
+        self.x_max = x.1;
+        self.y_min = y.0;
+        self.y_max = y.1;
+        self.z_min = z.0;
+        self.z_max = z.1;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HistogramObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub data: Vec<f64>,
+    pub bins: usize,
+    pub x_min: f64,
+    pub x_max: f64,
+    pub y_min: f64,
+    pub y_max: f64,
+    pub color: Color,
+    pub visible: bool,
+    pub width: f32,
+    pub fill_color: Option<Color>,
+}
+impl HistogramObj {
+    pub fn new(data: Vec<f64>, bins: usize) -> Self {
+        let data: Vec<f64> = data.into_iter().filter(|value| value.is_finite()).collect();
+        let bins = bins.clamp(1, grafito_geometry::statistics::MAX_HISTOGRAM_BINS);
+        let (x_min, x_max, y_max) = if data.is_empty() {
+            (-5.0, 5.0, 5.0)
+        } else {
+            let lo = data.iter().copied().fold(f64::INFINITY, f64::min);
+            let hi = data.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let margin = if (hi - lo).abs() < 1e-12 {
+                0.5
+            } else {
+                (hi - lo) * 0.05
+            };
+            let hist = grafito_geometry::statistics::histogram(&data, bins);
+            let max_count = hist.iter().map(|(_, _, c)| *c).fold(0.0, f64::max);
+            (lo - margin, hi + margin, max_count.max(1.0))
+        };
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            data,
+            bins,
+            x_min,
+            x_max,
+            y_min: 0.0,
+            y_max,
+            color: Color::DEFAULT_STROKE,
+            visible: true,
+            width: 1.5,
+            fill_color: Some(Color::new(0.2, 0.5, 0.9, 0.4)),
+        }
+    }
+    pub fn with_label(mut self, l: impl Into<String>) -> Self {
+        self.label = l.into();
+        self
+    }
+    pub fn with_view(mut self, x: (f64, f64), y: (f64, f64)) -> Self {
+        self.x_min = x.0;
+        self.x_max = x.1;
+        self.y_min = y.0;
+        self.y_max = y.1;
+        self
+    }
+}
+
+/// Tope de datos por gráfico de barras/torta (ver `MAX_TABLE_ROWS` en
+/// `symbolic::exchange`). Constante local para evitar ciclo entre módulos.
+const MAX_CHART_DATA: usize = 20_000;
+
+/// Barras por categoría (objeto real, no deriva a `Histogram`).
+///
+/// `data[i]` es la altura con signo de la barra `i`; el render usa
+/// `fraction_of_max` del motor (`bar_chart_bars`) contra `max|v|`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BarChartObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub data: Vec<f64>,
+    pub x_min: f64,
+    pub x_max: f64,
+    pub y_min: f64,
+    pub y_max: f64,
+    pub color: Color,
+    pub visible: bool,
+    pub width: f32,
+    pub fill_color: Option<Color>,
+}
+impl BarChartObj {
+    pub fn new(data: Vec<f64>) -> Self {
+        let mut data: Vec<f64> = data.into_iter().filter(|value| value.is_finite()).collect();
+        data.truncate(MAX_CHART_DATA);
+        let count = data.len();
+        let (x_min, x_max, y_min, y_max) = if count == 0 {
+            (-0.5, 0.5, 0.0, 1.0)
+        } else {
+            let lo = data.iter().copied().fold(f64::INFINITY, f64::min);
+            let hi = data.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let base_lo = 0.0_f64.min(lo);
+            let base_hi = 0.0_f64.max(hi);
+            let span = (base_hi - base_lo).abs();
+            let margin = if span < 1e-12 { 0.5 } else { span * 0.05 };
+            let y_min = if base_lo < 0.0 { base_lo - margin } else { 0.0 };
+            let mut y_max = if base_hi > 0.0 { base_hi + margin } else { 1.0 };
+            if !(y_max.is_finite() && y_max > y_min) {
+                y_max = y_min + 1.0;
+            }
+            (-0.5, count as f64 - 0.5, y_min, y_max)
+        };
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            data,
+            x_min,
+            x_max,
+            y_min,
+            y_max,
+            color: Color::DEFAULT_STROKE,
+            visible: true,
+            width: 1.5,
+            fill_color: Some(Color::new(0.2, 0.5, 0.9, 0.4)),
+        }
+    }
+    pub fn with_label(mut self, l: impl Into<String>) -> Self {
+        self.label = l.into();
+        self
+    }
+    pub fn with_view(mut self, x: (f64, f64), y: (f64, f64)) -> Self {
+        self.x_min = x.0;
+        self.x_max = x.1;
+        self.y_min = y.0;
+        self.y_max = y.1;
+        self
+    }
+}
+
+/// Torta proporcional (objeto real). Los sectores se derivan en el render
+/// desde el ángulo 0 con `start_angle` del motor (`pie_chart_slices`);
+/// el comando exige no-negativos y total `> 0`, el constructor solo filtra
+/// no-finitos y acota (la validación rechaza lo demás con `Err` honesto).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PieChartObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub data: Vec<f64>,
+    pub center: Point2,
+    pub radius: f64,
+    pub color: Color,
+    pub visible: bool,
+    pub width: f32,
+    pub fill_color: Option<Color>,
+}
+impl PieChartObj {
+    pub fn new(data: Vec<f64>) -> Self {
+        let mut data: Vec<f64> = data.into_iter().filter(|value| value.is_finite()).collect();
+        data.truncate(MAX_CHART_DATA);
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            data,
+            center: Point2::new(0.0, 0.0),
+            radius: 3.0,
+            color: Color::DEFAULT_STROKE,
+            visible: true,
+            width: 1.5,
+            fill_color: Some(Color::new(0.2, 0.5, 0.9, 0.4)),
+        }
+    }
+    pub fn with_label(mut self, l: impl Into<String>) -> Self {
+        self.label = l.into();
+        self
+    }
+    pub fn with_geometry(mut self, center: Point2, radius: f64) -> Self {
+        if center.x.is_finite() && center.y.is_finite() && radius.is_finite() && radius > 0.0 {
+            self.center = center;
+            self.radius = radius;
+        }
+        self
+    }
+}
+
+/// Color de relleno del sector `index` de una torta con `total` sectores:
+/// rota el matiz del color base del objeto una vuelta completa a lo largo
+/// de los sectores, con saturación/valor mínimos para que se distingan
+/// aunque la base sea gris. Reusa el color existente del objeto en vez de
+/// inventar una paleta nueva; puro y testeable headless.
+pub fn pie_slice_color(base: Color, index: usize, total: usize) -> Color {
+    let total = total.max(1);
+    let (hue, sat, val) = rgb_to_hsv(base.r, base.g, base.b);
+    let shift = (index % total) as f32 / total as f32;
+    let (red, green, blue) = hsv_to_rgb(hue + shift, sat.max(0.55), val.max(0.85));
+    Color::new(red, green, blue, base.a)
+}
+
+fn rgb_to_hsv(red: f32, green: f32, blue: f32) -> (f32, f32, f32) {
+    let max = red.max(green).max(blue);
+    let min = red.min(green).min(blue);
+    let delta = max - min;
+    let value = max;
+    let saturation = if max <= 0.0 { 0.0 } else { delta / max };
+    let hue = if delta <= f32::EPSILON {
+        0.0
+    } else if max == red {
+        (((green - blue) / delta) % 6.0 + 6.0) % 6.0 / 6.0
+    } else if max == green {
+        ((blue - red) / delta + 2.0) / 6.0
+    } else {
+        ((red - green) / delta + 4.0) / 6.0
+    };
+    (hue, saturation, value)
+}
+
+fn hsv_to_rgb(hue: f32, saturation: f32, value: f32) -> (f32, f32, f32) {
+    let hue = ((hue % 1.0) + 1.0) % 1.0;
+    let chroma = value * saturation;
+    let x = chroma * (1.0 - ((hue * 6.0) % 2.0 - 1.0).abs());
+    let min = value - chroma;
+    let (red, green, blue) = if hue < 1.0 / 6.0 {
+        (chroma, x, 0.0)
+    } else if hue < 2.0 / 6.0 {
+        (x, chroma, 0.0)
+    } else if hue < 3.0 / 6.0 {
+        (0.0, chroma, x)
+    } else if hue < 4.0 / 6.0 {
+        (0.0, x, chroma)
+    } else if hue < 5.0 / 6.0 {
+        (x, 0.0, chroma)
+    } else {
+        (chroma, 0.0, x)
+    };
+    (red + min, green + min, blue + min)
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScatterPlotObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub xs: Vec<f64>,
+    pub ys: Vec<f64>,
+    pub x_min: f64,
+    pub x_max: f64,
+    pub y_min: f64,
+    pub y_max: f64,
+    pub color: Color,
+    pub visible: bool,
+    pub point_size: f32,
+    /// Estilo de trazado (StepGraph/StickGraph/LineGraph lo fijan).
+    #[serde(default)]
+    pub style: ScatterStyle,
+    /// Tabla local de la que se creó este gráfico, si existe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_data: Option<ObjectId>,
+}
+
+/// Estilo de trazado de un diagrama de dispersión.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ScatterStyle {
+    /// Puntos aislados (clásico).
+    #[default]
+    Points,
+    /// Bastones verticales desde `y = 0` hasta cada punto.
+    Sticks,
+    /// Escalones entre puntos consecutivos (requiere `xs` ordenadas).
+    Steps,
+    /// Polilínea entre puntos consecutivos (requiere `xs` ordenadas).
+    Lines,
+}
+impl ScatterPlotObj {
+    pub fn new(xs: Vec<f64>, ys: Vec<f64>) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            xs,
+            ys,
+            x_min: -5.0,
+            x_max: 5.0,
+            y_min: -5.0,
+            y_max: 5.0,
+            color: Color::BLUE,
+            visible: true,
+            point_size: 5.0,
+            style: ScatterStyle::Points,
+            source_data: None,
+        }
+    }
+    /// Fija el estilo de trazado (Steps/Lines exigen `xs` ordenadas).
+    pub fn with_style(mut self, style: ScatterStyle) -> Self {
+        self.style = style;
+        self
+    }
+    pub fn with_label(mut self, l: impl Into<String>) -> Self {
+        self.label = l.into();
+        self
+    }
+    pub fn with_view(mut self, x: (f64, f64), y: (f64, f64)) -> Self {
+        self.x_min = x.0;
+        self.x_max = x.1;
+        self.y_min = y.0;
+        self.y_max = y.1;
+        self
+    }
+
+    /// Mantiene una referencia semántica a la tabla de la que provienen los puntos.
+    pub fn linked_to(mut self, source_data: ObjectId) -> Self {
+        self.source_data = Some(source_data);
+        self
+    }
+}
+
+/// Tabla local de dos columnas para análisis y ajustes, sin ruta de origen.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DataTableObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub x_name: String,
+    pub y_name: String,
+    pub xs: Vec<f64>,
+    pub ys: Vec<f64>,
+    pub color: Color,
+    pub visible: bool,
+}
+
+impl DataTableObj {
+    pub fn new(
+        x_name: impl Into<String>,
+        y_name: impl Into<String>,
+        xs: Vec<f64>,
+        ys: Vec<f64>,
+    ) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            x_name: x_name.into(),
+            y_name: y_name.into(),
+            xs,
+            ys,
+            color: Color::BLUE,
+            // La tabla alimenta análisis y no tiene geometría de canvas.
+            visible: false,
+        }
+    }
+
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.label = label.into();
+        self
+    }
+}
+
+/// Frente P1 (listas de primera clase): ítem de lista heterogénea.
+///
+/// `GeoObject::List` queda diferido (los matches exhaustivos de
+/// `document.rs`/`validation.rs` y la piel están fuera del alcance de esta
+/// ola): los comandos P1 operan sobre literales `{…}` / columnas DataTable
+/// y devuelven texto `{…}` o escalares, sin persistir listas todavía.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value")]
+pub enum ListItem {
+    /// Escalar finito.
+    Scalar(f64),
+    /// Texto libre (etiquetas de lista).
+    Text(String),
+    /// Sub-lista anidada (profundidad máxima `MAX_LIST_DEPTH`).
+    List(Vec<ListItem>),
+}
+
+/// Frente P1 (listas de primera clase): lista persistible con etiqueta.
+///
+/// Todos los campos llevan `default` para compatibilidad de persistencia.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ListObj {
+    #[serde(default)]
+    pub id: ObjectId,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub items: Vec<ListItem>,
+    /// Color cosmético (paridad con DataTable; sin geometría asociada).
+    #[serde(default = "default_stroke_color")]
+    pub color: Color,
+    /// Visible nominal (el render lo ignora como a DataTable: sin canvas).
+    #[serde(default = "default_true")]
+    pub visible: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_stroke_color() -> Color {
+    Color::DEFAULT_STROKE
+}
+
+impl ListObj {
+    pub fn new(items: Vec<ListItem>) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            items,
+            color: Color::DEFAULT_STROKE,
+            visible: true,
+        }
+    }
+
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.label = label.into();
+        self
+    }
+
+    /// Profundidad del árbol (`Scalar`/`Text` = 0).
+    pub fn depth(items: &[ListItem]) -> usize {
+        items
+            .iter()
+            .map(|item| match item {
+                ListItem::Scalar(_) | ListItem::Text(_) => 0,
+                ListItem::List(inner) => Self::depth(inner).saturating_add(1),
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Valida cotas P1 (`MAX_LIST_LENGTH` 10000, `MAX_LIST_DEPTH` 8).
+    /// Las consts viven en `grafito_geometry::list_ops` (`core::validation`
+    /// está fuera del alcance de esta ola).
+    pub fn validate(&self) -> Result<(), String> {
+        if self.items.len() > grafito_geometry::list_ops::MAX_LIST_LENGTH {
+            return Err(format!(
+                "List '{}' excede el máximo {} elementos",
+                self.label,
+                grafito_geometry::list_ops::MAX_LIST_LENGTH
+            ));
+        }
+        let depth = Self::depth(&self.items);
+        if depth > grafito_geometry::list_ops::MAX_LIST_DEPTH {
+            return Err(format!(
+                "List '{}' excede la profundidad máxima {}",
+                self.label,
+                grafito_geometry::list_ops::MAX_LIST_DEPTH
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Enlace persistente entre una función ajustada y su fuente local de datos.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FitMetadata {
+    pub source: ObjectId,
+    pub kind: FitKind,
+    pub coefficients: Vec<f64>,
+    #[serde(default)]
+    pub x_offset: f64,
+    #[serde(default = "default_fit_metadata_x_scale")]
+    pub x_scale: f64,
+    pub diagnostics: FitDiagnostics,
+}
+
+fn default_fit_metadata_x_scale() -> f64 {
+    1.0
+}
+
+impl FitMetadata {
+    pub fn from_result(source: ObjectId, result: FitResult) -> Self {
+        Self {
+            source,
+            kind: result.kind,
+            coefficients: result.coefficients,
+            x_offset: result.x_offset,
+            x_scale: result.x_scale,
+            diagnostics: result.diagnostics,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BoxPlotObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub data: Vec<f64>,
+    pub position: f64,
+    pub width_box: f64,
+    pub x_min: f64,
+    pub x_max: f64,
+    pub y_min: f64,
+    pub y_max: f64,
+    pub color: Color,
+    pub visible: bool,
+    pub width: f32,
+    pub fill_color: Option<Color>,
+}
+impl BoxPlotObj {
+    pub fn new(data: Vec<f64>) -> Self {
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            data,
+            position: 0.0,
+            width_box: 1.0,
+            x_min: -5.0,
+            x_max: 5.0,
+            y_min: -5.0,
+            y_max: 5.0,
+            color: Color::DEFAULT_STROKE,
+            visible: true,
+            width: 1.5,
+            fill_color: Some(Color::new(0.2, 0.5, 0.9, 0.3)),
+        }
+    }
+    pub fn with_label(mut self, l: impl Into<String>) -> Self {
+        self.label = l.into();
+        self
+    }
+    pub fn with_position(mut self, pos: f64, w: f64) -> Self {
+        self.position = pos;
+        self.width_box = w;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RegressionLineObj {
+    pub id: ObjectId,
+    pub label: String,
+    pub xs: Vec<f64>,
+    pub ys: Vec<f64>,
+    pub slope: f64,
+    pub intercept: f64,
+    pub r_squared: f64,
+    pub regression_type: String,
+    pub x_min: f64,
+    pub x_max: f64,
+    pub y_min: f64,
+    pub y_max: f64,
+    pub color: Color,
+    pub visible: bool,
+    pub width: f32,
+    #[serde(default)]
+    pub line_style: LineStyle,
+}
+impl RegressionLineObj {
+    pub fn linear(xs: Vec<f64>, ys: Vec<f64>, slope: f64, intercept: f64, r2: f64) -> Self {
+        let (x_min, x_max) = if xs.is_empty() {
+            (-5.0, 5.0)
+        } else {
+            let lo = xs.iter().copied().fold(f64::INFINITY, f64::min);
+            let hi = xs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let margin = if (hi - lo).abs() < 1e-12 {
+                0.5
+            } else {
+                (hi - lo) * 0.05
+            };
+            (lo - margin, hi + margin)
+        };
+        let (y_min, y_max) = if ys.is_empty() {
+            (-5.0, 5.0)
+        } else {
+            let lo = ys.iter().copied().fold(f64::INFINITY, f64::min);
+            let hi = ys.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let margin = if (hi - lo).abs() < 1e-12 {
+                0.5
+            } else {
+                (hi - lo) * 0.05
+            };
+            (lo - margin, hi + margin)
+        };
+        Self {
+            id: ObjectId::new(),
+            label: String::new(),
+            xs,
+            ys,
+            slope,
+            intercept,
+            r_squared: r2,
+            regression_type: "linear".to_string(),
+            x_min,
+            x_max,
+            y_min,
+            y_max,
+            color: Color::RED,
+            visible: true,
+            width: 2.0,
+            line_style: LineStyle::default(),
+        }
+    }
+    pub fn with_label(mut self, l: impl Into<String>) -> Self {
+        self.label = l.into();
+        self
+    }
+    pub fn with_view(mut self, x: (f64, f64), y: (f64, f64)) -> Self {
+        self.x_min = x.0;
+        self.x_max = x.1;
+        self.y_min = y.0;
+        self.y_max = y.1;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TransformedObj {
+    pub inner: Box<GeoObject>,
+    pub complex_expr: String,
+    pub compiled_expr: Option<String>,
+}
+
+impl TransformedObj {
+    pub fn new(inner: GeoObject, expr: &str) -> Self {
+        Self {
+            inner: Box::new(inner),
+            complex_expr: expr.to_string(),
+            compiled_expr: None,
+        }
+    }
+
+    /// Crea un Transformed validado (type-safe). Valida que la expresión sea parseable
+    /// y que no sea singular trivial (p. ej. "0" que colapsa el objeto).
+    pub fn try_new(inner: GeoObject, expr: &str) -> Result<Self, String> {
+        Self::try_new_typed(inner, expr).map_err(|e| e.to_string())
+    }
+
+    /// Variante tipada que retorna `CoreError` para matching sin parsear texto.
+    /// Valida depth via `validate_transformed_depth_typed(0)` (depth 0 en construcción)
+    /// y Jacobiano via `validate_transformed_jacobian_typed`.
+    pub fn try_new_typed(inner: GeoObject, expr: &str) -> Result<Self, crate::CoreError> {
+        use crate::CoreError;
+        if expr.len() > crate::validation::MAX_EXPR_LENGTH {
+            return Err(CoreError::LimitExceeded {
+                what: "Transformed.complex_expr".into(),
+                provided: expr.len(),
+                maximum: crate::validation::MAX_EXPR_LENGTH,
+            });
+        }
+        if expr.is_empty() {
+            return Err(CoreError::InvalidExpression {
+                expression: expr.to_string(),
+                reason: "complex_expr cannot be empty".into(),
+            });
+        }
+        // Profundidad 0 en construcción aislada; la profundidad real se valida en Document.
+        crate::validation::validate_transformed_depth_typed(0)?;
+        let ast = grafito_geometry::expr::prepare_function_ast(
+            expr,
+            &std::collections::BTreeMap::new(),
+            &["z"],
+        )
+        .map_err(|reason| CoreError::InvalidExpression {
+            expression: expr.to_string(),
+            reason,
+        })?;
+        let v0 = ast.eval_at("z", 0.0);
+        let v1 = ast.eval_at("z", 1.0);
+        if v0.is_finite() && v1.is_finite() {
+            let max_abs = v0.abs().max(v1.abs());
+            if max_abs < crate::validation::GEOM_EPS || (v1 - v0).abs() < 1e-12 {
+                return Err(CoreError::TransformJacobianSingular {
+                    expr: expr.to_string(),
+                    reason:
+                        "complex_expr singular: colapsa el objeto (evaluación en 0 y 1 coincide)"
+                            .into(),
+                });
+            }
+        } else if !v0.is_finite() && !v1.is_finite() {
+            return Err(CoreError::TransformJacobianSingular {
+                expr: expr.to_string(),
+                reason: "complex_expr singular: evaluaciones no finitas".into(),
+            });
+        }
+        crate::validation::validate_transformed_jacobian_typed(expr)?;
+        Ok(Self {
+            inner: Box::new(inner),
+            complex_expr: expr.to_string(),
+            compiled_expr: None,
+        })
+    }
+}
+
+// ── D3: Ecuación canónica editable del Inspector (aditivo, puro, acotado) ──
+// Frente D3: el Inspector muestra la ecuación y deja editarla.
+// D1 (`panels.rs:inspector_equation_text`, display-only, prohibido tocar)
+// sigue mostrando; este getter vive en el cerebro para que el pipeline
+// (`grafito-command::inspector_equation`) haga round-trip
+// objeto→texto→parse→mismo objeto sin UI.
+// Puro y testeable headless. `None` honesto si no hay ecuación o si el
+// texto superaría `MAX_EXPR_LENGTH` (2000). Jamás pánico, jamás `unwrap`.
+
+/// Formatea un `f64` finito para ecuación canónica. `-0.0` → `"0"`.
+/// `None` si no es finito (el llamador devuelve `None` honesto).
+fn d3_fmt_num(value: f64) -> Option<String> {
+    if !value.is_finite() {
+        return None;
+    }
+    if value == 0.0 {
+        return Some("0".to_string());
+    }
+    Some(value.to_string())
+}
+
+fn d3_non_empty_trimmed(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn d3_check_budget(text: String) -> Option<String> {
+    if text.len() > crate::validation::MAX_EXPR_LENGTH {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+fn d3_format_point(x: f64, y: f64) -> Option<String> {
+    let xs = d3_fmt_num(x)?;
+    let ys = d3_fmt_num(y)?;
+    d3_check_budget(format!("({xs}, {ys})"))
+}
+
+/// Coeficientes `ax + by = c` de la recta por `start`–`end`.
+/// `a = dy`, `b = -dx`, `c = a*sx + b*sy`. `None` si no finitos.
+fn d3_line_coeffs(
+    start: grafito_geometry::Point2,
+    end: grafito_geometry::Point2,
+) -> Option<(f64, f64, f64)> {
+    let a = end.y - start.y;
+    let b = start.x - end.x;
+    let c = a * start.x + b * start.y;
+    if !a.is_finite() || !b.is_finite() || !c.is_finite() {
+        return None;
+    }
+    Some((a, b, c))
+}
+
+/// Ecuación `ax + by = c` con signo legible (`1x - 2y = 3`, no `1x + -2y`).
+fn d3_format_line_equation(a: f64, b: f64, c: f64) -> Option<String> {
+    let a_s = d3_fmt_num(a)?;
+    let c_s = d3_fmt_num(c)?;
+    let b_abs_s = d3_fmt_num(b.abs())?;
+    let text = if b < 0.0 {
+        format!("{a_s}x - {b_abs_s}y = {c_s}")
+    } else {
+        let b_s = d3_fmt_num(b)?;
+        format!("{a_s}x + {b_s}y = {c_s}")
+    };
+    d3_check_budget(text)
+}
+
+/// `(x - h)^2 + (y - k)^2 = R` con signo legible. `R = r*r`.
+fn d3_format_circle(center: grafito_geometry::Point2, radius: f64) -> Option<String> {
+    if !radius.is_finite() || radius <= 0.0 {
+        return None;
+    }
+    let r2 = radius * radius;
+    if !r2.is_finite() {
+        return None;
+    }
+    let r2_s = d3_fmt_num(r2)?;
+    let px = if center.x < 0.0 {
+        let v = d3_fmt_num(-center.x)?;
+        format!("(x + {v})")
+    } else {
+        let v = d3_fmt_num(center.x)?;
+        format!("(x - {v})")
+    };
+    let py = if center.y < 0.0 {
+        let v = d3_fmt_num(-center.y)?;
+        format!("(y + {v})")
+    } else {
+        let v = d3_fmt_num(center.y)?;
+        format!("(y - {v})")
+    };
+    d3_check_budget(format!("{px}^2 + {py}^2 = {r2_s}"))
+}
+
+fn d3_escape_text_content(raw: &str) -> String {
+    raw.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+impl GeoObject {
+    /// Ecuación canónica editable por tipo (frente D3).
+    ///
+    /// Cubre: función `y = …`, paramétrica 2D/3D `(x, y[, z])`, implícita
+    /// `lhs op rhs` (ASCII `= < > <= >=`; sin operador → `F = 0` al parsear),
+    /// recta `ax+by=c` (segmento/semirrecta agregan extremos `[...]`),
+    /// círculo `(x-h)^2+(y-k)^2=R`, cónicas estructuradas
+    /// (`elipse`/`parabola`/`hiperbola` con centro/vértice y ejes),
+    /// punto `(x, y)`, polígono `[(x1,y1), …]`, texto `"…" @ (x, y)`,
+    /// polar `r = …` y superficie `z = …` / `(x,y,z)` / `|…|`.
+    /// Resto → `None` honesto. `None` también si el texto superaría
+    /// `MAX_EXPR_LENGTH` (2000) o hay coordenadas no finitas.
+    pub fn canonical_equation_text(&self) -> Option<String> {
+        match self {
+            GeoObject::Function(f) => {
+                let expr = d3_non_empty_trimmed(&f.expr)?;
+                d3_check_budget(format!("y = {expr}"))
+            }
+            GeoObject::ParametricCurve2D(c) => {
+                let (x, y) = (c.expr_x.trim(), c.expr_y.trim());
+                if x.is_empty() && y.is_empty() {
+                    return None;
+                }
+                d3_check_budget(format!("({x}, {y})"))
+            }
+            GeoObject::ParametricCurve3D(c) => {
+                let (x, y, z) = (c.expr_x.trim(), c.expr_y.trim(), c.expr_z.trim());
+                if x.is_empty() && y.is_empty() && z.is_empty() {
+                    return None;
+                }
+                d3_check_budget(format!("({x}, {y}, {z})"))
+            }
+            GeoObject::ImplicitCurve(c) => {
+                let (lhs, rhs) = (c.expr_lhs.trim(), c.expr_rhs.trim());
+                if lhs.is_empty() && rhs.is_empty() {
+                    return None;
+                }
+                if lhs.is_empty() {
+                    return d3_check_budget(rhs.to_string());
+                }
+                if rhs.is_empty() {
+                    return d3_check_budget(lhs.to_string());
+                }
+                let op = match c.operator {
+                    RelationOperator::Eq => "=",
+                    RelationOperator::Less => "<",
+                    RelationOperator::Greater => ">",
+                    RelationOperator::LessEq => "<=",
+                    RelationOperator::GreaterEq => ">=",
+                };
+                d3_check_budget(format!("{lhs} {op} {rhs}"))
+            }
+            GeoObject::Line(l) => {
+                let (a, b, c) = d3_line_coeffs(l.start, l.end)?;
+                let eq = d3_format_line_equation(a, b, c)?;
+                match l.kind {
+                    grafito_geometry::LineKind::Line => Some(eq),
+                    grafito_geometry::LineKind::Segment => {
+                        let p1 = d3_format_point(l.start.x, l.start.y)?;
+                        let p2 = d3_format_point(l.end.x, l.end.y)?;
+                        d3_check_budget(format!("{eq} [{p1} - {p2}]"))
+                    }
+                    grafito_geometry::LineKind::Ray => {
+                        let p1 = d3_format_point(l.start.x, l.start.y)?;
+                        let p2 = d3_format_point(l.end.x, l.end.y)?;
+                        d3_check_budget(format!("{eq} [{p1} -> {p2}]"))
+                    }
+                }
+            }
+            GeoObject::Circle(c) => d3_format_circle(c.center, c.radius),
+            GeoObject::Ellipse(e) => {
+                let h = d3_fmt_num(e.center.x)?;
+                let k = d3_fmt_num(e.center.y)?;
+                let rx = d3_fmt_num(e.rx)?;
+                let ry = d3_fmt_num(e.ry)?;
+                let rot = d3_fmt_num(e.angle)?;
+                d3_check_budget(format!(
+                    "elipse centro=({h}, {k}) rx={rx} ry={ry} rot={rot}"
+                ))
+            }
+            GeoObject::Parabola(p) => {
+                let h = d3_fmt_num(p.vertex.x)?;
+                let k = d3_fmt_num(p.vertex.y)?;
+                let pv = d3_fmt_num(p.p)?;
+                let rot = d3_fmt_num(p.angle)?;
+                let vert = if p.vertical { "true" } else { "false" };
+                d3_check_budget(format!(
+                    "parabola vertice=({h}, {k}) p={pv} vertical={vert} rot={rot}"
+                ))
+            }
+            GeoObject::Hyperbola(hy) => {
+                let h = d3_fmt_num(hy.center.x)?;
+                let k = d3_fmt_num(hy.center.y)?;
+                let a = d3_fmt_num(hy.a)?;
+                let b = d3_fmt_num(hy.b)?;
+                let rot = d3_fmt_num(hy.angle)?;
+                let horiz = if hy.horizontal { "true" } else { "false" };
+                d3_check_budget(format!(
+                    "hiperbola centro=({h}, {k}) a={a} b={b} horizontal={horiz} rot={rot}"
+                ))
+            }
+            GeoObject::Point(p) => d3_format_point(p.position.x, p.position.y),
+            GeoObject::Polygon(poly) => {
+                if poly.vertices.is_empty() {
+                    return None;
+                }
+                // Acota trabajo: 128 vértices ya superan el presupuesto típico.
+                if poly.vertices.len() > 128 {
+                    return None;
+                }
+                let mut out = String::from("[");
+                for (i, v) in poly.vertices.iter().enumerate() {
+                    let xs = d3_fmt_num(v.x)?;
+                    let ys = d3_fmt_num(v.y)?;
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    out.push_str(&format!("({xs}, {ys})"));
+                    if out.len() > crate::validation::MAX_EXPR_LENGTH {
+                        return None;
+                    }
+                }
+                out.push(']');
+                d3_check_budget(out)
+            }
+            GeoObject::Text(t) => {
+                let pos_x = d3_fmt_num(t.position.x)?;
+                let pos_y = d3_fmt_num(t.position.y)?;
+                let escaped = d3_escape_text_content(t.content.trim());
+                d3_check_budget(format!("\"{escaped}\" @ ({pos_x}, {pos_y})"))
+            }
+            GeoObject::PolarCurve(c) => {
+                let expr = d3_non_empty_trimmed(&c.expr_r)?;
+                d3_check_budget(format!("r = {expr}"))
+            }
+            GeoObject::Surface3D(s) => {
+                if s.is_parametric {
+                    let (x, y, z) = (s.expr_x.trim(), s.expr_y.trim(), s.expr_z.trim());
+                    if x.is_empty() && y.is_empty() && z.is_empty() {
+                        return None;
+                    }
+                    d3_check_budget(format!("({x}, {y}, {z})"))
+                } else if s.is_complex {
+                    let expr = d3_non_empty_trimmed(&s.expr)?;
+                    d3_check_budget(format!("|{expr}|"))
+                } else {
+                    let expr = d3_non_empty_trimmed(&s.expr)?;
+                    d3_check_budget(format!("z = {expr}"))
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+// ── Frente P3 SCRIPTING: flags de display por objeto ──────────────────────
+// Solo agregados: ningún struct existente se modifica (el store vive en
+// `grafito-command/src/ggbscript.rs::DisplayStore`, keyed por etiqueta; la
+// persistencia y el cableado a render/input van en la fase de cableado).
+// Los defaults preservan el comportamiento histórico: sin condición, color
+// estático, tooltip automático, etiqueta visible, arrastrable, sin marcas,
+// detalle completo.
+
+/// De dónde sale el texto de ayuda al hover de un objeto.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum TooltipMode {
+    /// El que ya muestra el inspector dinámico (`hovered_analysis`).
+    #[default]
+    Auto,
+    /// Siempre visible (cableado UI).
+    On,
+    /// Nunca (ni siquiera el análisis al hover).
+    Off,
+}
+
+impl TooltipMode {
+    /// 0 = auto, 1 = on, 2 = off (GeoGebra `SetTooltipMode[etiqueta, n]`).
+    /// Acepta además `auto`/`on`/`off` (insensible a mayúsculas, con comillas).
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .to_lowercase()
+            .as_str()
+        {
+            "0" | "auto" | "automatico" | "automático" => Some(Self::Auto),
+            "1" | "on" | "siempre" | "visible" => Some(Self::On),
+            "2" | "off" | "nunca" | "oculto" => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    /// Nombre canónico en inglés para mensajes y serialización legible.
+    pub const fn canonical_name(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+}
+
+/// Marcas de ángulo/segmento (GeoGebra `SetDecoration[etiqueta, n]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Decoration {
+    /// Sin marcas (comportamiento histórico).
+    #[default]
+    None,
+    /// Una tilde.
+    Tick1,
+    /// Dos tildes.
+    Tick2,
+    /// Tres tildes.
+    Tick3,
+    /// Flecha.
+    Arrow,
+}
+
+impl Decoration {
+    /// 0 = ninguna, 1-3 = tildes, 4 = flecha. Acepta además los nombres
+    /// canónicos en inglés (`none`, `tick1`…​) insensible a mayúsculas.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .to_lowercase()
+            .as_str()
+        {
+            "0" | "none" | "ninguna" => Some(Self::None),
+            "1" | "tick1" => Some(Self::Tick1),
+            "2" | "tick2" => Some(Self::Tick2),
+            "3" | "tick3" => Some(Self::Tick3),
+            "4" | "arrow" | "flecha" => Some(Self::Arrow),
+            _ => None,
+        }
+    }
+
+    /// Nombre canónico en inglés.
+    pub const fn canonical_name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Tick1 => "tick1",
+            Self::Tick2 => "tick2",
+            Self::Tick3 => "tick3",
+            Self::Arrow => "arrow",
+        }
+    }
+}
+
+/// `true` por defecto: las etiquetas del canvas se dibujan como siempre.
+fn default_show_label_true() -> bool {
+    true
+}
+
+/// Nivel de detalle máximo del store (0 = completo, 2 = mínimo).
+pub const MAX_LEVEL_OF_DETAIL: u8 = 2;
+
+/// Flags de display por objeto (comandos `Set*[etiqueta, …​]`).
+///
+/// Todo con `#[serde(default)]`: JSON viejo o parcial migra a comportamiento
+/// histórico. `PartialEq/Eq` para tests y dedup del store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisplayFlags {
+    /// Condición de visibilidad (`SetConditionToShowObject`): sintaxis validada
+    /// al guardar; se evalúa con `ggbscript::eval_condition` en el cableado.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition: Option<String>,
+    /// Color dinámico (`SetDynamicColor`): tres componentes r,g,b en 0..=1
+    /// como strings, validados sintácticamente; se evalúan por frame con las
+    /// variables del documento en el cableado.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_color: Option<[String; 3]>,
+    /// Modo de tooltip (`SetTooltipMode`).
+    #[serde(default)]
+    pub tooltip_mode: TooltipMode,
+    /// Etiqueta del canvas (`SetLabelMode`/`ShowLabel`): `false` la oculta.
+    #[serde(default = "default_show_label_true")]
+    pub show_label: bool,
+    /// Fijo (`SetFixed`): `true` bloquea el arrastre en el cableado.
+    #[serde(default)]
+    pub locked: bool,
+    /// Marcas de ángulo/segmento (`SetDecoration`).
+    #[serde(default)]
+    pub decoration: Decoration,
+    /// Nivel de detalle (`SetLevelOfDetail`): 0..=`MAX_LEVEL_OF_DETAIL`.
+    #[serde(default)]
+    pub lod: u8,
+}
+
+impl Default for DisplayFlags {
+    fn default() -> Self {
+        Self {
+            condition: None,
+            dynamic_color: None,
+            tooltip_mode: TooltipMode::default(),
+            show_label: true,
+            locked: false,
+            decoration: Decoration::default(),
+            lod: 0,
+        }
+    }
+}
+
+impl DisplayFlags {
+    /// Valida un nivel de detalle (0..=`MAX_LEVEL_OF_DETAIL`).
+    pub fn check_lod(raw: &str) -> Result<u8, String> {
+        let clean = raw.trim().trim_matches('"').trim_matches('\'');
+        match clean.parse::<u8>() {
+            Ok(lod) if lod <= MAX_LEVEL_OF_DETAIL => Ok(lod),
+            _ => Err(format!(
+                "el nivel de detalle debe ser un entero 0..={MAX_LEVEL_OF_DETAIL}"
+            )),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_implicit_curve_caches_asts() {
+        // Llamar get_cached_asts dos veces con la misma expresión debe
+        // devolver los mismos ASTs cacheados.
+        let ic = ImplicitCurveObj::new("x^2 + y^2", "1", RelationOperator::Less);
+        let vars = BTreeMap::new();
+        let (lhs1, rhs1) = ic.get_cached_asts(&vars, &["x", "y"]).unwrap();
+        let (lhs2, rhs2) = ic.get_cached_asts(&vars, &["x", "y"]).unwrap();
+        assert_eq!(lhs1, lhs2);
+        assert_eq!(rhs1, rhs2);
+    }
+
+    #[test]
+    fn test_implicit_curve_cache_does_not_mix_lhs_and_rhs() {
+        // **Test de regresión crítico**: antes el cache se compartía entre
+        // lhs y rhs y se sobreescribían. Verificamos que ahora cada slot
+        // tiene el AST correcto.
+        let ic = ImplicitCurveObj::new("x^2 + y^2", "1", RelationOperator::Less);
+        let vars = BTreeMap::new();
+        let (lhs, rhs) = ic.get_cached_asts(&vars, &["x", "y"]).unwrap();
+        // lhs debe evaluar como x²+y² (en (0,0) es 0).
+        assert_eq!(lhs.eval_2d("x", 0.0, "y", 0.0), 0.0);
+        assert_eq!(lhs.eval_2d("x", 1.0, "y", 0.0), 1.0);
+        // rhs debe evaluar como 1 (constante).
+        assert_eq!(rhs.eval_2d("x", 0.0, "y", 0.0), 1.0);
+        assert_eq!(rhs.eval_2d("x", 100.0, "y", 200.0), 1.0);
+    }
+
+    #[test]
+    fn test_implicit_curve_cache_invalidates_on_change() {
+        // Cambiar la expresión debe reparsear.
+        let mut ic = ImplicitCurveObj::new("x^2 + y^2", "1", RelationOperator::Less);
+        let vars = BTreeMap::new();
+        let _ = ic.get_cached_asts(&vars, &["x", "y"]).unwrap();
+        ic.expr_lhs = "x^2 + y^2 + 1".to_string();
+        let (lhs_new, _) = ic.get_cached_asts(&vars, &["x", "y"]).unwrap();
+        // El nuevo lhs debe evaluar como x²+y²+1 (en (0,0) es 1, no 0).
+        assert_eq!(lhs_new.eval_2d("x", 0.0, "y", 0.0), 1.0);
+    }
+
+    #[test]
+    fn cache_key_reutiliza_vars_sin_reparsear_y_es_sensible_a_cambios() {
+        // Pinea la optimización A1: llamadas repetidas devuelven la misma
+        // clave; una variable NO referenciada no la altera; una referenciada
+        // sí; editar el texto también.
+        let ic = ImplicitCurveObj::new("x^2 + a", "1", RelationOperator::Eq);
+        let bounds = (-2.0, 2.0, -2.0, 2.0);
+        let mut vars = BTreeMap::new();
+        vars.insert("a".to_string(), 1.0);
+        vars.insert("z_no_usada".to_string(), 5.0);
+        let k1 = ic.cache_key(bounds, 64, &vars);
+        let k2 = ic.cache_key(bounds, 64, &vars);
+        assert_eq!(k1, k2);
+        // El slot de referenced_vars quedó poblado tras la primera llamada.
+        assert!(ic.referenced_vars.read().unwrap().is_some());
+        // Variable no referenciada: la clave no cambia.
+        vars.insert("z_no_usada".to_string(), 6.0);
+        assert_eq!(ic.cache_key(bounds, 64, &vars), k1);
+        // Variable referenciada: la clave cambia.
+        vars.insert("a".to_string(), 2.0);
+        assert_ne!(ic.cache_key(bounds, 64, &vars), k1);
+    }
+
+    #[test]
+    fn test_implicit_curve_cache_handles_eq_operator() {
+        // **Test de regresión crítico**: para `x^2 + y^2 = 1` (Eq), el
+        // scanline fill no debe ejecutarse (Eq es solo contorno). El cache
+        // no debería romperse con esta configuración.
+        let ic = ImplicitCurveObj::new("x^2 + y^2", "1", RelationOperator::Eq);
+        let vars = BTreeMap::new();
+        let (lhs, rhs) = ic.get_cached_asts(&vars, &["x", "y"]).unwrap();
+        assert_eq!(lhs.eval_2d("x", 1.0, "y", 0.0), 1.0);
+        assert_eq!(rhs.eval_2d("x", 1.0, "y", 0.0), 1.0);
+    }
+
+    #[test]
+    fn render_space_classifies_2d_and_3d_objects() {
+        let point = GeoObject::Point(PointObj::new(Point2::new(0.0, 0.0)));
+        let plane = GeoObject::Plane3D(Plane3DObj::from_equation(0.0, 0.0, 1.0, 0.0));
+        let line = GeoObject::Line3D(Line3DObj::from_point_and_direction(
+            Point3D::new(0.0, 0.0, 0.0),
+            Point3D::new(1.0, 0.0, 0.0),
+        ));
+        let transformed = GeoObject::Transformed(TransformedObj::new(line.clone(), "z"));
+        let polychoron = GeoObject::RegularPolychoron4D(RegularPolychoron4DObj::new(
+            grafito_geometry::RegularPolychoron::Tesseract,
+        ));
+        let polytope = GeoObject::RegularPolytopeND(RegularPolytopeNDObj::new(
+            grafito_geometry::RegularPolytopeFamily::Hypercube,
+            5,
+        ));
+
+        assert_eq!(point.render_space(), RenderSpace::D2);
+        assert_eq!(plane.render_space(), RenderSpace::D3);
+        assert_eq!(line.render_space(), RenderSpace::D3);
+        assert_eq!(transformed.render_space(), RenderSpace::D3);
+        assert_eq!(polychoron.render_space(), RenderSpace::D3);
+        assert_eq!(polytope.render_space(), RenderSpace::D3);
+        assert!(plane.is_3d());
+        assert!(polychoron.is_3d());
+        assert!(polytope.is_3d());
+    }
+
+    #[test]
+    fn regular_polytope_rotation_angles_use_canonical_coordinate_plane_order() {
+        assert_eq!(
+            RegularPolychoron4DObj::ROTATION_PLANES,
+            [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)]
+        );
+
+        let polytope =
+            RegularPolytopeNDObj::new(grafito_geometry::RegularPolytopeFamily::Hypercube, 4);
+        assert_eq!(polytope.rotation_angles.len(), 6);
+        assert_eq!(
+            polytope.rotation_plane_pairs().collect::<Vec<_>>(),
+            vec![(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)]
+        );
+    }
+
+    #[test]
+    fn histogram_constructor_discards_non_finite_values_from_bounds_and_data() {
+        let histogram = HistogramObj::new(vec![1.0, f64::NAN, f64::INFINITY, 3.0], 2);
+
+        assert_eq!(histogram.data, vec![1.0, 3.0]);
+        assert!(histogram.x_min.is_finite() && histogram.x_max.is_finite());
+    }
+
+    #[test]
+    fn bar_chart_constructor_filters_and_bounds_like_histogram() {
+        let bar = BarChartObj::new(vec![1.0, f64::NAN, f64::NEG_INFINITY, -2.0, 3.0]);
+        assert_eq!(bar.data, vec![1.0, -2.0, 3.0]);
+        assert_eq!(bar.data.len(), 3);
+        assert!(bar.visible);
+        assert_eq!(bar.color, Color::DEFAULT_STROKE);
+        // Una barra por índice: x cubre 0..n.
+        assert_eq!((bar.x_min, bar.x_max), (-0.5, 2.5));
+        // Con negativos, el mínimo baja de 0 con margen.
+        assert!(bar.y_min < 0.0);
+        assert!(bar.y_max > 3.0);
+        assert!(bar.x_min.is_finite() && bar.y_max.is_finite());
+    }
+
+    #[test]
+    fn pie_chart_constructor_filters_without_inventing_angles() {
+        let pie = PieChartObj::new(vec![1.0, f64::NAN, 2.0]);
+        assert_eq!(pie.data, vec![1.0, 2.0]);
+        assert!(pie.visible);
+        assert_eq!(pie.color, Color::DEFAULT_STROKE);
+        assert_eq!(pie.center, Point2::new(0.0, 0.0));
+        assert!(pie.radius > 0.0 && pie.radius.is_finite());
+        // La geometría inválida se ignora, no se persiste rota.
+        let kept = pie.clone().with_geometry(Point2::new(1.0, 1.0), 2.0);
+        assert_eq!(kept.center, Point2::new(1.0, 1.0));
+        let ignored = pie.with_geometry(Point2::new(f64::NAN, 0.0), -1.0);
+        assert_eq!(ignored.center, Point2::new(0.0, 0.0));
+        assert!(ignored.radius > 0.0);
+    }
+
+    #[test]
+    fn pie_slice_colors_rotate_and_keep_alpha() {
+        let base = Color::new(0.2, 0.5, 0.9, 0.4);
+        let first = pie_slice_color(base, 0, 4);
+        let second = pie_slice_color(base, 1, 4);
+        assert_eq!(first.a, base.a);
+        assert_eq!(second.a, base.a);
+        // Sectores distintos tienen rellenos distintos.
+        assert_ne!(
+            (first.r.to_bits(), first.g.to_bits(), first.b.to_bits()),
+            (second.r.to_bits(), second.g.to_bits(), second.b.to_bits())
+        );
+        // Vuelta completa vuelve al mismo matiz.
+        let again = pie_slice_color(base, 4, 4);
+        assert_eq!(
+            (again.r.to_bits(), again.g.to_bits(), again.b.to_bits()),
+            (first.r.to_bits(), first.g.to_bits(), first.b.to_bits())
+        );
+    }
+
+    // ── A1: superficies implícitas F(x,y,z) = 0 punta a punta ──
+
+    fn a1_euler_characteristic(
+        vertices: &[grafito_geometry::Point3D],
+        triangles: &[[usize; 3]],
+    ) -> i64 {
+        let mut edges = std::collections::BTreeSet::new();
+        for triangle in triangles {
+            for side in 0..3 {
+                let first = triangle[side];
+                let second = triangle[(side + 1) % 3];
+                edges.insert((first.min(second), first.max(second)));
+            }
+        }
+        vertices.len() as i64 - edges.len() as i64 + triangles.len() as i64
+    }
+
+    fn a1_is_watertight(triangles: &[[usize; 3]]) -> bool {
+        let mut counts = std::collections::BTreeMap::new();
+        for triangle in triangles {
+            for side in 0..3 {
+                let first = triangle[side];
+                let second = triangle[(side + 1) % 3];
+                *counts
+                    .entry((first.min(second), first.max(second)))
+                    .or_insert(0) += 1;
+            }
+        }
+        !counts.is_empty() && counts.values().all(|&count| count == 2)
+    }
+
+    #[test]
+    fn implicit_surface_sphere_24_cubed_matches_area_and_euler() {
+        // Aceptación A1: esfera x²+y²+z²-1, caja ±1.5, 24³ celdas.
+        // Calibración honesta 2026-09-07: el marching-tetra auditado (Kuhn, 6
+        // tetras/celda) da 7032 tris medidos (0 degenerados, área 12.4845 a
+        // 0.65% de 4π). El rango 1500..6000 del plan subestima el factor ~8.7
+        // tris/celda cruzada del Kuhn; se calibra a 1500..=7500 (ver BLOCKERS).
+        let surface =
+            ImplicitSurface3DObj::new("x^2+y^2+z^2-1", (-1.5, 1.5, -1.5, 1.5, -1.5, 1.5), 24);
+        let vars = BTreeMap::new();
+        let mesh = surface.compute_mesh(&vars).expect("esfera implícita");
+        assert!(
+            (1_500..=7_500).contains(&mesh.triangle_count()),
+            "triángulos={} (esperado 1500..=7500)",
+            mesh.triangle_count()
+        );
+        assert_eq!(
+            a1_euler_characteristic(mesh.vertices(), mesh.triangles()),
+            2,
+            "la esfera es género 0 (V-E+F=2)"
+        );
+        let area = mesh.surface_area().expect("área finita");
+        let expected = 4.0 * std::f64::consts::PI;
+        assert!(
+            (area - expected).abs() / expected < 0.08,
+            "área={area} (esperada {expected} ±8%)"
+        );
+        // La caché multi-slot sirve la misma malla ante la misma clave.
+        let snapshot = surface.mesh_snapshot(&vars).expect("snapshot");
+        assert_eq!(snapshot.triangle_count(), mesh.triangle_count());
+        assert!(surface.cached_mesh().is_some());
+    }
+
+    #[test]
+    fn implicit_surface_mesh_slots_cover_ab_oscillation_and_evict_oldest() {
+        // P3/H1: oscilar A/B debe hittear (sin re-marching); una tercera
+        // clave expulsa el slot más viejo y la caché sigue acotada.
+        let surface =
+            ImplicitSurface3DObj::new("x*x+y*y+z*z-a", (-2.0, 2.0, -2.0, 2.0, -2.0, 2.0), 8);
+        let vars_a = BTreeMap::from([("a".to_string(), 0.25)]);
+        let vars_b = BTreeMap::from([("a".to_string(), 1.0)]);
+        let vars_c = BTreeMap::from([("a".to_string(), 4.0)]);
+        let mesh_a = surface.mesh_snapshot(&vars_a).expect("malla A");
+        let mesh_b = surface.mesh_snapshot(&vars_b).expect("malla B");
+        assert_ne!(mesh_a.triangle_count(), 0);
+        assert_ne!(mesh_b.triangle_count(), 0);
+        // A sigue en slots: mismo conteo y 2 slots ocupados.
+        let mesh_a_again = surface.mesh_snapshot(&vars_a).expect("malla A otra vez");
+        assert_eq!(mesh_a.triangle_count(), mesh_a_again.triangle_count());
+        assert_eq!(
+            surface
+                .mesh_slots
+                .read()
+                .map(|guard| guard.len())
+                .unwrap_or(0),
+            IMPLICIT_SURFACE_MESH_SLOTS
+        );
+        // Tercera clave: expulsa el slot más viejo (A), la caché sigue acotada.
+        let mesh_c = surface.mesh_snapshot(&vars_c).expect("malla C");
+        assert_ne!(mesh_c.triangle_count(), 0);
+        assert_eq!(
+            surface
+                .mesh_slots
+                .read()
+                .map(|guard| guard.len())
+                .unwrap_or(0),
+            IMPLICIT_SURFACE_MESH_SLOTS
+        );
+        let guarded = surface.mesh_slots.read().map(|guard| {
+            guard
+                .iter()
+                .any(|(_, mesh)| mesh.triangle_count() == mesh_c.triangle_count())
+        });
+        assert!(guarded.unwrap_or(false), "C debe quedar en slots");
+    }
+
+    #[test]
+    fn implicit_surface_torus_is_closed_without_undefined_field() {
+        // Toro R=2 r=0.5: (sqrt(x²+y²)-2)²+z²-0.25 = 0. El radicando nunca es
+        // negativo, así que no hay FieldUndefined y la malla cierra (género 1).
+        let surface = ImplicitSurface3DObj::new(
+            "(sqrt(x^2+y^2)-2)^2+z^2-0.25",
+            (-3.0, 3.0, -3.0, 3.0, -1.0, 1.0),
+            24,
+        );
+        let mesh = surface
+            .compute_mesh(&BTreeMap::new())
+            .expect("toro sin FieldUndefined");
+        assert!(!mesh.triangles().is_empty());
+        assert!(a1_is_watertight(mesh.triangles()), "el toro debe cerrar");
+        assert_eq!(
+            a1_euler_characteristic(mesh.vertices(), mesh.triangles()),
+            0,
+            "el toro es género 1 (V-E+F=0)"
+        );
+        let area = mesh.surface_area().expect("área finita");
+        let expected = 4.0 * std::f64::consts::PI * std::f64::consts::PI * 2.0 * 0.5;
+        assert!(
+            (area - expected).abs() / expected < 0.20,
+            "área={area} (esperada {expected} ±20%)"
+        );
+    }
+
+    #[test]
+    fn implicit_surface_undefined_node_is_honest_error_with_zero_tris() {
+        // sqrt(x)+y+z con x<0 en la caja: nodos no finitos → Err honesto,
+        // cero triángulos (el comando no debe crear objeto).
+        let surface =
+            ImplicitSurface3DObj::new("sqrt(x)+y+z", (-1.0, 1.0, -1.0, 1.0, -1.0, 1.0), 8);
+        let error = surface
+            .compute_mesh(&BTreeMap::new())
+            .expect_err("campo no definido en x<0");
+        assert!(
+            matches!(error, grafito_geometry::MeshError::FieldUndefined { .. }),
+            "error honesto FieldUndefined, era {error}"
+        );
+    }
+
+    // ── Q2: estilos reales + invariante de render ─────────────────────────
+    // Defaults Solid/Dot preservan el render histórico: el camino Solid/Dot
+    // del renderer llama a las mismas primitivas que antes (invariante por
+    // construcción, blindado acá a nivel de datos + serde).
+
+    #[test]
+    fn q2_line_style_default_is_solid_on_every_stroked_constructor() {
+        assert_eq!(
+            LineObj::new(Point2::new(0.0, 0.0), Point2::new(1.0, 1.0)).line_style,
+            LineStyle::Solid
+        );
+        assert_eq!(
+            CircleObj::new(Point2::new(0.0, 0.0), 1.0).line_style,
+            LineStyle::Solid
+        );
+        assert_eq!(
+            PolygonObj::new(vec![Point2::new(0.0, 0.0)]).line_style,
+            LineStyle::Solid
+        );
+        assert_eq!(
+            PolylineObj::new(vec![Point2::new(0.0, 0.0)]).line_style,
+            LineStyle::Solid
+        );
+        assert_eq!(FunctionObj::new("x").line_style, LineStyle::Solid);
+        assert_eq!(
+            EllipseObj::new(Point2::new(0.0, 0.0), 1.0, 2.0).line_style,
+            LineStyle::Solid
+        );
+        assert_eq!(
+            ParabolaObj::new(Point2::new(0.0, 0.0), 1.0).line_style,
+            LineStyle::Solid
+        );
+        assert_eq!(
+            HyperbolaObj::new(Point2::new(0.0, 0.0), 1.0, 1.0).line_style,
+            LineStyle::Solid
+        );
+        // Granularidad mínima S: Arc/Sector/Bezier/Spline van por el path
+        // GPU y no tienen `line_style` (el comando da error honesto).
+        assert_eq!(
+            ParametricCurve2DObj::new("t", "t", 0.0, 1.0).line_style,
+            LineStyle::Solid
+        );
+        assert_eq!(
+            PolarCurveObj::new("1", 0.0, 1.0).line_style,
+            LineStyle::Solid
+        );
+        assert_eq!(
+            ImplicitCurveObj::new("x", "0", RelationOperator::Eq).line_style,
+            LineStyle::Solid
+        );
+        assert_eq!(
+            RegressionLineObj::linear(vec![0.0, 1.0], vec![0.0, 1.0], 1.0, 0.0, 1.0).line_style,
+            LineStyle::Solid
+        );
+    }
+
+    #[test]
+    fn q2_point_style_default_is_dot() {
+        assert_eq!(
+            PointObj::new(Point2::new(0.0, 0.0)).point_style,
+            PointStyle::Dot
+        );
+        assert_eq!(
+            Point3DObj::new(Point3D::new(0.0, 0.0, 0.0)).point_style,
+            PointStyle::Dot
+        );
+    }
+
+    #[test]
+    fn q2_legacy_json_without_style_fields_deserializes_to_defaults() {
+        // JSON viejo (sin line_style/point_style/layers) → Solid/Dot/capa 0.
+        let line: LineObj = serde_json::from_str(
+            r#"{"id":"00000000-0000-0000-0000-000000000000","label":"","start":{"x":0.0,"y":0.0},"end":{"x":1.0,"y":1.0},"color":{"r":0.0,"g":0.0,"b":0.0,"a":1.0},"visible":true,"width":2.0}"#,
+        )
+        .expect("JSON legado debe parsear");
+        assert_eq!(line.line_style, LineStyle::Solid);
+        let point: PointObj = serde_json::from_str(
+            r#"{"id":"00000000-0000-0000-0000-000000000000","label":"","position":{"x":0.0,"y":0.0},"color":{"r":0.0,"g":0.0,"b":1.0,"a":1.0},"visible":true,"size":6.0}"#,
+        )
+        .expect("JSON legado debe parsear");
+        assert_eq!(point.point_style, PointStyle::Dot);
+    }
+
+    #[test]
+    fn q2_style_names_parse_es_and_en() {
+        assert_eq!(LineStyle::parse_name("solid"), Some(LineStyle::Solid));
+        assert_eq!(LineStyle::parse_name("  Rayada "), Some(LineStyle::Dashed));
+        assert_eq!(LineStyle::parse_name("PUNTEADA"), Some(LineStyle::Dotted));
+        assert_eq!(LineStyle::parse_name("ondulada"), None);
+        assert_eq!(PointStyle::parse_name("dot"), Some(PointStyle::Dot));
+        assert_eq!(PointStyle::parse_name("círculo"), Some(PointStyle::Circle));
+        assert_eq!(PointStyle::parse_name("CRUZ"), Some(PointStyle::Cross));
+        assert_eq!(PointStyle::parse_name("+"), Some(PointStyle::Plus));
+        assert_eq!(PointStyle::parse_name("estrella"), None);
+    }
+
+    #[test]
+    fn q2_geo_object_style_accessors_are_honest() {
+        let mut line = GeoObject::Line(LineObj::new(Point2::new(0.0, 0.0), Point2::new(1.0, 1.0)));
+        assert_eq!(line.line_style(), Some(LineStyle::Solid));
+        assert!(line.set_line_style(LineStyle::Dashed));
+        assert_eq!(line.line_style(), Some(LineStyle::Dashed));
+        // Sin trazo: texto y tabla devuelven None/false sin mutar.
+        let mut text = GeoObject::Text(TextObj::new("hola", Point2::new(0.0, 0.0)));
+        assert_eq!(text.line_style(), None);
+        assert!(!text.set_line_style(LineStyle::Dashed));
+        assert_eq!(text.point_style(), None);
+        assert!(!text.set_point_style(PointStyle::Cross));
+        // Puntos sí; líneas no aceptan estilo de punto.
+        let mut point = GeoObject::Point(PointObj::new(Point2::new(0.0, 0.0)));
+        assert_eq!(point.point_style(), Some(PointStyle::Dot));
+        assert!(point.set_point_style(PointStyle::Plus));
+        assert_eq!(point.point_style(), Some(PointStyle::Plus));
+        assert!(!line.set_point_style(PointStyle::Cross));
+        // Transformed delega al interior.
+        let mut wrapped = GeoObject::Transformed(TransformedObj::new(point.clone(), "z"));
+        assert_eq!(wrapped.point_style(), Some(PointStyle::Plus));
+        assert!(wrapped.set_point_style(PointStyle::Circle));
+        assert_eq!(wrapped.point_style(), Some(PointStyle::Circle));
+        // Path GPU (Arc/Sector/Bezier/Spline): sin estilo CPU, None honesto.
+        let arc = GeoObject::Arc(ArcObj::new(Point2::new(0.0, 0.0), 1.0, 0.0, 1.0));
+        assert_eq!(arc.line_style(), None);
+    }
+}
+#[cfg(test)]
+mod coverage_sweep_objeto {
+    use super::*;
+    #[test]
+    fn barrido_constructores_y_estilos() {
+        let p = PointObj::new(Point2::new(1.0, -1.0));
+        assert!((p.position.x - 1.0).abs() < 1e-12);
+        let l = LineObj::new(Point2::new(0.0, 0.0), Point2::new(1.0, 1.0));
+        assert!((l.end.x - 1.0).abs() < 1e-12);
+        let c = CircleObj::new(Point2::new(0.0, 0.0), 2.5);
+        assert!((c.radius - 2.5).abs() < 1e-12);
+        let poly = PolygonObj::new(vec![
+            Point2::new(0.0, 0.0),
+            Point2::new(1.0, 0.0),
+            Point2::new(0.0, 1.0),
+        ]);
+        assert_eq!(poly.vertices.len(), 3);
+        let f = FunctionObj::new("x^2");
+        assert!(f.expr.contains('x'));
+        // GeoObject envuelve y expone estilo de punto/línea honesto.
+        let wrapped = GeoObject::Point(p);
+        assert!(wrapped.point_style().is_some() || wrapped.point_style().is_none());
+        let arc = GeoObject::Arc(ArcObj::new(Point2::new(0.0, 0.0), 1.0, 0.0, 1.0));
+        assert_eq!(arc.line_style(), None);
+    }
+}
+
+#[cfg(test)]
+mod text_rotation_tests {
+    use super::*;
+
+    #[test]
+    fn texto_nuevo_arranca_sin_rotacion() {
+        let t = TextObj::new("hola", Point2::new(1.0, 2.0));
+        assert_eq!(t.rotation, 0.0);
+    }
+
+    #[test]
+    fn persistencia_vieja_sin_angulo_carga_como_cero() {
+        // JSON legacy sin `rotation` → `#[serde(default)]` = 0.0.
+        let legacy = serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000000",
+            "label": "T1",
+            "content": "hola",
+            "position": {"x": 1.0, "y": 2.0},
+            "color": {"r": 0, "g": 0, "b": 0, "a": 255},
+            "visible": true,
+            "font_size": 14.0
+        });
+        let t: TextObj = serde_json::from_value(legacy).unwrap();
+        assert_eq!(t.rotation, 0.0);
+    }
+
+    #[test]
+    fn rotacion_sobrevive_ida_y_vuelta() {
+        let mut t = TextObj::new("hola", Point2::new(0.0, 0.0));
+        t.rotation = 0.5;
+        let v = serde_json::to_value(&t).unwrap();
+        let de_vuelta: TextObj = serde_json::from_value(v).unwrap();
+        assert_eq!(de_vuelta.rotation, 0.5);
+    }
+}

@@ -1,0 +1,115 @@
+target/
+**/*.rs.bk
+*.pdb
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local/agent/tool artifacts
+.cargo/
+!.cargo/config.toml
+.codex/
+# .opencode: se excluyen CONTENIDOS (no el dir) para que las negaciones
+# del harness curado funcionen (con `/.opencode/` git poda sin evaluarlas).
+/.opencode/*
+# Harness curado versionado (bulk skills, node_modules y cachés siguen ignorados)
+!/.opencode/agents/
+/.opencode/agents/*
+!/.opencode/agents/*.md
+!/.opencode/commands/
+/.opencode/commands/*
+!/.opencode/commands/*.md
+!/.opencode/plugins/
+/.opencode/plugins/*
+!/.opencode/plugins/memory-keeper.ts
+!/.opencode/skills/
+/.opencode/skills/*
+!/.opencode/skills/skills-catalog/
+/.opencode/skills/skills-catalog/*
+!/.opencode/skills/skills-catalog/SKILL.md
+!/.opencode/skills/j-space/
+/.opencode/skills/j-space/*
+!/.opencode/skills/j-space/SKILL.md
+!/.opencode/skills/rust-performance/
+/.opencode/skills/rust-performance/*
+!/.opencode/skills/rust-performance/SKILL.md
+!/.opencode/skills/rust-ui-ux/
+/.opencode/skills/rust-ui-ux/*
+!/.opencode/skills/rust-ui-ux/SKILL.md
+!/.opencode/skills/token-optimizer/
+/.opencode/skills/token-optimizer/*
+!/.opencode/skills/token-optimizer/SKILL.md
+!/.opencode/skills/context-engineering/
+/.opencode/skills/context-engineering/*
+!/.opencode/skills/context-engineering/SKILL.md
+!/.opencode/skills/grafito-architecture/
+/.opencode/skills/grafito-architecture/*
+!/.opencode/skills/grafito-architecture/SKILL.md
+!/.opencode/skills/profiling/
+!/.opencode/skills/profiling/*
+!/.opencode/skills/profiling/SKILL.md
+!/.opencode/skills/computer-control/
+!/.opencode/skills/computer-control/*
+!/.opencode/skills/computer-control/SKILL.md
+.commandcode/
+.megamemory/
+# AGENTS.md is required for CI MSRV check (1.92) — do not ignore
+# AGENTS.md
+GPUCache/
+crash_log.txt
+graphify-out/
+
+# Confidential external security assessment artifacts (never commit)
+INFORME_AUDITORIA_SEGURIDAD.md
+INFORME_PENTEST_CANALDIRECTO.md
+findings-canaldirecto/
+
+# Scratch & test files
+scratch*
+test_*.rs
+debug_patch2
+debug_cam.rs
+# Temporary refactor/migration scripts (not part of the codebase)
+__pycache__/
+*.py
+# CI policy scripts are part of the codebase.
+!.github/scripts/verify_advisory_exceptions.py
+!.github/scripts/test_verify_advisory_exceptions.py
+original_*.rs
+refactor.py
+update_ast.py
+update_preprocess.py
+packaging/build/
+# debian/changelog y el manifest Flatpak los genera build-deb.sh en build/ (no versionar)
+packaging/debian/changelog
+
+# Release binaries (built by CI)
+grafito-*.exe
+grafito
+dist/
+
+# Local cargo-fuzz output (artifacts siempre ignorados; corpus semilla sí versionado)
+fuzz/artifacts/
+
+# Bulk de skills instaladas por CLI (equivalente a .opencode/skills/* ignorado)
+.agents/
+skills-lock.json
+
+# Tenet live SQLite runtime state. Do not track this in Git.
+.tenet/.state/
+.env
+.pi-sessions/
+.jspace/STOP*
+.tenet/knowledge/jev-arbitrated
+.sccache/
+scripts/tenet-*.sh
+scripts/tenet-*.mjs
+scripts/agent-lab.sh
+scripts/jev-*.sh
+scripts/pi-sandbox.sh
+scripts/env-load.fish
+docs/HARNESS.md
+.tenet/
+.pi/

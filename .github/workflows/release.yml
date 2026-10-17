@@ -1,0 +1,404 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate-release:
+    name: Validate release source
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    outputs:
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1482605bfc5719782e1267fd0c0cc350fe7646b8  # stable
+        with:
+          toolchain: stable
+
+      - name: Validate tag, version, changelog, and ancestry
+        id: version
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          package_id="$(cargo pkgid --locked --package grafito-release-tests)"
+          version="${package_id##*@}"
+
+          [[ "$tag" == "v$version" ]] || { echo "tag $tag does not match Cargo version $version" >&2; exit 1; }
+          grep -F -- "## [$version]" CHANGELOG.md >/dev/null || { echo "CHANGELOG.md has no $version entry" >&2; exit 1; }
+          # actions/checkout sobrescribe refs/tags/* con el commit (refspec
+          # explícito +<sha>:refs/tags/*), así que el objeto anotado NUNCA se
+          # puede verificar en el clon local: se lee por API.
+          read -r tag_obj tag_obj_type < <(gh api "repos/${{ github.repository }}/git/refs/tags/${tag}" --jq '[.object.sha, .object.type] | @tsv')
+          [[ "$tag_obj_type" == "tag" ]] || { echo "release tag must be annotated (got $tag_obj_type)" >&2; exit 1; }
+          tag_commit="$(gh api "repos/${{ github.repository }}/git/tags/${tag_obj}" --jq .object.sha)"
+          main_commit="$(git rev-parse --verify 'refs/remotes/origin/main^{commit}')"
+
+          git merge-base --is-ancestor "$tag_commit" "$main_commit" || { echo "release tag is not on main" >&2; exit 1; }
+          [[ "$tag_commit" == "$(git rev-parse 'HEAD^{commit}')" ]] || { echo "checkout is not the tagged release commit" >&2; exit 1; }
+
+          if [[ "$version" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Calling the reusable CI workflow keeps tag releases gated by the same
+  # checks as main/PRs, with the release profile: deterministic jobs only
+  # (check/test/examples/docs/clippy/fmt/all-targets/supply-chain/lint).
+  # GPU lavapipe, benches --test, smokes multiplataforma y .deb se excluyen:
+  # son sensibles al entorno o redundantes con la matriz de build que sigue.
+  # GitHub Actions cannot make this workflow depend on a
+  # separate CI run's status.
+  ci-gate:
+    name: Run release CI gate
+    uses: ./.github/workflows/ci.yml
+    with:
+      profile: release
+    permissions:
+      contents: read
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: [validate-release, ci-gate]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
+    strategy:
+      matrix:
+        include:
+          # This archive is built and tested against Ubuntu 22.04 (glibc 2.35).
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            artifact: grafito
+            archive: grafito-linux-x64.tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: grafito.exe
+            archive: grafito-windows-x64.zip
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact: grafito
+            archive: grafito-macos-x64.tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: grafito
+            archive: grafito-macos-arm64.tar.gz
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1482605bfc5719782e1267fd0c0cc350fe7646b8  # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Cache APT packages
+        if: runner.os == 'Linux'
+        uses: awalsh128/cache-apt-pkgs-action@7ca5f46d061ad9aa95863cd9b214dd48edef361d # v1.5.0
+        with:
+          packages: build-essential libgmp-dev libmpfr-dev libmpc-dev m4 pkg-config libdbus-1-dev
+          version: 1.0
+      - name: Install C toolchain and dependencies (Ubuntu)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y build-essential libgmp-dev libmpfr-dev libmpc-dev m4 pkg-config libdbus-1-dev
+
+      - uses: Swatinem/rust-cache@82a92a6e8fbeee089604da2575dc567ae9ddeaab  # v2.7.5
+        with:
+          shared-key: "release-${{ matrix.target }}"
+          cache-all-crates: true
+
+      - name: Run workspace tests
+        # Los readbacks GPU del harness usan el presupuesto de frame (250 ms)
+        # en producción; en un runner con Metal/D3D recién arrancado la
+        # compilación de shaders puede superarlo y el test da un falso
+        # "must execute on the GPU" (visto en macos arm64). El override
+        # explícito documentado en `gpu_readback` da 10 s solo a los tests.
+        env:
+          GRAFITO_GPU_READBACK_TIMEOUT_MS: "10000"
+        run: cargo test --workspace --locked
+
+      - name: Build release
+        run: cargo build --release --target ${{ matrix.target }} -p grafito-app --locked
+
+      - name: Verify Windows subsystem, resources, metadata, and CLI startup
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path "target/${{ matrix.target }}/release/grafito.exe").Path
+          & ./packaging/verify-msvc-runtime.ps1 -ExePath $exe
+          $bytes = [System.IO.File]::ReadAllBytes($exe)
+          $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
+          $optionalHeader = $peOffset + 24
+          $magic = [BitConverter]::ToUInt16($bytes, $optionalHeader)
+          $dataDirectoryOffset = if ($magic -eq 0x20b) { 112 } elseif ($magic -eq 0x10b) { 96 } else { throw "Unknown PE optional header" }
+          $subsystem = [BitConverter]::ToUInt16($bytes, $optionalHeader + 68)
+          $resourceRva = [BitConverter]::ToUInt32($bytes, $optionalHeader + $dataDirectoryOffset + 16)
+          if ($subsystem -ne 2) { throw "grafito.exe is not a Windows GUI-subsystem executable" }
+          if ($resourceRva -eq 0) { throw "grafito.exe has no PE resource directory" }
+
+          $version = (Get-Item $exe).VersionInfo
+          $expectedVersion = $env:GITHUB_REF_NAME.TrimStart('v')
+          if ($version.ProductName -ne "Grafito") { throw "Missing Grafito ProductName resource" }
+          if ($version.ProductVersion -ne $expectedVersion) { throw "ProductVersion does not match the tag" }
+          if ($version.OriginalFilename -ne "grafito.exe") { throw "OriginalFilename resource is incorrect" }
+
+          Add-Type -AssemblyName System.Drawing
+          $icon = [System.Drawing.Icon]::ExtractAssociatedIcon($exe)
+          if ($null -eq $icon) { throw "grafito.exe has no extractable application icon" }
+          $icon.Dispose()
+
+          $smoke = Start-Process -FilePath $exe -ArgumentList "--help" -Wait -PassThru
+          if ($smoke.ExitCode -ne 0) { throw "grafito.exe --help exited with $($smoke.ExitCode)" }
+
+      - name: Package
+        env:
+          ARCHIVE: ${{ matrix.archive }}
+          ARTIFACT: ${{ matrix.artifact }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir -p dist
+          cp "target/$TARGET/release/$ARTIFACT" dist/
+          cp README.md CHANGELOG.md LICENSE dist/ 2>/dev/null || true
+          cd dist
+          if [[ "$ARCHIVE" == *.zip ]]; then
+            cp "$ARTIFACT" ../grafito-windows-x64.exe
+            7z a "../$ARCHIVE" ./*
+          else
+            tar czf "../$ARCHIVE" ./*
+          fi
+        shell: bash
+
+      - name: Verify Linux archive/runtime compatibility
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          extract_dir="$(mktemp -d)"
+          trap 'rm -rf "$extract_dir"' EXIT
+          tar -xzf "${{ matrix.archive }}" -C "$extract_dir"
+          binary="$extract_dir/grafito"
+          [[ -x "$binary" ]]
+          ldd "$binary" | tee grafito-linux-ldd.txt
+          if grep -Fq 'not found' grafito-linux-ldd.txt; then
+            echo "Linux archive has unresolved runtime dependencies" >&2
+            exit 1
+          fi
+          grep -Eq '^[[:space:]]*libdbus-1\.so\.3[[:space:]]+=>' grafito-linux-ldd.txt
+          "$binary" --help
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: ${{ matrix.archive }}
+          path: ${{ matrix.archive }}
+          retention-days: 7
+
+      - name: Upload direct Windows executable
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: grafito-windows-x64-exe
+          path: grafito-windows-x64.exe
+          retention-days: 7
+
+  debian:
+    name: Build Debian package on Ubuntu 22.04
+    needs: [validate-release, ci-gate]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Cache APT packages
+        uses: awalsh128/cache-apt-pkgs-action@7ca5f46d061ad9aa95863cd9b214dd48edef361d # v1.5.0
+        with:
+          packages: build-essential desktop-file-utils dpkg-dev libgmp-dev libmpfr-dev libmpc-dev lintian m4 pkg-config libdbus-1-dev
+          version: 1.0
+      - name: Install package build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential desktop-file-utils dpkg-dev libgmp-dev libmpfr-dev libmpc-dev lintian m4 pkg-config libdbus-1-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1482605bfc5719782e1267fd0c0cc350fe7646b8  # stable
+        with:
+          toolchain: stable
+
+      - name: Build and inspect Debian package
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_date_epoch="$(git log -1 --format=%ct)"
+          export SOURCE_DATE_EPOCH="$source_date_epoch"
+          packaging/build-deb.sh
+          shopt -s nullglob
+          packages=(packaging/build/*.deb)
+          (( ${#packages[@]} == 1 )) || { echo "expected exactly one Debian package" >&2; exit 1; }
+          dpkg-deb --info "${packages[0]}"
+          dpkg-deb -f "${packages[0]}" Depends
+
+      - name: Upload direct Debian package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: grafito-debian
+          path: packaging/build/*.deb
+          if-no-files-found: error
+          retention-days: 7
+
+  sbom:
+    name: Generate tagged-source SBOM
+    needs: [validate-release, ci-gate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610  # v0.24.0
+        with:
+          path: .
+          format: spdx-json
+          output-file: grafito.spdx.json
+          syft-version: v1.48.0
+          dependency-snapshot: false
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: grafito-sbom
+          path: grafito.spdx.json
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Create GitHub Release
+    needs: [validate-release, ci-gate, build, debian, sbom]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      id-token: write        # OIDC provenance (repo público)
+      attestations: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Download artifacts
+        # Pin correcto de download-artifact (v4.3.0, último v4): el SHA
+        # anterior era de upload-artifact v4.6.2 y el job moría al resolverlo
+        # ("unable to find version"), recién visible cuando la matriz entera
+        # llegó verde.
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          path: artifacts
+
+      - name: Gather and verify release artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          archives=(
+            grafito-linux-x64.tar.gz
+            grafito-windows-x64.zip
+            grafito-macos-x64.tar.gz
+            grafito-macos-arm64.tar.gz
+          )
+          rm -rf release-assets
+          mkdir release-assets
+          for archive in "${archives[@]}"; do
+            test -f "artifacts/$archive/$archive"
+            cp "artifacts/$archive/$archive" "release-assets/$archive"
+          done
+          test -f artifacts/grafito-windows-x64-exe/grafito-windows-x64.exe
+          cp artifacts/grafito-windows-x64-exe/grafito-windows-x64.exe release-assets/
+
+          shopt -s nullglob
+          debs=(artifacts/grafito-debian/*.deb)
+          (( ${#debs[@]} == 1 )) || { echo "expected exactly one Debian release artifact" >&2; exit 1; }
+          cp "${debs[0]}" release-assets/grafito-linux-x64.deb
+          test -f artifacts/grafito-sbom/grafito.spdx.json
+          cp artifacts/grafito-sbom/grafito.spdx.json release-assets/
+
+      - name: Generate checksums for every release asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          assets=(
+            grafito-linux-x64.tar.gz
+            grafito-windows-x64.zip
+            grafito-macos-x64.tar.gz
+            grafito-macos-arm64.tar.gz
+            grafito-windows-x64.exe
+            grafito-linux-x64.deb
+            grafito.spdx.json
+          )
+          (
+            cd release-assets
+            sha256sum "${assets[@]}" > SHA256SUMS.txt
+            sha256sum --check SHA256SUMS.txt
+          )
+
+      # Attestations habilitadas: repo público → provenance firmada por GitHub
+      # OIDC (checksums + SBOM quedan como segunda capa, no reemplazo).
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@c074443f1aee8d4aeeae555aebba3282517141b2  # v2.2.3
+        with:
+          subject-path: |
+            release-assets/grafito-linux-x64.tar.gz
+            release-assets/grafito-windows-x64.zip
+            release-assets/grafito-macos-x64.tar.gz
+            release-assets/grafito-macos-arm64.tar.gz
+            release-assets/grafito-windows-x64.exe
+            release-assets/grafito-linux-x64.deb
+            release-assets/grafito.spdx.json
+
+      - name: Create Release
+        uses: softprops/action-gh-release@01570a1f39cb168c169c802c3bceb9e93fb10974  # v2.1.0
+        with:
+          files: |
+            release-assets/grafito-linux-x64.tar.gz
+            release-assets/grafito-windows-x64.zip
+            release-assets/grafito-macos-x64.tar.gz
+            release-assets/grafito-macos-arm64.tar.gz
+            release-assets/grafito-windows-x64.exe
+            release-assets/grafito-linux-x64.deb
+            release-assets/grafito.spdx.json
+            release-assets/SHA256SUMS.txt
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          prerelease: ${{ needs.validate-release.outputs.prerelease == 'true' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

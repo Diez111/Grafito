@@ -1,0 +1,337 @@
+#![allow(unknown_lints, float_literal_f32_fallback)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+//! Grafito UI — Componentes y paneles de interfaz construidos con egui.
+//!
+//! Provee la toolbar, la paleta de comandos, el panel de álgebra, el selector
+//! de color, temas y la enumeración [`Tool`] que sincroniza el modo de
+//! interacción del canvas.
+//!
+//! # Ejemplo mínimo
+//!
+//! ```
+//! use grafito_ui::Tool;
+//!
+//! let mut tool = Tool::default();
+//! assert_eq!(tool, Tool::Select);
+//!
+//! tool = Tool::Point;
+//! assert_eq!(tool.cursor_icon(), egui::CursorIcon::Crosshair);
+//! ```
+
+pub mod animation;
+pub mod assistant;
+pub mod avatar;
+pub mod color_picker;
+pub mod command_palette;
+pub mod confetti;
+pub mod formula_raster;
+pub mod i18n;
+pub mod icons;
+pub mod md_view;
+pub mod professional;
+pub mod projector;
+pub mod prosa;
+pub mod step_by_step;
+pub mod teaching;
+pub mod theme;
+pub mod toast;
+pub mod tokens;
+pub mod toolbar;
+pub mod trace;
+pub mod udl;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum Tool {
+    // Basic 2D tools
+    #[default]
+    Select,
+    Point,
+    Line,
+    Circle,
+    Polygon,
+    Pencil,
+    Function,
+    // 3D tools
+    Point3D,
+    Segment3D,
+    Plane3D,
+    Line3D,
+    Sphere3D,
+    Cube3D,
+    Cylinder3D,
+    Cone3D,
+    Torus3D,
+    Prism3D,
+    Tetrahedron3D,
+    MoebiusStrip,
+    Surface3D,
+    ParametricCurve3D,
+    VectorField3D,
+    HyperSurface4D,
+    /// Crea un teseracto tipado centrado y proyectado.
+    Tesseract4D,
+    /// Crea un hipercubo 5D tipado centrado y proyectado.
+    Hypercube5D,
+    // Advanced tools
+    Attractor,
+    Fractal,
+    Histogram,
+    ScatterPlot,
+    Root,
+    Extremum,
+    Inflection,
+    YIntercept,
+    XIntercept,
+    Analyze,
+    Intersect,
+    // Curve creators
+    ParametricCurve2D,
+    PolarCurve,
+    ImplicitCurve,
+    VectorField2D,
+    Arc,
+    Sector,
+    Semicircle,
+    Compass,
+    Spline,
+    // Construction tools
+    Segment,
+    Ray,
+    Vector,
+    RegularPolygon,
+    Tangent,
+    Perpendicular,
+    Parallel,
+    Locus,
+    Midpoint,
+    // Rigid & similarity transforms (GeoGebra parity, motor: Translate/Rotate/Dilate/Reflect)
+    Translate,
+    Rotate,
+    Dilate,
+    Reflect,
+    // Measurement tools
+    Distance,
+    Angle,
+    Area,
+    Slope,
+    // Control tools
+    Slider,
+    Button,
+    Image,
+    Checkbox,
+    InputBox,
+    Text,
+    Eraser,
+    // Complex & Visualization
+    DomainColoring,
+    HeatMap,
+    ComplexGrid,
+    /// Contorno complejo dibujado a mano (integra f(z) sobre el trazo).
+    ComplexContour,
+    TrigAnimation,
+    // Numeric constraints
+    DistanceConstraint,
+    AngleConstraint,
+    Coincident,
+    Horizontal,
+    Vertical,
+    EqualLength,
+    Symmetry,
+    // Conic constructions
+    EllipseByFoci,
+    ParabolaByFocusDirectrix,
+    HyperbolaByFoci,
+    ConicByFivePoints,
+    // Polygon booleans
+    PolygonUnion,
+    PolygonIntersection,
+    PolygonDifference,
+    PolygonXor,
+}
+
+impl Tool {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Tool::Select => "Select",
+            Tool::Point => "Point",
+            Tool::Line => "Line",
+            Tool::Circle => "Circle",
+            Tool::Polygon => "Polygon",
+            Tool::Pencil => "Pencil",
+            Tool::Function => "Function",
+            Tool::Point3D => "Point3D",
+            Tool::Segment3D => "Segment3D",
+            Tool::Plane3D => "Plane3D",
+            Tool::Line3D => "Line3D",
+            Tool::Sphere3D => "Sphere3D",
+            Tool::Cube3D => "Cube3D",
+            Tool::Cylinder3D => "Cylinder3D",
+            Tool::Cone3D => "Cone3D",
+            Tool::Torus3D => "Torus3D",
+            Tool::Prism3D => "Prism3D",
+            Tool::Tetrahedron3D => "Tetrahedron3D",
+            Tool::MoebiusStrip => "MoebiusStrip",
+            Tool::Surface3D => "Surface3D",
+            Tool::ParametricCurve3D => "ParametricCurve3D",
+            Tool::VectorField3D => "VectorField3D",
+            Tool::HyperSurface4D => "HyperSurface4D",
+            Tool::Tesseract4D => "Tesseract4D",
+            Tool::Hypercube5D => "Hypercube5D",
+            Tool::Attractor => "Attractor",
+            Tool::Fractal => "Fractal",
+            Tool::Histogram => "Histogram",
+            Tool::ScatterPlot => "ScatterPlot",
+            Tool::Root => "Root",
+            Tool::Extremum => "Extremum",
+            Tool::Inflection => "Inflection",
+            Tool::YIntercept => "YIntercept",
+            Tool::XIntercept => "XIntercept",
+            Tool::Analyze => "Analyze",
+            Tool::Intersect => "Intersect",
+            Tool::ParametricCurve2D => "ParametricCurve2D",
+            Tool::PolarCurve => "PolarCurve",
+            Tool::ImplicitCurve => "ImplicitCurve",
+            Tool::VectorField2D => "VectorField2D",
+            Tool::Arc => "Arc",
+            Tool::Sector => "Sector",
+            Tool::Semicircle => "Semicircle",
+            Tool::Compass => "Compass",
+            Tool::Spline => "Spline",
+            Tool::Segment => "Segment",
+            Tool::Ray => "Ray",
+            Tool::Vector => "Vector",
+            Tool::RegularPolygon => "RegularPolygon",
+            Tool::Tangent => "Tangent",
+            Tool::Perpendicular => "Perpendicular",
+            Tool::Parallel => "Parallel",
+            Tool::Translate => "Translate",
+            Tool::Rotate => "Rotate",
+            Tool::Dilate => "Dilate",
+            Tool::Reflect => "Reflect",
+            Tool::Locus => "Locus",
+            Tool::Midpoint => "Midpoint",
+            Tool::Distance => "Distance",
+            Tool::Angle => "Angle",
+            Tool::Area => "Area",
+            Tool::Slope => "Slope",
+            Tool::Slider => "Slider",
+            Tool::Button => "Button",
+            Tool::Checkbox => "Checkbox",
+            Tool::InputBox => "InputBox",
+            Tool::Text => "Text",
+            Tool::Image => "Image",
+            Tool::DomainColoring => "DomainColoring",
+            Tool::HeatMap => "HeatMap",
+            Tool::ComplexGrid => "ComplexGrid",
+            Tool::ComplexContour => "ComplexContour",
+            Tool::TrigAnimation => "TrigAnimation",
+            Tool::DistanceConstraint => "DistanceConstraint",
+            Tool::AngleConstraint => "AngleConstraint",
+            Tool::Coincident => "Coincident",
+            Tool::Horizontal => "Horizontal",
+            Tool::Vertical => "Vertical",
+            Tool::EqualLength => "EqualLength",
+            Tool::Symmetry => "Symmetry",
+            Tool::EllipseByFoci => "EllipseByFoci",
+            Tool::ParabolaByFocusDirectrix => "ParabolaByFocusDirectrix",
+            Tool::HyperbolaByFoci => "HyperbolaByFoci",
+            Tool::ConicByFivePoints => "ConicByFivePoints",
+            Tool::PolygonUnion => "PolygonUnion",
+            Tool::PolygonIntersection => "PolygonIntersection",
+            Tool::PolygonDifference => "PolygonDifference",
+            Tool::PolygonXor => "PolygonXor",
+            Tool::Eraser => "Eraser",
+        }
+    }
+
+    pub fn cursor_icon(&self) -> egui::CursorIcon {
+        match self {
+            Tool::Select => egui::CursorIcon::Default,
+            Tool::Point | Tool::Point3D | Tool::Text => egui::CursorIcon::Crosshair,
+            Tool::Tesseract4D | Tool::Hypercube5D => egui::CursorIcon::PointingHand,
+            Tool::Line
+            | Tool::Circle
+            | Tool::Polygon
+            | Tool::Pencil
+            | Tool::Function
+            | Tool::Segment3D
+            | Tool::Plane3D
+            | Tool::Line3D
+            | Tool::Sphere3D
+            | Tool::Cube3D
+            | Tool::Cylinder3D
+            | Tool::Cone3D
+            | Tool::Torus3D
+            | Tool::Prism3D
+            | Tool::Tetrahedron3D
+            | Tool::MoebiusStrip
+            | Tool::Surface3D
+            | Tool::ParametricCurve3D
+            | Tool::VectorField3D
+            | Tool::HyperSurface4D
+            | Tool::Attractor
+            | Tool::Fractal
+            | Tool::Histogram
+            | Tool::ScatterPlot
+            | Tool::Root
+            | Tool::Extremum
+            | Tool::Inflection
+            | Tool::YIntercept
+            | Tool::XIntercept
+            | Tool::Analyze
+            | Tool::Intersect
+            | Tool::ParametricCurve2D
+            | Tool::PolarCurve
+            | Tool::ImplicitCurve
+            | Tool::VectorField2D
+            | Tool::Arc
+            | Tool::Sector
+            | Tool::Semicircle
+            | Tool::Compass
+            | Tool::Spline
+            | Tool::Segment
+            | Tool::Ray
+            | Tool::Vector
+            | Tool::RegularPolygon
+            | Tool::Tangent
+            | Tool::Perpendicular
+            | Tool::Parallel
+            | Tool::Translate
+            | Tool::Rotate
+            | Tool::Dilate
+            | Tool::Reflect
+            | Tool::Checkbox
+            | Tool::InputBox
+            | Tool::Locus
+            | Tool::Midpoint
+            | Tool::Distance
+            | Tool::Angle
+            | Tool::Area
+            | Tool::Slope
+            | Tool::Slider
+            | Tool::Button
+            | Tool::Image
+            | Tool::Eraser
+            | Tool::DomainColoring
+            | Tool::HeatMap
+            | Tool::ComplexGrid
+            | Tool::ComplexContour
+            | Tool::Coincident
+            | Tool::Horizontal
+            | Tool::Vertical
+            | Tool::EqualLength
+            | Tool::Symmetry
+            | Tool::EllipseByFoci
+            | Tool::ParabolaByFocusDirectrix
+            | Tool::HyperbolaByFoci
+            | Tool::ConicByFivePoints
+            | Tool::PolygonUnion
+            | Tool::PolygonIntersection
+            | Tool::PolygonDifference
+            | Tool::PolygonXor => egui::CursorIcon::Crosshair,
+            Tool::DistanceConstraint | Tool::AngleConstraint => egui::CursorIcon::Crosshair,
+            Tool::TrigAnimation => egui::CursorIcon::Default,
+        }
+    }
+}

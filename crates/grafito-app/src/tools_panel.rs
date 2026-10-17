@@ -1,0 +1,625 @@
+use crate::GrafitoApp;
+use egui::Ui;
+use grafito_ui::theme::current_theme;
+use grafito_ui::tokens::{
+    CARD_SPACING, RADIUS_SM, SPACE_SM, SPACE_XS, TYPE_SM, TYPE_XS, ZOOM_ICON_HIT,
+};
+use grafito_ui::toolbar::{draw_tool_icon, filter_groups_by_level, ToolGroupId};
+use grafito_ui::Tool;
+
+pub fn draw_tools_panel(app: &mut GrafitoApp, ctx: &egui::Context) {
+    let theme = current_theme(ctx);
+    let panel_fill = theme.panel_bg;
+
+    egui::SidePanel::left("tools_panel")
+        .show_separator_line(false)
+        .exact_width(crate::panels::panel_left_width(ctx))
+        .resizable(false)
+        .frame(
+            egui::Frame::none()
+                .fill(panel_fill)
+                .inner_margin(egui::Margin::same(SPACE_SM)),
+        )
+        .show(ctx, |ui| {
+            // Sin header: el rail dice "Herram." y el tab activo cierra.
+            ui.add_space(SPACE_SM);
+
+            // Aire derecho 24 para la flotante (ver tokens).
+            let outer_w = ui.available_width();
+            egui::ScrollArea::vertical()
+                .id_salt("tools_panel_scroll")
+                .auto_shrink([false, false])
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                .show(ui, |ui| {
+                    let inner_w = grafito_ui::tokens::scroll_content_width(outer_w).max(0.0);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(inner_w, ui.available_height().max(1.0)),
+                        egui::Layout::top_down(egui::Align::LEFT),
+                        |ui| {
+                            let is_3d = app.current_view == crate::ViewMode::D3;
+
+                            // Progressive disclosure (F5): el lateral respeta el mismo
+                            // filtrado por nivel que la toolbar superior — intersección
+                            // perspectiva × nivel pedagógico (ver `toolbar.rs`).
+                            let level_value = app.profile.level;
+                            let perspective_groups = app.perspective.layout().visible_tool_groups;
+                            let groups = filter_groups_by_level(perspective_groups, level_value);
+                            let has = |g: ToolGroupId| groups.contains(&g);
+
+                            // ── BÁSICAS ──
+                            let mut basic_tools = vec![(Tool::Select, "Mover", "Arrastra objetos")];
+                            if is_3d {
+                                basic_tools.push((
+                                    Tool::Point3D,
+                                    "Punto 3D",
+                                    "Punto en el espacio",
+                                ));
+                            } else {
+                                basic_tools.push((Tool::Point, "Punto", "Crea un punto nuevo"));
+                            }
+                            basic_tools.push((
+                                Tool::Slider,
+                                "Deslizador",
+                                "Variable numérica dinámica",
+                            ));
+                            draw_tool_group(ui, app, inner_w, "Básicas", &basic_tools);
+
+                            // ── EDICIÓN ──
+                            // `Move` está en los 3 niveles (5/8/17) y en toda perspectiva.
+                            if has(ToolGroupId::Move) {
+                                draw_tool_group(
+                                    ui,
+                                    app,
+                                    inner_w,
+                                    "Edición",
+                                    &[(Tool::Select, "Seleccionar", "Selecciona un objeto")],
+                                );
+                            }
+
+                            // ── CONSTRUCCIÓN ──
+                            // Punto medio ∈ Point, Perpendicular ∈ Line, Tangente ∈ Circle.
+                            if !is_3d
+                                && (has(ToolGroupId::Point)
+                                    || has(ToolGroupId::Line)
+                                    || has(ToolGroupId::Circle))
+                            {
+                                draw_tool_group(
+                                    ui,
+                                    app,
+                                    inner_w,
+                                    "Construcción",
+                                    &[
+                                        (Tool::Midpoint, "Punto Medio", "Medio o centro"),
+                                        (
+                                            Tool::Perpendicular,
+                                            "Perpendicular",
+                                            "Recta perpendicular",
+                                        ),
+                                        (Tool::Tangent, "Tangentes", "Tangentes a una curva"),
+                                    ],
+                                );
+                            }
+
+                            // ── MEDICIÓN ──
+                            // Secondary+ (nivel 5..10): Measure.
+                            if !is_3d && has(ToolGroupId::Measure) {
+                                draw_tool_group(
+                                    ui,
+                                    app,
+                                    inner_w,
+                                    "Medición",
+                                    &[
+                                        (Tool::Angle, "Ángulo", "Ángulo entre 3 puntos"),
+                                        (Tool::Distance, "Distancia", "Distancia o longitud"),
+                                        (Tool::Area, "Área", "Área de un polígono/cónica"),
+                                        (Tool::Slope, "Pendiente", "Pendiente de recta"),
+                                    ],
+                                );
+                            }
+
+                            // ── LÍNEAS Y POLÍGONOS ──
+                            if !is_3d && (has(ToolGroupId::Line) || has(ToolGroupId::Polygon)) {
+                                draw_tool_group(
+                                    ui,
+                                    app,
+                                    inner_w,
+                                    "Líneas y Polígonos",
+                                    &[
+                                        (Tool::Segment, "Segmento", "Segmento entre 2 puntos"),
+                                        (Tool::Line, "Recta", "Recta por 2 puntos"),
+                                        (Tool::Ray, "Semirrecta", "Semirrecta por 2 puntos"),
+                                        (Tool::Vector, "Vector", "Vector desde un origen"),
+                                        (Tool::Polygon, "Polígono", "Polígono libre"),
+                                        (Tool::RegularPolygon, "Polígono Reg.", "Polígono regular"),
+                                    ],
+                                );
+                            }
+
+                            // ── CÓNICAS Y COMPÁS ──
+                            // Calm: descarga Cónicas, añade construcciones de compás.
+                            if !is_3d && (has(ToolGroupId::Circle) || has(ToolGroupId::Conic)) {
+                                draw_tool_group(ui, app, inner_w,
+                                "Cónicas y Compás",
+                                &[
+                                    (
+                                        Tool::Circle,
+                                        "Círculo",
+                                        "Circle[centro, radio] — centro y punto del borde",
+                                    ),
+                                    (
+                                        Tool::EllipseByFoci,
+                                        "Elipse",
+                                        "Dos focos y punto — EllipseByFoci[F1,F2,P]",
+                                    ),
+                                    (
+                                        Tool::ParabolaByFocusDirectrix,
+                                        "Parábola",
+                                        "Foco y directriz — ParabolaByFocusDirectrix[F,d]",
+                                    ),
+                                    (
+                                        Tool::HyperbolaByFoci,
+                                        "Hipérbola",
+                                        "Dos focos y punto — HyperbolaByFoci[F1,F2,P]",
+                                    ),
+                                    (
+                                        Tool::ConicByFivePoints,
+                                        "Cónica 5 ptos",
+                                        "Por 5 puntos — ConicByFivePoints[A,B,C,D,E]",
+                                    ),
+                                    (
+                                        Tool::Circle,
+                                        "Incírculo",
+                                        "Incircle[A,B,C] — círculo inscrito en el triángulo",
+                                    ),
+                                    (
+                                        Tool::Circle,
+                                        "Circuncírculo",
+                                        "Circumcircle[A,B,C] — círculo circunscrito al triángulo",
+                                    ),
+                                    (
+                                        Tool::Circle,
+                                        "Compás",
+                                        "Compasses[centro, punto] — traza círculo con compás",
+                                    ),
+                                ],
+                            );
+                            }
+
+                            // ── CURVAS ESPECIALES ──
+                            // Nuevo grupo calm 2 cols que aligera Líneas/Cónicas.
+                            // Arco/Sector/Semicírculo ∈ Circle; Bezier/Spline ∈ Curve.
+                            if !is_3d && (has(ToolGroupId::Curve) || has(ToolGroupId::Circle)) {
+                                draw_tool_group(
+                                    ui,
+                                    app,
+                                    inner_w,
+                                    "Curvas especiales",
+                                    &[
+                                        (
+                                            Tool::Circle,
+                                            "Arco",
+                                            "Arc[centro, radio, inicio, fin] o Arc[P1,P2,P3]",
+                                        ),
+                                        (
+                                            Tool::Circle,
+                                            "Sector circular",
+                                            "Sector[centro, radio, ángulo] — relleno circular",
+                                        ),
+                                        (
+                                            Tool::Circle,
+                                            "Semicírculo",
+                                            "Semicircle[centro, radio] o Semicircle[P1,P2,P3]",
+                                        ),
+                                        (
+                                            Tool::ParametricCurve2D,
+                                            "Bezier",
+                                            "BezierCurve[P1,P2,...] — 2..64 puntos de control",
+                                        ),
+                                        (
+                                            Tool::PolarCurve,
+                                            "Spline",
+                                            "Spline[P1,P2,...] — Catmull-Rom 2..64 puntos",
+                                        ),
+                                    ],
+                                );
+                            }
+
+                            // ── TRANSFORMACIONES ──
+                            // Shear/Stretch/Reflect no tienen Tool dedicado: se mapean a Select con tooltip.
+                            // University (nivel 11+): Constraint.
+                            if !is_3d && has(ToolGroupId::Constraint) {
+                                draw_tool_group(ui, app, inner_w,
+                        "Transformaciones",
+                        &[
+                            (
+                                Tool::Select,
+                                "Reflect (espejo)",
+                                "Reflect[obj, eje] o Reflect[obj, círculo] — inversión circular",
+                            ),
+                            (
+                                Tool::Select,
+                                "Cizalla (Shear)",
+                                "Shear[obj, ángulo, eje] — x' = x + k·y, k=tan(ángulo)",
+                            ),
+                            (
+                                Tool::Select,
+                                "Estira (Stretch)",
+                                "Stretch[obj, factor, eje] — estiramiento afín",
+                            ),
+                        ],
+                    );
+                            }
+
+                            // ── TEXTO ──
+                            if !is_3d {
+                                draw_tool_group(
+                                    ui,
+                                    app,
+                                    inner_w,
+                                    "Texto",
+                                    &[
+                                        (
+                                            Tool::Select,
+                                            "FractionText",
+                                            "FractionText[valor] — 0.5 → \"1/2\" — vía comando",
+                                        ),
+                                        (
+                                            Tool::Select,
+                                            "SurdText",
+                                            "SurdText[valor] — 1.414 → \"√2\" — vía comando",
+                                        ),
+                                    ],
+                                );
+                            }
+
+                            // ── 3D ──
+                            // Misma intersección perspectiva × nivel que la toolbar superior.
+                            if is_3d && has(ToolGroupId::ThreeD) {
+                                draw_tool_group(
+                                    ui,
+                                    app,
+                                    inner_w,
+                                    "Sólidos 3D",
+                                    &[
+                                        (Tool::Sphere3D, "Esfera", "Centro y punto en borde"),
+                                        (Tool::Cube3D, "Cubo", "Centro y radio (aprox)"),
+                                    ],
+                                );
+                                // Sólidos avanzados — solo en 3D (progressive disclosure).
+                                // Nota: comparte el gate `ThreeD` del bloque `if is_3d` superior.
+                                draw_tool_group(
+                                    ui,
+                                    app,
+                                    inner_w,
+                                    "Sólidos avanzados",
+                                    &[
+                                        (
+                                            Tool::Cube3D,
+                                            "Prisma",
+                                            "Prism[polígono, altura] o [polígono, dx,dy,dz]",
+                                        ),
+                                        (
+                                            Tool::Sphere3D,
+                                            "Cuádrica",
+                                            "Quadric[a,b,c,d,e,f,g,h,i,j] — a·x²+…+j=0",
+                                        ),
+                                        (
+                                            Tool::Plane3D,
+                                            "Intersección 3D",
+                                            "Intersection3D[a,b] — plano/plano, recta/plano, etc.",
+                                        ),
+                                    ],
+                                );
+                                if has(ToolGroupId::FourD) {
+                                    draw_tool_group(
+                                        ui,
+                                        app,
+                                        inner_w,
+                                        "4D proyectado",
+                                        &[
+                                            (
+                                                Tool::Tesseract4D,
+                                                "Teseracto 4D",
+                                                "Crea un teseracto 4D centrado y proyectado",
+                                            ),
+                                            (
+                                                Tool::Hypercube5D,
+                                                "Hipercubo 5D",
+                                                "Crea un hipercubo 5D centrado y proyectado",
+                                            ),
+                                        ],
+                                    );
+                                }
+                            }
+
+                            // ── ANÁLISIS ──
+                            // Secondary+ (nivel 5..10): Analysis; AlgebraCas/Calculus aportan Curve.
+                            if !is_3d && (has(ToolGroupId::Analysis) || has(ToolGroupId::Curve)) {
+                                draw_tool_group(
+                                    ui,
+                                    app,
+                                    inner_w,
+                                    "Análisis",
+                                    &[
+                                        (Tool::Root, "Raíces", "Cortes con el eje X — Root[f]"),
+                                        (
+                                            Tool::Extremum,
+                                            "Extremos",
+                                            "Puntos máximos y mínimos — Extremum[f]",
+                                        ),
+                                        (
+                                            Tool::Intersect,
+                                            "Intersección",
+                                            "Intersección de 2 objetos — Intersect[a,b]",
+                                        ),
+                                        (
+                                            Tool::Function,
+                                            "Función Libre",
+                                            "Crear f(x) libre — Function[expr]",
+                                        ),
+                                    ],
+                                );
+                            }
+
+                            // ── BOOL. POLÍGONOS ──
+                            // University (nivel 11+): Boolean.
+                            if !is_3d && has(ToolGroupId::Boolean) {
+                                draw_tool_group(
+                                    ui,
+                                    app,
+                                    inner_w,
+                                    "Operaciones Booleanas",
+                                    &[
+                                        (
+                                            Tool::PolygonUnion,
+                                            "Unión",
+                                            "Unión de polígonos — PolygonUnion[A,B]",
+                                        ),
+                                        (
+                                            Tool::PolygonIntersection,
+                                            "Intersección",
+                                            "Intersección — PolygonIntersection[A,B]",
+                                        ),
+                                        (
+                                            Tool::PolygonDifference,
+                                            "Diferencia",
+                                            "A menos B — PolygonDifference[A,B]",
+                                        ),
+                                        (
+                                            Tool::PolygonXor,
+                                            "XOR",
+                                            "Diferencia simétrica — PolygonXor[A,B]",
+                                        ),
+                                    ],
+                                );
+                            }
+
+                            // ── DISCRETA Y LISTAS ──
+                            // Progressive disclosure: solo en 2D + University/Advanced,
+                            // vía comando (Financiera/CAS/Probabilidad en paleta).
+                            if !is_3d && has(ToolGroupId::Advanced) {
+                                draw_tool_group(
+                                    ui,
+                                    app,
+                                    inner_w,
+                                    "Discreta y Listas",
+                                    &[
+                                        (
+                                            Tool::Select,
+                                            "ConvexHull",
+                                            "ConvexHull[puntos] — envolvente convexa",
+                                        ),
+                                        (
+                                            Tool::Select,
+                                            "Voronoi",
+                                            "Voronoi[puntos] — diagrama aproximado",
+                                        ),
+                                        (
+                                            Tool::Select,
+                                            "Sequence",
+                                            "Sequence[expr, var, inicio, fin] — genera lista",
+                                        ),
+                                        (
+                                            Tool::Select,
+                                            "Sort",
+                                            "Sort[lista] — ordena lista numérica",
+                                        ),
+                                    ],
+                                );
+                                // Ruta a lo avanzado en 1 línea (antes ejemplos eternos).
+                                ui.label(
+                                    egui::RichText::new("Más herramientas con Ctrl+K.")
+                                        .size(TYPE_XS)
+                                        .color(theme.text_tertiary),
+                                );
+                                ui.add_space(SPACE_SM);
+                            }
+                            // ── EXPORTAR / COMPARTIR ──
+                            // Vive acá y en Archivo > Exportar (nunca en Vista: Vista es
+                            // solo visual). Reutiliza la sección canónica de panels.
+                            crate::panels::draw_export_section(ui, app);
+                            ui.add_space(SPACE_SM);
+                        },
+                    );
+                });
+        });
+}
+
+/// Recorta la etiqueta al ancho disponible (≈6.4 px por carácter a
+/// `TYPE_SM`) para que nunca pise la celda vecina; el nombre completo y la
+/// explicación quedan en el tooltip y en accessibility.
+fn fit_tool_label(name: &str, max_width: f32) -> String {
+    let max_chars = ((max_width / 6.4).floor() as i64).max(3) as usize;
+    if name.chars().count() <= max_chars {
+        return name.to_string();
+    }
+    let mut out: String = name.chars().take(max_chars.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+fn draw_tool_group(
+    ui: &mut Ui,
+    app: &mut GrafitoApp,
+    content_w: f32,
+    title: &str,
+    tools: &[(Tool, &str, &str)],
+) {
+    let theme = current_theme(ui.ctx());
+    ui.label(
+        egui::RichText::new(title)
+            .strong()
+            .size(TYPE_XS)
+            .color(theme.text_tertiary),
+    );
+    ui.add_space(SPACE_XS);
+
+    // Columnas iguales y responsive: a menos de 240 px una sola columna
+    // (a 180 el clamp de 96 desbordaba 200 > 164). Sin mínimo que empuje: el
+    // texto se recorta con `…` y el nombre completo queda en tooltip.
+    // Id namespaced: títulos genéricos ("Texto") colisionaban entre paneles.
+    // Ancho precalculado por el llamador (con gutter de scroll descontado):
+    // las celdas nunca corren bajo la barra flotante ni cambian solas.
+    let num_cols = if content_w < 240.0 { 1 } else { 2 };
+    let cell_w = ((content_w - (num_cols as f32 - 1.0) * SPACE_SM) / num_cols as f32).max(0.0);
+    egui::Grid::new(format!("tools_panel::{title}"))
+        .num_columns(num_cols)
+        .spacing(egui::vec2(SPACE_SM, SPACE_SM))
+        .show(ui, |ui| {
+            for (i, (tool, name, desc)) in tools.iter().enumerate() {
+                let is_selected = app.current_tool == *tool;
+
+                let btn_fill = if is_selected {
+                    // `selection_bg` (pressed), no el wash `accent_muted`: en
+                    // claro el wash coincidía con el hover y el activo no se
+                    // distinguía del hover-no-seleccionado.
+                    theme.selection_bg
+                } else {
+                    theme.button_bg
+                };
+
+                let border = if is_selected {
+                    egui::Stroke::new(1.0, theme.accent)
+                } else {
+                    egui::Stroke::NONE
+                };
+
+                let (rect, resp) =
+                    ui.allocate_exact_size(egui::vec2(cell_w, ZOOM_ICON_HIT), egui::Sense::click());
+                let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+
+                // Ancho útil de texto = celda − icono (40) − aire (6).
+                let shown = fit_tool_label(name, (cell_w - 46.0).max(0.0));
+                if ui.is_rect_visible(rect) {
+                    let painter = ui.painter();
+                    painter.rect_filled(
+                        rect,
+                        RADIUS_SM,
+                        if resp.hovered() && !is_selected {
+                            theme.button_hover
+                        } else {
+                            btn_fill
+                        },
+                    );
+                    painter.rect_stroke(rect, RADIUS_SM, border);
+
+                    let icon_rect = egui::Rect::from_center_size(
+                        rect.left_center() + egui::vec2(20.0, 0.0),
+                        egui::vec2(24.0, 24.0),
+                    );
+
+                    painter.circle_filled(icon_rect.center(), 12.0, theme.input_bg);
+                    draw_tool_icon(
+                        painter,
+                        icon_rect.shrink(4.0),
+                        *tool,
+                        if is_selected {
+                            theme.accent
+                        } else {
+                            theme.text_primary
+                        },
+                    );
+
+                    // Texto de la herramienta, recortado y con clip al botón:
+                    // jamás pisa la celda vecina ni el borde del panel.
+                    let text_rect = egui::Rect::from_min_max(
+                        egui::pos2(rect.left() + 40.0, rect.top()),
+                        egui::pos2(rect.right() - 6.0, rect.bottom()),
+                    );
+                    painter.with_clip_rect(rect).text(
+                        egui::pos2(text_rect.left(), rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        shown.clone(),
+                        egui::FontId::proportional(TYPE_SM),
+                        theme.text_primary,
+                    );
+                    // Barra de selección (doble señal, no solo color): como la
+                    // toolbar, el activo lleva indicador además del fill.
+                    if is_selected {
+                        painter.rect_filled(
+                            egui::Rect::from_min_size(
+                                egui::pos2(rect.left() + 4.0, rect.center().y - 8.0),
+                                egui::vec2(3.0, 16.0),
+                            ),
+                            1.5,
+                            theme.accent,
+                        );
+                    }
+                }
+
+                resp.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::Button,
+                        true,
+                        format!("{name}: {desc}"),
+                    )
+                });
+                // Nombre completo en el tooltip cuando se recorta: sin él no
+                // había forma visual de recuperar "Circuncírculo" truncado.
+                // (`shown` se calculó arriba con el mismo ancho útil.)
+                let resp = if shown.ends_with('…') {
+                    resp.on_hover_text(format!("{name}\n{desc}"))
+                } else {
+                    resp.on_hover_text(*desc)
+                };
+
+                // Foco visible + teclado (Enter/Espacio), como la toolbar.
+                if resp.has_focus() {
+                    theme.paint_focus_ring(ui.painter(), resp.rect);
+                }
+                let activated = resp.clicked()
+                    || (resp.has_focus()
+                        && ui.input(|i| {
+                            i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space)
+                        }));
+                if activated {
+                    app.current_tool = *tool;
+                    app.clear_pending_action();
+                    app.tool_ghost = None;
+                    app.reset_tool_input();
+                }
+
+                if (i + 1) % num_cols == 0 || i + 1 == tools.len() {
+                    ui.end_row();
+                }
+            }
+        });
+    ui.add_space(CARD_SPACING);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fit_tool_label;
+
+    #[test]
+    fn fit_tool_label_recorta_sin_pisar_al_vecino() {
+        assert_eq!(fit_tool_label("Punto", 100.0), "Punto");
+        let largo = fit_tool_label("Circuncírculo con nombre largo", 96.0);
+        assert!(largo.ends_with('…'), "{largo}");
+        assert!(largo.chars().count() <= 15, "{largo}");
+        // Piso: nunca devuelve vacío ni sin puntos suspensivos.
+        let minimo = fit_tool_label("Cualquier cosa", 10.0);
+        assert!(minimo.ends_with('…'));
+        assert!(minimo.chars().count() >= 3);
+    }
+}

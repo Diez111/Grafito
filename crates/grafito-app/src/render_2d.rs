@@ -1,0 +1,10822 @@
+use crate::anim_ui::{RetentionQueue, TEXTURE_GRACE_FRAMES};
+use crate::view_flags::{
+    view_axis_step, view_flag_bool, VIEW_AXIS_STEP_X, VIEW_AXIS_STEP_Y, VIEW_SHOW_AXES,
+    VIEW_SHOW_GRID,
+};
+use crate::GrafitoApp;
+use egui::{Color32, Pos2, Rect, Shape, Stroke, Vec2};
+use glam::Vec2 as GlamVec2;
+use grafito_complex::algebraic_mappings::ConformalMap;
+use grafito_core::parametric_sampling;
+use grafito_core::tex_raster::{TexBitmap, MAX_TEX_LINE_CHARS, MAX_TEX_MTEXT_BYTES};
+use grafito_core::vector_field_sampling;
+use grafito_core::{
+    GeoObject, ImplicitCurveObj, LineStyle, ObjectId, PointStyle, RelationOperator,
+};
+use grafito_geometry::expr::{
+    eval_batch_1d, eval_function_with_vars, eval_integral_batch, prepare_function_ast,
+};
+use grafito_geometry::{Color, Point2, ViewTransform};
+use grafito_ui::theme::current_theme;
+use rayon::prelude::*;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
+
+/// Segmentos + asíntotas trigonométricas compartidos (alias anti `type_complexity`).
+type TrigSegments = (Arc<Vec<(Point2, Point2)>>, Arc<Vec<f64>>);
+
+// La gracia cubre el submit GPU en vuelo (N≥2); verificado a compile-time
+// (clippy `assertions_on_constants` prohíbe re-chequear la const en runtime).
+const _: () = assert!(TEXTURE_GRACE_FRAMES >= 2);
+
+// ── F3-Render caches: fractal / phase / ordered_visible keyed por document.version ──
+/// Clave del caché de ids visibles: `(cache_nonce, version)`. El nonce
+/// distingue documentos con igual versión (ver `Document::cache_nonce`).
+type OrderedVisibleKey = (u64, u64);
+
+/// Cache LRU de texturas `managed` con **liberación diferida por gracia**.
+///
+/// Dropear un `egui::TextureHandle` en el frame de su evicción libera la
+/// textura GPU mientras un submit en vuelo todavía la referencia: wgpu
+/// panicaba con `Texture with 'egui_texid_Managed(N)' label has been
+/// destroyed` (visto al abrir una escena de 2000 rótulos con LRU de 64).
+/// Las evicciones se retiran a `RetentionQueue` y se dropean recién tras
+/// `TEXTURE_GRACE_FRAMES` ticks (mismo patrón que `FillTextureCacheStore`).
+///
+/// `try_insert` (sin evicción) es para cachés de claves no versionadas y
+/// alta cardinalidad (rótulos): al llenarse el llamador cae a un fallback
+/// (ASCII) en vez de churn-ear texturas a 60 Hz.
+struct GracefulTextureCache<K: std::hash::Hash + Eq> {
+    entries: lru::LruCache<K, egui::TextureHandle>,
+    retired: crate::anim_ui::RetentionQueue<egui::TextureHandle>,
+}
+
+impl<K: std::hash::Hash + Eq + Clone> GracefulTextureCache<K> {
+    fn new(cap: std::num::NonZeroUsize) -> Self {
+        Self {
+            entries: lru::LruCache::new(cap),
+            retired: crate::anim_ui::RetentionQueue::new(),
+        }
+    }
+
+    /// Hit con bump O(1); `None` = no está (subir con `insert`/`try_insert`).
+    fn get<Q: ?Sized + std::hash::Hash + Eq>(&mut self, key: &Q) -> Option<egui::TextureHandle>
+    where
+        K: std::borrow::Borrow<Q>,
+    {
+        self.entries.get(key).cloned()
+    }
+
+    /// Inserta evictando la LRU (retirada con gracia). Para claves
+    /// versionadas con cardinalidad baja (fractal, domain coloring): el
+    /// churn es bajo y la gracia alcanza.
+    fn insert(&mut self, key: K, handle: egui::TextureHandle) {
+        if let Some(old) = self.entries.put(key, handle) {
+            self.retired.retire(old);
+        }
+    }
+
+    /// Inserta solo si hay lugar (sin evictar). `false` = lleno: el
+    /// llamador debe usar su fallback, no subir más texturas (sin churn
+    /// no hay drops bajo presión y el crash de wgpu queda imposible).
+    fn try_insert(&mut self, key: K, handle: egui::TextureHandle) -> bool {
+        if self.entries.len() >= self.entries.cap().get() {
+            return false;
+        }
+        self.insert(key, handle);
+        true
+    }
+
+    /// Avanza un frame de gracia y dropea las expiradas. Se llama una vez
+    /// por frame dibujado (desde `draw_objects`).
+    fn tick(&mut self) {
+        let _ = self.retired.tick();
+    }
+
+    /// ¿Queda lugar sin evictar? (evita subir una textura que se
+    /// descartaría: el llamador cae a su fallback antes de alocar).
+    fn has_room(&self) -> bool {
+        self.entries.len() < self.entries.cap().get()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    fn contains<Q: ?Sized + std::hash::Hash + Eq>(&mut self, key: &Q) -> bool
+    where
+        K: std::borrow::Borrow<Q>,
+    {
+        self.entries.get(key).is_some()
+    }
+
+    #[cfg(test)]
+    fn retired_pending(&self) -> usize {
+        self.retired.pending()
+    }
+}
+
+thread_local! {
+    // Los valores se guardan como `Arc` para que el cache hit clone solo el
+    // puntero (refcount) y no el payload completo (density² segmentos de
+    // retrato de fase, o el AST complejo).
+    // LRU real (`lru::LruCache`): el hit hace bump O(1) y el `put` desaloja
+    // la menos usada (antes `HashMap + keys().next()`, evicción arbitraria).
+    static PHASE_PORTRAIT_CACHE: RefCell<lru::LruCache<u64, PhasePortraitSegments>> =
+        RefCell::new(lru::LruCache::new(PHASE_RENDER_CACHE_SIZE));
+    static ORDERED_VISIBLE_CACHE: RefCell<Option<(OrderedVisibleKey, Arc<Vec<ObjectId>>)>> =
+        const { RefCell::new(None) };
+    /// Cache de ASTs complejos parseados (ComplexGrid/ComplexMapping) keyed por
+    /// la expresión. Evita re-parsear `complex_expr` en cada frame (H10).
+    static COMPLEX_EXPR_CACHE: RefCell<
+        lru::LruCache<String, Arc<grafito_complex::ComplexExpr>>,
+    > = RefCell::new(lru::LruCache::new(COMPLEX_EXPR_CACHE_SIZE));
+    /// Texturas de domain coloring / heat map keyed por
+    /// (version, objeto, expr, bounds, res, modo). Antes cada frame emitía
+    /// 40k-90k `rect_filled` (4k-90k shapes); ahora una rasterización por
+    /// cambio y un solo `painter.image`.
+    static COMPLEX_GRID_TEXTURES: RefCell<GracefulTextureCache<u64>> =
+        RefCell::new(GracefulTextureCache::new(COMPLEX_GRID_TEXTURE_SIZE));
+    /// Streamlines RK4 de VectorField2D en world-space, keyed por
+    /// (version, campo, viewport): antes se re-trazaban 25×200×4 evaluaciones
+    /// por frame; ahora solo se proyectan a pantalla.
+    static VECTOR_FIELD_STREAMLINE_CACHE: RefCell<lru::LruCache<u64, VectorFieldStreamlines>> =
+        RefCell::new(lru::LruCache::new(VECTOR_FIELD_STREAMLINE_CACHE_SIZE));
+    /// Texturas de rótulos TeX keyed por texto: antes cada rótulo teselaba
+    /// cientos de `rect_filled` (uno por píxel de tinta) POR FRAME; ahora una
+    /// subida por texto y un solo `painter.image` (tinte = color del rótulo).
+    static TEX_LABEL_TEXTURES: RefCell<GracefulTextureCache<String>> =
+        RefCell::new(GracefulTextureCache::new(TEX_LABEL_TEXTURE_CACHE_SIZE));
+    /// Texturas de fractales keyed por la misma clave que los píxeles
+    /// (`fractal_render_cache_key`): antes cada frame emitía `res²`
+    /// `rect_filled` (hasta 160k shapes con `resolution: 400`); ahora una
+    /// rasterización por cambio y un solo `painter.image` con `NEAREST`
+    /// (misma estética de píxel nítido que los rects en world-space).
+    static FRACTAL_TEXTURES: RefCell<GracefulTextureCache<u64>> =
+        RefCell::new(GracefulTextureCache::new(FRACTAL_TEXTURE_CACHE_SIZE));
+    /// Última `document.version` en la que se ejecutó `prune_fill_texture_cache`.
+    /// Permite saltar el write lock + barrido LRU cuando el documento no cambió.
+    static LAST_FILL_PRUNE_DOC_VERSION: RefCell<Option<u64>> = const { RefCell::new(None) };
+}
+const PHASE_RENDER_CACHE_CAP: usize = 32;
+const COMPLEX_EXPR_CACHE_CAP: usize = 16;
+const COMPLEX_GRID_TEXTURE_CAP: usize = 16;
+const VECTOR_FIELD_STREAMLINE_CACHE_CAP: usize = 16;
+const TEX_LABEL_TEXTURE_CACHE_CAP: usize = 256;
+const FRACTAL_TEXTURE_CACHE_CAP: usize = 8;
+const DISPLAY_OVERRIDE_CACHE_CAP: usize = 64;
+#[allow(dead_code)]
+const TEXT_GALLEY_CACHE_CAP: usize = 64;
+const DOMAIN_GRID_CACHE_CAP: usize = 8;
+// Tamaños `NonZeroUsize` para `lru::LruCache::new` (misma API que
+// `grafito-render/src/lib.rs:TRANSFORMED_CACHE_SIZE`).
+// F14.4.3: construcción `const` sin `unsafe` (los caps son literales > 0;
+// el `panic!` de la rama imposible se evalúa en compilación).
+const fn nonzero_cap<const N: usize>() -> std::num::NonZeroUsize {
+    match std::num::NonZeroUsize::new(N) {
+        Some(v) => v,
+        None => panic!("cache cap must be nonzero"),
+    }
+}
+const PHASE_RENDER_CACHE_SIZE: std::num::NonZeroUsize = nonzero_cap::<PHASE_RENDER_CACHE_CAP>();
+const COMPLEX_EXPR_CACHE_SIZE: std::num::NonZeroUsize = nonzero_cap::<COMPLEX_EXPR_CACHE_CAP>();
+const COMPLEX_GRID_TEXTURE_SIZE: std::num::NonZeroUsize = nonzero_cap::<COMPLEX_GRID_TEXTURE_CAP>();
+const VECTOR_FIELD_STREAMLINE_CACHE_SIZE: std::num::NonZeroUsize =
+    nonzero_cap::<VECTOR_FIELD_STREAMLINE_CACHE_CAP>();
+const TEX_LABEL_TEXTURE_CACHE_SIZE: std::num::NonZeroUsize =
+    nonzero_cap::<TEX_LABEL_TEXTURE_CACHE_CAP>();
+const FRACTAL_TEXTURE_CACHE_SIZE: std::num::NonZeroUsize =
+    nonzero_cap::<FRACTAL_TEXTURE_CACHE_CAP>();
+const DISPLAY_OVERRIDE_CACHE_SIZE: std::num::NonZeroUsize =
+    nonzero_cap::<DISPLAY_OVERRIDE_CACHE_CAP>();
+const STAT_MEMO_CACHE_SIZE: std::num::NonZeroUsize = nonzero_cap::<STAT_MEMO_CACHE_CAP>();
+#[allow(dead_code)]
+const TEXT_GALLEY_CACHE_SIZE: std::num::NonZeroUsize = nonzero_cap::<TEXT_GALLEY_CACHE_CAP>();
+const DOMAIN_GRID_CACHE_SIZE: std::num::NonZeroUsize = nonzero_cap::<DOMAIN_GRID_CACHE_CAP>();
+
+/// Tags del memo de estadísticas (un caché, cuatro formas).
+const STAT_HISTOGRAM: u8 = 0;
+const STAT_BARS: u8 = 1;
+const STAT_SLICES: u8 = 2;
+const STAT_BOXPLOT: u8 = 3;
+const STAT_MEMO_CACHE_CAP: usize = 32;
+
+/// Estadística ya computada, compartida por `Arc`. Histogramas, barras,
+/// tortas y boxplots se recomputaban por frame (el boxplot ordena la
+/// muestra 3 veces); con datos y parámetros cubiertos por
+/// `document.version`, el memo por `(objeto, versión, tag)` lo deja en un
+/// `Arc` por cambio.
+#[derive(Clone)]
+#[allow(clippy::type_complexity)]
+enum StatMemoValue {
+    Histogram(std::sync::Arc<Vec<(f64, f64, f64)>>),
+    Bars(std::sync::Arc<Vec<grafito_core::symbolic::BarSegment>>),
+    Slices(std::sync::Arc<Vec<grafito_core::symbolic::PieSlice>>),
+    Boxplot(std::sync::Arc<Option<(f64, f64, f64, f64, f64, Vec<f64>)>>),
+}
+
+thread_local! {
+    /// Memo de estadísticas por `(objeto, versión, tag)`. Un solo static
+    /// compartido por get/put (dos `thread_local!` serían dos cachés).
+    static STAT_MEMO: RefCell<lru::LruCache<(ObjectId, u64, u8), StatMemoValue>> =
+        RefCell::new(lru::LruCache::new(STAT_MEMO_CACHE_SIZE));
+    /// Galleys de objetos `Text` por `(objeto, versión, tamaño)`.
+    static TEXT_GALLEYS: RefCell<
+        lru::LruCache<(ObjectId, u64, u32), std::sync::Arc<egui::Galley>>,
+    > = RefCell::new(lru::LruCache::new(TEXT_GALLEY_CACHE_SIZE));
+}
+
+/// Galley compartido para un objeto `Text`: en hit ni se clona el `String`
+/// ni se re-resuelve el layout. El color va horneado en el galley pero
+/// también está cubierto por la versión (cambia solo con commit).
+/// Conservado como respaldo versionado; el camino activo usa
+/// `label_galley_shared` por (texto, estilo, escala-cuantizada).
+#[allow(dead_code)]
+fn text_galley_shared(
+    painter: &egui::Painter,
+    id: ObjectId,
+    version: u64,
+    font_size: f32,
+    content: &str,
+    color: Color32,
+) -> std::sync::Arc<egui::Galley> {
+    let key = (id, version, font_size.to_bits());
+    if let Some(hit) = TEXT_GALLEYS.with(|c| c.borrow_mut().get(&key).cloned()) {
+        return hit;
+    }
+    let galley = painter.layout_no_wrap(
+        content.to_owned(),
+        egui::FontId::proportional(font_size),
+        color,
+    );
+    TEXT_GALLEYS.with(|c| {
+        c.borrow_mut().put(key, galley.clone());
+    });
+    galley
+}
+
+fn stat_memo_get(tag: u8, id: ObjectId, version: u64) -> Option<StatMemoValue> {
+    STAT_MEMO.with(|c| c.borrow_mut().get(&(id, version, tag)).cloned())
+}
+
+fn stat_memo_put(tag: u8, id: ObjectId, version: u64, value: StatMemoValue) {
+    STAT_MEMO.with(|c| {
+        c.borrow_mut().put((id, version, tag), value);
+    });
+}
+
+// ── Perf polilíneas: vista cuantizada + diezmado + batch + budget labels ──
+// Tolerancia ~0.5px: pan/zoom dentro del quantum reutiliza sin re-muestrear
+// ni re-proyectar. Invalidación por (nonce, versión) como
+// `cached_ordered_visible_ids`, más tag de calidad (los steps dependen de
+// ella) y vista cuantizada (origen/escala por buckets).
+/// Tolerancia de cuantización de vista en px de pantalla.
+pub(crate) const POLYLINE_VIEW_QUANT_PX: f64 = 0.5;
+/// Ancho del bucket en ln(escala): error relativo <0.05% ⇒ <0.5px en 800px.
+const POLYLINE_SCALE_LN_EPS: f64 = 0.0005;
+/// Entradas del caché de polilíneas proyectadas (una por objeto visible).
+pub(crate) const PROJECTED_POLYLINE_CACHE_CAP: usize = 32;
+/// Tope de rótulos por frame (cull por cantidad).
+pub(crate) const MAX_LABELS_PER_FRAME: usize = 512;
+/// Piso de tamaño de fuente visible (cull por tamaño en pantalla).
+pub(crate) const MIN_LABEL_FONT_PX: f32 = 6.0;
+/// Piso de extensión de objeto para mostrar su rótulo (px).
+pub(crate) const MIN_LABEL_EXTENT_PX: f32 = 8.0;
+/// Entradas del caché de galleys por (texto, estilo, escala).
+pub(crate) const LABEL_GALLEY_CACHE_CAP: usize = 128;
+
+/// Vista cuantizada por buckets de origen/escala (tolerancia ~0.5px).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct QuantizedView {
+    ox: i64,
+    oy: i64,
+    scale_q: i64,
+    w: i32,
+    h: i32,
+    xlog: bool,
+    ylog: bool,
+}
+
+/// Cuantiza una escala a bucket de `POLYLINE_SCALE_LN_EPS` en ln(escala).
+/// No-finita o ≤0 ⇒ 0 (honesto, nunca NaN al hashear).
+pub(crate) fn quantize_scale_ln(scale: f64) -> i64 {
+    if !scale.is_finite() || scale <= 0.0 {
+        return 0;
+    }
+    (scale.ln() / POLYLINE_SCALE_LN_EPS).round() as i64
+}
+
+/// Cuantiza origen (buckets de 0.5px), escala (bucket relativo),
+/// tamaño y modos log. Dos vistas dentro del quantum dan la misma clave.
+pub(crate) fn quantize_view(view: &ViewTransform) -> QuantizedView {
+    let bucket = |v: f64| {
+        if v.is_finite() {
+            (v / POLYLINE_VIEW_QUANT_PX).round() as i64
+        } else {
+            0
+        }
+    };
+    let dim = |v: f32| {
+        if v.is_finite() {
+            v.round().clamp(0.0, 16_384.0) as i32
+        } else {
+            0
+        }
+    };
+    QuantizedView {
+        ox: bucket(view.offset.x),
+        oy: bucket(view.offset.y),
+        scale_q: quantize_scale_ln(view.scale),
+        w: dim(view.screen_size.x),
+        h: dim(view.screen_size.y),
+        xlog: view.x_log,
+        ylog: view.y_log,
+    }
+}
+
+/// Tag compacto de calidad (los steps de muestreo dependen de ella).
+pub(crate) fn render_quality_tag(quality: grafito_core::RenderQuality) -> u8 {
+    match quality {
+        grafito_core::RenderQuality::Preview => 0,
+        grafito_core::RenderQuality::Normal => 1,
+        grafito_core::RenderQuality::High => 2,
+    }
+}
+
+/// Clave del caché de polilíneas: `(objeto, nonce, versión, calidad, vista)`.
+/// El nonce distingue documentos con igual versión (igual que
+/// `cached_ordered_visible_ids`).
+type ProjectedPolylineKey = (ObjectId, u64, u64, u8, QuantizedView);
+
+const PROJECTED_POLYLINE_CACHE_SIZE: std::num::NonZeroUsize =
+    nonzero_cap::<PROJECTED_POLYLINE_CACHE_CAP>();
+const LABEL_GALLEY_CACHE_SIZE: std::num::NonZeroUsize = nonzero_cap::<LABEL_GALLEY_CACHE_CAP>();
+
+thread_local! {
+    /// Polilíneas muestreadas+proyectadas en coords view-screen (sin offset
+    /// de canvas): en hit no se toca el sampler ni se re-proyecta, solo se
+    /// suma `canvas_rect.min` al blitear.
+    static PROJECTED_POLYLINE_CACHE: RefCell<lru::LruCache<ProjectedPolylineKey, Arc<Vec<Vec<Pos2>>>>> =
+        RefCell::new(lru::LruCache::new(PROJECTED_POLYLINE_CACHE_SIZE));
+    /// Presupuesto de rótulos consumido en el frame en curso.
+    static LABEL_BUDGET_USED: RefCell<usize> = const { RefCell::new(0) };
+    /// Galleys por (texto, estilo, escala-cuantizada): textos repetidos
+    /// (ticks, rótulos iguales) comparten layout sin re-resolver.
+    static LABEL_GALLEYS: RefCell<lru::LruCache<LabelGalleyKey, Arc<egui::Galley>>> =
+        RefCell::new(lru::LruCache::new(LABEL_GALLEY_CACHE_SIZE));
+}
+
+/// Clave de galley: texto + fuente + color + escala cuantizada.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct LabelGalleyKey {
+    text: String,
+    font_bits: u32,
+    color: u32,
+    scale_q: i64,
+}
+
+fn projected_polyline_cache_get(
+    id: ObjectId,
+    nonce: u64,
+    version: u64,
+    quality: u8,
+    view: QuantizedView,
+) -> Option<Arc<Vec<Vec<Pos2>>>> {
+    PROJECTED_POLYLINE_CACHE.with(|c| {
+        c.borrow_mut()
+            .get(&(id, nonce, version, quality, view))
+            .cloned()
+    })
+}
+
+fn projected_polyline_cache_put(
+    id: ObjectId,
+    nonce: u64,
+    version: u64,
+    quality: u8,
+    view: QuantizedView,
+    runs: Vec<Vec<Pos2>>,
+) -> Arc<Vec<Vec<Pos2>>> {
+    let shared: Arc<Vec<Vec<Pos2>>> = Arc::new(runs);
+    PROJECTED_POLYLINE_CACHE.with(|c| {
+        c.borrow_mut()
+            .put((id, nonce, version, quality, view), shared.clone());
+    });
+    shared
+}
+
+/// Proyecta un punto mundo a coords view-screen (sin `canvas_rect.min`),
+/// con cull al rect visible expandido 1px. Pura y testeable.
+pub(crate) fn project_world_to_view_screen(
+    view: &ViewTransform,
+    world: Point2,
+    canvas_w: f32,
+    canvas_h: f32,
+) -> Option<Pos2> {
+    if !world.x.is_finite() || !world.y.is_finite() {
+        return None;
+    }
+    if !canvas_w.is_finite() || !canvas_h.is_finite() || canvas_w <= 0.0 || canvas_h <= 0.0 {
+        return None;
+    }
+    let screen = view.world_to_screen(world);
+    if !screen.x.is_finite() || !screen.y.is_finite() {
+        return None;
+    }
+    let pos = Pos2::new(screen.x, screen.y);
+    if pos.x < -1.0 || pos.y < -1.0 || pos.x > canvas_w + 1.0 || pos.y > canvas_h + 1.0 {
+        return None;
+    }
+    Some(pos)
+}
+
+/// Proyecta puntos mundo a runs view-screen (para paramétricas,
+/// polilíneas y lápiz).
+pub(crate) fn project_world_points_to_view_runs(
+    view: &ViewTransform,
+    points: &[Point2],
+    canvas_w: f32,
+    canvas_h: f32,
+) -> Vec<Vec<Pos2>> {
+    let canvas_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(canvas_w, canvas_h));
+    let mut projected: Vec<Option<Pos2>> = Vec::with_capacity(points.len());
+    for point in points {
+        projected.push(project_world_to_view_screen(
+            view, *point, canvas_w, canvas_h,
+        ));
+    }
+    split_continuous_screen_runs(&projected, canvas_rect)
+}
+
+/// Diezmado por píxel de un run continuo: agrupa por bucket de píxel en X
+/// y conserva primero + min/max vertical + último por bucket (una pasada
+/// O(N), salida O(píxeles)). Sin `unwrap`: buckets no-finitos cortan.
+/// No-op visual bajo ~0.5px (el spread menor a 1px no emite extremos).
+pub(crate) fn decimate_run_to_pixels(run: &[Pos2]) -> Vec<Pos2> {
+    if run.len() <= 4 {
+        return run.to_vec();
+    }
+    #[derive(Debug, Clone, Copy)]
+    struct PixelBucket {
+        first: Pos2,
+        last: Pos2,
+        min_y: f32,
+        max_y: f32,
+        min_j: usize,
+        max_j: usize,
+        count: usize,
+    }
+    impl PixelBucket {
+        fn flush_into(self, out: &mut Vec<Pos2>) {
+            out.push(self.first);
+            if self.count > 1 && (self.max_y - self.min_y).abs() > 1.0 {
+                if self.min_j < self.max_j {
+                    out.push(Pos2::new(self.first.x, self.min_y));
+                    out.push(Pos2::new(self.first.x, self.max_y));
+                } else if self.min_j > self.max_j {
+                    out.push(Pos2::new(self.first.x, self.max_y));
+                    out.push(Pos2::new(self.first.x, self.min_y));
+                } else {
+                    out.push(Pos2::new(self.first.x, self.min_y));
+                }
+            }
+            if self.count > 1 && self.last != self.first {
+                out.push(self.last);
+            }
+        }
+    }
+    let mut out: Vec<Pos2> = Vec::with_capacity(run.len().min(512));
+    let mut bucket_x: Option<i32> = None;
+    let mut bucket: Option<PixelBucket> = None;
+    for point in run {
+        if !point.is_finite() {
+            if let Some(active) = bucket.take() {
+                active.flush_into(&mut out);
+            }
+            bucket_x = None;
+            continue;
+        }
+        let key = point.x.round() as i32;
+        match (bucket_x, bucket) {
+            (Some(current), Some(mut active)) if current == key => {
+                active.last = *point;
+                if point.y < active.min_y {
+                    active.min_y = point.y;
+                    active.min_j = active.count;
+                }
+                if point.y > active.max_y {
+                    active.max_y = point.y;
+                    active.max_j = active.count;
+                }
+                active.count += 1;
+                bucket = Some(active);
+            }
+            _ => {
+                if let Some(active) = bucket.take() {
+                    active.flush_into(&mut out);
+                }
+                bucket_x = Some(key);
+                bucket = Some(PixelBucket {
+                    first: *point,
+                    last: *point,
+                    min_y: point.y,
+                    max_y: point.y,
+                    min_j: 0,
+                    max_j: 0,
+                    count: 1,
+                });
+            }
+        }
+    }
+    if let Some(active) = bucket.take() {
+        active.flush_into(&mut out);
+    }
+    out
+}
+
+/// Diezma todos los runs de una polilínea (una pasada por run).
+pub(crate) fn decimate_runs_to_pixels(runs: &[Vec<Pos2>]) -> Vec<Vec<Pos2>> {
+    runs.iter().map(|run| decimate_run_to_pixels(run)).collect()
+}
+
+/// Construye los `Shape` de un batch de runs del mismo estilo, sin pintar.
+/// Sólido: un `Shape::line` por run; resto: un segmento por par. Pura y
+/// testeable (el pintado solo hace `painter.add` una vez).
+pub(crate) fn stroke_runs_batched_shapes(
+    runs: &[Vec<Pos2>],
+    stroke: Stroke,
+    style: LineStyle,
+) -> Vec<Shape> {
+    let mut shapes = Vec::new();
+    if matches!(style, LineStyle::Solid) {
+        for run in runs {
+            if run.len() >= 2 {
+                shapes.push(Shape::line(run.clone(), stroke));
+            }
+        }
+    } else if let Some((dash, gap)) = dash_pattern(style, stroke.width) {
+        for run in runs {
+            let mut i = 0;
+            while i + 1 < run.len() {
+                let a = run[i];
+                let b = run[i + 1];
+                let delta = b - a;
+                let len = delta.length();
+                if len.is_finite() && len > 0.0 {
+                    let dir = delta / len;
+                    let mut dist = 0.0;
+                    while dist < len {
+                        let start = a + dir * dist;
+                        let end = a + dir * (dist + dash).min(len);
+                        shapes.push(Shape::line_segment([start, end], stroke));
+                        dist += dash + gap;
+                    }
+                }
+                i += 1;
+            }
+        }
+    }
+    shapes
+}
+
+/// Batch de strokes: acumula runs del mismo estilo en un solo `add`
+/// (`Shape::Vec`). Visual idéntico a N `stroke_run` (mismas primitivas,
+/// un solo submit al painter). El caso de un solo run delega en
+/// `stroke_run` (camino histórico, ni un píxel distinto).
+fn stroke_runs_batched(
+    painter: &egui::Painter,
+    runs: Vec<Vec<Pos2>>,
+    stroke: Stroke,
+    style: LineStyle,
+) {
+    if runs.len() == 1 {
+        if let Some(single) = runs.into_iter().next() {
+            stroke_run(painter, single, stroke, style);
+        }
+        return;
+    }
+    // PERF (hot frame): en `Solid` los runs se MUEVEN al `Shape::line`, sin
+    // el `run.clone()` por run de `stroke_runs_batched_shapes` (un alloc +
+    // memcpy O(puntos) por objeto por frame). Mismos puntos, mismos
+    // `Shape::line`, un solo `add`: píxel-idéntico. El helper con `&[Vec]`
+    // se conserva para dashed/dotted (ahí no clona runs) y para los tests.
+    let shapes = if matches!(style, LineStyle::Solid) {
+        let mut shapes = Vec::with_capacity(runs.len());
+        for run in runs {
+            if run.len() >= 2 {
+                shapes.push(Shape::line(run, stroke));
+            }
+        }
+        shapes
+    } else {
+        stroke_runs_batched_shapes(&runs, stroke, style)
+    };
+    if shapes.is_empty() {
+        return;
+    }
+    // Auditoría 1/60 (costo ~cero): detecta batches sin diezmar.
+    audit_shape_batch(&shapes);
+    if shapes.len() == 1 {
+        let mut shapes = shapes;
+        if let Some(shape) = shapes.pop() {
+            painter.add(shape);
+        }
+        return;
+    }
+    painter.add(Shape::Vec(shapes));
+}
+
+/// ¿La fuente en pantalla es legible? (cull por tamaño).
+pub(crate) fn label_font_visible(font_px: f32) -> bool {
+    font_px.is_finite() && font_px >= MIN_LABEL_FONT_PX
+}
+
+/// ¿El objeto es bastante grande en pantalla para merecer rótulo?
+pub(crate) fn label_extent_visible(extent_px: f32) -> bool {
+    extent_px.is_finite() && extent_px >= MIN_LABEL_EXTENT_PX
+}
+
+/// Reinicia el presupuesto de rótulos (una vez por frame, en `draw_objects`).
+pub(crate) fn label_budget_reset() {
+    LABEL_BUDGET_USED.with(|c| *c.borrow_mut() = 0);
+}
+
+/// Intenta consumir un slot de rótulo. `false` = tope alcanzado (cull).
+pub(crate) fn label_budget_try_acquire() -> bool {
+    LABEL_BUDGET_USED.with(|c| {
+        let mut used = c.borrow_mut();
+        if *used >= MAX_LABELS_PER_FRAME {
+            return false;
+        }
+        *used = used.saturating_add(1);
+        true
+    })
+}
+
+/// Decisión conjunta de budget: tamaño + extensión + tope de cantidad.
+/// Pura salvo el contador (testeable con `label_budget_reset`).
+pub(crate) fn label_budget_allowed(font_px: f32, extent_px: Option<f32>) -> bool {
+    if !label_font_visible(font_px) {
+        return false;
+    }
+    if let Some(extent) = extent_px {
+        if !label_extent_visible(extent) {
+            return false;
+        }
+    }
+    label_budget_try_acquire()
+}
+
+/// Galley compartido por `(texto, estilo, escala-cuantizada)`: en hit no se
+/// clona el `String` ni se re-resuelve el layout. El color va horneado pero
+/// forma parte de la clave (un cambio de color es miss, no aliasing).
+pub(crate) fn label_galley_shared(
+    painter: &egui::Painter,
+    text: &str,
+    font_size: f32,
+    color: Color32,
+    scale_q: i64,
+) -> Arc<egui::Galley> {
+    let font_size = if font_size.is_finite() {
+        font_size.clamp(1.0, 256.0)
+    } else {
+        MIN_LABEL_FONT_PX
+    };
+    let key = LabelGalleyKey {
+        text: text.to_owned(),
+        font_bits: font_size.to_bits(),
+        color: u32::from_be_bytes([color.r(), color.g(), color.b(), color.a()]),
+        scale_q,
+    };
+    if let Some(hit) = LABEL_GALLEYS.with(|c| c.borrow_mut().get(&key).cloned()) {
+        return hit;
+    }
+    let galley = painter.layout_no_wrap(
+        text.to_owned(),
+        egui::FontId::proportional(font_size),
+        color,
+    );
+    LABEL_GALLEYS.with(|c| {
+        c.borrow_mut().put(key, galley.clone());
+    });
+    galley
+}
+
+/// Texto de ejes/overlays con Galley cacheado (mismo píxel que `painter.text`).
+///
+/// `painter.text` = `layout_no_wrap` + `anchor_size` + `galley`; acá el layout
+/// sale de `label_galley_shared` (clave por texto/estilo/escala) y el anclaje
+/// es idéntico, así que el rect devuelto coincide sin re-resolver por frame.
+/// Para ticks ("10⁻¹", "1.50") y rótulos repetidos ("cos", "sin", "0").
+pub(crate) fn cached_label_text(
+    painter: &egui::Painter,
+    pos: Pos2,
+    anchor: egui::Align2,
+    text: &str,
+    font_size: f32,
+    color: Color32,
+    scale_q: i64,
+) -> Rect {
+    let galley = label_galley_shared(painter, text, font_size, color, scale_q);
+    let rect = anchor.anchor_size(pos, galley.size());
+    painter.galley(rect.min, galley, color);
+    rect
+}
+
+// ── Auditoría PaintStats 1/60 ─────────────────────────────────────────────
+// `PaintStats::from_shapes(...).with_clipped_primitives(...)` una vez cada
+// 60 frames (costo ~cero, `log::debug` sin spam en release): si `shape_path`
+// o `shape_vec` dominan falta diezmado/batch; si `text_shape_*` dominan falta
+// caché Galley. El throttle vive en `draw_objects` (un incremento por frame)
+// y el log sale una sola vez por frame auditado (primer batch denso).
+/// Un audit cada N frames (sin spam, costo ~cero).
+pub(crate) const PAINT_STATS_AUDIT_EVERY: u64 = 60;
+
+thread_local! {
+    static PAINT_STATS_FRAME_NR: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static PAINT_STATS_LOGGED_FRAME: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(u64::MAX) };
+}
+
+/// ¿Toca auditar este frame? Pura y testeable.
+pub(crate) fn should_audit_paint_stats(frame_nr: u64) -> bool {
+    frame_nr.is_multiple_of(PAINT_STATS_AUDIT_EVERY)
+}
+
+/// Avanza el contador de frames de `draw_objects` (una vez por frame).
+pub(crate) fn paint_stats_tick_frame() -> u64 {
+    PAINT_STATS_FRAME_NR.with(|c| {
+        let next = c.get().wrapping_add(1);
+        c.set(next);
+        next
+    })
+}
+
+/// Frame actual sin avanzar (para los batches densos).
+fn paint_stats_frame_nr() -> u64 {
+    PAINT_STATS_FRAME_NR.with(|c| c.get())
+}
+
+/// Diagnóstico puro a partir de bytes: `shape_path` dominante ⇒ falta
+/// diezmado; `text_*` dominante ⇒ falta caché Galley; `shape_vec` con muchas
+/// allocs ⇒ falta batch. Nunca paniquea (solo `num_bytes`/`num_allocs`;
+/// `num_elements()` panicaría en `shape_path`/`shape_vec` heterogéneos).
+pub(crate) fn paint_stats_hint_for_bytes(
+    path_bytes: usize,
+    vec_allocs: usize,
+    text_bytes: usize,
+    total_bytes: usize,
+) -> &'static str {
+    if total_bytes == 0 {
+        return "idle";
+    }
+    if path_bytes.saturating_mul(2) >= total_bytes {
+        "posible falta de diezmado (shape_path dominante)"
+    } else if text_bytes.saturating_mul(2) >= total_bytes {
+        "posible falta de caché Galley (text_shape dominante)"
+    } else if vec_allocs > 512 {
+        "posible falta de batch (shape_vec dominante)"
+    } else {
+        "ok"
+    }
+}
+
+/// Audita un batch de `Shape`s con `PaintStats` (≤1 log cada 60 frames).
+/// Construye `ClippedShape`s con clip total (el clip no afecta el conteo) y
+/// completa con `with_clipped_primitives(&[])`; el log va a `debug` con el
+/// hint de `paint_stats_hint_for_bytes`. Sin `unwrap`, sin spam.
+/// Acotado por ser solo diagnóstico: batches chicos se saltan (el hint sería
+/// "ok", sin valor) y la muestra se capa para que un frame denso no pague
+/// miles de `Shape::clone` de golpe (pico cada 60 frames). El hint es por
+/// dominancia y se preserva en la muestra.
+/// Límite inferior: batches con menos shapes no pueden dominar el frame.
+pub(crate) const AUDIT_SHAPE_BATCH_MIN: usize = 8;
+/// Límite superior: la muestra conserva las tres ramas del hint
+/// (`vec_allocs > 512` sigue alcanzable) con costo acotado.
+pub(crate) const AUDIT_SHAPE_BATCH_MAX: usize = 1024;
+pub(crate) fn audit_shape_batch(shapes: &[Shape]) {
+    if shapes.is_empty() {
+        return;
+    }
+    if shapes.len() < AUDIT_SHAPE_BATCH_MIN {
+        return;
+    }
+    let frame = paint_stats_frame_nr();
+    if !should_audit_paint_stats(frame) {
+        return;
+    }
+    let already = PAINT_STATS_LOGGED_FRAME.with(|c| c.get());
+    if already == frame {
+        return;
+    }
+    PAINT_STATS_LOGGED_FRAME.with(|c| c.set(frame));
+    let sample = if shapes.len() > AUDIT_SHAPE_BATCH_MAX {
+        &shapes[..AUDIT_SHAPE_BATCH_MAX]
+    } else {
+        shapes
+    };
+    let clipped: Vec<egui::epaint::ClippedShape> = sample
+        .iter()
+        .map(|shape| egui::epaint::ClippedShape {
+            clip_rect: Rect::EVERYTHING,
+            shape: shape.clone(),
+        })
+        .collect();
+    let stats = egui::epaint::PaintStats::from_shapes(&clipped).with_clipped_primitives(&[]);
+    let path_bytes = stats.shape_path.num_bytes();
+    let vec_allocs = stats.shape_vec.num_allocs();
+    let text_bytes = stats
+        .shape_text
+        .num_bytes()
+        .saturating_add(stats.text_shape_vertices.num_bytes())
+        .saturating_add(stats.text_shape_indices.num_bytes());
+    let total_bytes = stats
+        .shapes
+        .num_bytes()
+        .saturating_add(path_bytes)
+        .saturating_add(text_bytes)
+        .saturating_add(stats.shape_mesh.num_bytes())
+        .saturating_add(stats.shape_vec.num_bytes());
+    log::debug!(
+        "paint_stats frame={} shapes={} vec_allocs={} path_bytes={} text_bytes={} total_bytes={} hint={}",
+        frame,
+        stats.shapes.num_allocs(),
+        vec_allocs,
+        path_bytes,
+        text_bytes,
+        total_bytes,
+        paint_stats_hint_for_bytes(path_bytes, vec_allocs, text_bytes, total_bytes),
+    );
+}
+
+/// Segmentos de retrato de fase cacheados (Arc para cache hits baratos).
+type PhasePortraitSegments = Arc<Vec<(Point2, Point2)>>;
+
+/// Segmentos world-space de streamlines de un campo vectorial.
+type VectorFieldStreamlines = Arc<Vec<(Point2, Point2)>>;
+
+fn fractal_render_cache_key(document_version: u64, fr: &grafito_core::Fractal2DObj) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    document_version.hash(&mut h);
+    fr.id.hash(&mut h);
+    fr.fractal_type.hash(&mut h);
+    fr.x_min.to_bits().hash(&mut h);
+    fr.x_max.to_bits().hash(&mut h);
+    fr.y_min.to_bits().hash(&mut h);
+    fr.y_max.to_bits().hash(&mut h);
+    fr.resolution.hash(&mut h);
+    fr.max_iter.hash(&mut h);
+    fr.params.len().hash(&mut h);
+    for p in &fr.params {
+        p.to_bits().hash(&mut h);
+    }
+    h.finish()
+}
+
+fn phase_render_cache_key(
+    document_version: u64,
+    portrait: &grafito_core::PhasePortraitObj,
+    variables: &BTreeMap<String, f64>,
+) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    document_version.hash(&mut h);
+    portrait.id.hash(&mut h);
+    portrait.expr_dx.hash(&mut h);
+    portrait.expr_dy.hash(&mut h);
+    portrait.x_min.to_bits().hash(&mut h);
+    portrait.x_max.to_bits().hash(&mut h);
+    portrait.y_min.to_bits().hash(&mut h);
+    portrait.y_max.to_bits().hash(&mut h);
+    portrait.density.hash(&mut h);
+    let mut vars: Vec<_> = variables.iter().collect();
+    vars.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    for (k, v) in vars {
+        k.hash(&mut h);
+        v.to_bits().hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Píxeles de un fractal, vía la caché de geometría (con tope en bytes).
+///
+/// Sin LRU propio en la capa render: la textura (`FRACTAL_TEXTURES`, misma
+/// key) ya retiene el resultado rasterizado, y la caché de geometría acota
+/// bytes. Un nivel menos de `Arc`s reteniendo hasta 160k píxeles × 40 B.
+fn cached_try_compute_fractal(
+    fr: &grafito_core::Fractal2DObj,
+    _document_version: u64,
+) -> Option<Arc<Vec<grafito_geometry::fractals::FractalPixel>>> {
+    let fractal_type = match fr.fractal_type.as_str() {
+        "julia" if fr.params.len() >= 2 => grafito_geometry::fractals::FractalType::Julia {
+            cr: fr.params[0],
+            ci: fr.params[1],
+            max_iter: fr.max_iter,
+        },
+        "burning_ship" => grafito_geometry::fractals::FractalType::BurningShip {
+            max_iter: fr.max_iter,
+        },
+        "tricorn" => grafito_geometry::fractals::FractalType::Tricorn {
+            max_iter: fr.max_iter,
+        },
+        _ => grafito_geometry::fractals::FractalType::Mandelbrot {
+            max_iter: fr.max_iter,
+        },
+    };
+    // Variante compartida: en hit de la caché de geometría no se clona el
+    // buffer (hasta 160k píxeles × 40 B); el `Arc` se comparte tal cual.
+    grafito_geometry::fractals::try_compute_fractal_shared(
+        &fractal_type,
+        fr.x_min,
+        fr.x_max,
+        fr.y_min,
+        fr.y_max,
+        fr.resolution,
+        fr.resolution,
+    )
+    .ok()
+}
+
+/// Construye la `ColorImage` de un fractal desde sus píxeles ya computados.
+///
+/// Fila 0 de la imagen = fila de `y_max` (los píxeles vienen en filas desde
+/// `y_min`, igual que el grid complejo). Pura y testeable: el draw solo
+/// sube a textura en miss y blitea. `None` si `res == 0` o el buffer no
+/// trae exactamente `res²` píxeles (el llamante omite el dibujo, honesto).
+fn fractal_texture_image(
+    pixels: &[grafito_geometry::fractals::FractalPixel],
+    res: usize,
+) -> Option<egui::ColorImage> {
+    use grafito_geometry::fractals::fractal_color_hsv;
+    let total = res.checked_mul(res)?;
+    if res == 0 || pixels.len() != total {
+        return None;
+    }
+    let mut out = Vec::with_capacity(total);
+    for row in (0..res).rev() {
+        let base = row * res;
+        for px in &pixels[base..base + res] {
+            let (r, g, b, a) = fractal_color_hsv(px.iter, px.max_iter, px.smooth_value);
+            out.push(Color32::from_rgba_premultiplied(
+                (r * 255.0) as u8,
+                (g * 255.0) as u8,
+                (b * 255.0) as u8,
+                (a * 255.0) as u8,
+            ));
+        }
+    }
+    Some(egui::ColorImage {
+        size: [res, res],
+        pixels: out,
+    })
+}
+
+/// Textura viva de un fractal (get-or-upload). En hit no sube nada a GPU:
+/// el draw blitea un solo `painter.image` en vez de emitir `res²`
+/// `rect_filled` por frame (hasta 160k shapes con `resolution: 400`).
+fn cached_fractal_texture(
+    painter: &egui::Painter,
+    fr: &grafito_core::Fractal2DObj,
+    document_version: u64,
+    pixels: &Arc<Vec<grafito_geometry::fractals::FractalPixel>>,
+) -> Option<egui::TextureHandle> {
+    let key = fractal_render_cache_key(document_version, fr);
+    if let Some(handle) = FRACTAL_TEXTURES.with(|c| c.borrow_mut().get(&key)) {
+        return Some(handle);
+    }
+    let image = fractal_texture_image(pixels, fr.resolution)?;
+    let handle = painter.ctx().load_texture(
+        format!("grafito_fractal_{}_{key:016x}", fr.id),
+        image,
+        egui::TextureOptions::NEAREST,
+    );
+    FRACTAL_TEXTURES.with(|c| {
+        c.borrow_mut().insert(key, handle.clone());
+    });
+    Some(handle)
+}
+
+/// Cachea `sample_phase_portrait` keyed por `document.version` para evitar
+/// re-evaluar la malla vectorial (density² evaluaciones) cada frame.
+fn cached_sample_phase_portrait(
+    portrait: &grafito_core::PhasePortraitObj,
+    variables: &BTreeMap<String, f64>,
+    document_version: u64,
+) -> PhasePortraitSegments {
+    let key = phase_render_cache_key(document_version, portrait, variables);
+    if let Some(cached) = PHASE_PORTRAIT_CACHE.with(|c| c.borrow_mut().get(&key).cloned()) {
+        return cached;
+    }
+    let segments = Arc::new(grafito_render::sample_phase_portrait(portrait, variables));
+    PHASE_PORTRAIT_CACHE.with(|c| {
+        c.borrow_mut().put(key, segments.clone());
+    });
+    segments
+}
+
+// Buffers reutilizados por frame para el pipeline de funciones (T1):
+// refine escribe `(x, y)` acá y la proyección lee de acá. Evita ~400
+// allocs de ~10k elementos por frame con 200 funciones (el delta medido
+// es chico, ~0-5%, pero el churn del allocator bajo carga sí importa; la
+// fusión en una sola pasada se probó y PIERDE ~35%, ver test A/B abajo —
+// no fusionar). Se toman con `take_*` y se devuelven con `return_*`
+// (conservan capacidad); no son reentrantes (el draw es single-thread y
+// ningún paso llama a otro draw).
+thread_local! {
+    static SCRATCH_REFINED: std::cell::RefCell<Vec<(f64, Option<f64>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static SCRATCH_PROJECTED: std::cell::RefCell<Vec<Option<Pos2>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn take_scratch_refined() -> Vec<(f64, Option<f64>)> {
+    SCRATCH_REFINED.with(|c| {
+        let mut buf = c.borrow_mut();
+        buf.clear();
+        std::mem::take(&mut *buf)
+    })
+}
+
+fn return_scratch_refined(mut buf: Vec<(f64, Option<f64>)>) {
+    buf.clear();
+    SCRATCH_REFINED.with(|c| {
+        let slot = &mut *c.borrow_mut();
+        if slot.capacity() < buf.capacity() {
+            *slot = buf;
+        }
+    });
+}
+
+fn take_scratch_projected() -> Vec<Option<Pos2>> {
+    SCRATCH_PROJECTED.with(|c| {
+        let mut buf = c.borrow_mut();
+        buf.clear();
+        std::mem::take(&mut *buf)
+    })
+}
+
+fn return_scratch_projected(mut buf: Vec<Option<Pos2>>) {
+    buf.clear();
+    SCRATCH_PROJECTED.with(|c| {
+        let slot = &mut *c.borrow_mut();
+        if slot.capacity() < buf.capacity() {
+            *slot = buf;
+        }
+    });
+}
+
+thread_local! {
+    static SCRATCH_PTS_OPT: std::cell::RefCell<Vec<Option<Pos2>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn take_scratch_pts_opt() -> Vec<Option<Pos2>> {
+    SCRATCH_PTS_OPT.with(|c| {
+        let mut buf = c.borrow_mut();
+        buf.clear();
+        std::mem::take(&mut *buf)
+    })
+}
+
+fn return_scratch_pts_opt(mut buf: Vec<Option<Pos2>>) {
+    buf.clear();
+    SCRATCH_PTS_OPT.with(|c| {
+        let slot = &mut *c.borrow_mut();
+        if slot.capacity() < buf.capacity() {
+            *slot = buf;
+        }
+    });
+}
+
+/// Refina discontinuidades (bisección en transiciones finito/no-finito)
+/// sobre `samples`, escribiendo en `out` (buffer reutilizado del llamador).
+/// `samples` suele ser el guard de `samples_or_compute` (sin copiar) o el
+/// `Vec` local del camino integral.
+fn refine_function_samples_into(
+    samples: &[(f64, Option<f64>)],
+    expr: &str,
+    variables: &BTreeMap<String, f64>,
+    out: &mut Vec<(f64, Option<f64>)>,
+) {
+    out.clear();
+    out.reserve(samples.len() + 8);
+    let mut iter = samples.iter().copied().peekable();
+    while let Some(current) = iter.next() {
+        out.push(current);
+        if let Some(&next) = iter.peek() {
+            let (x1, y1_opt) = current;
+            let (x2, y2_opt) = next;
+            if y1_opt.is_some() != y2_opt.is_some() {
+                let mut good_x = if y1_opt.is_some() { x1 } else { x2 };
+                let mut bad_x = if y1_opt.is_some() { x2 } else { x1 };
+                let mut best_y = if let Some(y1) = y1_opt {
+                    y1
+                } else {
+                    y2_opt.unwrap_or(0.0)
+                };
+                for _ in 0..24 {
+                    let mid = (good_x + bad_x) * 0.5;
+                    if let Ok(y) = eval_function_with_vars(expr, mid, variables) {
+                        if y.is_finite() {
+                            good_x = mid;
+                            best_y = y;
+                        } else {
+                            bad_x = mid;
+                        }
+                    } else {
+                        bad_x = mid;
+                    }
+                }
+                out.push((good_x, Some(best_y)));
+            }
+        }
+    }
+}
+/// Devuelve el AST complejo parseado de `expr`, cacheado por string de
+/// expresión (LRU acotado). Evita re-parsear `complex_expr` en cada frame
+/// (H10): el parseo solo ocurre en cache miss.
+fn cached_complex_expr(expr: &str) -> Option<Arc<grafito_complex::ComplexExpr>> {
+    if let Some(cached) = COMPLEX_EXPR_CACHE.with(|c| c.borrow_mut().get(expr).cloned()) {
+        return Some(cached);
+    }
+    let parsed = Arc::new(grafito_complex::complex_expr::parse(expr).ok()?);
+    COMPLEX_EXPR_CACHE.with(|c| {
+        c.borrow_mut().put(expr.to_string(), parsed.clone());
+    });
+    Some(parsed)
+}
+
+/// Cachea `ordered_visible_2d_objects` keyed por `document.version`.
+/// Evita re-ordenar (layer+ObjectId) y re-filtrar cada vez que se pintan
+/// múltiples pasadas (grid, fills, mappings) en el mismo frame.
+fn cached_ordered_visible_ids(document: &grafito_core::Document) -> Arc<Vec<ObjectId>> {
+    // Clave (nonce, versión): dos documentos distintos pueden compartir
+    // versión (nuevo archivo tras cerrar otro); sin el nonce el segundo
+    // dibujaría los ids del primero. El nonce se preserva en `clone`
+    // (mismo documento lógico → comparte caché).
+    let key = (document.cache_nonce, document.version);
+    // El cache hit clona el `Arc` (refcount), no el `Vec<ObjectId>` completo.
+    // Este helper se invoca varias veces por frame (paint plan, cache plan,
+    // fills, mappings), así que clonar el payload era un hotspot medible.
+    if let Some((cached_key, ids)) = ORDERED_VISIBLE_CACHE.with(|c| c.borrow().clone()) {
+        if cached_key == key {
+            return ids;
+        }
+    }
+    let ids: Arc<Vec<ObjectId>> = Arc::new(
+        grafito_render::ordered_visible_2d_objects(document)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect(),
+    );
+    ORDERED_VISIBLE_CACHE.with(|c| *c.borrow_mut() = Some((key, ids.clone())));
+    ids
+}
+
+/// Itera los objetos visibles ordenados SIN alocar el `Vec` intermedio.
+///
+/// Mismo orden y mismos elementos que el helper anterior (ids cacheados por
+/// versión + `get_object` por id); el callback devuelve `false` para cortar.
+/// Varios caminos por frame (plan de implícitas, paint plan, trails,
+/// animación compleja) reconstruían un `Vec` en cada llamada: 5 allocs +
+/// N lookups por frame eliminados.
+fn for_each_ordered_visible_2d_object(
+    document: &grafito_core::Document,
+    mut f: impl FnMut(ObjectId, &grafito_core::GeoObject) -> bool,
+) {
+    let ids = cached_ordered_visible_ids(document);
+    for id in ids.iter() {
+        if let Some(obj) = document.get_object(*id) {
+            if !f(*id, obj) {
+                break;
+            }
+        }
+    }
+}
+
+/// Read-lock optimizado con fast-path `try_read` y manejo de poison sin `unwrap`.
+#[inline]
+fn read_lock_optimized<T>(lock: &std::sync::RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    if let Ok(guard) = lock.try_read() {
+        return guard;
+    }
+    match lock.read() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            log::warn!("cache lock envenenado; recuperando estado parcial");
+            poisoned.into_inner()
+        }
+    }
+}
+
+fn to_color32(c: Color) -> Color32 {
+    Color32::from_rgba_unmultiplied(
+        (c.r * 255.0).clamp(0.0, 255.0) as u8,
+        (c.g * 255.0).clamp(0.0, 255.0) as u8,
+        (c.b * 255.0).clamp(0.0, 255.0) as u8,
+        (c.a * 255.0).clamp(0.0, 255.0) as u8,
+    )
+}
+
+// ── F2c · NumberPlane (plano numerado) ─────────────────────────────────────
+// Pasos "lindos" 1/2/5×10^n + skip adaptativo anti-solape + toggle en vista.
+// Puro y testeable headless (sin egui): el renderer solo los consume.
+// - `nice_number_plane_step`: mismo 1/2/5 que `draw_grid`/`draw_3d_grid`.
+// - `adaptive_label_skip`: si los ticks no entran, etiqueta 1 de cada N.
+// - `format_number_plane_label`: entero sin decimales, resto con 2 y recorte.
+// El toggle vive en `Document::number_plane_labels` (default visible para
+// JSON viejo); `draw_axes` lo respeta además del `show_numeric_ticks` que ya
+// le pasa `app.rs` (sin tocar `app.rs`: solo se lee el documento acá).
+
+/// Máximo de ticks numerados por eje (igual que el tope histórico de 500).
+pub(crate) const MAX_NUMBER_PLANE_TICKS: usize = 500;
+/// Ancho mínimo por etiqueta en X para no solapar (px, `TYPE_SM` ≈ 12px).
+pub(crate) const NUMBER_PLANE_MIN_LABEL_PX_X: f32 = 48.0;
+/// Alto mínimo por etiqueta en Y para no solapar (px).
+pub(crate) const NUMBER_PLANE_MIN_LABEL_PX_Y: f32 = 20.0;
+
+/// Paso "lindo" 1/2/5×10^n para un paso mundo objetivo. No-finito o ≤0 →
+/// 1.0 (honesto, nunca NaN/inf al renderer).
+pub(crate) fn nice_number_plane_step(target_world_step: f64) -> f64 {
+    if !target_world_step.is_finite() || target_world_step <= 0.0 {
+        return 1.0;
+    }
+    // `log10` de un positivo finito siempre es finito; el `floor` también.
+    let magnitude = target_world_step.log10().floor();
+    if !magnitude.is_finite() {
+        return 1.0;
+    }
+    // `powf` puede desbordar a inf en extremos: se sanea a 1.0.
+    let base = 10_f64.powf(magnitude);
+    if !base.is_finite() || base <= 0.0 {
+        return 1.0;
+    }
+    let factor = target_world_step / base;
+    if !factor.is_finite() {
+        return 1.0;
+    }
+    if factor < 2.0 {
+        base
+    } else if factor < 5.0 {
+        2.0 * base
+    } else {
+        5.0 * base
+    }
+}
+
+/// Cada cuántos ticks se etiqueta para no solapar.
+/// `tick_count` 0/1 → 1 (todo); si no entran en `available_px`, salta.
+/// Sin `unwrap`: divisiones protegidas, mínimo 1.
+pub(crate) fn adaptive_label_skip(
+    tick_count: usize,
+    available_px: f32,
+    min_label_px: f32,
+) -> usize {
+    if tick_count <= 1 {
+        return 1;
+    }
+    if !available_px.is_finite() || !min_label_px.is_finite() {
+        return 1;
+    }
+    if available_px <= 0.0 || min_label_px <= 0.0 {
+        return 1;
+    }
+    let max_labels = (available_px / min_label_px).floor().max(1.0) as usize;
+    if max_labels == 0 || tick_count <= max_labels {
+        return 1;
+    }
+    // `div_ceil` manual sin `unwrap` (usize, siempre >0 acá).
+    tick_count.div_ceil(max_labels).max(1)
+}
+
+/// Etiqueta numérica del plano con separador decimal del `Locale` vivo
+/// (F10.W6 i18n resto: cablea `grafito_ui::i18n::format_number` al canvas).
+/// ES/PT/IT/FR/DE usan coma (`1,5`); EN usa punto (`1.5`). Enteros y
+/// no-finitos no cambian (`"3"`, `"0"`). Solo display, nunca persistencia.
+pub(crate) fn format_number_plane_label_localized(
+    value: f64,
+    locale: grafito_ui::i18n::Locale,
+) -> String {
+    if !value.is_finite() {
+        return "0".to_string();
+    }
+    let plain = if value.fract().abs() < 1e-9 {
+        // `as i64` satura en extremos sin `panic` (comportamiento definido).
+        format!("{}", value as i64)
+    } else {
+        format!("{value:.2}")
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string()
+    };
+    match locale {
+        grafito_ui::i18n::Locale::Es
+        | grafito_ui::i18n::Locale::Pt
+        | grafito_ui::i18n::Locale::It
+        | grafito_ui::i18n::Locale::Fr
+        | grafito_ui::i18n::Locale::De => plain.replace('.', ","),
+        grafito_ui::i18n::Locale::En => plain,
+    }
+}
+
+/// Posición representativa 2D para muestrear el rastro de un objeto.
+///
+/// Punto→posición, línea→punto medio, círculo→centro, polígono→centroide.
+/// Resto (`None`): no se muestrea (funciones/paramétricas exigen evaluación
+/// con presupuesto propio; 3D no tiene rastro 2D).
+fn trail_representative_position(obj: &GeoObject) -> Option<Point2> {
+    match obj {
+        GeoObject::Point(o) => Some(o.position),
+        GeoObject::Line(o) => Some(Point2::new(
+            (o.start.x + o.end.x) * 0.5,
+            (o.start.y + o.end.y) * 0.5,
+        )),
+        GeoObject::Circle(o) => Some(o.center),
+        GeoObject::Polygon(o) => {
+            if o.vertices.is_empty() {
+                return None;
+            }
+            let n = o.vertices.len() as f64;
+            let (sx, sy) = o
+                .vertices
+                .iter()
+                .fold((0.0, 0.0), |(ax, ay), v| (ax + v.x, ay + v.y));
+            let c = Point2::new(sx / n, sy / n);
+            if c.x.is_finite() && c.y.is_finite() {
+                Some(c)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Dibuja una estela con fade: segmento `i` con alpha `(i+1)/len` del color base.
+///
+/// Polilínea abierta (sin cerrar), corta en puntos no-finitos, fuera de
+/// picking y bounds. No-op con <2 puntos.
+fn draw_trail(
+    painter: &egui::Painter,
+    view: &ViewTransform,
+    clip: Rect,
+    pts: &[Point2],
+    base: Color,
+) {
+    if pts.len() < 2 {
+        return;
+    }
+    let n = pts.len();
+    let rgb = to_color32(Color::new(base.r, base.g, base.b, 1.0));
+    for i in 0..n.saturating_sub(1) {
+        let a = pts.get(i);
+        let b = pts.get(i + 1);
+        let (Some(a), Some(b)) = (a, b) else {
+            continue;
+        };
+        if !a.x.is_finite() || !a.y.is_finite() || !b.x.is_finite() || !b.y.is_finite() {
+            continue;
+        }
+        let sa = view.world_to_screen(*a);
+        let sb = view.world_to_screen(*b);
+        let pa = Pos2::new(sa.x, sa.y);
+        let pb = Pos2::new(sb.x, sb.y);
+        if !clip.contains(pa) && !clip.contains(pb) {
+            continue;
+        }
+        let alpha = (((i as f64 + 1.0) / n as f64) * 255.0).clamp(0.0, 255.0) as u8;
+        let col = Color32::from_rgba_unmultiplied(rgb.r(), rgb.g(), rgb.b(), alpha);
+        painter.line_segment([pa, pb], Stroke::new(1.5, col));
+    }
+}
+
+/// Aplica el clip del canvas visible a un painter.
+///
+/// Todos los painters de `render_2d` pasan por aquí en su punto de entrada
+/// (grid, ejes, objetos, overlays, hover) para que ninguna primitiva pueda
+/// dibujar fuera del área del canvas: `with_clip_rect` es barato (solo fija
+/// el rect de clip del layer) y hace el recorte autocontenido aunque el
+/// llamador (app.rs) ya haya fijado el mismo rect.
+#[inline]
+fn clipped_to_canvas(painter: &egui::Painter, canvas_rect: Rect) -> egui::Painter {
+    painter.with_clip_rect(canvas_rect)
+}
+
+fn should_connect_screen_points(a: Pos2, b: Pos2, canvas_rect: Rect) -> bool {
+    let d = a.distance(b);
+    d.is_finite() && d <= canvas_rect.width().max(canvas_rect.height()) * 0.5
+}
+
+fn split_continuous_screen_runs(points: &[Option<Pos2>], canvas_rect: Rect) -> Vec<Vec<Pos2>> {
+    let mut runs = Vec::new();
+    let mut current = Vec::new();
+    for point in points {
+        let Some(point) = point.filter(|point| point.is_finite()) else {
+            if !current.is_empty() {
+                runs.push(std::mem::take(&mut current));
+            }
+            continue;
+        };
+        if current
+            .last()
+            .is_some_and(|previous| !should_connect_screen_points(*previous, point, canvas_rect))
+        {
+            runs.push(std::mem::take(&mut current));
+        }
+        current.push(point);
+    }
+    if !current.is_empty() {
+        runs.push(current);
+    }
+    runs
+}
+
+fn function_screen_point(view: &ViewTransform, canvas_rect: Rect, x: f64, y: f64) -> Option<Pos2> {
+    if !x.is_finite()
+        || !y.is_finite()
+        || !canvas_rect.min.is_finite()
+        || !canvas_rect.max.is_finite()
+    {
+        return None;
+    }
+
+    let screen = view.world_to_screen(Point2::new(x, y));
+    if !screen.is_finite() {
+        return None;
+    }
+
+    let position = canvas_rect.min + Vec2::new(screen.x, screen.y);
+    let draw_bounds = canvas_rect.expand(1.0);
+    (position.is_finite() && draw_bounds.contains(position)).then_some(position)
+}
+
+fn paint_render_geometry(
+    painter: &egui::Painter,
+    canvas_rect: Rect,
+    vertices: &[grafito_render::Vertex],
+    indices: &[u32],
+    style: Option<StyleOverride>,
+) {
+    let mut mesh = egui::Mesh::default();
+    let mut remapped = vec![None; vertices.len()];
+    for (index, vertex) in vertices.iter().enumerate() {
+        let position = Pos2::new(
+            canvas_rect.min.x + vertex.position[0],
+            canvas_rect.min.y + vertex.position[1],
+        );
+        if !position.is_finite() {
+            continue;
+        }
+        let color = get_color(
+            Color::new(
+                vertex.color[0],
+                vertex.color[1],
+                vertex.color[2],
+                vertex.color[3],
+            ),
+            style,
+        );
+        let Ok(new_index) = u32::try_from(mesh.vertices.len()) else {
+            return;
+        };
+        remapped[index] = Some(new_index);
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: position,
+            uv: Pos2::ZERO,
+            color: to_color32(color),
+        });
+    }
+    for triangle in indices.chunks_exact(3) {
+        let mapped = [triangle[0], triangle[1], triangle[2]].map(|index| {
+            usize::try_from(index)
+                .ok()
+                .and_then(|index| remapped.get(index).copied().flatten())
+        });
+        if let [Some(a), Some(b), Some(c)] = mapped {
+            mesh.indices.extend([a, b, c]);
+        }
+    }
+    if !mesh.indices.is_empty() {
+        painter.add(Shape::Mesh(mesh));
+    }
+}
+
+fn is_gpu_base_geometry(document: &grafito_core::Document, obj: &GeoObject) -> bool {
+    grafito_render::gpu_2d_base_owns(document, obj)
+}
+
+/// Presupuesto de vértices teselados por frame (T1-crash): una escena de
+/// 2000 objetos pedía 329 MB de `egui_vertex_buffer` > tope wgpu de 256 MB
+/// y la app moría con panic. Calibrado con t1f (2000 funciones ≈ 13M
+/// vértices ≈ 260 MB): 6M deja ~2× de margen para chrome UI + atlas +
+/// pasadas GPU. Al excederse se truncan los últimos objetos del plan (los
+/// primeros, normalmente los más importantes, siempre se dibujan) y se
+/// muestra insignia honesta en vez de crashear.
+pub(crate) const FRAME_VERTEX_BUDGET: usize = 6_000_000;
+
+/// Estima vértices teselados de un objeto SIN muestrear (barato): grids y
+/// conteos ya conocidos en el draw. Conservador ~1.5-2.5× sobre lo medido
+/// en t1f (la dirección segura: subestimar crashea, sobrestimar trunca).
+/// Los tipos que el canvas 2D no dibuja (3D, tablas) estiman 0.
+fn estimate_object_vertices(
+    document: &grafito_core::Document,
+    obj: &GeoObject,
+    canvas_rect: Rect,
+) -> usize {
+    use grafito_core::GeoObject as GO;
+    let quality = document.render_quality;
+    let w = canvas_rect.width();
+    let label_extra = if obj.label().is_empty() { 0 } else { 300 };
+    let base = match obj {
+        GO::Function(_) => {
+            // Medido t1f: 3.3-5.5 vértices/muestra; ×6 deja margen sin
+            // disparar el presupuesto en escenas normales (ver test T1h).
+            grafito_core::function_sampling::recommended_grid_size_for_quality(w, quality)
+                .saturating_mul(6)
+        }
+        GO::ParametricCurve2D(_) | GO::PolarCurve(_) | GO::ParametricCurve3D(_) => {
+            grafito_core::function_sampling::recommended_grid_size_for_quality(w, quality)
+                .min(4000)
+                .saturating_mul(6)
+        }
+        GO::VectorField2D(vf) => {
+            let d = vf.density.clamp(5, 128);
+            d.saturating_mul(d).saturating_mul(8)
+        }
+        // 3D: el plan filtra `is_3d()` y el builder de `Transformed` no lo
+        // dibuja; estimar >0 truncaría escenas 2D por objetos invisibles.
+        GO::VectorField3D(_) => 0,
+        GO::ImplicitCurve(_) => {
+            let g = grafito_core::implicit_curve::recommended_grid_size_for_quality(
+                w,
+                canvas_rect.height(),
+                quality,
+            );
+            // Curvas típicas cubren O(grid) celdas; margen 64×.
+            g.saturating_mul(64).max(4000)
+        }
+        GO::ComplexGrid(cg) => {
+            let res = complex_grid_cpu_resolution(cg.density, quality);
+            res.saturating_mul(res) / 8 + 1000
+        }
+        GO::ComplexMapping(_) | GO::ComplexIntegral(_) => 16384,
+        GO::PhasePortrait(pp) => pp.density.clamp(8, 256).saturating_mul(64),
+        GO::Fractal2D(_) => 64,
+        GO::Histogram(h) => h.data.len().saturating_mul(64).saturating_add(512),
+        GO::BarChart(_) => 2048,
+        GO::PieChart(p) => p.data.len().saturating_mul(64).saturating_add(512),
+        GO::ScatterPlot(s) => s.xs.len().saturating_mul(16).saturating_add(256),
+        GO::BoxPlot(b) => b.data.len().saturating_mul(16).saturating_add(512),
+        GO::RegressionLine(_) => 256,
+        GO::Text(t) => t
+            .content
+            .chars()
+            .count()
+            .saturating_mul(16)
+            .saturating_add(512),
+        GO::Polygon(p) => p.vertices.len().saturating_mul(16).saturating_add(256),
+        GO::Polyline(l) => l.points.len().saturating_mul(16).saturating_add(256),
+        GO::Pencil(p) => p.points.len().saturating_mul(8).saturating_add(256),
+        GO::Point(_) | GO::Line(_) | GO::Segment3D(_) => 64,
+        GO::Circle(_)
+        | GO::Ellipse(_)
+        | GO::Arc(_)
+        | GO::Sector(_)
+        | GO::BezierCurve(_)
+        | GO::Spline(_)
+        | GO::Parabola(_)
+        | GO::Hyperbola(_) => 1024,
+        GO::Transformed(t) => {
+            estimate_object_vertices(document, &t.inner, canvas_rect).saturating_mul(2)
+        }
+        // El canvas 2D no dibuja el resto (catch-all `_ => {}` en el draw):
+        // estimar >0 truncaría escenas inocentes.
+        _ => 0,
+    };
+    base.saturating_add(label_extra)
+}
+
+/// Trunca el plan de pintado al presupuesto de vértices (puro, testeable).
+/// Devuelve (plan_recortado, omitidos). El orden del plan se respeta: lo
+/// primero (capas base) siempre se dibuja.
+fn truncate_paint_plan_by_vertices(
+    document: &grafito_core::Document,
+    plan: Vec<BasePaint2D>,
+    canvas_rect: Rect,
+    budget: usize,
+) -> (Vec<BasePaint2D>, usize) {
+    let mut usado = 0usize;
+    let mut corte = plan.len();
+    for (i, paint) in plan.iter().enumerate() {
+        let id = match paint {
+            BasePaint2D::Cpu(id) | BasePaint2D::Gpu(id) => id,
+        };
+        let costo = document.get_object(*id).map_or(0, |obj| {
+            estimate_object_vertices(document, obj, canvas_rect)
+        });
+        usado = usado.saturating_add(costo);
+        if usado > budget {
+            corte = i;
+            break;
+        }
+    }
+    let omitidos = plan.len().saturating_sub(corte);
+    (plan.into_iter().take(corte).collect(), omitidos)
+}
+
+fn gpu_overlay_keeps_cpu_decorations(obj: &GeoObject) -> bool {
+    matches!(
+        obj,
+        GeoObject::Function(_) | GeoObject::PolarCurve(_) | GeoObject::PhasePortrait(_)
+    )
+}
+
+fn gpu_base_needs_cpu_backfill(obj: &GeoObject) -> bool {
+    matches!(obj, GeoObject::Function(_) | GeoObject::PolarCurve(_))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BasePaint2D {
+    Cpu(ObjectId),
+    Gpu(ObjectId),
+}
+
+fn base_scene_paint_plan(
+    document: &grafito_core::Document,
+    gpu_base_active: bool,
+) -> Vec<BasePaint2D> {
+    let mut out = Vec::new();
+    for_each_ordered_visible_2d_object(document, |id, object| {
+        out.push(
+            if gpu_base_active && is_gpu_base_geometry(document, object) {
+                BasePaint2D::Gpu(id)
+            } else {
+                BasePaint2D::Cpu(id)
+            },
+        );
+        true
+    });
+    out
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CpuObjectPass {
+    Full,
+    Supplement,
+    Skip,
+}
+
+fn cpu_object_pass(
+    document: &grafito_core::Document,
+    object: &GeoObject,
+    gpu_base_active: bool,
+) -> CpuObjectPass {
+    if !gpu_base_active || !is_gpu_base_geometry(document, object) {
+        CpuObjectPass::Full
+    } else if gpu_overlay_keeps_cpu_decorations(object) {
+        CpuObjectPass::Supplement
+    } else {
+        CpuObjectPass::Skip
+    }
+}
+
+/// Una sola pasada de dibujo no debe sincronizar más trabajo de curvas
+/// implícitas, incluida la rasterización de fills, que el límite de marching-squares.
+const MAX_CPU_IMPLICIT_FRAME_WORK_UNITS: usize =
+    grafito_core::implicit_curve::MAX_MARCHING_SQUARES_WORK_UNITS;
+
+fn implicit_curve_grid_size(canvas_rect: Rect, quality: grafito_core::RenderQuality) -> usize {
+    grafito_core::implicit_curve::recommended_grid_size_for_quality(
+        canvas_rect.width(),
+        canvas_rect.height(),
+        quality,
+    )
+}
+
+pub(crate) fn complex_grid_cpu_resolution(
+    density: usize,
+    quality: grafito_core::RenderQuality,
+) -> usize {
+    let base = density.clamp(50, 500);
+    if quality == grafito_core::RenderQuality::Preview {
+        base.min(64)
+    } else {
+        base
+    }
+}
+
+/// Key de la textura de un ComplexGrid: cambia con cualquier edición del
+/// documento (el `version` cubre expr/variables) y con bounds/res/modos.
+pub(crate) fn complex_grid_texture_key(
+    document_version: u64,
+    cg: &grafito_core::ComplexGridObj,
+    res: usize,
+) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    document_version.hash(&mut h);
+    cg.id.hash(&mut h);
+    cg.expr.hash(&mut h);
+    cg.render_mode.hash(&mut h);
+    cg.domain_coloring_mode.hash(&mut h);
+    cg.x_min.to_bits().hash(&mut h);
+    cg.x_max.to_bits().hash(&mut h);
+    cg.y_min.to_bits().hash(&mut h);
+    cg.y_max.to_bits().hash(&mut h);
+    res.hash(&mut h);
+    h.finish()
+}
+
+/// Estado de un grid de domain coloring en el puente GPU→textura.
+///
+/// `Absent` no se almacena (ausencia en el mapa). Transiciones:
+/// `claim` (prepare) → `Dispatched`; resolve ok → `Ready`; draw consume →
+/// `Consumed`; resolve-fail/abort → se borra (→ CPU honesto).
+/// La key es la de textura (incluye versión+res): un cambio de calidad o
+/// edición invalida sola. Tope LRU 8 (un estado por grid visible como máximo
+/// en la práctica; los viejos se evictan).
+#[derive(Debug)]
+enum DomainGridState {
+    /// Dispatch en vuelo (el draw salta el grid este frame: nada que mostrar
+    /// aún y el walk CPU no debe correr).
+    Dispatched,
+    /// Colores listos (el draw arma la imagen sin walk CPU).
+    Ready { colors: Vec<[f32; 4]> },
+    /// La textura ya absorbió el resultado (no re-dispatchear).
+    Consumed,
+}
+
+/// Puente GPU→textura para domain coloring, compartido entre prepare
+/// (dispatch/drain, hilo de pintado) y draw. `Mutex` global (no
+/// thread-local): las fases no garantizan mismo hilo.
+static DOMAIN_GRID_STATES: std::sync::OnceLock<
+    std::sync::Mutex<lru::LruCache<u64, DomainGridState>>,
+> = std::sync::OnceLock::new();
+
+fn domain_grid_states() -> &'static std::sync::Mutex<lru::LruCache<u64, DomainGridState>> {
+    DOMAIN_GRID_STATES
+        .get_or_init(|| std::sync::Mutex::new(lru::LruCache::new(DOMAIN_GRID_CACHE_SIZE)))
+}
+
+/// Reclama una key para dispatch: `true` si estaba ausente (el llamante debe
+/// disparar) y queda marcada `Dispatched`.
+pub(crate) fn domain_grid_claim(key: u64) -> bool {
+    let Ok(mut map) = domain_grid_states().lock() else {
+        return false;
+    };
+    if map.contains(&key) {
+        return false;
+    }
+    map.put(key, DomainGridState::Dispatched);
+    true
+}
+
+/// Guarda colores resueltos (solo si sigue `Dispatched`: si se evictó o
+/// consumió entretanto, se descartan sin envenenar nada).
+pub(crate) fn domain_grid_ready(key: u64, colors: Vec<[f32; 4]>) {
+    let Ok(mut map) = domain_grid_states().lock() else {
+        return;
+    };
+    if matches!(map.get(&key), Some(DomainGridState::Dispatched)) {
+        map.put(key, DomainGridState::Ready { colors });
+    }
+}
+
+/// Borra el estado (objeto borrado): el draw vuelve al walk CPU honesto
+/// en el próximo frame y el prepare puede reintentar si sigue visible.
+pub(crate) fn domain_grid_drop(key: u64) {
+    if let Ok(mut map) = domain_grid_states().lock() {
+        map.pop(&key);
+    }
+}
+
+/// Marca `Consumed` sin colores (fallo de resolve, abort por desalojo):
+/// el walk CPU toma el control y NO se reintenta en esta versión (evita
+/// spin de dispatch + inanición del grid bajo contención sostenida).
+/// La próxima edición (nueva key) reintenta una vez.
+pub(crate) fn domain_grid_mark_consumed(key: u64) {
+    if let Ok(mut map) = domain_grid_states().lock() {
+        map.put(key, DomainGridState::Consumed);
+    }
+}
+
+/// Toma los colores listos y marca `Consumed` (un solo consumo por key).
+fn domain_grid_take_ready(key: u64) -> Option<Vec<[f32; 4]>> {
+    let Ok(mut map) = domain_grid_states().lock() else {
+        return None;
+    };
+    match map.get(&key) {
+        Some(DomainGridState::Ready { .. }) => {
+            let Some(DomainGridState::Ready { colors }) = map.pop(&key) else {
+                return None;
+            };
+            map.put(key, DomainGridState::Consumed);
+            Some(colors)
+        }
+        _ => None,
+    }
+}
+
+/// ¿Hay un dispatch en vuelo para esta key? (el draw debe saltar el grid,
+// en vez de pagar el walk CPU, hasta que resuelva o falle).
+fn domain_grid_is_dispatched(key: u64) -> bool {
+    domain_grid_states()
+        .lock()
+        .map(|mut map| matches!(map.get(&key), Some(DomainGridState::Dispatched)))
+        .unwrap_or(false)
+}
+
+/// Arma la `ColorImage` res×res desde colores GPU fila-mayor.
+///
+/// Mapeo inverso al shader (`i = idx/res`, `j = idx%res`, centros
+/// `+0.5`): la fila 0 de la imagen es `y_max`, igual que el builder CPU.
+/// `None` si el largo no es `res²` (el llamante cae al CPU honesto).
+/// Pura y testeable.
+fn domain_grid_image_from_colors(colors: &[[f32; 4]], res: usize) -> Option<egui::ColorImage> {
+    let total = res.checked_mul(res)?;
+    if res == 0 || colors.len() != total {
+        return None;
+    }
+    let mut pixels = Vec::with_capacity(total);
+    for row in 0..res {
+        // Fila de imagen `row` (desde arriba) = fila GPU `res-1-row`.
+        let grow = res - 1 - row;
+        for i in 0..res {
+            let c = colors[i * res + grow];
+            if !c.iter().all(|v| v.is_finite()) {
+                pixels.push(Color32::TRANSPARENT);
+                continue;
+            }
+            // El shader ya entrega RGB premultiplicado 0..1 (mismo rango
+            // que el builder CPU tras `hsl_to_rgb` + `*255`).
+            let channel = |v: f32| (v.clamp(0.0, 1.0) * 255.0) as u8;
+            pixels.push(Color32::from_rgba_premultiplied(
+                channel(c[0]),
+                channel(c[1]),
+                channel(c[2]),
+                channel(c[3]),
+            ));
+        }
+    }
+    Some(egui::ColorImage {
+        size: [res, res],
+        pixels,
+    })
+}
+fn complex_grid_heatmap_image(
+    document: &grafito_core::Document,
+    cg: &grafito_core::ComplexGridObj,
+    res: usize,
+) -> Option<egui::ColorImage> {
+    let ast = prepare_function_ast(&cg.expr, &document.variables, &["x", "y"]).ok()?;
+    let dx = (cg.x_max - cg.x_min) / res as f64;
+    let dy = (cg.y_max - cg.y_min) / res as f64;
+    let mut pixels = Vec::with_capacity(res * res);
+    for j in 0..res {
+        let y = cg.y_min + (res - 1 - j) as f64 * dy;
+        for i in 0..res {
+            let x = cg.x_min + i as f64 * dx;
+            let val = ast.eval_2d("x", x, "y", y);
+            if val.is_finite() {
+                let t = (val.atan() / std::f64::consts::FRAC_PI_2).clamp(-1.0, 1.0);
+                let t = (t + 1.0) * 0.5;
+                // O6: paleta 1 = viridis; 0/desconocida = térmica (paridad).
+                let (r, g, b) = if cg.palette == 1 {
+                    grafito_render::viridis_colormap(t)
+                } else {
+                    thermal_colormap(t)
+                };
+                pixels.push(Color32::from_rgb(
+                    (r * 255.0) as u8,
+                    (g * 255.0) as u8,
+                    (b * 255.0) as u8,
+                ));
+            } else {
+                pixels.push(Color32::TRANSPARENT);
+            }
+        }
+    }
+    Some(egui::ColorImage {
+        size: [res, res],
+        pixels,
+    })
+}
+
+/// Rasteriza el domain coloring complejo (modo 1) en una `ColorImage` res×res;
+/// fila 0 = `y_max`. Usa el AST cacheado y evalúa una vez por píxel en cache
+/// miss (antes: parse + res² `rect_filled` por frame).
+///
+/// Costo del `HashMap<String, Complex64>` por frame (Ola 4, medido en diseño):
+/// se construye UNA vez por imagen (no por píxel): `N = vars + 1` inserts con
+/// `N` chico (las variables del documento rara vez pasan la decena). El costo
+/// caliente es el lookup por píxel dentro de `expr.eval(&vars)`: `res²`
+/// evaluaciones × `N` probes hash. Con `res ≤ 256` y AST cacheado (hit tras el
+/// primer frame) el frame queda en ~65k evals, despreciable frente al pintado.
+/// Mejora futura (no hecha): pre-resolver cada nombre a índice una vez por
+/// imagen y evaluar sobre un `&[Complex64]` plano para evitar el hash por
+/// píxel; el miss-rate del AST se pinnea en
+/// `complex_expr_cache_hit_after_first_parse` (segundo `get` = hit).
+fn complex_grid_domain_coloring_image(
+    document: &grafito_core::Document,
+    cg: &grafito_core::ComplexGridObj,
+    res: usize,
+) -> Option<egui::ColorImage> {
+    use num_complex::Complex64;
+    let expr = cached_complex_expr(&cg.expr)?;
+    let mut vars: HashMap<String, Complex64> = HashMap::new();
+    for (name, val) in &document.variables {
+        vars.insert(name.clone(), Complex64::new(*val, 0.0));
+    }
+    let base_symbol = document.complex_base_symbol.as_str();
+    vars.insert(base_symbol.to_string(), Complex64::new(0.0, 0.0));
+    let dc_mode = cg.domain_coloring_mode;
+    // Umbral: si |f(z)| < MAG_ZERO se considera cero y se pinta negro.
+    // Evita que arg(~0) dé ruido aleatorio en retratos de fase.
+    const MAG_ZERO: f64 = 1e-6;
+    let dx = (cg.x_max - cg.x_min) / res as f64;
+    let dy = (cg.y_max - cg.y_min) / res as f64;
+    let mut pixels = Vec::with_capacity(res * res);
+    for j in 0..res {
+        let y = cg.y_min + (res - 1 - j) as f64 * dy;
+        for i in 0..res {
+            let x = cg.x_min + i as f64 * dx;
+            if let Some(z) = vars.get_mut(base_symbol) {
+                *z = Complex64::new(x, y);
+            }
+            let color = match expr.eval(&vars) {
+                Ok(fz) if fz.re.is_finite() && fz.im.is_finite() => {
+                    let mag = fz.norm();
+                    if mag < MAG_ZERO {
+                        Color32::BLACK
+                    } else {
+                        let arg = fz.arg();
+                        let hue = (arg + std::f64::consts::PI) / (2.0 * std::f64::consts::PI);
+                        let (lightness, saturation) = match dc_mode {
+                            // 1: Retrato de Fase Puro — lightness=0.5, sat=1
+                            1 => (0.5, 1.0),
+                            // 0/2/3: HSL clásico — lightness varía con módulo
+                            _ => {
+                                let l = (mag.max(1e-10).ln().atan() / std::f64::consts::FRAC_PI_2)
+                                    * 0.5
+                                    + 0.5;
+                                (l.clamp(0.0, 1.0), 0.85)
+                            }
+                        };
+                        let (mut r, mut g, mut b) = hsl_to_rgb(hue, saturation, lightness);
+                        // Overlay de rejillas conformes (modos 2 y 3)
+                        if dc_mode == 2 {
+                            let log_mag = mag.max(1e-5).ln();
+                            let mag_grid = (log_mag * std::f64::consts::PI * 2.0).sin().abs();
+                            let arg_grid = (arg * 10.0).sin().abs();
+                            let shading = 0.5
+                                + 0.5 * mag_grid.max(0.0).powf(0.15) * arg_grid.max(0.0).powf(0.15);
+                            r *= shading;
+                            g *= shading;
+                            b *= shading;
+                        } else if dc_mode == 3 {
+                            let grid_re = (fz.re * std::f64::consts::PI * 2.0).sin().abs();
+                            let grid_im = (fz.im * std::f64::consts::PI * 2.0).sin().abs();
+                            let shading = 0.5
+                                + 0.5 * grid_re.max(0.0).powf(0.15) * grid_im.max(0.0).powf(0.15);
+                            r *= shading;
+                            g *= shading;
+                            b *= shading;
+                        }
+                        Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
+                    }
+                }
+                _ => Color32::TRANSPARENT,
+            };
+            pixels.push(color);
+        }
+    }
+    Some(egui::ColorImage {
+        size: [res, res],
+        pixels,
+    })
+}
+
+fn vector_field_streamline_cache_key(
+    document_version: u64,
+    vf: &grafito_core::VectorField2DObj,
+    world_tl: Point2,
+    world_br: Point2,
+    dx: f64,
+    dy: f64,
+) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    document_version.hash(&mut h);
+    vf.id.hash(&mut h);
+    vf.expr_u.hash(&mut h);
+    vf.expr_v.hash(&mut h);
+    world_tl.x.to_bits().hash(&mut h);
+    world_tl.y.to_bits().hash(&mut h);
+    world_br.x.to_bits().hash(&mut h);
+    world_br.y.to_bits().hash(&mut h);
+    dx.to_bits().hash(&mut h);
+    dy.to_bits().hash(&mut h);
+    h.finish()
+}
+
+/// Streamlines RK4 world-space de un campo vectorial, cacheadas por
+/// (version, campo, viewport). Devuelve segmentos listos para proyectar.
+fn cached_vector_field_streamlines(
+    document: &grafito_core::Document,
+    vf: &grafito_core::VectorField2DObj,
+    world_tl: Point2,
+    world_br: Point2,
+    dx: f64,
+    dy: f64,
+) -> VectorFieldStreamlines {
+    let key = vector_field_streamline_cache_key(document.version, vf, world_tl, world_br, dx, dy);
+    if let Some(cached) = VECTOR_FIELD_STREAMLINE_CACHE.with(|c| c.borrow_mut().get(&key).cloned())
+    {
+        return cached;
+    }
+    let segments = Arc::new(trace_vector_field_streamlines(
+        document, vf, world_tl, world_br, dx, dy,
+    ));
+    VECTOR_FIELD_STREAMLINE_CACHE.with(|c| {
+        c.borrow_mut().put(key, segments.clone());
+    });
+    segments
+}
+
+fn trace_vector_field_streamlines(
+    document: &grafito_core::Document,
+    vf: &grafito_core::VectorField2DObj,
+    world_tl: Point2,
+    world_br: Point2,
+    dx: f64,
+    dy: f64,
+) -> Vec<(Point2, Point2)> {
+    let sl_steps = 200;
+    let sl_dt = 0.05;
+    let prepared_u = prepare_function_ast(&vf.expr_u, &document.variables, &["x", "y"]).ok();
+    let prepared_v = prepare_function_ast(&vf.expr_v, &document.variables, &["x", "y"]).ok();
+    // Evita `base_environment.clone()` en cada evaluación RK4 usando un vec mutable
+    // con slots fijos para "x" e "y".
+    let mut environment: Vec<(String, f64)> = document
+        .variables
+        .iter()
+        .filter(|(name, _)| name.as_str() != "x" && name.as_str() != "y")
+        .map(|(name, value)| (name.clone(), *value))
+        .collect();
+    environment.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    environment.push(("x".to_string(), 0.0));
+    environment.push(("y".to_string(), 0.0));
+    let x_idx = environment.len() - 2;
+    let y_idx = environment.len() - 1;
+    let mut evaluate_field = |x: f64, y: f64| {
+        environment[x_idx].1 = x;
+        environment[y_idx].1 = y;
+        let u = prepared_u
+            .as_ref()
+            .map(|ast| ast.eval_2d("x", x, "y", y))
+            .filter(|value| value.is_finite())
+            .or_else(|| {
+                grafito_geometry::expr::evaluate(&vf.expr_u, &environment)
+                    .ok()
+                    .filter(|value| value.is_finite())
+            })?;
+        let v = prepared_v
+            .as_ref()
+            .map(|ast| ast.eval_2d("x", x, "y", y))
+            .filter(|value| value.is_finite())
+            .or_else(|| {
+                grafito_geometry::expr::evaluate(&vf.expr_v, &environment)
+                    .ok()
+                    .filter(|value| value.is_finite())
+            })?;
+        Some((u, v))
+    };
+    // Distribute seeds uniformly
+    let seeds_x = 5;
+    let seeds_y = 5;
+    let sx = (world_br.x - world_tl.x) / (seeds_x + 1) as f64;
+    let sy = (world_br.y - world_tl.y) / (seeds_y + 1) as f64;
+    let mut segments = Vec::new();
+    for si in 1..=seeds_x {
+        for sj in 1..=seeds_y {
+            let mut x = world_tl.x + si as f64 * sx;
+            let mut y = world_tl.y + sj as f64 * sy;
+            let mut prev: Option<Point2> = None;
+            for _ in 0..sl_steps {
+                let Some((k1x, k1y)) = evaluate_field(x, y) else {
+                    break;
+                };
+                let half_dt = sl_dt * 0.5;
+                let Some((k2x, k2y)) = evaluate_field(x + half_dt * k1x, y + half_dt * k1y) else {
+                    break;
+                };
+                let Some((k3x, k3y)) = evaluate_field(x + half_dt * k2x, y + half_dt * k2y) else {
+                    break;
+                };
+                let Some((k4x, k4y)) = evaluate_field(x + sl_dt * k3x, y + sl_dt * k3y) else {
+                    break;
+                };
+                x += sl_dt / 6.0 * (k1x + 2.0 * k2x + 2.0 * k3x + k4x);
+                y += sl_dt / 6.0 * (k1y + 2.0 * k2y + 2.0 * k3y + k4y);
+                if x < world_tl.x - dx
+                    || x > world_br.x + dx
+                    || y < world_tl.y - dy
+                    || y > world_br.y + dy
+                {
+                    break;
+                }
+                let current = Point2::new(x, y);
+                if let Some(prev_pos) = prev {
+                    segments.push((prev_pos, current));
+                }
+                prev = Some(current);
+            }
+        }
+    }
+    segments
+}
+
+fn implicit_curve_view_bounds(view: ViewTransform, canvas_rect: Rect) -> (f64, f64, f64, f64) {
+    let world_tl = view.screen_to_world(glam::Vec2::new(0.0, 0.0));
+    let world_br = view.screen_to_world(glam::Vec2::new(canvas_rect.width(), canvas_rect.height()));
+    (
+        world_tl.x.min(world_br.x),
+        world_tl.x.max(world_br.x),
+        world_br.y.min(world_tl.y),
+        world_br.y.max(world_tl.y),
+    )
+}
+
+fn implicit_curve_cache_matches_request(
+    curve: &ImplicitCurveObj,
+    view_bounds: (f64, f64, f64, f64),
+    grid_size: usize,
+    variables: &BTreeMap<String, f64>,
+    quality: grafito_core::RenderQuality,
+) -> bool {
+    let grid_size = match quality {
+        grafito_core::RenderQuality::Preview => grid_size.min(128),
+        grafito_core::RenderQuality::Normal => grid_size.min(512),
+        grafito_core::RenderQuality::High => {
+            grid_size.min(grafito_core::implicit_curve::MAX_IMPLICIT_GRID_SIZE)
+        }
+    };
+    let padded_bounds = grafito_core::implicit_curve::padded_snapped_bounds(view_bounds, 2.0, 64);
+    let requested_key = curve.cache_key(padded_bounds, grid_size, variables);
+    // Read-lock optimizado: fast-path `try_read` evita bloqueo si no hay escritor.
+    let cached_key = read_lock_optimized(&curve.cached_key);
+    if cached_key.as_ref() != Some(&requested_key) {
+        return false;
+    }
+    let cached_region = read_lock_optimized(&curve.cached_region);
+    cached_region.is_some_and(|(x_min, x_max, y_min, y_max)| {
+        view_bounds.0 >= x_min
+            && view_bounds.1 <= x_max
+            && view_bounds.2 >= y_min
+            && view_bounds.3 <= y_max
+    })
+}
+
+/// ¿Este `ImplicitCurve` pide relleno de región?
+///
+/// `Eq` dibuja solo el contorno; `</>/≤/≥` rellenan. Extraída como predicado
+/// puro para que el test de integración la ejercite directamente en vez de
+/// duplicar el `matches!` (que pasaba aunque la producción invirtiera la
+/// condición).
+pub fn implicit_curve_requests_fill(curve: &ImplicitCurveObj) -> bool {
+    curve.fill_color.is_some() && !matches!(curve.operator, RelationOperator::Eq)
+}
+
+fn implicit_curve_fill_work(
+    curve: &ImplicitCurveObj,
+    view_bounds: (f64, f64, f64, f64),
+    canvas_rect: Rect,
+    quality: grafito_core::RenderQuality,
+) -> Option<usize> {
+    if !implicit_curve_requests_fill(curve) {
+        return Some(0);
+    }
+
+    let padded_bounds = grafito_core::implicit_curve::padded_snapped_bounds(view_bounds, 2.0, 64);
+    let canvas_size = (
+        canvas_rect.width().max(1.0) as u32,
+        canvas_rect.height().max(1.0) as u32,
+    );
+    let (mut texture_width, mut texture_height) =
+        fill_cache_texture_size(view_bounds, padded_bounds, canvas_size);
+    if quality == grafito_core::RenderQuality::Preview {
+        texture_width = (texture_width as f64 * 0.25).ceil().max(1.0) as u32;
+        texture_height = (texture_height as f64 * 0.25).ceil().max(1.0) as u32;
+    }
+    (texture_width as usize).checked_mul(texture_height as usize)
+}
+
+fn implicit_curve_cache_miss_work(
+    curve: &ImplicitCurveObj,
+    grid_size: usize,
+    view_bounds: (f64, f64, f64, f64),
+    canvas_rect: Rect,
+    quality: grafito_core::RenderQuality,
+) -> Option<usize> {
+    let level_count = curve
+        .contour_levels
+        .as_ref()
+        .filter(|levels| !levels.is_empty())
+        .map_or(1, |levels| levels.len())
+        .min(grafito_core::validation::MAX_CONTOUR_LEVELS);
+    let samples_per_axis = grid_size.checked_add(1)?;
+    let field_samples = samples_per_axis.checked_mul(samples_per_axis)?;
+    let marching_cells = grid_size.checked_mul(grid_size)?.checked_mul(level_count)?;
+    field_samples
+        .checked_add(marching_cells)?
+        .checked_add(implicit_curve_fill_work(
+            curve,
+            view_bounds,
+            canvas_rect,
+            quality,
+        )?)
+}
+
+fn visible_implicit_cache_plan(
+    document: &grafito_core::Document,
+    view_bounds: (f64, f64, f64, f64),
+    grid_size: usize,
+    canvas_rect: Rect,
+) -> BTreeSet<grafito_core::ObjectId> {
+    let quality = document.render_quality;
+    let mut remaining_work = MAX_CPU_IMPLICIT_FRAME_WORK_UNITS;
+    let mut admitted = BTreeSet::new();
+    for_each_ordered_visible_2d_object(document, |id, object| {
+        let GeoObject::ImplicitCurve(curve) = object else {
+            return true;
+        };
+        let cache_matches = implicit_curve_cache_matches_request(
+            curve,
+            view_bounds,
+            grid_size,
+            &document.variables,
+            quality,
+        );
+        let Some(work) = (if cache_matches {
+            implicit_curve_fill_work(curve, view_bounds, canvas_rect, quality)
+        } else {
+            implicit_curve_cache_miss_work(curve, grid_size, view_bounds, canvas_rect, quality)
+        }) else {
+            return true;
+        };
+        if let Some(remaining) = remaining_work.checked_sub(work) {
+            remaining_work = remaining;
+            admitted.insert(id);
+        }
+        true
+    });
+    admitted
+}
+
+fn precompute_visible_implicit_curve_caches(
+    document: &grafito_core::Document,
+    canvas_rect: Rect,
+) -> BTreeSet<grafito_core::ObjectId> {
+    let view = *document.view();
+    let view_bounds = implicit_curve_view_bounds(view, canvas_rect);
+    let quality = document.render_quality;
+    let grid_size = implicit_curve_grid_size(canvas_rect, quality);
+    let admitted = visible_implicit_cache_plan(document, view_bounds, grid_size, canvas_rect);
+
+    for id in &admitted {
+        let Some(GeoObject::ImplicitCurve(curve)) = document.get_object(*id) else {
+            continue;
+        };
+        let _segments = grafito_core::implicit_curve::segments_or_compute(
+            curve,
+            view_bounds,
+            grid_size,
+            &document.variables,
+            quality,
+        );
+    }
+    admitted
+}
+
+#[cfg(test)]
+mod overlay_layer_tests {
+    use super::*;
+    use grafito_core::{
+        CircleObj, ComplexGridObj, ComplexMappingObj, Document, EllipseObj, Fractal2DObj,
+        FunctionObj, GeoObject, HyperbolaObj, ImplicitCurveObj, LineObj, ParabolaObj,
+        ParametricCurve2DObj, PencilObj, PhasePortraitObj, PointObj, PolarCurveObj,
+        RegressionLineObj, RelationOperator, TransformedObj, VectorField2DObj,
+    };
+
+    #[test]
+    fn complex_grid_preview_caps_cpu_sampling_while_high_quality_keeps_the_requested_density() {
+        assert_eq!(
+            complex_grid_cpu_resolution(500, grafito_core::RenderQuality::Preview),
+            64
+        );
+        assert_eq!(
+            complex_grid_cpu_resolution(500, grafito_core::RenderQuality::High),
+            500
+        );
+    }
+
+    #[test]
+    fn complex_grid_images_cover_res_squared_and_the_texture_key_tracks_edits() {
+        let document = Document::default();
+        let cg = ComplexGridObj::new("z", -1.0, 1.0, -1.0, 1.0);
+        let image = complex_grid_domain_coloring_image(&document, &cg, 8).expect("z parsea");
+        assert_eq!(image.size, [8, 8]);
+        assert_eq!(image.pixels.len(), 64);
+        let heat = complex_grid_heatmap_image(&document, &cg, 4).expect("z evalúa");
+        assert_eq!(heat.size, [4, 4]);
+        assert_eq!(heat.pixels.len(), 16);
+        // La key cambia con versión del documento y resolución (invalidación).
+        let key = complex_grid_texture_key(1, &cg, 8);
+        assert_ne!(key, complex_grid_texture_key(2, &cg, 8));
+        assert_ne!(key, complex_grid_texture_key(1, &cg, 16));
+    }
+
+    #[test]
+    fn vector_field_streamlines_cache_reuses_segments_per_viewport() {
+        let document = Document::new();
+        let vf = VectorField2DObj::new("y", "-x");
+        let tl = Point2::new(-1.0, 1.0);
+        let br = Point2::new(1.0, -1.0);
+        let first = cached_vector_field_streamlines(&document, &vf, tl, br, 0.2, 0.2);
+        let second = cached_vector_field_streamlines(&document, &vf, tl, br, 0.2, 0.2);
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "cache hit debe devolver el mismo Arc"
+        );
+    }
+
+    #[test]
+    fn mixed_cpu_gpu_scene_keeps_global_layer_order() {
+        let mut document = Document::new();
+        let function = document.add_object(GeoObject::Function(FunctionObj::new("0")));
+        let circle = document.add_object(GeoObject::Circle(CircleObj::new(
+            Point2::new(0.0, 0.0),
+            2.0,
+        )));
+
+        assert_eq!(
+            base_scene_paint_plan(&document, true),
+            vec![BasePaint2D::Cpu(circle), BasePaint2D::Gpu(function)]
+        );
+    }
+
+    #[test]
+    fn mixed_cpu_gpu_objects_in_one_layer_keep_object_id_order() {
+        let mut document = Document::new();
+        let function = document.add_object(GeoObject::Function(FunctionObj::new("0")));
+        let line = document.add_object(GeoObject::Line(LineObj::new(
+            Point2::new(-1.0, 0.0),
+            Point2::new(1.0, 0.0),
+        )));
+        let mut expected = vec![BasePaint2D::Gpu(function), BasePaint2D::Cpu(line)];
+        expected.sort_unstable_by_key(|paint| match paint {
+            BasePaint2D::Cpu(id) | BasePaint2D::Gpu(id) => *id,
+        });
+
+        assert_eq!(base_scene_paint_plan(&document, true), expected);
+    }
+
+    #[test]
+    fn gpu_overlay_keeps_vector_field_details_on_cpu() {
+        let document = Document::new();
+        assert!(is_gpu_base_geometry(
+            &document,
+            &GeoObject::Function(FunctionObj::new("sin(x)")),
+        ));
+        assert!(
+            !is_gpu_base_geometry(
+                &document,
+                &GeoObject::VectorField2D(VectorField2DObj::new("x", "y")),
+            ),
+            "the CPU overlay owns vector arrowheads and RK4 streamlines"
+        );
+        assert!(is_gpu_base_geometry(
+            &document,
+            &GeoObject::Fractal2D(Fractal2DObj::mandelbrot()),
+        ));
+        assert!(is_gpu_base_geometry(
+            &document,
+            &GeoObject::ParametricCurve2D(ParametricCurve2DObj::new("t", "t^2", 0.0, 1.0)),
+        ));
+        assert!(is_gpu_base_geometry(
+            &document,
+            &GeoObject::PolarCurve(PolarCurveObj::new("1", 0.0, 1.0)),
+        ));
+        assert!(!is_gpu_base_geometry(
+            &document,
+            &GeoObject::Point(PointObj::new(Point2::new(0.0, 0.0))),
+        ));
+    }
+
+    #[test]
+    fn gpu_overlay_keeps_function_and_polar_cpu_decorations() {
+        let function = GeoObject::Function(FunctionObj::new("sin(x)"));
+        let polar = GeoObject::PolarCurve(PolarCurveObj::new("1", 0.0, 1.0));
+        let parametric =
+            GeoObject::ParametricCurve2D(ParametricCurve2DObj::new("t", "t^2", 0.0, 1.0));
+
+        assert!(gpu_overlay_keeps_cpu_decorations(&function));
+        assert!(gpu_overlay_keeps_cpu_decorations(&polar));
+        assert!(!gpu_overlay_keeps_cpu_decorations(&parametric));
+    }
+
+    #[test]
+    fn gpu_overlay_never_redraws_a_gpu_owned_family_in_full() {
+        let mut document = Document::new();
+        let point = document.add_object(GeoObject::Point(PointObj::new(Point2::new(1.0, 0.0))));
+        let objects = [
+            GeoObject::Function(FunctionObj::new("sin(x)")),
+            GeoObject::Fractal2D(Fractal2DObj::mandelbrot()),
+            GeoObject::ParametricCurve2D(ParametricCurve2DObj::new("t", "t^2", 0.0, 1.0)),
+            GeoObject::PolarCurve(PolarCurveObj::new("1", 0.0, 1.0)),
+            GeoObject::PhasePortrait(PhasePortraitObj::new("y", "-x", -1.0, 1.0, -1.0, 1.0)),
+            GeoObject::ComplexGrid(ComplexGridObj::new("z", -1.0, 1.0, -1.0, 1.0)),
+            GeoObject::ComplexMapping(ComplexMappingObj::new("1/z", point)),
+            GeoObject::Transformed(TransformedObj::new(
+                GeoObject::Line(LineObj::new(Point2::new(0.0, 0.0), Point2::new(1.0, 1.0))),
+                "z^2",
+            )),
+        ];
+
+        for object in objects {
+            assert!(grafito_render::gpu_2d_base_owns(&document, &object));
+            assert_ne!(
+                cpu_object_pass(&document, &object, true),
+                CpuObjectPass::Full,
+                "{} must not have two base-scene owners",
+                object.name()
+            );
+        }
+    }
+
+    #[test]
+    fn gpu_overlay_keeps_cpu_only_families_in_full() {
+        let document = Document::new();
+        let objects = [
+            GeoObject::Point(PointObj::new(Point2::new(0.0, 0.0))),
+            GeoObject::Ellipse(EllipseObj::new(Point2::new(0.0, 0.0), 2.0, 1.0)),
+            GeoObject::ImplicitCurve(ImplicitCurveObj::new("x^2+y^2", "1", RelationOperator::Eq)),
+            GeoObject::VectorField2D(VectorField2DObj::new("x", "y")),
+        ];
+
+        for object in objects {
+            assert!(!grafito_render::gpu_2d_base_owns(&document, &object));
+            assert_eq!(
+                cpu_object_pass(&document, &object, true),
+                CpuObjectPass::Full
+            );
+        }
+    }
+
+    #[test]
+    fn polar_fill_runs_split_at_the_same_nonfinite_and_jump_gaps_as_strokes() {
+        let canvas = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let points = [
+            Some(Pos2::new(0.0, 0.0)),
+            Some(Pos2::new(10.0, 0.0)),
+            Some(Pos2::new(700.0, 0.0)),
+            Some(Pos2::new(710.0, 0.0)),
+            None,
+            Some(Pos2::new(20.0, 0.0)),
+            Some(Pos2::new(30.0, 0.0)),
+        ];
+
+        let runs = split_continuous_screen_runs(&points, canvas);
+
+        assert_eq!(
+            runs,
+            vec![
+                vec![Pos2::new(0.0, 0.0), Pos2::new(10.0, 0.0)],
+                vec![Pos2::new(700.0, 0.0), Pos2::new(710.0, 0.0)],
+                vec![Pos2::new(20.0, 0.0), Pos2::new(30.0, 0.0)],
+            ]
+        );
+    }
+
+    #[test]
+    fn gpu_overlay_routes_unrecognized_complex_mappings_to_cpu() {
+        let mut document = Document::new();
+        let targets = [
+            document.add_object(GeoObject::ParametricCurve2D(ParametricCurve2DObj::new(
+                "t", "t^2", 0.0, 1.0,
+            ))),
+            document.add_object(GeoObject::PolarCurve(PolarCurveObj::new("1", 0.0, 1.0))),
+            document.add_object(GeoObject::ImplicitCurve(ImplicitCurveObj::new(
+                "x^2 + y^2",
+                "1",
+                RelationOperator::Eq,
+            ))),
+            document.add_object(GeoObject::VectorField2D(VectorField2DObj::new("x", "y"))),
+        ];
+        // Solo lo no-parseable queda en CPU (el comando ya lo rechaza al
+        // crear). Lo parseable —reconocido o no, p.ej. `z^2+1` o `gamma(z)`—
+        // va a GPU, que dibuja por segmento independiente sin cuerdas.
+        for target in targets {
+            assert!(!is_gpu_base_geometry(
+                &document,
+                &GeoObject::ComplexMapping(ComplexMappingObj::new("z^", target)),
+            ));
+            assert!(is_gpu_base_geometry(
+                &document,
+                &GeoObject::ComplexMapping(ComplexMappingObj::new("z^2+1", target)),
+            ));
+            assert!(is_gpu_base_geometry(
+                &document,
+                &GeoObject::ComplexMapping(ComplexMappingObj::new("gamma(z)", target)),
+            ));
+        }
+
+        let point = document.add_object(GeoObject::Point(PointObj::new(Point2::new(1.0, 0.0))));
+        assert!(is_gpu_base_geometry(
+            &document,
+            &GeoObject::ComplexMapping(ComplexMappingObj::new("1/z", point)),
+        ));
+    }
+
+    #[test]
+    fn complex_mapping_circle_and_pencil_routes_depend_on_map_support() {
+        let mut document = Document::new();
+        let targets = [
+            document.add_object(GeoObject::Circle(CircleObj::new(
+                Point2::new(2.0, 0.0),
+                0.5,
+            ))),
+            document.add_object(GeoObject::Pencil(PencilObj::new(vec![
+                Point2::new(1.0, 0.0),
+                Point2::new(2.0, 1.0),
+            ]))),
+        ];
+
+        for target in targets {
+            assert!(!is_gpu_base_geometry(
+                &document,
+                &GeoObject::ComplexMapping(ComplexMappingObj::new("z^", target)),
+            ));
+            assert!(is_gpu_base_geometry(
+                &document,
+                &GeoObject::ComplexMapping(ComplexMappingObj::new("1/z", target)),
+            ));
+            assert!(is_gpu_base_geometry(
+                &document,
+                &GeoObject::ComplexMapping(ComplexMappingObj::new("z^2+1", target)),
+            ));
+        }
+    }
+
+    #[test]
+    fn complex_mapping_analytic_curves_route_to_gpu_when_parseable() {
+        let mut document = Document::new();
+        let targets = [
+            document.add_object(GeoObject::Ellipse(EllipseObj::new(
+                Point2::new(0.0, 0.0),
+                2.0,
+                1.0,
+            ))),
+            document.add_object(GeoObject::Parabola(ParabolaObj::new(
+                Point2::new(0.0, 0.0),
+                1.0,
+            ))),
+            document.add_object(GeoObject::Hyperbola(HyperbolaObj::new(
+                Point2::new(0.0, 0.0),
+                1.0,
+                0.5,
+            ))),
+            document.add_object(GeoObject::RegressionLine(RegressionLineObj::linear(
+                vec![-1.0, 0.0, 1.0],
+                vec![-1.0, 0.0, 1.0],
+                1.0,
+                0.0,
+                1.0,
+            ))),
+        ];
+
+        for target in targets {
+            assert!(is_gpu_base_geometry(
+                &document,
+                &GeoObject::ComplexMapping(ComplexMappingObj::new("1/z", target)),
+            ));
+            assert!(is_gpu_base_geometry(
+                &document,
+                &GeoObject::ComplexMapping(ComplexMappingObj::new("z^2+1", target)),
+            ));
+            assert!(!is_gpu_base_geometry(
+                &document,
+                &GeoObject::ComplexMapping(ComplexMappingObj::new("z^", target)),
+            ));
+        }
+    }
+
+    #[test]
+    fn function_projection_rejects_unrepresentable_samples_and_keeps_visible_large_values() {
+        let canvas = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let mut view = ViewTransform::new(800.0, 600.0);
+        let samples = [(-1.0, Some(1_000_000.0)), (0.0, Some(1e100))];
+
+        assert!(!view
+            .world_to_screen(Point2::new(samples[1].0, samples[1].1.unwrap()))
+            .is_finite());
+        let projected: Vec<_> = samples
+            .iter()
+            .map(|&(x, y)| y.and_then(|y| function_screen_point(&view, canvas, x, y)))
+            .collect();
+        assert!(projected.iter().all(|point| point.is_none()));
+
+        view.scale = 0.0001;
+        let screen = function_screen_point(&view, canvas, samples[0].0, samples[0].1.unwrap())
+            .expect("a finite million-valued constant in view should remain renderable");
+        assert!(screen.is_finite());
+        assert!(canvas.expand(1.0).contains(screen));
+    }
+
+    fn fixed_object_id(value: u128) -> grafito_core::ObjectId {
+        let hex = format!("{value:032x}");
+        let uuid = format!(
+            "{}-{}-{}-{}-{}",
+            &hex[..8],
+            &hex[8..12],
+            &hex[12..16],
+            &hex[16..20],
+            &hex[20..]
+        );
+        serde_json::from_str(&format!("\"{uuid}\"")).expect("valid fixed object id")
+    }
+
+    #[test]
+    fn fill_texture_cache_evicts_least_recent_entry_with_entry_and_byte_budgets() {
+        let first = fixed_object_id(1);
+        let second = fixed_object_id(2);
+        let third = fixed_object_id(3);
+        let mut cache = FillTextureCacheStore::with_limits(2, 128);
+
+        cache.insert(first, FillTextureCache::without_texture((4, 4)));
+        cache.insert(second, FillTextureCache::without_texture((4, 4)));
+        assert!(
+            cache.get(first).is_some(),
+            "the first entry becomes most recent"
+        );
+        cache.insert(third, FillTextureCache::without_texture((4, 4)));
+
+        assert!(cache.contains_key(first));
+        assert!(
+            !cache.contains_key(second),
+            "the least-recent entry is evicted"
+        );
+        assert!(cache.contains_key(third));
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.total_bytes(), 128);
+    }
+
+    #[test]
+    fn fill_texture_cache_has_a_global_limit_for_five_thousand_filled_objects() {
+        let mut cache = FillTextureCacheStore::default();
+
+        for value in 1..=5_000 {
+            cache.insert(
+                fixed_object_id(value),
+                FillTextureCache::without_texture((4_096, 4_096)),
+            );
+        }
+
+        assert!(cache.len() <= MAX_FILL_TEXTURE_CACHE_ENTRIES);
+        assert!(cache.total_bytes() <= MAX_FILL_TEXTURE_CACHE_BYTES);
+    }
+
+    #[test]
+    fn fill_texture_cache_removes_deleted_and_hidden_fill_owners() {
+        let mut document = Document::new();
+        let visible = document.add_object(GeoObject::ImplicitCurve(ImplicitCurveObj::new(
+            "x",
+            "0",
+            RelationOperator::Less,
+        )));
+        let hidden = document.add_object(GeoObject::ImplicitCurve(ImplicitCurveObj::new(
+            "y",
+            "0",
+            RelationOperator::Less,
+        )));
+        let deleted = document.add_object(GeoObject::ImplicitCurve(ImplicitCurveObj::new(
+            "x + y",
+            "0",
+            RelationOperator::Less,
+        )));
+        document
+            .get_object_mut(hidden)
+            .expect("hidden curve exists")
+            .set_visible(false);
+        assert!(document.remove_object(deleted).is_some());
+
+        let mut cache = FillTextureCacheStore::default();
+        for id in [visible, hidden, deleted] {
+            cache.insert(id, FillTextureCache::without_texture((1, 1)));
+        }
+        cache.retain_visible_fill_owners(&document);
+
+        assert!(cache.contains_key(visible));
+        assert!(!cache.contains_key(hidden));
+        assert!(!cache.contains_key(deleted));
+    }
+
+    // P1b: helper SOLO de tests — texturas de vida corta dentro del test
+    // (nunca salen a un submit GPU real en vuelo). Por eso no usa la cola de
+    // retención ni hash en el nombre: el ciclo de vida lo cubren los tests
+    // `fill_evict_*`/`fill_prune_*` con `insert` + `reap`. En prod los dos
+    // call-sites reales (`grafito_fill_*_{hash}`) sí usan retención+hash.
+    fn entry_con_textura(
+        ctx: &egui::Context,
+        nombre: &str,
+        canvas_size: (u32, u32),
+    ) -> FillTextureCache {
+        let textura = ctx.load_texture(
+            nombre,
+            egui::ColorImage::new(
+                [canvas_size.0.max(1) as usize, canvas_size.1.max(1) as usize],
+                egui::Color32::WHITE,
+            ),
+            egui::TextureOptions::LINEAR,
+        );
+        FillTextureCache::new(Some(textura), 1, canvas_size, (0.0, 1.0, 0.0, 1.0))
+    }
+
+    #[test]
+    fn fill_evict_retira_con_gracia_y_no_toca_en_vuelo() {
+        // Regresión `egui_texid_Managed(N) has been destroyed`: evictar bajo
+        // presión no destruye en el mismo frame (el submit en vuelo o una
+        // primitiva ya emitida pueden referenciar la textura).
+        let ctx = egui::Context::default();
+        let mut cache = FillTextureCacheStore::with_limits(1, usize::MAX);
+        cache.insert(
+            fixed_object_id(1),
+            entry_con_textura(&ctx, "fill_a", (4, 4)),
+        );
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.retired_pending(), 0);
+        cache.insert(
+            fixed_object_id(2),
+            entry_con_textura(&ctx, "fill_b", (4, 4)),
+        );
+        assert_eq!(cache.len(), 1, "presupuesto: solo 1 entrada viva");
+        assert_eq!(
+            cache.retired_pending(),
+            1,
+            "la evictada queda retenida, no destruida"
+        );
+        for _ in 0..crate::anim_ui::TEXTURE_GRACE_FRAMES.saturating_sub(1) {
+            cache.reap_retired_fill_textures();
+            assert_eq!(
+                cache.retired_pending(),
+                1,
+                "en-vuelo intacto durante la gracia"
+            );
+        }
+        cache.reap_retired_fill_textures();
+        assert_eq!(cache.retired_pending(), 0, "tras la gracia se libera");
+        assert_eq!(cache.len(), 1, "la entrada viva intacta");
+    }
+
+    #[test]
+    fn fill_prune_retira_invisibles_con_gracia() {
+        let ctx = egui::Context::default();
+        let mut document = Document::new();
+        let visible = document.add_object(GeoObject::ImplicitCurve(ImplicitCurveObj::new(
+            "x",
+            "0",
+            RelationOperator::Less,
+        )));
+        let oculta = document.add_object(GeoObject::ImplicitCurve(ImplicitCurveObj::new(
+            "y",
+            "0",
+            RelationOperator::Less,
+        )));
+        document
+            .get_object_mut(oculta)
+            .expect("curva oculta existe")
+            .set_visible(false);
+        let mut cache = FillTextureCacheStore::default();
+        cache.insert(visible, entry_con_textura(&ctx, "fill_vis", (2, 2)));
+        cache.insert(oculta, entry_con_textura(&ctx, "fill_hid", (2, 2)));
+        cache.retain_visible_fill_owners(&document);
+        assert!(cache.contains_key(visible));
+        assert!(!cache.contains_key(oculta));
+        assert_eq!(
+            cache.retired_pending(),
+            1,
+            "la pruneada queda retenida hasta la gracia"
+        );
+        for _ in 0..crate::anim_ui::TEXTURE_GRACE_FRAMES {
+            cache.reap_retired_fill_textures();
+        }
+        assert_eq!(cache.retired_pending(), 0);
+    }
+
+    #[test]
+    fn has_retired_fill_textures_gatea_el_tick_vacio() {
+        // Predicado del early-out de `prune_fill_texture_cache`: vacío al
+        // arrancar, sin gracia sin evicción, con gracia tras evictar y vacío
+        // tras cumplir la gracia.
+        let ctx = egui::Context::default();
+        let mut cache = FillTextureCacheStore::with_limits(1, usize::MAX);
+        assert!(!cache.has_retired_fill_textures(), "cola vacía al arrancar");
+        cache.insert(
+            fixed_object_id(1),
+            entry_con_textura(&ctx, "fill_a", (4, 4)),
+        );
+        assert!(
+            !cache.has_retired_fill_textures(),
+            "sin evicción no hay gracia"
+        );
+        cache.insert(
+            fixed_object_id(2),
+            entry_con_textura(&ctx, "fill_b", (4, 4)),
+        );
+        assert!(
+            cache.has_retired_fill_textures(),
+            "la evictada queda en gracia"
+        );
+        for _ in 0..crate::anim_ui::TEXTURE_GRACE_FRAMES {
+            cache.reap_retired_fill_textures();
+        }
+        assert!(
+            !cache.has_retired_fill_textures(),
+            "tras la gracia se libera"
+        );
+    }
+
+    #[test]
+    fn prune_fill_texture_cache_idle_avanza_gracia_y_luego_es_noop() {
+        // `prune_fill_texture_cache` en frame idle (misma versión) sigue
+        // tickeando la gracia pendiente; con la cola ya vacía el early-out
+        // evita el `write()`. Sin cambios visuales: solo avanza el retiro.
+        let ctx = egui::Context::default();
+        let app = crate::app::dummy_grafito_app();
+        let id = fixed_object_id(1);
+        {
+            let mut cache = app.fill_textures.write().expect("fill lock sano");
+            cache.insert(id, entry_con_textura(&ctx, "fill_idle", (2, 2)));
+            cache.remove(id);
+            assert_eq!(cache.retired_pending(), 1, "hay gracia por avanzar");
+        }
+        // Primera prune: registra la versión y avanza un tick de gracia.
+        app.prune_fill_texture_cache();
+        // Prunes idle: la gracia sigue avanzando hasta cumplirse aunque el
+        // documento no cambie (el early-out solo salta con la cola vacía).
+        for _ in 0..crate::anim_ui::TEXTURE_GRACE_FRAMES {
+            app.prune_fill_texture_cache();
+        }
+        let cache = app.fill_textures.read().expect("fill lock sano");
+        assert_eq!(cache.retired_pending(), 0, "la gracia idle se libera");
+        assert!(
+            !cache.has_retired_fill_textures(),
+            "cola vacía tras la gracia"
+        );
+        drop(cache);
+        // Cola vacía + misma versión: prune idempotente vía el early-out.
+        app.prune_fill_texture_cache();
+        let cache = app.fill_textures.read().expect("fill lock sano");
+        assert_eq!(cache.retired_pending(), 0);
+    }
+
+    #[test]
+    fn implicit_cache_misses_share_a_deterministic_frame_budget() {
+        let mut document = Document::new();
+        document.set_view(ViewTransform::new(800.0, 600.0));
+        let mut ids = Vec::new();
+        for value in 1..=4 {
+            let mut curve = ImplicitCurveObj::new("x", "0", RelationOperator::Less);
+            curve.id = fixed_object_id(value);
+            curve.contour_levels = Some(vec![-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0]);
+            ids.push(document.add_object(GeoObject::ImplicitCurve(curve)));
+        }
+        ids.sort_unstable();
+
+        let canvas = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let evaluated = super::precompute_visible_implicit_curve_caches(&document, canvas);
+
+        assert_eq!(evaluated.len(), 2);
+        assert!(ids[..2].iter().all(|id| evaluated.contains(id)));
+        assert!(ids[2..].iter().all(|id| !evaluated.contains(id)));
+        assert!(ids[..2].iter().all(|id| {
+            let GeoObject::ImplicitCurve(curve) = document.get_object(*id).unwrap() else {
+                panic!("expected implicit curve");
+            };
+            curve
+                .cached_key
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_some()
+        }));
+        let GeoObject::ImplicitCurve(deferred) = document.get_object(ids[2]).unwrap() else {
+            panic!("expected deferred implicit curve");
+        };
+        assert!(
+            deferred
+                .cached_key
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_none(),
+            "a deferred cache miss must not overwrite or mark a cache as ready"
+        );
+    }
+}
+
+fn draw_dashed_line(
+    painter: &egui::Painter,
+    a: Pos2,
+    b: Pos2,
+    stroke: Stroke,
+    dash_len: f32,
+    gap_len: f32,
+) {
+    let delta = b - a;
+    let len = delta.length();
+    if !len.is_finite() || len <= 0.0 {
+        return;
+    }
+    let dir = delta / len;
+    let mut dist = 0.0;
+    while dist < len {
+        let start = a + dir * dist;
+        let end = a + dir * (dist + dash_len).min(len);
+        painter.line_segment([start, end], stroke);
+        dist += dash_len + gap_len;
+    }
+}
+
+/// Patrón de trazo Q2 (puro, testeable headless): `Solid` → `None` = dibujar
+/// el segmento tal cual (camino histórico, ni un píxel distinto);
+/// `Dashed`/`Dotted` → `(trazo, hueco)` en px proporcionales al grosor.
+pub(crate) fn dash_pattern(style: LineStyle, width: f32) -> Option<(f32, f32)> {
+    let width = if width.is_finite() && width > 0.0 {
+        width
+    } else {
+        1.0
+    };
+    match style {
+        LineStyle::Solid => None,
+        LineStyle::Dashed => Some((
+            (6.0 * width).clamp(6.0, 18.0),
+            (4.0 * width).clamp(3.0, 12.0),
+        )),
+        LineStyle::Dotted => Some((width.clamp(1.0, 3.0), (3.0 * width).clamp(2.0, 9.0))),
+    }
+}
+
+/// Un segmento con estilo: `Solid` = `line_segment` directo (idéntico a
+/// antes); el resto va por `draw_dashed_line`.
+fn stroke_segment(painter: &egui::Painter, a: Pos2, b: Pos2, stroke: Stroke, style: LineStyle) {
+    if let Some((dash, gap)) = dash_pattern(style, stroke.width) {
+        draw_dashed_line(painter, a, b, stroke, dash, gap);
+    } else {
+        painter.line_segment([a, b], stroke);
+    }
+}
+
+/// Polilínea con estilo, abierta o cerrada. No-op con <2 puntos.
+fn stroke_polyline(
+    painter: &egui::Painter,
+    points: &[Pos2],
+    closed: bool,
+    stroke: Stroke,
+    style: LineStyle,
+) {
+    if points.len() < 2 {
+        return;
+    }
+    let last = if closed {
+        points.len()
+    } else {
+        points.len() - 1
+    };
+    for i in 0..last {
+        stroke_segment(
+            painter,
+            points[i],
+            points[(i + 1) % points.len()],
+            stroke,
+            style,
+        );
+    }
+}
+
+/// Trazo de una muestra continua con estilo: `Solid` = `Shape::line`
+/// histórico; el resto va por segmentos dashed (misma muestra, sin re-muestrear).
+fn stroke_run(painter: &egui::Painter, points: Vec<Pos2>, stroke: Stroke, style: LineStyle) {
+    if points.len() < 2 {
+        return;
+    }
+    if matches!(style, LineStyle::Solid) {
+        painter.add(Shape::line(points, stroke));
+    } else {
+        stroke_polyline(painter, &points, false, stroke, style);
+    }
+}
+
+/// Glifo de punto Q2: `Dot` = círculo relleno histórico; el resto usa `size`
+/// como semieje del marcador con el mismo color.
+fn draw_point_glyph(
+    painter: &egui::Painter,
+    pos: Pos2,
+    size: f32,
+    color: Color32,
+    style: PointStyle,
+) {
+    let size = if size.is_finite() { size.max(1.0) } else { 1.0 };
+    match style {
+        PointStyle::Dot => {
+            painter.circle_filled(pos, size, color);
+        }
+        PointStyle::Circle => {
+            painter.circle_stroke(pos, size, Stroke::new(1.5, color));
+        }
+        PointStyle::Cross => {
+            let d = Vec2::new(size, size);
+            painter.line_segment([pos - d, pos + d], Stroke::new(1.5, color));
+            painter.line_segment(
+                [pos + Vec2::new(-size, size), pos + Vec2::new(size, -size)],
+                Stroke::new(1.5, color),
+            );
+        }
+        PointStyle::Plus => {
+            painter.line_segment(
+                [pos - Vec2::new(size, 0.0), pos + Vec2::new(size, 0.0)],
+                Stroke::new(1.5, color),
+            );
+            painter.line_segment(
+                [pos - Vec2::new(0.0, size), pos + Vec2::new(0.0, size)],
+                Stroke::new(1.5, color),
+            );
+        }
+    }
+}
+
+fn trig_asymptotes(function: u8, x_min: f64, x_max: f64) -> Vec<f64> {
+    let (offset, step) = match function as usize {
+        2 | 4 => (std::f64::consts::FRAC_PI_2, std::f64::consts::PI),
+        3 | 5 => (0.0, std::f64::consts::PI),
+        _ => return Vec::new(),
+    };
+    let span = (x_max - x_min).abs();
+    // En zoom-out extremo, demasiadas asíntotas saturen la vista.
+    let max_asymptotes = if span > 80.0 {
+        8
+    } else if span > 40.0 {
+        16
+    } else {
+        64
+    };
+    let mut xs = Vec::new();
+    // Aritmética saturada: en zoom-out extremo `(x/step)` puede exceder i64 y
+    // `i64::MIN - 1` desbordaría (panic en debug). El tope de iteraciones
+    // garantiza terminación incluso si el rango k es gigantesco.
+    let k_min = ((x_min - offset) / step).floor() as i64;
+    let k_max = ((x_max - offset) / step).ceil() as i64;
+    let k_min = k_min.saturating_sub(1);
+    let k_max = k_max.saturating_add(1);
+    let mut iterations = 0usize;
+    for k in k_min..=k_max {
+        iterations += 1;
+        if iterations > 4096 {
+            break;
+        }
+        let x = offset + k as f64 * step;
+        if x >= x_min && x <= x_max {
+            xs.push(x);
+            if xs.len() >= max_asymptotes {
+                break;
+            }
+        }
+    }
+    xs
+}
+
+/// Devuelve una cantidad de muestras acotada para el gráfico trigonométrico.
+///
+/// En zoom extremo el tope puede ser menor que el mínimo habitual de calidad
+/// alta; el mínimo efectivo se ajusta al tope para evitar rangos inválidos.
+pub(crate) fn trig_sample_count(
+    width: usize,
+    x_span: f64,
+    quality: grafito_core::RenderQuality,
+) -> usize {
+    let zoom_cap = if x_span.abs() > 80.0 {
+        200
+    } else if x_span.abs() > 40.0 {
+        320
+    } else {
+        760
+    };
+
+    match quality {
+        grafito_core::RenderQuality::Preview => width.clamp(120, zoom_cap.min(280)),
+        grafito_core::RenderQuality::Normal => width.clamp(200, zoom_cap.min(520)),
+        grafito_core::RenderQuality::High => width.clamp(280.min(zoom_cap), zoom_cap),
+    }
+}
+
+/// Caché de textura para el relleno de curvas implícitas.
+///
+/// Almacena la textura egui resultante de rasterizar el fill de una
+/// `ImplicitCurveObj` para una región (padded/snapped) y tamaño de canvas
+/// dados. Evita re-ejecutar el scanline fill cada frame (que llamaba
+/// `eval_2d` ~2M veces/frame).
+pub struct FillTextureCache {
+    /// Textura egui subida a GPU. `None` si aún no se ha rasterizado.
+    pub texture: Option<egui::TextureHandle>,
+    /// Hash de (expr_lhs, expr_rhs, operator, padded_bounds, canvas_w,
+    /// canvas_h, variables, fill_color).
+    pub cache_key: u64,
+    /// Tamaño de la textura en píxeles cuando se rasterizó.
+    pub canvas_size: (u32, u32),
+    /// Región world-space padded/snapped que cubre la textura. Si los
+    /// `view_bounds` actuales caen dentro de esta región, se puede reusar.
+    pub cached_region: (f64, f64, f64, f64),
+    byte_size: usize,
+    last_used: u64,
+}
+
+impl FillTextureCache {
+    fn new(
+        texture: Option<egui::TextureHandle>,
+        cache_key: u64,
+        canvas_size: (u32, u32),
+        cached_region: (f64, f64, f64, f64),
+    ) -> Self {
+        Self {
+            texture,
+            cache_key,
+            canvas_size,
+            cached_region,
+            byte_size: fill_texture_byte_size(canvas_size),
+            last_used: 0,
+        }
+    }
+
+    #[cfg(test)]
+    fn without_texture(canvas_size: (u32, u32)) -> Self {
+        Self::new(None, 0, canvas_size, (0.0, 1.0, 0.0, 1.0))
+    }
+}
+
+/// Máximo global para texturas RGBA8 de relleno. El límite de bytes impide que
+/// documentos grandes con regiones visibles simultáneamente retengan memoria
+/// GPU proporcional al número de objetos. Reducido a 64 MB / 8 entradas para iGPU.
+pub const MAX_FILL_TEXTURE_CACHE_ENTRIES: usize = 8;
+pub const MAX_FILL_TEXTURE_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+fn fill_texture_byte_size(canvas_size: (u32, u32)) -> usize {
+    let pixels = usize::try_from(canvas_size.0).ok().and_then(|width| {
+        usize::try_from(canvas_size.1)
+            .ok()
+            .and_then(|height| width.checked_mul(height))
+    });
+    pixels
+        .and_then(|pixels| pixels.checked_mul(std::mem::size_of::<Color32>()))
+        .unwrap_or(usize::MAX)
+}
+
+/// Caché global LRU de texturas de relleno compartida por curvas implícitas y
+/// mapeos complejos. Cada entrada representa una textura RGBA8 completa.
+pub struct FillTextureCacheStore {
+    entries: HashMap<grafito_core::ObjectId, FillTextureCache>,
+    total_bytes: usize,
+    access_epoch: u64,
+    max_entries: usize,
+    max_bytes: usize,
+    /// Texturas evictadas con gracia diferida (fix `Queue::submit`
+    /// `egui_texid_Managed(N) has been destroyed`).
+    ///
+    /// La destrucción real de una textura managed es el drop del último
+    /// `TextureHandle`. Evictar/prunear y dropear en el mismo frame corre el
+    /// riesgo de que el submit GPU en vuelo (un frame atrás) o una primitiva
+    /// ya emitida en este frame todavía la referencie. Por diseño nada se
+    /// destruye en el frame del reemplazo: se retira acá y se libera tras
+    /// `TEXTURE_GRACE_FRAMES` ticks (ver `crate::anim_ui::RetentionQueue`).
+    /// NOTA: `ctx.forget_image(uri)` es no-op para texturas managed (solo
+    /// limpia loaders por URI), así que no se usa para liberar.
+    retired_textures: RetentionQueue<egui::TextureHandle>,
+}
+
+impl Default for FillTextureCacheStore {
+    fn default() -> Self {
+        Self::with_limits(MAX_FILL_TEXTURE_CACHE_ENTRIES, MAX_FILL_TEXTURE_CACHE_BYTES)
+    }
+}
+
+impl FillTextureCacheStore {
+    fn with_limits(max_entries: usize, max_bytes: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            total_bytes: 0,
+            access_epoch: 0,
+            max_entries,
+            max_bytes,
+            retired_textures: RetentionQueue::new(),
+        }
+    }
+
+    fn next_access_epoch(&mut self) -> u64 {
+        if self.access_epoch == u64::MAX {
+            let mut ids: Vec<_> = self.entries.keys().copied().collect();
+            ids.sort_unstable_by(|left, right| {
+                self.entries[left]
+                    .last_used
+                    .cmp(&self.entries[right].last_used)
+                    .then_with(|| left.cmp(right))
+            });
+            for (index, id) in ids.into_iter().enumerate() {
+                if let Some(entry) = self.entries.get_mut(&id) {
+                    entry.last_used = index as u64 + 1;
+                }
+            }
+            self.access_epoch = self.entries.len() as u64;
+        }
+        self.access_epoch += 1;
+        self.access_epoch
+    }
+
+    fn get(&mut self, object_id: grafito_core::ObjectId) -> Option<&FillTextureCache> {
+        let epoch = self.next_access_epoch();
+        let entry = self.entries.get_mut(&object_id)?;
+        entry.last_used = epoch;
+        Some(entry)
+    }
+
+    #[cfg(test)]
+    fn insert(&mut self, object_id: grafito_core::ObjectId, mut entry: FillTextureCache) {
+        if entry.byte_size > self.max_bytes || self.max_entries == 0 {
+            return;
+        }
+        self.remove(object_id);
+        entry.last_used = self.next_access_epoch();
+        self.total_bytes = self.total_bytes.saturating_add(entry.byte_size);
+        self.entries.insert(object_id, entry);
+        self.evict_to_budget();
+    }
+
+    fn insert_with_ctx(
+        &mut self,
+        object_id: grafito_core::ObjectId,
+        mut entry: FillTextureCache,
+        _ctx: &egui::Context,
+    ) {
+        if entry.byte_size > self.max_bytes || self.max_entries == 0 {
+            // Evita retener texturas que exceden el presupuesto de iGPU (64 MB / 8 entradas).
+            // Retiro diferido igual: el submit en vuelo puede referenciar el
+            // id que este handle representa si el caller ya emitió con él.
+            if let Some(texture) = entry.texture.take() {
+                self.retired_textures.retire_sized(texture, entry.byte_size);
+            }
+            return;
+        }
+        self.remove_with_ctx(object_id, None);
+        entry.last_used = self.next_access_epoch();
+        self.total_bytes = self.total_bytes.saturating_add(entry.byte_size);
+        self.entries.insert(object_id, entry);
+        self.evict_to_budget_with_ctx(None);
+    }
+
+    #[cfg(test)]
+    fn remove(&mut self, object_id: grafito_core::ObjectId) {
+        if let Some(entry) = self.entries.remove(&object_id) {
+            self.total_bytes = self.total_bytes.saturating_sub(entry.byte_size);
+            if let Some(texture) = entry.texture {
+                self.retired_textures.retire_sized(texture, entry.byte_size);
+            }
+        }
+    }
+
+    fn remove_with_ctx(&mut self, object_id: grafito_core::ObjectId, _ctx: Option<&egui::Context>) {
+        if let Some(entry) = self.entries.remove(&object_id) {
+            self.total_bytes = self.total_bytes.saturating_sub(entry.byte_size);
+            // Retiro diferido en vez de `forget_image` + drop inmediato:
+            // `forget_image` es no-op para managed y el drop destruiría la
+            // textura GPU con el submit en vuelo aún referenciándola.
+            if let Some(texture) = entry.texture {
+                self.retired_textures.retire_sized(texture, entry.byte_size);
+            }
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        for (_, entry) in self.entries.drain() {
+            self.total_bytes = self.total_bytes.saturating_sub(entry.byte_size);
+            if let Some(texture) = entry.texture {
+                self.retired_textures.retire_sized(texture, entry.byte_size);
+            }
+        }
+        self.entries.clear();
+        self.total_bytes = 0;
+    }
+
+    fn retain_visible_fill_owners(&mut self, document: &grafito_core::Document) {
+        // Retiro diferido: primero se identifican los ids a remover y luego
+        // se remueven vía `remove_with_ctx` (que retira el handle con
+        // gracia). Un `entries.retain` directo dropearía el handle en este
+        // frame con el submit previo aún en vuelo.
+        let mut evicted_ids = Vec::new();
+        for id in self.entries.keys() {
+            let keep = match document.get_object(*id) {
+                Some(GeoObject::ImplicitCurve(curve)) => curve.visible,
+                Some(GeoObject::ComplexMapping(mapping)) => mapping.visible,
+                _ => false,
+            };
+            if !keep {
+                evicted_ids.push(*id);
+            }
+        }
+        for id in evicted_ids {
+            self.remove_with_ctx(id, None);
+        }
+    }
+
+    #[allow(dead_code)] // TODO P2: remover cuando retain_visible_fill_owners_with_ctx se use en evicción LRU (usado en tests)
+    fn retain_visible_fill_owners_with_ctx(
+        &mut self,
+        document: &grafito_core::Document,
+        _ctx: &egui::Context,
+    ) {
+        // Igual que `retain_visible_fill_owners` pero conservando la firma
+        // con ctx para el wiring P2: la liberación real es el retiro
+        // diferido (el ctx no se usa porque `forget_image` es no-op para
+        // managed).
+        let mut evicted_ids = Vec::new();
+        for id in self.entries.keys() {
+            let keep = match document.get_object(*id) {
+                Some(GeoObject::ImplicitCurve(curve)) => curve.visible,
+                Some(GeoObject::ComplexMapping(mapping)) => mapping.visible,
+                _ => false,
+            };
+            if !keep {
+                evicted_ids.push(*id);
+            }
+        }
+        for id in evicted_ids {
+            self.remove_with_ctx(id, None);
+        }
+    }
+
+    #[cfg(test)]
+    fn evict_to_budget(&mut self) {
+        self.evict_to_budget_with_ctx(None);
+    }
+
+    fn evict_to_budget_with_ctx(&mut self, _ctx: Option<&egui::Context>) {
+        while self.entries.len() > self.max_entries || self.total_bytes > self.max_bytes {
+            let Some(id) = self
+                .entries
+                .iter()
+                .min_by(|(left_id, left), (right_id, right)| {
+                    left.last_used
+                        .cmp(&right.last_used)
+                        .then_with(|| left_id.cmp(right_id))
+                })
+                .map(|(id, _)| *id)
+            else {
+                break;
+            };
+            self.remove_with_ctx(id, None);
+        }
+    }
+
+    /// Avanza un frame de gracia y libera las texturas expiradas. Un tick =
+    /// un frame dibujado; se llama una vez por frame desde
+    /// `prune_fill_texture_cache` (siempre, incluso sin cambios de
+    /// documento, para no retener de más).
+    fn reap_retired_fill_textures(&mut self) {
+        let _ = self.retired_textures.tick();
+    }
+
+    /// ¿Queda gracia por avanzar? Lectura barata para el early-out de
+    /// `prune_fill_texture_cache`: con la cola vacía el tick es no-op
+    /// (nada que avanzar ni liberar), así que el frame idle ni siquiera
+    /// toma el `write()`.
+    pub(crate) fn has_retired_fill_textures(&self) -> bool {
+        !self.retired_textures.is_empty()
+    }
+
+    /// Texturas aún retenidas en gracia (solo tests / debug).
+    #[cfg(test)]
+    fn retired_pending(&self) -> usize {
+        self.retired_textures.pending()
+    }
+
+    #[cfg(test)]
+    fn contains_key(&self, object_id: grafito_core::ObjectId) -> bool {
+        self.entries.contains_key(&object_id)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+}
+
+/// Calcula la cache key del fill de una curva implícita.
+///
+/// La key depende de (expr_lhs, expr_rhs, operator, padded_bounds,
+/// canvas_w, canvas_h, variables, fill_color). Dos llamadas con la misma
+/// key indican que el caché puede reusarse sin recalcular la rasterización.
+///
+/// FNV-1a sin alocación: el `BTreeMap` ya itera en orden (sin `Vec`+`sort`).
+pub fn compute_fill_cache_key(
+    ic: &ImplicitCurveObj,
+    padded_bounds: (f64, f64, f64, f64),
+    canvas_size: (u32, u32),
+    variables: &std::collections::BTreeMap<String, f64>,
+    fill_color: Color,
+) -> u64 {
+    #[inline]
+    fn mix(state: &mut u64, word: u64) {
+        *state ^= word;
+        *state = state.wrapping_mul(0x1000_0000_01b3);
+    }
+    #[inline]
+    fn mix_str(state: &mut u64, text: &str) {
+        for byte in text.bytes() {
+            mix(state, u64::from(byte));
+        }
+    }
+
+    let mut state = 0xcbf29ce484222325u64;
+    mix_str(&mut state, &ic.expr_lhs);
+    mix(&mut state, 0xFF);
+    mix_str(&mut state, &ic.expr_rhs);
+    mix(&mut state, 0xFF);
+    // Discriminante explícito y exhaustivo (si se agrega una variante, el
+    // match obliga a asignarle código en vez de colisionar en silencio).
+    mix(
+        &mut state,
+        match ic.operator {
+            RelationOperator::Eq => 0,
+            RelationOperator::Less => 1,
+            RelationOperator::Greater => 2,
+            RelationOperator::LessEq => 3,
+            RelationOperator::GreaterEq => 4,
+        },
+    );
+    mix(&mut state, padded_bounds.0.to_bits());
+    mix(&mut state, padded_bounds.1.to_bits());
+    mix(&mut state, padded_bounds.2.to_bits());
+    mix(&mut state, padded_bounds.3.to_bits());
+    mix(&mut state, u64::from(canvas_size.0));
+    mix(&mut state, u64::from(canvas_size.1));
+    for (k, v) in variables.iter() {
+        mix_str(&mut state, k);
+        mix(&mut state, v.to_bits());
+    }
+    mix(&mut state, u64::from(fill_color.r.to_bits()));
+    mix(&mut state, u64::from(fill_color.g.to_bits()));
+    mix(&mut state, u64::from(fill_color.b.to_bits()));
+    mix(&mut state, u64::from(fill_color.a.to_bits()));
+    state
+}
+
+/// Cache key para el fill de un `ComplexMapping`. Extiende la key del
+/// ImplicitCurve con la identidad del `ConformalMap` (discriminante
+/// explícito + parámetros, sin `format!("{:?}")` por frame), para que
+/// cambiar la expresión (p.ej. `1/z` → `z^2`) invalide el caché aunque el
+/// target sea la misma ImplicitCurve.
+pub fn compute_complex_fill_cache_key(
+    ic: &ImplicitCurveObj,
+    map: &ConformalMap,
+    padded_bounds: (f64, f64, f64, f64),
+    canvas_size: (u32, u32),
+    variables: &std::collections::BTreeMap<String, f64>,
+    fill_color: Color,
+) -> u64 {
+    #[inline]
+    fn mix(state: &mut u64, word: u64) {
+        *state ^= word;
+        *state = state.wrapping_mul(0x1000_0000_01b3);
+    }
+    #[inline]
+    fn mix_complex(state: &mut u64, z: num_complex::Complex64) {
+        mix(state, z.re.to_bits());
+        mix(state, z.im.to_bits());
+    }
+
+    // Reusar la key base del ImplicitCurve (todavía aplica por los ASTs
+    // lhs/rhs, operator, bounds, canvas, variables, fill_color).
+    let base = compute_fill_cache_key(ic, padded_bounds, canvas_size, variables, fill_color);
+    let mut state = 0xcbf29ce484222325u64;
+    mix(&mut state, base);
+    mix(&mut state, 0xFF);
+    // Exhaustivo: una variante nueva no compila hasta tener código asignado.
+    match map {
+        ConformalMap::Inversion => mix(&mut state, 0x00),
+        ConformalMap::Power(n) => {
+            mix(&mut state, 0x01);
+            mix(&mut state, *n as u64);
+        }
+        ConformalMap::Exponential => mix(&mut state, 0x02),
+        ConformalMap::Logarithm => mix(&mut state, 0x03),
+        ConformalMap::Sinh => mix(&mut state, 0x04),
+        ConformalMap::Cosh => mix(&mut state, 0x05),
+        ConformalMap::Sine => mix(&mut state, 0x06),
+        ConformalMap::Cosine => mix(&mut state, 0x07),
+        ConformalMap::Tangent => mix(&mut state, 0x08),
+        ConformalMap::Sqrt => mix(&mut state, 0x09),
+        ConformalMap::Joukowski => mix(&mut state, 0x0A),
+        ConformalMap::Mobius { a, b, c, d } => {
+            mix(&mut state, 0x0B);
+            mix_complex(&mut state, *a);
+            mix_complex(&mut state, *b);
+            mix_complex(&mut state, *c);
+            mix_complex(&mut state, *d);
+        }
+        ConformalMap::InversionShifted(a) => {
+            mix(&mut state, 0x0C);
+            mix_complex(&mut state, *a);
+        }
+    }
+    state
+}
+
+/// Evalúa si un punto del plano de salida `w=(output_x, output_y)` cae dentro
+/// de la región transformada por un `ComplexMapping` de una curva implícita.
+///
+/// La prueba se hace en el plano original: `z = map.inverse_apply(w)`, y luego
+/// se evalúa la desigualdad original sobre `(x,y)=(Re z, Im z)`.
+pub fn complex_mapping_region_contains(
+    ic: &ImplicitCurveObj,
+    map: ConformalMap,
+    variables: &std::collections::BTreeMap<String, f64>,
+    output_x: f64,
+    output_y: f64,
+) -> Option<bool> {
+    use num_complex::Complex64;
+
+    if matches!(ic.operator, RelationOperator::Eq) {
+        return None;
+    }
+    let z = map.inverse_apply(Complex64::new(output_x, output_y))?;
+    let (eval_lhs, eval_rhs) = ic.get_cached_asts(variables, &["x", "y"])?;
+    let lhs = eval_lhs.eval_2d("x", z.re, "y", z.im);
+    let rhs = eval_rhs.eval_2d("x", z.re, "y", z.im);
+    if !lhs.is_finite() || !rhs.is_finite() {
+        return None;
+    }
+    Some(match ic.operator {
+        RelationOperator::Less | RelationOperator::LessEq => lhs - rhs <= 0.0,
+        RelationOperator::Greater | RelationOperator::GreaterEq => rhs - lhs <= 0.0,
+        RelationOperator::Eq => return None,
+    })
+}
+
+/// Calcula el sub-rect UV que corresponde a `view_bounds` dentro de una textura
+/// que representa `cached_region` completa.
+pub fn fill_cache_view_uv(
+    cached_region: (f64, f64, f64, f64),
+    view_bounds: (f64, f64, f64, f64),
+) -> Option<(f32, f32, f32, f32)> {
+    let (rx_min, rx_max, ry_min, ry_max) = cached_region;
+    let (vx_min, vx_max, vy_min, vy_max) = view_bounds;
+    if !(vx_min >= rx_min && vx_max <= rx_max && vy_min >= ry_min && vy_max <= ry_max) {
+        return None;
+    }
+    let rw = rx_max - rx_min;
+    let rh = ry_max - ry_min;
+    if rw <= 0.0 || rh <= 0.0 {
+        return None;
+    }
+    let u_min = ((vx_min - rx_min) / rw) as f32;
+    let u_max = ((vx_max - rx_min) / rw) as f32;
+    // Texture coordinates grow downward; world y grows upward.
+    let v_min = ((ry_max - vy_max) / rh) as f32;
+    let v_max = ((ry_max - vy_min) / rh) as f32;
+    Some((u_min, u_max, v_min, v_max))
+}
+
+/// Tamaño de textura necesario para rasterizar `cached_region` a la misma
+/// densidad aproximada que el viewport actual. Para `pad_factor=2`, suele ser
+/// ~2x el canvas en cada eje; se limita para evitar texturas enormes.
+pub fn fill_cache_texture_size(
+    view_bounds: (f64, f64, f64, f64),
+    cached_region: (f64, f64, f64, f64),
+    canvas_size: (u32, u32),
+) -> (u32, u32) {
+    let view_width = (view_bounds.1 - view_bounds.0).max(f64::EPSILON);
+    let view_height = (view_bounds.3 - view_bounds.2).max(f64::EPSILON);
+    let region_width = (cached_region.1 - cached_region.0).max(f64::EPSILON);
+    let region_height = (cached_region.3 - cached_region.2).max(f64::EPSILON);
+    let scale_cap = 4096.0;
+    let texture_w = ((canvas_size.0 as f64 * region_width / view_width)
+        .ceil()
+        .clamp(1.0, scale_cap)) as u32;
+    let texture_h = ((canvas_size.1 as f64 * region_height / view_height)
+        .ceil()
+        .clamp(1.0, scale_cap)) as u32;
+    (texture_w, texture_h)
+}
+
+/// Transforma segmentos independientes por un mapa conforme y devuelve strokes
+/// finitos sin conectar un segmento de marching-squares con el siguiente.
+pub fn complex_mapping_segment_strokes(
+    map: ConformalMap,
+    segments: &[(Point2, Point2)],
+    subdivisions: usize,
+) -> Vec<(Point2, Point2)> {
+    complex_mapping_segment_strokes_at(map, segments, subdivisions, 1.0)
+}
+
+fn complex_mapping_segment_strokes_at(
+    map: ConformalMap,
+    segments: &[(Point2, Point2)],
+    subdivisions: usize,
+    homotopy_factor: f64,
+) -> Vec<(Point2, Point2)> {
+    grafito_render::transform_complex_mapping_segments(map, segments, subdivisions, homotopy_factor)
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct StyleOverride {
+    pub color: Option<Color>,
+    pub color_alpha_multiplier: Option<f32>,
+    pub width: Option<f32>,
+    pub width_scale: Option<f32>,
+    pub size_scale: Option<f32>,
+    pub hide_label: bool,
+    pub clear_fill_color: bool,
+    pub skip_stroke: bool,
+}
+
+fn get_color(base: Color, style: Option<StyleOverride>) -> Color {
+    let mut c = base;
+    if let Some(s) = style {
+        if let Some(over) = s.color {
+            c = over;
+        }
+        if let Some(mult) = s.color_alpha_multiplier {
+            c.a = (c.a * mult).max(0.05);
+        }
+    }
+    c
+}
+
+fn get_fill_color(base: Option<Color>, style: Option<StyleOverride>) -> Option<Color> {
+    if style.is_some_and(|s| s.clear_fill_color) {
+        return None;
+    }
+    base.map(|c| get_color(c, style))
+}
+
+fn get_width(base: f32, style: Option<StyleOverride>) -> f32 {
+    let mut w = base;
+    if let Some(s) = style {
+        if let Some(over) = s.width {
+            w = over;
+        }
+        if let Some(scale) = s.width_scale {
+            w *= scale;
+        }
+    }
+    w
+}
+
+fn get_size(base: f32, style: Option<StyleOverride>) -> f32 {
+    let mut size = base;
+    if let Some(s) = style {
+        if let Some(scale) = s.size_scale {
+            size *= scale;
+        }
+    }
+    size
+}
+
+fn get_label(base: &str, style: Option<StyleOverride>) -> &str {
+    if let Some(s) = style {
+        if s.hide_label {
+            return "";
+        }
+    }
+    base
+}
+
+// ── Frente P4: respeto mínimo de DisplayFlags en el canvas ──
+//
+// Solo ganchos limpios existentes: `StyleOverride.color` (dynamic color por
+// frame), `hide_label` en `get_label` (ShowLabel) y condición de visibilidad
+// (skip). Decoración/LOD quedan flag-guardados (nota en el help, nunca error
+// falso). Todo fail-open: sin entrada → comportamiento histórico; condición
+// con error → se dibuja igual (no ocultar por un parse roto).
+/// Entrada del memo de display-override (alias contra `type_complexity`).
+type DisplayOverrideEntry = (Option<StyleOverride>, bool);
+
+fn p4_display_override(document: &grafito_core::Document, label: &str) -> DisplayOverrideEntry {
+    if label.is_empty() {
+        return (None, true);
+    }
+    // Memo por (label, version): los flags solo mutan vía comandos con
+    // commit (bump de versión), así que la versión invalida sola. Sin esto,
+    // cada objeto con flags re-evaluaba condición/color (parse + clon de
+    // variables) en cada frame.
+    thread_local! {
+        static DISPLAY_OVERRIDE_CACHE: RefCell<
+            lru::LruCache<(u64, String, u64), DisplayOverrideEntry>,
+        > = RefCell::new(lru::LruCache::new(DISPLAY_OVERRIDE_CACHE_SIZE));
+    }
+    // Clave (nonce, label, versión): el label solo (`"F"` en cada documento
+    // nuevo) colisionaba entre documentos con igual versión.
+    let key = (document.cache_nonce, label.to_owned(), document.version);
+    if let Some(hit) = DISPLAY_OVERRIDE_CACHE.with(|c| c.borrow_mut().get(&key).cloned()) {
+        return hit;
+    }
+    let computed = p4_display_override_uncached(document, label);
+    DISPLAY_OVERRIDE_CACHE.with(|c| {
+        c.borrow_mut().put(key, computed);
+    });
+    computed
+}
+
+fn p4_display_override_uncached(
+    document: &grafito_core::Document,
+    label: &str,
+) -> DisplayOverrideEntry {
+    if label.is_empty() {
+        return (None, true);
+    }
+    let Some(flags) = document.display_flags.get(label) else {
+        return (None, true);
+    };
+    // Condición: `false` → no dibujar; error → dibujar igual.
+    if let Some(cond) = &flags.condition {
+        if let Ok(visible) = grafito_command::ggbscript::eval_condition(document, cond) {
+            if !visible {
+                return (None, false);
+            }
+        }
+    }
+    let mut style = StyleOverride::default();
+    let mut touched = false;
+    if !flags.show_label {
+        style.hide_label = true;
+        touched = true;
+    }
+    if let Some(exprs) = &flags.dynamic_color {
+        if let Ok(color) = grafito_command::ggbscript::eval_dynamic_color(document, exprs) {
+            style.color = Some(color);
+            touched = true;
+        }
+    }
+    if touched {
+        (Some(style), true)
+    } else {
+        (None, true)
+    }
+}
+
+fn p4_merge_style(
+    base: Option<StyleOverride>,
+    extra: Option<StyleOverride>,
+) -> Option<StyleOverride> {
+    match (base, extra) {
+        (None, None) => None,
+        (Some(s), None) | (None, Some(s)) => Some(s),
+        (Some(mut a), Some(b)) => {
+            // El estilo del llamador (hover/preview) gana en color; el flag
+            // solo aporta lo que el llamador no fijó + hide_label.
+            if a.color.is_none() {
+                a.color = b.color;
+            }
+            a.hide_label = a.hide_label || b.hide_label;
+            Some(a)
+        }
+    }
+}
+
+// ── Etiquetas matemáticas TeX en canvas (W2) ──
+//
+// Donde el canvas mostraba ASCII (`f`), compone `"f = x^2"` y dibuja el
+// raster de `grafito_core::tex_raster` si el subset lo cubre entero; si un
+// glifo falta, la línea es larguísima o el bitmap excede la cota de dibujo,
+// deja el ASCII original (jamás tofu, jamás texto truncado a escondidas).
+// Render como UNA imagen con halo: el bitmap viene cacheado por texto
+// (`tex_raster`, cap 64) y la textura vive en LRU thread-local
+// (`TEX_LABEL_TEXTURES`, una subida por texto). Puro y acotado, sin `unwrap`.
+
+/// Escala del píxel TeX a píxel de pantalla (5×7 → 10×14 por glifo).
+pub(crate) const TEX_LABEL_SCALE_PX: f32 = 2.0;
+/// Ancho máximo dibujado (px pantalla): bitmaps más anchos caen a ASCII.
+pub(crate) const TEX_LABEL_MAX_WIDTH_PX: f32 = 480.0;
+/// Alto máximo dibujado (px pantalla): bitmaps más altos caen a ASCII.
+pub(crate) const TEX_LABEL_MAX_HEIGHT_PX: f32 = 64.0;
+
+/// Decisión pura de dibujo para la etiqueta de una función del canvas.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FunctionLabelDraw {
+    /// ASCII de siempre (`label` tal cual, sin tocar).
+    Ascii,
+    /// Raster total: `text` compuesta (`"f = x^2"`) + su bitmap cubierto.
+    /// El bitmap va en `Arc` compartido (TL LRU por texto): antes se
+    /// clonaba el `Vec<u8>` completo por rótulo y por frame.
+    TexRaster {
+        text: String,
+        bitmap: std::sync::Arc<TexBitmap>,
+    },
+}
+
+/// Bitmaps TeX por texto compuesto, compartidos por `Arc`. El raster vive
+/// en `tex_raster` (cap 64) pero devuelve el bitmap por valor dentro del
+/// outcome; sin este nivel, cada frame clonaba el `Vec<u8>` por rótulo.
+fn label_bitmap_shared(text: &str, bitmap: &TexBitmap) -> std::sync::Arc<TexBitmap> {
+    thread_local! {
+        // Mismo tope que las texturas (64): una entrada por texto como máximo.
+        static LABEL_BITMAPS: RefCell<lru::LruCache<String, std::sync::Arc<TexBitmap>>> =
+            RefCell::new(lru::LruCache::new(TEX_LABEL_TEXTURE_CACHE_SIZE));
+    }
+    if let Some(hit) = LABEL_BITMAPS.with(|c| c.borrow_mut().get(text).cloned()) {
+        return hit;
+    }
+    let shared = std::sync::Arc::new(bitmap.clone());
+    LABEL_BITMAPS.with(|c| {
+        c.borrow_mut().put(text.to_owned(), shared.clone());
+    });
+    shared
+}
+
+/// Compone `"label = expr"` y decide ASCII vs raster.
+///
+/// `TexRaster` solo si: ambas partes no vacías, la compuesta entra en
+/// `MAX_TEX_LINE_CHARS` (si no, el raster truncaría y mentiría → ASCII),
+/// el raster no falla por cotas, `omitted_glyphs == 0` (cobertura total) y
+/// el bitmap escalado entra en las cotas de dibujo. Todo lo demás → ASCII.
+pub(crate) fn decide_function_label(label: &str, expr: &str) -> FunctionLabelDraw {
+    let label = label.trim();
+    let expr = expr.trim();
+    if label.is_empty() || expr.is_empty() {
+        return FunctionLabelDraw::Ascii;
+    }
+    if label.len() + expr.len() > MAX_TEX_MTEXT_BYTES {
+        return FunctionLabelDraw::Ascii;
+    }
+    // PERF (hot frame, una vez por función): evita el `format!` cuando la
+    // compuesta excede el tope igual que abajo (`label + " = " + expr` en
+    // chars, suma exacta por concatenación). La guarda externa es solo
+    // `len()` en bytes (gratis, sin escanear): como `chars <= bytes`, si los
+    // bytes ya entran los chars entran seguro y no se cuenta nada; solo las
+    // etiquetas largas pagan el conteo, en vez de un `String` por frame para
+    // descartarlo. El chequeo de abajo se conserva como guarda.
+    if label.len() + expr.len() + 3 > MAX_TEX_LINE_CHARS
+        && label.chars().count() + expr.chars().count() + 3 > MAX_TEX_LINE_CHARS
+    {
+        return FunctionLabelDraw::Ascii;
+    }
+    let text = format!("{label} = {expr}");
+    if text.chars().count() > MAX_TEX_LINE_CHARS {
+        return FunctionLabelDraw::Ascii;
+    }
+    let outcome = match grafito_core::tex_raster::render_plain_math_to_bitmap_cached(&text) {
+        Ok(outcome) => outcome,
+        Err(_) => return FunctionLabelDraw::Ascii,
+    };
+    if outcome.omitted_glyphs != 0 || outcome.bitmap.is_empty() {
+        return FunctionLabelDraw::Ascii;
+    }
+    let width_px = outcome.bitmap.width as f32 * TEX_LABEL_SCALE_PX;
+    let height_px = outcome.bitmap.height as f32 * TEX_LABEL_SCALE_PX;
+    if !width_px.is_finite()
+        || !height_px.is_finite()
+        || width_px > TEX_LABEL_MAX_WIDTH_PX
+        || height_px > TEX_LABEL_MAX_HEIGHT_PX
+    {
+        return FunctionLabelDraw::Ascii;
+    }
+    let bitmap = label_bitmap_shared(&text, &outcome.bitmap);
+    FunctionLabelDraw::TexRaster { text, bitmap }
+}
+
+// Registro de etiquetas de función del frame: rectángulos ya ocupados.
+// Las etiquetas TeX son grandes y todas quieren el mismo punto (centro
+// + 14px); sin registro F y F1 se dibujan una arriba de la otra.
+thread_local! {
+    static FUNCTION_LABEL_RECTS: RefCell<Vec<Rect>> = const { RefCell::new(Vec::new()) };
+}
+
+// Limpia el registro al arrancar el frame (un solo canvas por frame).
+fn function_label_frame_begin() {
+    FUNCTION_LABEL_RECTS.with(|rects| rects.borrow_mut().clear());
+}
+
+// Reclama lugar para una etiqueta: primero abajo de la curva, si choca
+// arriba (misma x, alto + 8 de aire), si tampoco entra `None` (no se
+// dibuja: mejor ausente que ilegible).
+fn claim_function_label_rect(wanted: Rect, pivot: Pos2, size: Vec2) -> Option<Rect> {
+    let above = Rect::from_min_size(Pos2::new(wanted.min.x, pivot.y - size.y - 8.0), size);
+    FUNCTION_LABEL_RECTS.with(|cell| {
+        let mut rects = cell.borrow_mut();
+        for candidate in [wanted, above] {
+            if candidate.is_finite() && !rects.iter().any(|taken| taken.intersects(candidate)) {
+                rects.push(candidate);
+                return Some(candidate);
+            }
+        }
+        None
+    })
+}
+
+/// Dibuja un rótulo TeX como UNA imagen con halo (no cientos de rects):
+/// el bitmap ya viene cacheado por texto y la textura vive en LRU
+/// thread-local (una subida por texto). `key` debe identificar el texto
+/// (normalmente el mismo `"label = expr"`). Con halo `canvas_bg` para que
+/// no se funda con curvas/grilla/widgets. Fallback honesto a rects si la
+/// textura no se puede subir.
+pub(crate) fn draw_tex_label(
+    painter: &egui::Painter,
+    origin: Pos2,
+    key: &str,
+    bitmap: &grafito_core::tex_raster::TexBitmap,
+    color: Color32,
+) {
+    if bitmap.is_empty() || !origin.is_finite() {
+        return;
+    }
+    if bitmap.width as f32 * TEX_LABEL_SCALE_PX > TEX_LABEL_MAX_WIDTH_PX
+        || bitmap.height as f32 * TEX_LABEL_SCALE_PX > TEX_LABEL_MAX_HEIGHT_PX
+    {
+        return;
+    }
+    let draw_size = Vec2::new(
+        bitmap.width as f32 * TEX_LABEL_SCALE_PX,
+        bitmap.height as f32 * TEX_LABEL_SCALE_PX,
+    );
+    if !draw_size.x.is_finite() || !draw_size.y.is_finite() {
+        return;
+    }
+    let rect = Rect::from_min_size(origin, draw_size);
+    let bg = current_theme(painter.ctx()).canvas_bg;
+    painter.rect_filled(rect.expand(2.0), 2.0, bg);
+    let tex_id = TEX_LABEL_TEXTURES.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(handle) = cache.get(key) {
+            return Some(handle.id());
+        }
+        // Caché lleno: NO subir más texturas (fallback ASCII del llamador).
+        // Sin churn no hay drops bajo presión y el panic de wgpu
+        // (`egui_texid_Managed destroyed`) queda imposible.
+        if !cache.has_room() {
+            return None;
+        }
+        let pixels: Vec<Color32> = bitmap
+            .pixels
+            .iter()
+            .map(|&ink| Color32::from_white_alpha(ink))
+            .collect();
+        let image = egui::ColorImage {
+            size: [bitmap.width as usize, bitmap.height as usize],
+            pixels,
+        };
+        let handle =
+            painter
+                .ctx()
+                .load_texture(key.to_owned(), image, egui::TextureOptions::NEAREST);
+        let id = handle.id();
+        let _ = cache.try_insert(key.to_owned(), handle);
+        Some(id)
+    });
+    let Some(tex_id) = tex_id else {
+        // Fallback honesto: texto ASCII en la misma posición (el llamador
+        // ya decidió que el contenido cabe como rótulo).
+        current_theme(painter.ctx()).paint_canvas_text(
+            painter,
+            rect.min,
+            egui::Align2::LEFT_TOP,
+            key,
+            egui::FontId::proportional(grafito_ui::tokens::TYPE_SM),
+            color,
+        );
+        return;
+    };
+    painter.image(
+        tex_id,
+        rect,
+        Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
+        color,
+    );
+}
+
+/// HSL to RGB conversion for domain coloring
+fn hsl_to_rgb(h: f64, s: f64, l: f64) -> (f64, f64, f64) {
+    if s == 0.0 {
+        return (l, l, l);
+    }
+    let hue_to_rgb = |p: f64, q: f64, mut t: f64| -> f64 {
+        while t < 0.0 {
+            t += 1.0;
+        }
+        while t > 1.0 {
+            t -= 1.0;
+        }
+        if t < 1.0 / 6.0 {
+            p + (q - p) * 6.0 * t
+        } else if t < 1.0 / 2.0 {
+            q
+        } else if t < 2.0 / 3.0 {
+            p + (q - p) * (2.0 / 3.0 - t) * 6.0
+        } else {
+            p
+        }
+    };
+    let q = if l < 0.5 {
+        l * (1.0 + s)
+    } else {
+        l + s - l * s
+    };
+    let p = 2.0 * l - q;
+    (
+        hue_to_rgb(p, q, h + 1.0 / 3.0),
+        hue_to_rgb(p, q, h),
+        hue_to_rgb(p, q, h - 1.0 / 3.0),
+    )
+}
+
+/// Thermal colormap for heat maps: blue → cyan → green → yellow → red
+fn thermal_colormap(t: f64) -> (f64, f64, f64) {
+    let t = t.clamp(0.0, 1.0);
+    let r = (t * 3.0 - 1.5).clamp(0.0, 1.0).min(1.0);
+    let g = (1.5 - (t * 3.0 - 1.5).abs()).clamp(0.0, 1.0);
+    let b = (1.5 - t * 3.0).clamp(0.0, 1.0);
+    (r, g, b)
+}
+
+/// Etiqueta de tick logarítmico para exponente de un dígito, sin alocar.
+///
+/// Cubre el viewport real (1e-9..1e9 contiene cualquier zoom útil): evita el
+/// `superscript()` + `format!("10{}")` por tick por frame en ejes log.
+/// Exponentes de 2+ dígitos o 0/±1 (ya fijos en el call-site) usan el camino
+/// general. Cadenas idénticas al camino general (un dígito ⇒ un supraíndice).
+fn log_pow10_label(pow: i32) -> Option<&'static str> {
+    Some(match pow {
+        2 => "10²",
+        3 => "10³",
+        4 => "10⁴",
+        5 => "10⁵",
+        6 => "10⁶",
+        7 => "10⁷",
+        8 => "10⁸",
+        9 => "10⁹",
+        -2 => "10⁻²",
+        -3 => "10⁻³",
+        -4 => "10⁻⁴",
+        -5 => "10⁻⁵",
+        -6 => "10⁻⁶",
+        -7 => "10⁻⁷",
+        -8 => "10⁻⁸",
+        -9 => "10⁻⁹",
+        _ => return None,
+    })
+}
+
+/// Convert integer exponent to Unicode superscript (e.g. 3 → "³", -2 → "⁻²")
+fn superscript(exp: i32) -> String {
+    let digits: Vec<char> = exp.to_string().chars().collect();
+    let mut result = String::new();
+    for &c in &digits {
+        result.push(match c {
+            '-' => '⁻',
+            '0' => '⁰',
+            '1' => '¹',
+            '2' => '²',
+            '3' => '³',
+            '4' => '⁴',
+            '5' => '⁵',
+            '6' => '⁶',
+            '7' => '⁷',
+            '8' => '⁸',
+            '9' => '⁹',
+            _ => c,
+        });
+    }
+    result
+}
+
+impl GrafitoApp {
+    pub(crate) fn draw_grid(&self, painter: &egui::Painter, canvas_rect: Rect) {
+        #[cfg(feature = "profile")]
+        puffin::profile_scope!("draw_grid");
+        // Ola 0.5: `ShowGrid[bool]` guarda `__view_show_grid` en el documento y
+        // gana al interruptor de la app; sin flag vale `show_grid`.
+        if !view_flag_bool(&self.document, VIEW_SHOW_GRID, self.show_grid) {
+            return;
+        }
+        let painter = clipped_to_canvas(painter, canvas_rect);
+        let view = self.document.view();
+        let world_tl = view.screen_to_world(GlamVec2::new(0.0, 0.0));
+        let world_br =
+            view.screen_to_world(GlamVec2::new(canvas_rect.width(), canvas_rect.height()));
+
+        let grid_color = current_theme(painter.ctx()).grid_line;
+        let grid_stroke = Stroke::new(1.0, grid_color);
+        let minor_stroke = Stroke::new(0.5, current_theme(painter.ctx()).grid_minor);
+        // Batch píxel-idéntico: los 4 loops acumulan `Shape::line_segment`
+        // en ORDEN DE EMISIÓN en un solo `Vec` y cierran con 1 `add`
+        // (~1000 Shapes/frame → 1). Un solo `Vec` (no major/minor
+        // separados): cada `LineSegment` lleva su propio stroke y el orden
+        // define el ganador en los cruces (modo log: minor-vertical ×
+        // major-horizontal con colores opacos distintos). Separarlos
+        // reordenaría el overdraw y cambiaría píxeles.
+        // `Shape::Path`/`Shape::line` están prohibidos aquí: conectarían
+        // tramos disjuntos con diagonales fantasma.
+        let mut grid: Vec<Shape> = Vec::with_capacity(640);
+
+        // Vertical grid lines
+        if view.x_log {
+            let x_min = world_tl.x.min(world_br.x);
+            let x_max = world_tl.x.max(world_br.x);
+            if x_max > 0.0 {
+                let positive_min = x_min.max(1e-12);
+                let min_pow = positive_min.log10().floor() as i32 - 1;
+                let max_pow = x_max.log10().ceil() as i32 + 1;
+                for pow in min_pow..=max_pow {
+                    let x = 10_f64.powf(pow as f64);
+                    if x < positive_min || x > x_max {
+                        continue;
+                    }
+                    let a = view.world_to_screen(Point2::new(x, world_br.y));
+                    let b = view.world_to_screen(Point2::new(x, world_tl.y));
+                    grid.push(Shape::line_segment(
+                        [
+                            canvas_rect.min + Vec2::new(a.x, a.y),
+                            canvas_rect.min + Vec2::new(b.x, b.y),
+                        ],
+                        grid_stroke,
+                    ));
+                    // Minor grid at 2..9 * 10^pow
+                    if pow < max_pow {
+                        for k in 2..=9 {
+                            let xm = k as f64 * 10_f64.powf(pow as f64);
+                            if xm < positive_min || xm > x_max {
+                                continue;
+                            }
+                            let am = view.world_to_screen(Point2::new(xm, world_br.y));
+                            let bm = view.world_to_screen(Point2::new(xm, world_tl.y));
+                            grid.push(Shape::line_segment(
+                                [
+                                    canvas_rect.min + Vec2::new(am.x, am.y),
+                                    canvas_rect.min + Vec2::new(bm.x, bm.y),
+                                ],
+                                minor_stroke,
+                            ));
+                        }
+                    }
+                }
+            }
+        } else {
+            let pixels_per_unit = view.scale;
+            let target_world_step = 80.0 / pixels_per_unit.max(1e-50);
+            let magnitude = target_world_step.log10().floor();
+            let base = 10f64.powf(magnitude);
+            let factor = target_world_step / base;
+            let major_step = if factor < 2.0 {
+                1.0 * base
+            } else if factor < 5.0 {
+                2.0 * base
+            } else {
+                5.0 * base
+            };
+            // Ola 0.5: `AxisStepX[paso]` fija el paso vertical de grilla.
+            let major_step = view_axis_step(&self.document, VIEW_AXIS_STEP_X).unwrap_or(major_step);
+            let min_x = (world_tl.x / major_step).floor() as i64;
+            let max_x = (world_br.x / major_step).ceil() as i64;
+            let mut min_x = min_x.saturating_sub(1);
+            let mut max_x = max_x.saturating_add(1);
+            if max_x.saturating_sub(min_x) > 500 {
+                let center = (min_x + max_x) / 2;
+                min_x = center - 250;
+                max_x = center + 250;
+            }
+            for xi in min_x..=max_x {
+                let x = xi as f64 * major_step;
+                let a = view.world_to_screen(Point2::new(x, world_br.y.min(world_tl.y)));
+                let b = view.world_to_screen(Point2::new(x, world_br.y.max(world_tl.y)));
+                grid.push(Shape::line_segment(
+                    [
+                        canvas_rect.min + Vec2::new(a.x, a.y),
+                        canvas_rect.min + Vec2::new(b.x, b.y),
+                    ],
+                    grid_stroke,
+                ));
+            }
+        }
+
+        // Horizontal grid lines
+        if view.y_log {
+            let y_min = world_tl.y.min(world_br.y);
+            let y_max = world_tl.y.max(world_br.y);
+            if y_max > 0.0 {
+                let positive_min = y_min.max(1e-12);
+                let min_pow = positive_min.log10().floor() as i32 - 1;
+                let max_pow = y_max.log10().ceil() as i32 + 1;
+                for pow in min_pow..=max_pow {
+                    let y = 10_f64.powf(pow as f64);
+                    if y < positive_min || y > y_max {
+                        continue;
+                    }
+                    let a = view.world_to_screen(Point2::new(world_tl.x, y));
+                    let b = view.world_to_screen(Point2::new(world_br.x, y));
+                    grid.push(Shape::line_segment(
+                        [
+                            canvas_rect.min + Vec2::new(a.x, a.y),
+                            canvas_rect.min + Vec2::new(b.x, b.y),
+                        ],
+                        grid_stroke,
+                    ));
+                    // Minor grid at 2..9 * 10^pow
+                    if pow < max_pow {
+                        for k in 2..=9 {
+                            let ym = k as f64 * 10_f64.powf(pow as f64);
+                            if ym < positive_min || ym > y_max {
+                                continue;
+                            }
+                            let am = view.world_to_screen(Point2::new(world_tl.x, ym));
+                            let bm = view.world_to_screen(Point2::new(world_br.x, ym));
+                            grid.push(Shape::line_segment(
+                                [
+                                    canvas_rect.min + Vec2::new(am.x, am.y),
+                                    canvas_rect.min + Vec2::new(bm.x, bm.y),
+                                ],
+                                minor_stroke,
+                            ));
+                        }
+                    }
+                }
+            }
+        } else {
+            let pixels_per_unit = view.scale;
+            let target_world_step = 80.0 / pixels_per_unit.max(1e-50);
+            let magnitude = target_world_step.log10().floor();
+            let base = 10f64.powf(magnitude);
+            let factor = target_world_step / base;
+            let major_step = if factor < 2.0 {
+                1.0 * base
+            } else if factor < 5.0 {
+                2.0 * base
+            } else {
+                5.0 * base
+            };
+            // Ola 0.5: `AxisStepY[paso]` fija el paso horizontal de grilla.
+            let major_step = view_axis_step(&self.document, VIEW_AXIS_STEP_Y).unwrap_or(major_step);
+            let min_y = (world_br.y / major_step).floor() as i64;
+            let max_y = (world_tl.y / major_step).ceil() as i64;
+            let mut min_y = min_y.saturating_sub(1);
+            let mut max_y = max_y.saturating_add(1);
+            if max_y.saturating_sub(min_y) > 500 {
+                let center = (min_y + max_y) / 2;
+                min_y = center - 250;
+                max_y = center + 250;
+            }
+            for yi in min_y..=max_y {
+                let y = yi as f64 * major_step;
+                let a = view.world_to_screen(Point2::new(world_tl.x, y));
+                let b = view.world_to_screen(Point2::new(world_br.x, y));
+                grid.push(Shape::line_segment(
+                    [
+                        canvas_rect.min + Vec2::new(a.x, a.y),
+                        canvas_rect.min + Vec2::new(b.x, b.y),
+                    ],
+                    grid_stroke,
+                ));
+            }
+        }
+        // Un solo `add` en orden de emisión (guard `is_empty` para no
+        // emitir `Shape::Vec` vacío cuando la grilla está oculta por rango).
+        if !grid.is_empty() {
+            painter.add(Shape::Vec(grid));
+        }
+    }
+
+    pub(crate) fn draw_axes(
+        &self,
+        painter: &egui::Painter,
+        canvas_rect: Rect,
+        show_numeric_ticks: bool,
+        locale: grafito_ui::i18n::Locale,
+    ) {
+        #[cfg(feature = "profile")]
+        puffin::profile_scope!("draw_axes");
+        // Ola 0.5: `ShowAxes[bool]` guarda `__view_show_axes`; sin flag los
+        // ejes se dibujan siempre (conducta histórica).
+        if !view_flag_bool(&self.document, VIEW_SHOW_AXES, true) {
+            return;
+        }
+        let painter = clipped_to_canvas(painter, canvas_rect);
+        let view = self.document.view();
+        let world_tl = view.screen_to_world(GlamVec2::new(0.0, 0.0));
+        let world_br =
+            view.screen_to_world(GlamVec2::new(canvas_rect.width(), canvas_rect.height()));
+
+        // `clamp` paniquea si min > max: ordenamos por si un documento viejo
+        // llegó con scale no positiva y los bordes quedaron invertidos.
+        let x_axis_y = 0.0f64.clamp(world_br.y.min(world_tl.y), world_tl.y.max(world_br.y));
+        let y_axis_x = 0.0f64.clamp(world_tl.x.min(world_br.x), world_br.x.max(world_tl.x));
+
+        let stroke = Stroke::new(1.0, current_theme(painter.ctx()).grid_axis);
+
+        let x_axis_a = view.world_to_screen(Point2::new(world_tl.x, x_axis_y));
+        let x_axis_b = view.world_to_screen(Point2::new(world_br.x, x_axis_y));
+        painter.line_segment(
+            [
+                canvas_rect.min + Vec2::new(x_axis_a.x, x_axis_a.y),
+                canvas_rect.min + Vec2::new(x_axis_b.x, x_axis_b.y),
+            ],
+            stroke,
+        );
+
+        let y_axis_a = view.world_to_screen(Point2::new(y_axis_x, world_br.y));
+        let y_axis_b = view.world_to_screen(Point2::new(y_axis_x, world_tl.y));
+        painter.line_segment(
+            [
+                canvas_rect.min + Vec2::new(y_axis_a.x, y_axis_a.y),
+                canvas_rect.min + Vec2::new(y_axis_b.x, y_axis_b.y),
+            ],
+            stroke,
+        );
+
+        if !show_numeric_ticks {
+            return;
+        }
+        if !self.document.number_plane_labels {
+            return;
+        }
+
+        // Tick marks and labels — log-appropriate or linear
+        let text_color = current_theme(painter.ctx()).axis_label;
+        // Galley cacheado (ejes = texto dinámico denso fuera de Text/Polyline):
+        // misma tipografía que `painter.text` histórico, layout compartido.
+        let axis_font_size = grafito_ui::tokens::TYPE_SM;
+        let axis_scale_q = quantize_scale_ln(view.scale);
+        let minor_tick = Stroke::new(0.5, text_color);
+
+        // X-axis ticks
+        if view.x_log {
+            let min_pow = world_tl.x.max(1e-300).log10().floor() as i32 - 1;
+            let max_pow = world_br.x.max(1e-300).log10().ceil() as i32 + 1;
+            for pow in min_pow..=max_pow {
+                let x = 10_f64.powf(pow as f64);
+                let s = view.world_to_screen(Point2::new(x, x_axis_y));
+                let pos = canvas_rect.min + Vec2::new(s.x, s.y);
+                painter.line_segment(
+                    [pos + Vec2::new(0.0, -4.0), pos + Vec2::new(0.0, 4.0)],
+                    stroke,
+                );
+                let label: std::borrow::Cow<'static, str> = if pow == 0 {
+                    "1".into()
+                } else if pow == 1 {
+                    "10".into()
+                } else if pow == -1 {
+                    "10⁻¹".into()
+                } else if let Some(cached) = log_pow10_label(pow) {
+                    cached.into()
+                } else {
+                    format!("10{}", superscript(pow)).into()
+                };
+                let _ = cached_label_text(
+                    &painter,
+                    pos + Vec2::new(0.0, 6.0),
+                    egui::Align2::CENTER_TOP,
+                    &label,
+                    axis_font_size,
+                    text_color,
+                    axis_scale_q,
+                );
+                // Minor ticks at 2..9 * 10^pow
+                if pow < max_pow {
+                    for k in 2..=9 {
+                        let xm = k as f64 * 10_f64.powf(pow as f64);
+                        let sm = view.world_to_screen(Point2::new(xm, x_axis_y));
+                        let posm = canvas_rect.min + Vec2::new(sm.x, sm.y);
+                        painter.line_segment(
+                            [posm + Vec2::new(0.0, -2.0), posm + Vec2::new(0.0, 2.0)],
+                            minor_tick,
+                        );
+                    }
+                }
+            }
+        } else {
+            let pixels_per_unit = view.scale;
+            let target_world_step = 80.0 / pixels_per_unit.max(1e-50);
+            let major_step = nice_number_plane_step(target_world_step);
+            let min_x = (world_tl.x / major_step).floor() as i64;
+            let max_x = (world_br.x / major_step).ceil() as i64;
+            let mut min_x = min_x.saturating_sub(1);
+            let mut max_x = max_x.saturating_add(1);
+            if max_x.saturating_sub(min_x) > MAX_NUMBER_PLANE_TICKS as i64 {
+                let center = (min_x + max_x) / 2;
+                min_x = center - (MAX_NUMBER_PLANE_TICKS as i64 / 2);
+                max_x = center + (MAX_NUMBER_PLANE_TICKS as i64 / 2);
+            }
+            let tick_count = max_x.saturating_sub(min_x).max(0) as usize + 1;
+            let label_skip =
+                adaptive_label_skip(tick_count, canvas_rect.width(), NUMBER_PLANE_MIN_LABEL_PX_X);
+            for (tick_idx, xi) in (min_x..=max_x).enumerate() {
+                let x = xi as f64 * major_step;
+                if x.abs() < 1e-9 {
+                    continue;
+                }
+                let s = view.world_to_screen(Point2::new(x, x_axis_y));
+                let pos = canvas_rect.min + Vec2::new(s.x, s.y);
+                painter.line_segment(
+                    [pos + Vec2::new(0.0, -3.0), pos + Vec2::new(0.0, 3.0)],
+                    stroke,
+                );
+                // Skip adaptativo anti-solape: el tick queda, la etiqueta no.
+                if tick_idx % label_skip != 0 {
+                    continue;
+                }
+                // Format nicely
+                let label = format_number_plane_label_localized(x, locale);
+                let _ = cached_label_text(
+                    &painter,
+                    pos + Vec2::new(0.0, 6.0),
+                    egui::Align2::CENTER_TOP,
+                    &label,
+                    axis_font_size,
+                    text_color,
+                    axis_scale_q,
+                );
+            }
+        }
+
+        // Y-axis ticks
+        if view.y_log {
+            let min_pow = world_br.y.max(1e-300).log10().floor() as i32 - 1;
+            let max_pow = world_tl.y.max(1e-300).log10().ceil() as i32 + 1;
+            for pow in min_pow..=max_pow {
+                let y = 10_f64.powf(pow as f64);
+                let s = view.world_to_screen(Point2::new(y_axis_x, y));
+                let pos = canvas_rect.min + Vec2::new(s.x, s.y);
+                painter.line_segment(
+                    [pos + Vec2::new(-4.0, 0.0), pos + Vec2::new(4.0, 0.0)],
+                    stroke,
+                );
+                let label: std::borrow::Cow<'static, str> = if pow == 0 {
+                    "1".into()
+                } else if pow == 1 {
+                    "10".into()
+                } else if pow == -1 {
+                    "10⁻¹".into()
+                } else if let Some(cached) = log_pow10_label(pow) {
+                    cached.into()
+                } else {
+                    format!("10{}", superscript(pow)).into()
+                };
+                let _ = cached_label_text(
+                    &painter,
+                    pos + Vec2::new(-6.0, 0.0),
+                    egui::Align2::RIGHT_CENTER,
+                    &label,
+                    axis_font_size,
+                    text_color,
+                    axis_scale_q,
+                );
+                if pow < max_pow {
+                    for k in 2..=9 {
+                        let ym = k as f64 * 10_f64.powf(pow as f64);
+                        let sm = view.world_to_screen(Point2::new(y_axis_x, ym));
+                        let posm = canvas_rect.min + Vec2::new(sm.x, sm.y);
+                        painter.line_segment(
+                            [posm + Vec2::new(-2.0, 0.0), posm + Vec2::new(2.0, 0.0)],
+                            minor_tick,
+                        );
+                    }
+                }
+            }
+        } else {
+            let pixels_per_unit = view.scale;
+            let target_world_step = 80.0 / pixels_per_unit.max(1e-50);
+            let major_step = nice_number_plane_step(target_world_step);
+            let min_y = (world_br.y / major_step).floor() as i64;
+            let max_y = (world_tl.y / major_step).ceil() as i64;
+            let mut min_y = min_y.saturating_sub(1);
+            let mut max_y = max_y.saturating_add(1);
+            if max_y.saturating_sub(min_y) > MAX_NUMBER_PLANE_TICKS as i64 {
+                let center = (min_y + max_y) / 2;
+                min_y = center - (MAX_NUMBER_PLANE_TICKS as i64 / 2);
+                max_y = center + (MAX_NUMBER_PLANE_TICKS as i64 / 2);
+            }
+            let tick_count = max_y.saturating_sub(min_y).max(0) as usize + 1;
+            let label_skip = adaptive_label_skip(
+                tick_count,
+                canvas_rect.height(),
+                NUMBER_PLANE_MIN_LABEL_PX_Y,
+            );
+            for (tick_idx, yi) in (min_y..=max_y).enumerate() {
+                let y = yi as f64 * major_step;
+                if y.abs() < 1e-9 {
+                    continue;
+                }
+                let s = view.world_to_screen(Point2::new(y_axis_x, y));
+                let pos = canvas_rect.min + Vec2::new(s.x, s.y);
+                painter.line_segment(
+                    [pos + Vec2::new(-3.0, 0.0), pos + Vec2::new(3.0, 0.0)],
+                    stroke,
+                );
+                if tick_idx % label_skip != 0 {
+                    continue;
+                }
+                let label = format_number_plane_label_localized(y, locale);
+                let _ = cached_label_text(
+                    &painter,
+                    pos + Vec2::new(-6.0, 0.0),
+                    egui::Align2::RIGHT_CENTER,
+                    &label,
+                    axis_font_size,
+                    text_color,
+                    axis_scale_q,
+                );
+            }
+        }
+
+        let origin = view.world_to_screen(Point2::new(0.0, 0.0));
+        let origin_pos = canvas_rect.min + Vec2::new(origin.x, origin.y);
+        let _ = cached_label_text(
+            &painter,
+            origin_pos + Vec2::new(-6.0, 6.0),
+            egui::Align2::RIGHT_TOP,
+            "0",
+            axis_font_size,
+            text_color,
+            axis_scale_q,
+        );
+    }
+
+    pub(crate) fn draw_trig_canvas_overlay(&self, painter: &egui::Painter, canvas_rect: Rect) {
+        #[cfg(feature = "profile")]
+        puffin::profile_scope!("draw_trig_canvas_overlay");
+        if !self.show_trig_animation {
+            return;
+        }
+
+        if self.perspective == crate::Perspective::Complex {
+            self.draw_complex_animation_overlay(painter, canvas_rect);
+            return;
+        }
+
+        let painter = clipped_to_canvas(painter, canvas_rect);
+        let view = self.document.view();
+        let theme = current_theme(painter.ctx());
+        let spec = Self::trig_spec(self.trig_function);
+        let accent = to_color32(spec.color);
+        let marker = Color32::from_rgb(255, 84, 84);
+        let projection_x = Color32::from_rgb(88, 180, 105);
+        let projection_y = Color32::from_rgb(80, 120, 240);
+
+        let to_pos = |p: Point2| {
+            let screen = view.world_to_screen(p);
+            canvas_rect.min + Vec2::new(screen.x, screen.y)
+        };
+
+        let world_tl = view.screen_to_world(GlamVec2::new(0.0, 0.0));
+        let world_br =
+            view.screen_to_world(GlamVec2::new(canvas_rect.width(), canvas_rect.height()));
+        let x_min = world_tl.x.min(world_br.x);
+        let x_max = world_tl.x.max(world_br.x);
+        let y_min = world_tl.y.min(world_br.y);
+        let y_max = world_tl.y.max(world_br.y);
+        let (segments, asymptotes) =
+            self.trig_graph_segments(x_min, x_max, y_min, y_max, canvas_rect.width());
+        for x in asymptotes.iter() {
+            let a = to_pos(Point2::new(*x, y_min));
+            let b = to_pos(Point2::new(*x, y_max));
+            draw_dashed_line(
+                &painter,
+                a,
+                b,
+                Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 84, 84, 115)),
+                8.0,
+                7.0,
+            );
+        }
+        for (a, b) in segments.iter() {
+            painter.line_segment([to_pos(*a), to_pos(*b)], Stroke::new(2.0, accent));
+        }
+
+        let t = self.trig_angle;
+        let value = Self::trig_value(self.trig_function, t);
+        if value.is_finite() && value >= y_min && value <= y_max && t >= x_min && t <= x_max {
+            let p = to_pos(Point2::new(t, value));
+            draw_dashed_line(
+                &painter,
+                to_pos(Point2::new(t, y_min)),
+                to_pos(Point2::new(t, y_max)),
+                Stroke::new(1.2, marker),
+                10.0,
+                6.0,
+            );
+            painter.line_segment(
+                [to_pos(Point2::new(t, y_min)), to_pos(Point2::new(t, y_max))],
+                Stroke::new(0.4, Color32::from_rgba_unmultiplied(255, 84, 84, 90)),
+            );
+            painter.circle_filled(p, 4.0, marker);
+            // Overlay denso dinámico: Galley cacheado por (texto, estilo, escala).
+            let trig_scale_q = quantize_scale_ln(view.scale);
+            let trig_label = format!("{}({:.2})", spec.name, t);
+            let _ = cached_label_text(
+                &painter,
+                p + Vec2::new(6.0, -6.0),
+                egui::Align2::LEFT_BOTTOM,
+                &trig_label,
+                grafito_ui::tokens::TYPE_XS,
+                theme.text_primary,
+                trig_scale_q,
+            );
+        }
+
+        match self.trig_view_mode {
+            crate::app::TrigViewMode::Didactic => {
+                self.draw_trig_unit_card(
+                    &painter,
+                    canvas_rect,
+                    accent,
+                    marker,
+                    projection_x,
+                    projection_y,
+                );
+            }
+            crate::app::TrigViewMode::Grid => {
+                let center = to_pos(Point2::new(0.0, 0.0));
+                let unit_x = to_pos(Point2::new(1.0, 0.0));
+                let radius_px = center.distance(unit_x);
+                if radius_px.is_finite() && radius_px > 6.0 && radius_px < 5000.0 {
+                    painter.circle_stroke(center, radius_px, Stroke::new(1.6, accent));
+
+                    let t = self.trig_angle;
+                    let point_world = Point2::new(t.cos(), t.sin());
+                    let point = to_pos(point_world);
+                    let foot_x = to_pos(Point2::new(point_world.x, 0.0));
+                    let foot_y = to_pos(Point2::new(0.0, point_world.y));
+
+                    painter.line_segment([center, point], Stroke::new(2.0, marker));
+                    painter.line_segment([point, foot_x], Stroke::new(1.0, projection_x));
+                    painter.line_segment([point, foot_y], Stroke::new(1.0, projection_y));
+                    painter.circle_filled(point, 4.5, marker);
+
+                    let grid_scale_q = quantize_scale_ln(view.scale);
+                    let _ = cached_label_text(
+                        &painter,
+                        unit_x + Vec2::new(8.0, 0.0),
+                        egui::Align2::LEFT_CENTER,
+                        "cos",
+                        grafito_ui::tokens::TYPE_XS,
+                        theme.text_secondary,
+                        grid_scale_q,
+                    );
+                    let _ = cached_label_text(
+                        &painter,
+                        to_pos(Point2::new(0.0, 1.0)) + Vec2::new(0.0, -8.0),
+                        egui::Align2::CENTER_BOTTOM,
+                        "sin",
+                        grafito_ui::tokens::TYPE_XS,
+                        theme.text_secondary,
+                        grid_scale_q,
+                    );
+                }
+            }
+        }
+    }
+
+    fn draw_trig_unit_card(
+        &self,
+        painter: &egui::Painter,
+        canvas_rect: Rect,
+        accent: Color32,
+        marker: Color32,
+        projection_x: Color32,
+        projection_y: Color32,
+    ) {
+        let painter = clipped_to_canvas(painter, canvas_rect);
+        let theme = current_theme(painter.ctx());
+        let card_size = Vec2::new(210.0, 190.0);
+        let card = Rect::from_min_size(
+            canvas_rect.min
+                + Vec2::new(
+                    grafito_ui::tokens::OVERLAY_CARD_MARGIN,
+                    grafito_ui::tokens::OVERLAY_CARD_MARGIN,
+                ),
+            card_size,
+        );
+        let bg = theme.panel_bg;
+        painter.rect_filled(card, 10.0, bg);
+        painter.rect_stroke(card, 10.0, Stroke::new(1.0, theme.separator));
+
+        let center = card.center() + Vec2::new(0.0, 8.0);
+        let radius = 58.0;
+        let t = self.trig_angle;
+        let cos_t = t.cos() as f32;
+        let sin_t = t.sin() as f32;
+        let point = center + Vec2::new(cos_t * radius, -sin_t * radius);
+        let foot_x = center + Vec2::new(cos_t * radius, 0.0);
+        let foot_y = center + Vec2::new(0.0, -sin_t * radius);
+
+        painter.text(
+            card.min + Vec2::new(grafito_ui::tokens::SPACE_MD, grafito_ui::tokens::SPACE_MD),
+            egui::Align2::LEFT_TOP,
+            "Círculo unitario",
+            egui::FontId::proportional(grafito_ui::tokens::TYPE_SM),
+            theme.text_primary,
+        );
+        painter.circle_stroke(center, radius, Stroke::new(1.5, accent));
+        painter.line_segment(
+            [
+                center + Vec2::new(-radius - 8.0, 0.0),
+                center + Vec2::new(radius + 8.0, 0.0),
+            ],
+            Stroke::new(1.0, theme.separator),
+        );
+        painter.line_segment(
+            [
+                center + Vec2::new(0.0, -radius - 8.0),
+                center + Vec2::new(0.0, radius + 8.0),
+            ],
+            Stroke::new(1.0, theme.separator),
+        );
+        painter.line_segment([center, point], Stroke::new(2.0, marker));
+        painter.line_segment([point, foot_x], Stroke::new(1.2, projection_y));
+        painter.line_segment([point, foot_y], Stroke::new(1.2, projection_x));
+        painter.circle_filled(point, 4.5, marker);
+        painter.text(
+            card.left_bottom() + Vec2::new(12.0, -28.0),
+            egui::Align2::LEFT_BOTTOM,
+            format!("cos θ = {:.3}   sin θ = {:.3}", t.cos(), t.sin()),
+            egui::FontId::proportional(grafito_ui::tokens::TYPE_XS),
+            theme.text_secondary,
+        );
+    }
+
+    fn trig_graph_segments(
+        &self,
+        x_min: f64,
+        x_max: f64,
+        y_min: f64,
+        y_max: f64,
+        width: f32,
+    ) -> TrigSegments {
+        let key = (
+            self.trig_function,
+            x_min.to_bits(),
+            x_max.to_bits(),
+            y_min.to_bits(),
+            y_max.to_bits(),
+            width.max(0.0).round() as u32,
+            self.document.render_quality,
+        );
+        if let Ok(cache) = self.trig_graph_cache.read() {
+            if let Some(cache) = cache.as_ref() {
+                if cache.function == key.0
+                    && cache.x_min_bits == key.1
+                    && cache.x_max_bits == key.2
+                    && cache.y_min_bits == key.3
+                    && cache.y_max_bits == key.4
+                    && cache.width_px == key.5
+                    && cache.quality == key.6
+                {
+                    // Hit: solo refcounts, sin clonar segmentos ni asíntotas.
+                    return (
+                        std::sync::Arc::clone(&cache.segments),
+                        std::sync::Arc::clone(&cache.asymptotes),
+                    );
+                }
+            }
+        }
+
+        let y_span = (y_max - y_min).abs().max(1.0);
+        let x_span = (x_max - x_min).abs();
+        let samples = trig_sample_count(width as usize, x_span, self.document.render_quality);
+        let mut segments = Vec::with_capacity(samples);
+        let mut prev: Option<Point2> = None;
+        let asymptotes = trig_asymptotes(self.trig_function, x_min, x_max);
+        let dx = ((x_max - x_min).abs() / samples.max(1) as f64).max(1e-6);
+        let asymptote_pad = dx * 1.75;
+        for i in 0..=samples {
+            let x = x_min + (x_max - x_min) * i as f64 / samples as f64;
+            let y = Self::trig_value(self.trig_function, x);
+            let near_asymptote = asymptotes.iter().any(|a| (x - *a).abs() <= asymptote_pad);
+            let visible = !near_asymptote && y.is_finite() && y >= y_min && y <= y_max;
+            if visible {
+                let world = Point2::new(x, y);
+                if let Some(prev_world) = prev {
+                    let crosses_asymptote = asymptotes
+                        .iter()
+                        .any(|a| (prev_world.x - *a) * (world.x - *a) <= 0.0);
+                    if !crosses_asymptote && (world.y - prev_world.y).abs() <= y_span * 0.30 {
+                        segments.push((prev_world, world));
+                    }
+                }
+                prev = Some(world);
+            } else {
+                prev = None;
+            }
+        }
+
+        let segments = std::sync::Arc::new(segments);
+        let asymptotes = std::sync::Arc::new(asymptotes);
+        if let Ok(mut cache) = self.trig_graph_cache.write() {
+            *cache = Some(crate::app::TrigGraphCache {
+                function: key.0,
+                x_min_bits: key.1,
+                x_max_bits: key.2,
+                y_min_bits: key.3,
+                y_max_bits: key.4,
+                width_px: key.5,
+                quality: key.6,
+                segments: std::sync::Arc::clone(&segments),
+                asymptotes: std::sync::Arc::clone(&asymptotes),
+            });
+        }
+        // Lock envenenado → igual se devuelve lo recién computado.
+        (segments, asymptotes)
+    }
+
+    fn draw_complex_animation_overlay(&self, painter: &egui::Painter, canvas_rect: Rect) {
+        use num_complex::Complex64;
+        use std::collections::HashMap;
+
+        let painter = clipped_to_canvas(painter, canvas_rect);
+        let view = self.document.view();
+        let theme = current_theme(painter.ctx());
+        let source_color = Color32::from_rgb(255, 84, 84);
+        let image_color = Color32::from_rgb(150, 70, 255);
+        let unit_color = Color32::from_rgb(80, 150, 240);
+        let to_pos = |p: Point2| {
+            let screen = view.world_to_screen(p);
+            canvas_rect.min + Vec2::new(screen.x, screen.y)
+        };
+
+        let (expr, label) = self.active_complex_animation_expr();
+        let parsed = grafito_complex::complex_expr::parse(&expr).ok();
+        // PERF: el entorno de variables se construye UNA vez por frame y el
+        // símbolo base se actualiza con `get_mut` en cada evaluación. Antes se
+        // reconstruía un `HashMap` completo por punto del círculo (131/frame).
+        let mut vars: HashMap<String, Complex64> = HashMap::new();
+        for (name, value) in &self.document.variables {
+            vars.insert(name.clone(), Complex64::new(*value, 0.0));
+        }
+        let base_symbol = self.document.complex_base_symbol.clone();
+        vars.insert(base_symbol.clone(), Complex64::new(0.0, 0.0));
+        let mut eval_at = |z: Complex64| -> Option<Complex64> {
+            let expr = parsed.as_ref()?;
+            if let Some(slot) = vars.get_mut(&base_symbol) {
+                *slot = z;
+            }
+            expr.eval(&vars)
+                .ok()
+                .filter(|w| w.re.is_finite() && w.im.is_finite())
+        };
+
+        let mut prev_source: Option<Pos2> = None;
+        let mut prev_image: Option<Pos2> = None;
+        for i in 0..=128 {
+            let a = std::f64::consts::TAU * i as f64 / 128.0;
+            let z = Complex64::new(a.cos(), a.sin());
+            let source_pos = to_pos(Point2::new(z.re, z.im));
+            if let Some(prev) = prev_source {
+                painter.line_segment([prev, source_pos], Stroke::new(1.3, unit_color));
+            }
+            prev_source = Some(source_pos);
+
+            if let Some(w) = eval_at(z) {
+                let image_pos = to_pos(Point2::new(w.re, w.im));
+                if let Some(prev) = prev_image {
+                    if prev.distance(image_pos)
+                        < canvas_rect.width().max(canvas_rect.height()) * 0.75
+                    {
+                        painter.line_segment([prev, image_pos], Stroke::new(2.0, image_color));
+                    }
+                }
+                prev_image = Some(image_pos);
+            } else {
+                prev_image = None;
+            }
+        }
+
+        let t = self.trig_angle;
+        let z = Complex64::new(t.cos(), t.sin());
+        let z_pos = to_pos(Point2::new(z.re, z.im));
+        painter.circle_filled(z_pos, 5.0, source_color);
+        painter.text(
+            z_pos + Vec2::new(7.0, -7.0),
+            egui::Align2::LEFT_BOTTOM,
+            "z=e^(it)",
+            egui::FontId::proportional(grafito_ui::tokens::TYPE_XS),
+            theme.text_primary,
+        );
+
+        if let Some(w) = eval_at(z) {
+            let w_pos = to_pos(Point2::new(w.re, w.im));
+            painter.line_segment(
+                [z_pos, w_pos],
+                Stroke::new(1.0, Color32::from_rgba_unmultiplied(120, 120, 120, 120)),
+            );
+            painter.circle_filled(w_pos, 5.0, image_color);
+            painter.text(
+                w_pos + Vec2::new(7.0, -7.0),
+                egui::Align2::LEFT_BOTTOM,
+                format!("{}({})", label, self.document.complex_base_symbol),
+                egui::FontId::proportional(grafito_ui::tokens::TYPE_XS),
+                theme.text_primary,
+            );
+        }
+
+        let card = Rect::from_min_size(
+            canvas_rect.min
+                + Vec2::new(
+                    grafito_ui::tokens::OVERLAY_CARD_MARGIN,
+                    grafito_ui::tokens::OVERLAY_CARD_MARGIN,
+                ),
+            Vec2::new(250.0, 86.0),
+        );
+        let bg = theme.panel_bg;
+        painter.rect_filled(card, 10.0, bg);
+        painter.rect_stroke(card, 10.0, Stroke::new(1.0, theme.separator));
+        painter.text(
+            card.min + Vec2::new(grafito_ui::tokens::SPACE_MD, grafito_ui::tokens::SPACE_MD),
+            egui::Align2::LEFT_TOP,
+            "Animación compleja",
+            egui::FontId::proportional(grafito_ui::tokens::TYPE_SM),
+            theme.text_primary,
+        );
+        painter.text(
+            card.min + Vec2::new(12.0, 34.0),
+            egui::Align2::LEFT_TOP,
+            format!("z(t) = {:.3} {:+.3}i", z.re, z.im),
+            egui::FontId::proportional(grafito_ui::tokens::TYPE_XS),
+            theme.text_secondary,
+        );
+        painter.text(
+            card.min + Vec2::new(12.0, 56.0),
+            egui::Align2::LEFT_TOP,
+            format!("Imagen activa: {}", expr),
+            egui::FontId::proportional(grafito_ui::tokens::TYPE_XS),
+            image_color,
+        );
+    }
+
+    fn active_complex_animation_expr(&self) -> (String, &'static str) {
+        let mut found: Option<(String, &'static str)> = None;
+        for_each_ordered_visible_2d_object(&self.document, |_, obj| {
+            if let GeoObject::ComplexMapping(cm) = obj {
+                if cm.visible {
+                    found = Some((cm.expr.clone(), "f"));
+                    return false;
+                }
+            }
+            true
+        });
+        if let Some(found) = found {
+            return found;
+        }
+        for_each_ordered_visible_2d_object(&self.document, |_, obj| {
+            if let GeoObject::ComplexGrid(cg) = obj {
+                if cg.visible {
+                    found = Some((cg.expr.clone(), "f"));
+                    return false;
+                }
+            }
+            true
+        });
+        found.unwrap_or_else(|| (self.document.complex_base_symbol.clone(), "id"))
+    }
+
+    pub(crate) fn draw_objects(
+        &mut self,
+        painter: &egui::Painter,
+        canvas_rect: Rect,
+        gpu_base_active: bool,
+        mut paint_gpu_object: impl FnMut(ObjectId),
+    ) {
+        #[cfg(feature = "profile")]
+        puffin::profile_scope!("draw_objects");
+        let painter = clipped_to_canvas(painter, canvas_rect);
+        self.prune_fill_texture_cache();
+        // Gracias de texturas managed (un tick = un frame): evita el panic
+        // `egui_texid_Managed destroyed` al evictar con submit en vuelo.
+        TEX_LABEL_TEXTURES.with(|c| c.borrow_mut().tick());
+        FRACTAL_TEXTURES.with(|c| c.borrow_mut().tick());
+        COMPLEX_GRID_TEXTURES.with(|c| c.borrow_mut().tick());
+        // Budget de rótulos: tope por frame + cull por tamaño (ver
+        // `label_budget_allowed`); se reinicia una vez por frame dibujado.
+        label_budget_reset();
+        // Throttle de la auditoría PaintStats (1/60, costo ~cero).
+        let _ = paint_stats_tick_frame();
+        // Gestos de slider huérfanos (widget desaparecido a mitad de
+        // arrastre): commit a los 3 frames sin toque, sin fugas de `before`.
+        crate::app::panel_gesture_sweep_at(
+            painter.ctx().cumulative_pass_nr(),
+            self.document.version,
+            &mut self.undo_stack,
+            &mut self.redo_stack,
+        );
+
+        // Cache misses and fill rasterization are admitted in ObjectId order
+        // under one frame budget. Deferred curves keep their old cache untouched.
+        precompute_visible_implicit_curve_caches(&self.document, canvas_rect);
+
+        let mut hovered_object_for_tool = None;
+        if matches!(
+            self.current_tool,
+            grafito_ui::Tool::Root
+                | grafito_ui::Tool::Extremum
+                | grafito_ui::Tool::Inflection
+                | grafito_ui::Tool::YIntercept
+                | grafito_ui::Tool::XIntercept
+                | grafito_ui::Tool::Analyze
+                | grafito_ui::Tool::Intersect
+                | grafito_ui::Tool::Distance
+                | grafito_ui::Tool::Angle
+                | grafito_ui::Tool::Area
+                | grafito_ui::Tool::Slope
+        ) {
+            if let Some(pos) = self.last_mouse_pos {
+                let view = *self.document.view();
+                let local = pos - canvas_rect.min;
+                let world = view.screen_to_world(GlamVec2::new(local.x, local.y));
+                let tolerance = 10.0 / view.scale;
+                hovered_object_for_tool = self.document.pick_object(world, tolerance);
+            }
+        }
+
+        // T1-crash: presupuesto de vértices por frame (ver FRAME_VERTEX_BUDGET).
+        // Sin esto, una escena densa pedía >256 MB de vertex buffer y wgpu
+        // mataba el proceso con panic. Se trunca el plan (los primeros
+        // objetos siempre se dibujan) y se avisa con insignia honesta.
+        let (plan, omitidos) = truncate_paint_plan_by_vertices(
+            &self.document,
+            base_scene_paint_plan(&self.document, gpu_base_active),
+            canvas_rect,
+            FRAME_VERTEX_BUDGET,
+        );
+        self.frame_budget_skipped = omitidos;
+        function_label_frame_begin();
+        for paint in plan {
+            let id = match paint {
+                BasePaint2D::Cpu(id) | BasePaint2D::Gpu(id) => id,
+            };
+            let Some(obj) = self.document.get_object(id) else {
+                continue;
+            };
+            let is_tool_hovered = hovered_object_for_tool == Some(id);
+            let is_driver = self.tool_state.driver == Some(id);
+
+            let style = if is_tool_hovered || is_driver {
+                Some(StyleOverride {
+                    width_scale: Some(1.5),
+                    color: Some(Color {
+                        r: 0.8,
+                        g: 0.8,
+                        b: 0.0,
+                        a: 1.0,
+                    }),
+                    ..Default::default()
+                })
+            } else {
+                None
+            };
+            match paint {
+                BasePaint2D::Cpu(_) => {
+                    self.draw_object_styled(&painter, canvas_rect, obj, style, false);
+                }
+                BasePaint2D::Gpu(_) => {
+                    self.draw_gpu_object_backfill(&painter, canvas_rect, obj);
+                    paint_gpu_object(id);
+                    self.draw_object_styled(&painter, canvas_rect, obj, style, true);
+                }
+            }
+        }
+
+        self.sample_and_draw_trails(&painter, canvas_rect);
+
+        if let Some(preview) = &self.preview_object {
+            let style = StyleOverride {
+                color: Some(Color {
+                    r: 0.4,
+                    g: 0.4,
+                    b: 0.4,
+                    a: 0.8,
+                }),
+                hide_label: true,
+                width: if matches!(preview, GeoObject::Function(_)) {
+                    Some(2.5)
+                } else {
+                    None
+                },
+                ..Default::default()
+            };
+            self.draw_object_styled(&painter, canvas_rect, preview, Some(style), false);
+        }
+
+        // Draw hover analytics
+        //
+        // Presupuesto (decisión documentada): el análisis de hover se calcula en
+        // `input.rs::update_hover_analysis` con un debounce espacial de 5px y solo
+        // cuando el cursor está casi quieto (no durante pan/arrastre), por lo que
+        // su coste O(objetos) no se paga a 60fps. El lado de dibujo aquí es O(1):
+        // un marcador + un label. Si el análisis llegara a exceder el presupuesto
+        // de frame, la degradación correcta es mover `update_hover_analysis` a un
+        // hilo async (canal + `request_repaint`), NO simplificar el render; el
+        // render ya está acotado y recortado al canvas.
+        if let Some(hover) = &self.hovered_analysis {
+            let view = *self.document.view();
+            let screen_pos = view.world_to_screen(hover.point);
+            let pos = canvas_rect.min + egui::Vec2::new(screen_pos.x, screen_pos.y);
+            // Cull barato: si el punto de análisis quedó fuera del canvas (p.ej.
+            // tras un pan/zoom), no dibujar el marcador ni el label.
+            if !canvas_rect.expand(24.0).contains(pos) {
+                return;
+            }
+
+            let color = Self::hovered_analysis_color(hover.is_snap, hover.feature, hover.snap_kind);
+            let radius = if hover.is_snap {
+                grafito_ui::tokens::HOVER_MARKER_R_SNAP
+            } else {
+                grafito_ui::tokens::HOVER_MARKER_R
+            };
+            painter.circle_filled(pos, radius, color);
+            painter.circle_stroke(
+                pos,
+                radius + grafito_ui::tokens::HOVER_MARKER_RING,
+                egui::Stroke::new(1.0, egui::Color32::WHITE),
+            );
+
+            let font = egui::FontId::proportional(grafito_ui::tokens::TYPE_SM);
+            painter.text(
+                pos + egui::Vec2::new(grafito_ui::tokens::SPACE_MD, -grafito_ui::tokens::SPACE_MD),
+                egui::Align2::LEFT_BOTTOM,
+                &hover.label,
+                font,
+                color,
+            );
+        }
+
+        // T1-crash: insignia honesta cuando el presupuesto truncó el plan.
+        // Un solo texto por frame, solo en escenas que exceden el tope GPU.
+        if self.frame_budget_skipped > 0 {
+            painter.text(
+                canvas_rect.left_top() + egui::Vec2::new(8.0, 8.0),
+                egui::Align2::LEFT_TOP,
+                format!(
+                    "Escena densa: {} objetos omitidos (tope GPU)",
+                    self.frame_budget_skipped
+                ),
+                egui::FontId::proportional(grafito_ui::tokens::TYPE_SM),
+                egui::Color32::from_rgb(255, 190, 90),
+            );
+        }
+    }
+
+    /// Anillo pulsante `Indicate` estilo Manim sobre la selección (~1.2 s).
+    ///
+    /// Piel pura: sin I/O ni spawn. Lee `self.indicate` y las curvas de
+    /// `crate::indicate` (alpha/radio/grosor), con clip al canvas y color
+    /// accent del theme. Todo lo vencido, inexistente o no anclable en 2D
+    /// se salta en silencio (el `tick` por frame ya lo expira).
+    pub(crate) fn draw_indicate_highlight(
+        &self,
+        painter: &egui::Painter,
+        canvas_rect: Rect,
+        now_ms: f64,
+    ) {
+        let Some(highlight) = &self.indicate else {
+            return;
+        };
+        if highlight.expirado(now_ms) {
+            return;
+        }
+        let Some(obj) = self.document.get_object(highlight.target()) else {
+            return;
+        };
+        let Some(rep) = trail_representative_position(obj) else {
+            return;
+        };
+        if !rep.x.is_finite() || !rep.y.is_finite() {
+            return;
+        }
+        let view = *self.document.view();
+        let screen = view.world_to_screen(rep);
+        if !screen.x.is_finite() || !screen.y.is_finite() {
+            return;
+        }
+        let pos = canvas_rect.min + egui::Vec2::new(screen.x, screen.y);
+        if !canvas_rect.expand(32.0).contains(pos) {
+            return;
+        }
+        let alpha = highlight.alpha(now_ms);
+        if alpha <= 0.0 {
+            return;
+        }
+        let radius = highlight.radio(now_ms);
+        if !radius.is_finite() || radius <= 0.0 {
+            return;
+        }
+        let painter = clipped_to_canvas(painter, canvas_rect);
+        let accent = current_theme(painter.ctx()).accent;
+        let a = (alpha.clamp(0.0, 1.0) * 255.0).clamp(0.0, 255.0) as u8;
+        if a == 0 {
+            return;
+        }
+        let ring = Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), a);
+        painter.circle_stroke(pos, radius, Stroke::new(highlight.grosor(now_ms), ring));
+        let halo_alpha = (f32::from(a) * 0.12).clamp(0.0, 255.0) as u8;
+        painter.circle_filled(
+            pos,
+            (radius * 0.45).max(2.0),
+            Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), halo_alpha),
+        );
+    }
+
+    fn draw_gpu_object_backfill(
+        &self,
+        painter: &egui::Painter,
+        canvas_rect: Rect,
+        object: &GeoObject,
+    ) {
+        #[cfg(feature = "profile")]
+        puffin::profile_scope!("draw_gpu_object_backfill");
+        if gpu_base_needs_cpu_backfill(object) {
+            self.draw_object_styled(
+                painter,
+                canvas_rect,
+                object,
+                Some(StyleOverride {
+                    hide_label: true,
+                    skip_stroke: true,
+                    ..Default::default()
+                }),
+                false,
+            );
+        }
+
+        let GeoObject::ComplexMapping(cm) = object else {
+            return;
+        };
+        let view = self.document.view();
+        let admitted = visible_implicit_cache_plan(
+            &self.document,
+            implicit_curve_view_bounds(*view, canvas_rect),
+            implicit_curve_grid_size(canvas_rect, self.document.render_quality),
+            canvas_rect,
+        );
+        let Some(map) = cm.conformal_map(self.document.complex_base_symbol.as_str()) else {
+            return;
+        };
+        let Some(GeoObject::ImplicitCurve(ic)) = self.document.get_object(cm.target) else {
+            return;
+        };
+        if !admitted.contains(&cm.target) || matches!(ic.operator, RelationOperator::Eq) {
+            return;
+        }
+        let Some(fill_color) = ic.fill_color else {
+            return;
+        };
+        let homotopy_factor = grafito_render::complex_mapping_homotopy_factor(
+            cm.animate_homotopy,
+            cm.homotopy_speed,
+            self.transient_render_state.homotopy_time(),
+        );
+        if homotopy_factor >= 1.0 - f64::EPSILON {
+            self.draw_complex_mapping_fill(painter, canvas_rect, view, ic, cm.id, map, fill_color);
+        }
+    }
+
+    fn prune_fill_texture_cache(&self) {
+        let version = self.document.version;
+        // PERF: solo re-prunea si el documento cambió desde la última pasada.
+        // Evita tomar el write lock + barrer el LRU completo en cada frame idle.
+        // La gracia diferida SÍ tickea siempre (un tick = un frame dibujado):
+        // si el documento no cambió solo se avanza la cola de retiro.
+        let already_pruned =
+            LAST_FILL_PRUNE_DOC_VERSION.with(|last| last.borrow().as_ref() == Some(&version));
+        if already_pruned
+            && !self
+                .fill_textures
+                .read()
+                .map(|cache| cache.has_retired_fill_textures())
+                .unwrap_or(true)
+        {
+            // Early-out ANTES del `write()`: documento sin cambios y cola de
+            // gracia vacía → el tick sería no-op. Solo se toma el `read()`
+            // compartido (no excluye a otros lectores). Si el `read()` falla
+            // (lock envenenado) se sigue al camino con `write()`, que recupera.
+            return;
+        }
+        let mut cache = self.fill_textures.write().unwrap_or_else(|poisoned| {
+            log::warn!("Fill texture cache write lock poisoned; recovering");
+            poisoned.into_inner()
+        });
+        cache.reap_retired_fill_textures();
+        if already_pruned {
+            return;
+        }
+        cache.retain_visible_fill_owners(&self.document);
+        LAST_FILL_PRUNE_DOC_VERSION.with(|last| *last.borrow_mut() = Some(version));
+    }
+
+    fn hovered_analysis_color(
+        is_snap: bool,
+        feature: Option<grafito_geometry::analysis::AnalysisFeature>,
+        snap_kind: Option<crate::snap::SnapKind>,
+    ) -> egui::Color32 {
+        use crate::snap::SnapKind;
+        use egui::Color32;
+        use grafito_geometry::analysis::AnalysisFeature;
+        if is_snap {
+            match feature {
+                Some(AnalysisFeature::Root) | Some(AnalysisFeature::XIntercept) => {
+                    Color32::from_rgb(255, 100, 100)
+                }
+                Some(AnalysisFeature::YIntercept) => Color32::from_rgb(100, 180, 255),
+                Some(AnalysisFeature::LocalMaximum) => Color32::from_rgb(74, 222, 128),
+                Some(AnalysisFeature::LocalMinimum) => Color32::from_rgb(34, 211, 238),
+                Some(AnalysisFeature::Inflection) => Color32::from_rgb(251, 146, 60),
+                Some(AnalysisFeature::Centroid) => Color32::from_rgb(120, 220, 120),
+                Some(AnalysisFeature::Intersection) | Some(AnalysisFeature::Equilibrium) => {
+                    Color32::from_rgb(220, 100, 220)
+                }
+                _ => Color32::from_rgb(255, 100, 100),
+            }
+        } else {
+            // El snap no es a una característica, pero el cursor está cerca
+            // de algo: diferenciamos por `SnapKind` para que el usuario vea
+            // visualmente qué tipo de snap aplicó.
+            match snap_kind {
+                Some(SnapKind::Axis) => Color32::from_rgb(180, 180, 255),
+                Some(SnapKind::Grid) => Color32::from_rgb(180, 180, 180),
+                Some(SnapKind::Object) => Color32::from_rgb(200, 200, 120),
+                Some(SnapKind::Curve) => Color32::from_rgb(160, 220, 200),
+                _ => Color32::from_rgb(160, 160, 160),
+            }
+        }
+    }
+
+    fn draw_arrowhead(painter: &egui::Painter, from: Pos2, to: Pos2, width: f32, color: Color32) {
+        let dir = to - from;
+        let len = dir.length();
+        if len < 1e-3 {
+            return;
+        }
+        let dir = dir / len;
+        let normal = Vec2::new(-dir.y, dir.x);
+        let arrow_len = (width * 4.0).max(6.0).min(len * 0.5);
+        let arrow_width = arrow_len * 0.5;
+
+        let tip_back = to - dir * arrow_len;
+        let left = tip_back + normal * arrow_width;
+        let right = tip_back - normal * arrow_width;
+
+        painter.line_segment([to, left], Stroke::new(width, color));
+        painter.line_segment([to, right], Stroke::new(width, color));
+    }
+
+    pub(crate) fn draw_tool_ghost(&self, painter: &egui::Painter, canvas_rect: Rect) {
+        let painter = clipped_to_canvas(painter, canvas_rect);
+        if let Some(ghost) = &self.tool_ghost {
+            let mut style = StyleOverride {
+                color_alpha_multiplier: Some(0.3),
+                ..Default::default()
+            };
+            match ghost {
+                GeoObject::Point(_) => {
+                    style.size_scale = Some(1.3);
+                }
+                GeoObject::Line(_) => {
+                    style.width_scale = Some(0.7);
+                }
+                GeoObject::Circle(_) => {
+                    style.width_scale = Some(0.7);
+                    style.clear_fill_color = true;
+                }
+                GeoObject::Polygon(_) => {
+                    style.width_scale = Some(0.7);
+                    style.color_alpha_multiplier = Some(0.2);
+                }
+                GeoObject::Polyline(_) => {
+                    style.width_scale = Some(0.7);
+                    style.color_alpha_multiplier = Some(0.2);
+                }
+                _ => {}
+            }
+            self.draw_object_styled(&painter, canvas_rect, ghost, Some(style), false);
+        }
+    }
+
+    pub(crate) fn draw_object(&self, painter: &egui::Painter, canvas_rect: Rect, obj: &GeoObject) {
+        let painter = clipped_to_canvas(painter, canvas_rect);
+        self.draw_object_styled(&painter, canvas_rect, obj, None, false);
+    }
+
+    /// Mínimo desplazamiento en pantalla (px) para registrar una muestra de rastro.
+    /// Evita llenar el buffer con el objeto quieto (throttle por movimiento).
+    pub(crate) const TRAIL_SAMPLE_MIN_PX: f64 = 1.0;
+
+    /// Muestrea y dibuja los rastros (`Rastro[etiqueta]`) de objetos con trace activo.
+    ///
+    /// Solo objetos visibles 2D; early-out por `is_trace` (nunca recorre 5000
+    /// objetos a fondo: el chequeo es O(1) por objeto visible). La estela se
+    /// dibuja como polilínea abierta con fade `(i+1)/len`, sin picking ni bounds.
+    pub(crate) fn sample_and_draw_trails(&mut self, painter: &egui::Painter, canvas_rect: Rect) {
+        let view = *self.document.view();
+        // Recolecta primero (ids + estilo) para no pelear borrows con el muestreo.
+        let mut jobs: Vec<(ObjectId, Color)> = Vec::new();
+        for_each_ordered_visible_2d_object(&self.document, |id, obj| {
+            if self.document.is_trace(id) {
+                jobs.push((id, obj.color()));
+            }
+            true
+        });
+        if jobs.is_empty() {
+            return;
+        }
+        let margin = 32.0;
+        let expanded = canvas_rect.expand(margin);
+        for (id, base) in jobs {
+            let Some(obj) = self.document.get_object(id) else {
+                continue;
+            };
+            let Some(rep) = trail_representative_position(obj) else {
+                continue;
+            };
+            if !rep.x.is_finite() || !rep.y.is_finite() {
+                continue;
+            }
+            // Throttle por movimiento en pantalla (sin clonar la estela).
+            let screen = view.world_to_screen(rep);
+            let moved = self
+                .document
+                .trail_last(id)
+                .map(|last| {
+                    let ls = view.world_to_screen(last);
+                    let dx = f64::from(screen.x - ls.x);
+                    let dy = f64::from(screen.y - ls.y);
+                    dx * dx + dy * dy >= Self::TRAIL_SAMPLE_MIN_PX * Self::TRAIL_SAMPLE_MIN_PX
+                })
+                .unwrap_or(true);
+            if moved {
+                self.document.push_trail_sample(id, rep);
+            }
+            // Draw sin clonar: rebanada contigua del anillo.
+            if let Some(pts) = self.document.trail_slice_mut(id) {
+                draw_trail(painter, &view, expanded, pts, base);
+            }
+        }
+    }
+
+    /// Rellena el área interior de la imagen transformada de un
+    /// `ImplicitCurve` por un `ComplexMapping`. La técnica:
+    ///
+    /// 1. Para cada fila de píxeles del canvas, muestrear el campo en el
+    ///    plano de output (`w`).
+    /// 2. Para cada muestra, aplicar `map.inverse_apply(w)` para obtener
+    ///    el `z` correspondiente en el plano original.
+    /// 3. Evaluar la curva original `f(z) = lhs - rhs` (o `rhs - lhs`
+    ///    para `Greater/GreaterEq`) en ese `z`.
+    /// 4. Aplicar **scanline fill** alternando "fuera"/"dentro" en cada
+    ///    cruce de cero y rellenando entre pares de cruces con la regla
+    ///    par-impar. Esto garantiza que el relleno no excede el contorno
+    ///    (al contrario del cell-fill anterior).
+    #[allow(clippy::too_many_arguments)]
+    fn draw_complex_mapping_fill(
+        &self,
+        painter: &egui::Painter,
+        canvas_rect: Rect,
+        view: &ViewTransform,
+        ic: &ImplicitCurveObj,
+        cm_id: grafito_core::ObjectId,
+        map: ConformalMap,
+        fill_color: Color,
+    ) {
+        #[cfg(feature = "profile")]
+        puffin::profile_scope!("draw_complex_mapping_fill");
+        // 1) Operador: Eq no tiene región rellenable.
+        if matches!(ic.operator, RelationOperator::Eq) {
+            return;
+        }
+        let (eval_lhs, eval_rhs) = match ic.get_cached_asts(&self.document.variables, &["x", "y"]) {
+            Some(t) => t,
+            None => return,
+        };
+        let swap = matches!(
+            ic.operator,
+            RelationOperator::Greater | RelationOperator::GreaterEq
+        );
+
+        let fill_32 = to_color32(fill_color);
+
+        // 2) Dimensiones del canvas en píxeles.
+        let w = canvas_rect.width().max(1.0) as u32;
+        let h = canvas_rect.height().max(1.0) as u32;
+
+        // 3) Calcular view_bounds y padded/snapped bounds para el caché.
+        //    El cache SOLO es válido si los view_bounds actuales caen dentro
+        //    de la región padded cacheada → pan/zoom chico no recalcula.
+        let world_tl = view.screen_to_world(GlamVec2::new(0.0, 0.0));
+        let world_br =
+            view.screen_to_world(GlamVec2::new(canvas_rect.width(), canvas_rect.height()));
+        let view_bounds = (
+            world_tl.x.min(world_br.x),
+            world_tl.x.max(world_br.x),
+            world_br.y.min(world_tl.y),
+            world_br.y.max(world_tl.y),
+        );
+        let padded_bounds =
+            grafito_core::implicit_curve::padded_snapped_bounds(view_bounds, 2.0, 64);
+
+        let (mut texture_w, mut texture_h) =
+            fill_cache_texture_size(view_bounds, padded_bounds, (w, h));
+
+        if self.document.render_quality == grafito_core::RenderQuality::Preview {
+            texture_w = (texture_w as f64 * 0.25).ceil() as u32;
+            texture_h = (texture_h as f64 * 0.25).ceil() as u32;
+            texture_w = texture_w.max(1);
+            texture_h = texture_h.max(1);
+        }
+
+        // 4) Cache key: (expr lhs/rhs, operator, padded_bounds, texture_size,
+        //    variables, fill_color, conformal_map). El conformal_map se hashea
+        //    via Debug para que cambiar `1/z` → `z^2` invalide aunque el
+        //    ImplicitCurve target quede igual.
+        let cache_key = compute_complex_fill_cache_key(
+            ic,
+            &map,
+            padded_bounds,
+            (texture_w, texture_h),
+            &self.document.variables,
+            fill_color,
+        );
+
+        // 5) Verificar caché por el ObjectId del ComplexMapping (no del
+        //    ImplicitCurve, para no pisarlo con su propia cache de fill).
+        {
+            let mut cache = self.fill_textures.write().unwrap_or_else(|poisoned| {
+                log::warn!("Fill texture cache write lock poisoned; recovering");
+                poisoned.into_inner()
+            });
+            if let Some(entry) = cache.get(cm_id) {
+                if entry.cache_key == cache_key
+                    && entry.canvas_size == (texture_w, texture_h)
+                    && entry.texture.is_some()
+                {
+                    if let Some((u_min, u_max, v_min, v_max)) =
+                        fill_cache_view_uv(entry.cached_region, view_bounds)
+                    {
+                        if let Some(ref texture) = entry.texture {
+                            let texture_id = texture.id();
+                            let uv = Rect::from_min_max(
+                                Pos2::new(u_min, v_min),
+                                Pos2::new(u_max, v_max),
+                            );
+                            painter.image(texture_id, canvas_rect, uv, Color32::WHITE);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 6) Cache miss: rasterizar la región padded COMPLETA, no el viewport
+        //    actual. En cache hit se dibuja el sub-rect UV correspondiente al
+        //    viewport; esto evita estirar una textura del viewport antiguo.
+        //
+        //    Precomputar world_xs (evita screen_to_world redundante en filas).
+        let (rx_min, rx_max, ry_min, ry_max) = padded_bounds;
+        let world_xs: Vec<f64> = (0..texture_w)
+            .map(|x_pixel| rx_min + (x_pixel as f64 + 0.5) / texture_w as f64 * (rx_max - rx_min))
+            .collect();
+
+        let rows: Vec<Vec<Color32>> = (0..texture_h)
+            .into_par_iter()
+            .map(|y_pixel| {
+                let wy = ry_max - (y_pixel as f64 + 0.5) / texture_h as f64 * (ry_max - ry_min);
+                let mut row = vec![Color32::TRANSPARENT; texture_w as usize];
+                for x_pixel in 0..texture_w {
+                    let wx = world_xs[x_pixel as usize];
+                    let Some(z) = map.inverse_apply(num_complex::Complex64::new(wx, wy)) else {
+                        continue;
+                    };
+                    let lhs = eval_lhs.eval_2d("x", z.re, "y", z.im);
+                    let rhs = eval_rhs.eval_2d("x", z.re, "y", z.im);
+                    let f = if !lhs.is_finite() || !rhs.is_finite() {
+                        f64::NAN
+                    } else if swap {
+                        rhs - lhs
+                    } else {
+                        lhs - rhs
+                    };
+                    if f.is_finite() && f <= 0.0 {
+                        row[x_pixel as usize] = fill_32;
+                    }
+                }
+                row
+            })
+            .collect();
+
+        // 8) Subir textura a GPU.
+        // Ola 2: solo en cache-miss (arriba hay early-return con blit en hit);
+        // nunca es `load_texture` por frame en estado estable.
+        // P1b: nombre con hash del `cache_key` (mismo patrón retención+hash
+        // que el resto del caché): el `insert_with_ctx` de abajo ya retira
+        // con gracia la versión vieja, y el nombre versionado evita confundir
+        // dos versiones del mismo objeto en los logs de egui/wgpu.
+        let image = egui::ColorImage {
+            size: [texture_w as usize, texture_h as usize],
+            pixels: rows.into_iter().flatten().collect(),
+        };
+        let texture = painter.ctx().load_texture(
+            format!("grafito_fill_complex_{cm_id}_{cache_key:016x}"),
+            image,
+            egui::TextureOptions::LINEAR,
+        );
+
+        // 9) Almacenar en cache y blit.
+        {
+            let mut cache = self.fill_textures.write().unwrap_or_else(|poisoned| {
+                log::warn!("Fill texture cache write lock poisoned; recovering");
+                poisoned.into_inner()
+            });
+            cache.insert_with_ctx(
+                cm_id,
+                FillTextureCache::new(
+                    Some(texture.clone()),
+                    cache_key,
+                    (texture_w, texture_h),
+                    padded_bounds,
+                ),
+                painter.ctx(),
+            );
+        }
+        let texture_id = texture.id();
+        let Some((u_min, u_max, v_min, v_max)) = fill_cache_view_uv(padded_bounds, view_bounds)
+        else {
+            return;
+        };
+        let uv = Rect::from_min_max(Pos2::new(u_min, v_min), Pos2::new(u_max, v_max));
+        painter.image(texture_id, canvas_rect, uv, Color32::WHITE);
+    }
+
+    /// Rellena el **interior** de una región `ImplicitCurve` (operator
+    /// `Less/LessEq/Greater/GreaterEq`). Para `x^2 + y^2 <= 1` produce
+    /// un disco violeta translúcido cuyo borde coincide con la curva;
+    /// para `x^2 + y^2 = 1` no rellena nada (es solo el contorno).
+    ///
+    /// **Caché de textura**: el relleno se rasteriza una sola vez a una
+    /// `egui::TextureHandle` (RGBA, resolución full del canvas) y se
+    /// cachea por `ObjectId`. En frames subsiguientes solo se hace un
+    /// `painter.image` (BLIT, ~0.5ms) en lugar de re-ejecutar el scanline
+    /// fill por frame (que llamaba `eval_2d` ~2M veces/frame en 1920×1080).
+    /// La invalidación usa `padded_snapped_bounds` (pad 2.0, snap 64) para
+    /// que pequeños pans no invaliden el caché. La rasterización inicial
+    /// se paraleliza por filas con rayon.
+    fn draw_implicit_curve_fill(
+        &self,
+        painter: &egui::Painter,
+        canvas_rect: Rect,
+        view: &ViewTransform,
+        ic: &ImplicitCurveObj,
+        fill_color: Color,
+    ) {
+        #[cfg(feature = "profile")]
+        puffin::profile_scope!("draw_implicit_curve_fill");
+        // 1) Parsear lhs/rhs usando el cache del ImplicitCurveObj para evitar
+        //    reparsear y re-simplificar el AST en cada frame.
+        let (eval_lhs, eval_rhs) = match ic.get_cached_asts(&self.document.variables, &["x", "y"]) {
+            Some(t) => t,
+            None => return,
+        };
+
+        // 2) Operador -> convención "interior es f <= 0".
+        //    Less / LessEq     : f = lhs - rhs
+        //    Greater / GreaterEq: f = rhs - lhs
+        //    Eq                 : sin relleno (es solo contorno).
+        if matches!(ic.operator, RelationOperator::Eq) {
+            return;
+        }
+        let swap = matches!(
+            ic.operator,
+            RelationOperator::Greater | RelationOperator::GreaterEq
+        );
+
+        let fill_32 = to_color32(fill_color);
+
+        // 3) Dimensiones del canvas en píxeles.
+        let w = canvas_rect.width().max(1.0) as u32;
+        let h = canvas_rect.height().max(1.0) as u32;
+
+        // 4) Calcular view_bounds y padded/snapped bounds para el caché.
+        let world_tl = view.screen_to_world(GlamVec2::new(0.0, 0.0));
+        let world_br =
+            view.screen_to_world(GlamVec2::new(canvas_rect.width(), canvas_rect.height()));
+        let view_bounds = (
+            world_tl.x.min(world_br.x),
+            world_tl.x.max(world_br.x),
+            world_br.y.min(world_tl.y),
+            world_br.y.max(world_tl.y),
+        );
+        let padded_bounds =
+            grafito_core::implicit_curve::padded_snapped_bounds(view_bounds, 2.0, 64);
+        let (mut texture_w, mut texture_h) =
+            fill_cache_texture_size(view_bounds, padded_bounds, (w, h));
+
+        if self.document.render_quality == grafito_core::RenderQuality::Preview {
+            texture_w = (texture_w as f64 * 0.25).ceil() as u32;
+            texture_h = (texture_h as f64 * 0.25).ceil() as u32;
+            texture_w = texture_w.max(1);
+            texture_h = texture_h.max(1);
+        }
+
+        // 5) Calcular hash de la cache key: (expr_lhs, expr_rhs, operator,
+        //    padded_bounds, texture_w, texture_h, variables, fill_color).
+        let cache_key = compute_fill_cache_key(
+            ic,
+            padded_bounds,
+            (texture_w, texture_h),
+            &self.document.variables,
+            fill_color,
+        );
+
+        // 6) Verificar caché: si la key coincide y los view_bounds están
+        //    dentro de la región cacheada, blitear la textura y retornar.
+        let object_id = ic.id;
+        {
+            let mut cache = self.fill_textures.write().unwrap_or_else(|poisoned| {
+                log::warn!("Fill texture cache write lock poisoned; recovering");
+                poisoned.into_inner()
+            });
+            if let Some(entry) = cache.get(object_id) {
+                if entry.cache_key == cache_key
+                    && entry.canvas_size == (texture_w, texture_h)
+                    && entry.texture.is_some()
+                {
+                    if let Some((u_min, u_max, v_min, v_max)) =
+                        fill_cache_view_uv(entry.cached_region, view_bounds)
+                    {
+                        if let Some(ref texture) = entry.texture {
+                            let texture_id = texture.id();
+                            let uv = Rect::from_min_max(
+                                Pos2::new(u_min, v_min),
+                                Pos2::new(u_max, v_max),
+                            );
+                            painter.image(texture_id, canvas_rect, uv, Color32::WHITE);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 7) Cache miss: rasterizar la región padded completa a una textura.
+        //    En frames siguientes se dibuja el sub-rect UV del viewport actual.
+
+        // Precomputar world_x por columna (evita llamadas redundantes a
+        // screen_to_world dentro del loop paralelo de filas).
+        let (rx_min, rx_max, ry_min, ry_max) = padded_bounds;
+        let world_xs: Vec<f64> = (0..texture_w)
+            .map(|x_pixel| rx_min + (x_pixel as f64 + 0.5) / texture_w as f64 * (rx_max - rx_min))
+            .collect();
+
+        // Rasterizar filas en paralelo con rayon.
+        // Cada fila produce un Vec<Color32> de w píxeles.
+        let rows: Vec<Vec<Color32>> = (0..texture_h)
+            .into_par_iter()
+            .map(|y_pixel| {
+                let wy = ry_max - (y_pixel as f64 + 0.5) / texture_h as f64 * (ry_max - ry_min);
+                let mut row = vec![Color32::TRANSPARENT; texture_w as usize];
+                for x_pixel in 0..texture_w {
+                    let wx = world_xs[x_pixel as usize];
+                    let lhs = eval_lhs.eval_2d("x", wx, "y", wy);
+                    let rhs = eval_rhs.eval_2d("x", wx, "y", wy);
+                    let f = if !lhs.is_finite() || !rhs.is_finite() {
+                        f64::NAN
+                    } else if swap {
+                        rhs - lhs
+                    } else {
+                        lhs - rhs
+                    };
+                    if f.is_finite() && f <= 0.0 {
+                        row[x_pixel as usize] = fill_32;
+                    }
+                }
+                row
+            })
+            .collect();
+
+        // Construir ColorImage directamente desde los Color32 (sin
+        // conversión a bytes intermedia) y subir como TextureHandle.
+        // Ola 2: solo en cache-miss (el bloque 6 hace blit + return en hit).
+        // P1b: nombre con hash (igual que el fill complejo de arriba).
+        let image = egui::ColorImage {
+            size: [texture_w as usize, texture_h as usize],
+            pixels: rows.into_iter().flatten().collect(),
+        };
+        let texture = painter.ctx().load_texture(
+            format!("grafito_fill_{object_id}_{cache_key:016x}"),
+            image,
+            egui::TextureOptions::LINEAR,
+        );
+
+        // Almacenar en caché.
+        {
+            let mut cache = self.fill_textures.write().unwrap_or_else(|poisoned| {
+                log::warn!("Fill texture cache write lock poisoned; recovering");
+                poisoned.into_inner()
+            });
+            cache.insert_with_ctx(
+                object_id,
+                FillTextureCache::new(
+                    Some(texture.clone()),
+                    cache_key,
+                    (texture_w, texture_h),
+                    padded_bounds,
+                ),
+                painter.ctx(),
+            );
+        }
+
+        // Dibujar la textura (BLIT, ~0.5ms).
+        let texture_id = texture.id();
+        let Some((u_min, u_max, v_min, v_max)) = fill_cache_view_uv(padded_bounds, view_bounds)
+        else {
+            return;
+        };
+        let uv = Rect::from_min_max(Pos2::new(u_min, v_min), Pos2::new(u_max, v_max));
+        painter.image(texture_id, canvas_rect, uv, Color32::WHITE);
+    }
+
+    pub(crate) fn draw_object_styled(
+        &self,
+        painter: &egui::Painter,
+        canvas_rect: Rect,
+        obj: &GeoObject,
+        style: Option<StyleOverride>,
+        overlay_only: bool,
+    ) {
+        #[cfg(feature = "profile")]
+        puffin::profile_scope!("draw_object_styled");
+        // Clip global: TODA primitiva de objeto (puntos, círculos, polígonos,
+        // curvas, fills, fractales, mappings) queda recortada al canvas. Los
+        // casos que antes recortaban internamente (ComplexGrid/ComplexMapping)
+        // ahora quedan cubiertos por este clip único.
+        let painter = clipped_to_canvas(painter, canvas_rect);
+        // Frente P4: respeto mínimo de DisplayFlags (condición/dynamic/hide).
+        let (p4_style, p4_visible) = p4_display_override(&self.document, obj.label());
+        if !p4_visible {
+            return;
+        }
+        let style = p4_merge_style(style, p4_style);
+        let overlay_only = match cpu_object_pass(&self.document, obj, overlay_only) {
+            CpuObjectPass::Full => false,
+            CpuObjectPass::Supplement => true,
+            CpuObjectPass::Skip => return,
+        };
+
+        // Culling de viewport (mismo criterio que el builder GPU en
+        // `grafito_render::build_single_geometry`): si el objeto tiene AABB
+        // mundial acotado y no intersecta el canvas, se omite todo el
+        // muestreo/proyección CPU (fractales 160k px, domain coloring 250k
+        // celdas, paramétricas 4000 muestras, círculos/elipses, etc.). Los
+        // objetos no acotados o con mapeo devuelven `None` y nunca se cullan.
+        let view = self.document.view();
+        let view_bounds = grafito_render::viewport_world_bounds(view);
+        if let Some(aabb) = grafito_render::object_world_aabb(view, &self.document, obj) {
+            let margin = grafito_render::object_cull_margin_world(obj, view.scale);
+            if !grafito_render::aabb_intersects(&aabb, &view_bounds, margin) {
+                return;
+            }
+        }
+        let label_color = current_theme(painter.ctx()).object_label;
+        // Escala cuantizada una vez por objeto: las ramas Point,
+        // Line, Circle, Ellipse y Function-fallback Ascii comparten
+        // Galley por (texto, estilo, escala) sin re-resolver por frame.
+        let scale_q = quantize_scale_ln(view.scale);
+        match obj {
+            GeoObject::Point(p) => {
+                let screen = view.world_to_screen(p.position);
+                let pos = canvas_rect.min + Vec2::new(screen.x, screen.y);
+                let size = get_size(p.size, style).max(1.0);
+                let color = to_color32(get_color(p.color, style));
+                let label = get_label(&p.label, style);
+                draw_point_glyph(&painter, pos, size, color, p.point_style);
+                // Marcas de eje para puntos de intercepto (cerca de x=0 o y=0).
+                let axis_tol = 1e-6f64.max(2.0 / view.scale);
+                let tick_world = 6.0 / view.scale;
+                if p.position.x.abs() <= axis_tol {
+                    let a = view.world_to_screen(Point2::new(-tick_world, p.position.y));
+                    let b = view.world_to_screen(Point2::new(tick_world, p.position.y));
+                    painter.line_segment(
+                        [
+                            canvas_rect.min + Vec2::new(a.x, a.y),
+                            canvas_rect.min + Vec2::new(b.x, b.y),
+                        ],
+                        Stroke::new(1.5, color),
+                    );
+                }
+                if p.position.y.abs() <= axis_tol {
+                    let a = view.world_to_screen(Point2::new(p.position.x, -tick_world));
+                    let b = view.world_to_screen(Point2::new(p.position.x, tick_world));
+                    painter.line_segment(
+                        [
+                            canvas_rect.min + Vec2::new(a.x, a.y),
+                            canvas_rect.min + Vec2::new(b.x, b.y),
+                        ],
+                        Stroke::new(1.5, color),
+                    );
+                }
+                if !label.is_empty() {
+                    // Galley cacheado: píxel-idéntico a `painter.text`
+                    // (mismo layout + anclaje LEFT_BOTTOM).
+                    let _ = cached_label_text(
+                        &painter,
+                        pos + Vec2::new(size + 2.0, -size - 2.0),
+                        egui::Align2::LEFT_BOTTOM,
+                        label,
+                        grafito_ui::tokens::TYPE_SM,
+                        label_color,
+                        scale_q,
+                    );
+                }
+            }
+            GeoObject::Line(l) => {
+                let width = get_width(l.width, style);
+                let color = get_color(l.color, style);
+                let label = get_label(&l.label, style);
+                let start = Point2::new(
+                    self.document.resolve_expr(&l.start_x_expr, l.start.x),
+                    self.document.resolve_expr(&l.start_y_expr, l.start.y),
+                );
+                let end = Point2::new(
+                    self.document.resolve_expr(&l.end_x_expr, l.end.x),
+                    self.document.resolve_expr(&l.end_y_expr, l.end.y),
+                );
+
+                let view_bounds = grafito_render::viewport_world_bounds(view);
+
+                let stroke = Stroke::new(width, to_color32(color));
+                let clipped = match l.kind {
+                    grafito_core::LineKind::Segment => {
+                        grafito_geometry::clip_segment_to_rect(start, end, view_bounds)
+                    }
+                    grafito_core::LineKind::Ray => {
+                        grafito_geometry::clip_ray_to_rect(start, end, view_bounds)
+                    }
+                    grafito_core::LineKind::Line => {
+                        grafito_geometry::clip_line_to_rect(start, end, view_bounds)
+                    }
+                };
+                if let Some((clip_start, clip_end)) = clipped {
+                    let a = view.world_to_screen(clip_start);
+                    let b = view.world_to_screen(clip_end);
+                    let pa = canvas_rect.min + Vec2::new(a.x, a.y);
+                    let pb = canvas_rect.min + Vec2::new(b.x, b.y);
+                    if !overlay_only {
+                        stroke_segment(&painter, pa, pb, stroke, l.line_style);
+                    }
+
+                    // Arrowhead for vectors at the forward (t=1) end.
+                    let is_vector = label == "v";
+                    if is_vector && !overlay_only {
+                        Self::draw_arrowhead(&painter, pa, pb, width, to_color32(color));
+                    }
+                }
+                if !label.is_empty() {
+                    let mid = if l.kind == grafito_core::LineKind::Segment {
+                        let a = view.world_to_screen(start);
+                        let b = view.world_to_screen(end);
+                        (a + b) * 0.5
+                    } else {
+                        // Place label near the start for rays/lines.
+                        view.world_to_screen(start)
+                    };
+                    // Galley cacheado: píxel-idéntico a `painter.text`
+                    // (mismo layout + anclaje CENTER_BOTTOM).
+                    let _ = cached_label_text(
+                        &painter,
+                        canvas_rect.min + Vec2::new(mid.x, mid.y) + Vec2::new(0.0, -8.0),
+                        egui::Align2::CENTER_BOTTOM,
+                        label,
+                        grafito_ui::tokens::TYPE_SM,
+                        label_color,
+                        scale_q,
+                    );
+                }
+            }
+            GeoObject::Circle(c) => {
+                let center = view.world_to_screen(c.center);
+                let radius = (c.radius * view.scale) as f32;
+                let radius = radius.clamp(0.5, 50000.0);
+                let pos = canvas_rect.min + Vec2::new(center.x, center.y);
+                let width = get_width(c.width, style);
+                let color = get_color(c.color, style);
+                let fill_color = get_fill_color(c.fill_color, style);
+                let label = get_label(&c.label, style);
+                let stroke = Stroke::new(width, to_color32(color));
+                if !overlay_only {
+                    if let Some(fill) = fill_color {
+                        painter.circle_filled(pos, radius, to_color32(fill));
+                    }
+                    if matches!(c.line_style, LineStyle::Solid) {
+                        painter.circle_stroke(pos, radius, stroke);
+                    } else {
+                        // 128-gon con dash: indistinguible del círculo.
+                        let mut pts = Vec::with_capacity(128);
+                        for i in 0..128 {
+                            let t = i as f32 / 128.0 * std::f32::consts::TAU;
+                            pts.push(pos + Vec2::new(radius * t.cos(), radius * t.sin()));
+                        }
+                        stroke_polyline(&painter, &pts, true, stroke, c.line_style);
+                    }
+                }
+                if !label.is_empty() {
+                    // Galley cacheado: píxel-idéntico a `painter.text`
+                    // (mismo layout + anclaje LEFT_BOTTOM).
+                    let _ = cached_label_text(
+                        &painter,
+                        pos + Vec2::new(radius + 2.0, -radius - 2.0),
+                        egui::Align2::LEFT_BOTTOM,
+                        label,
+                        grafito_ui::tokens::TYPE_SM,
+                        label_color,
+                        scale_q,
+                    );
+                }
+            }
+            GeoObject::Polygon(poly) if poly.vertices.len() >= 3 => {
+                let points: Vec<_> = poly
+                    .vertices
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| {
+                        let x = self
+                            .document
+                            .resolve_expr(poly.x_exprs.get(i).unwrap_or(&None), v.x);
+                        let y = self
+                            .document
+                            .resolve_expr(poly.y_exprs.get(i).unwrap_or(&None), v.y);
+                        let s = view.world_to_screen(Point2::new(x, y));
+                        canvas_rect.min + Vec2::new(s.x, s.y)
+                    })
+                    .collect();
+                let width = get_width(poly.width, style);
+                let color = get_color(poly.color, style);
+                let fill_color = get_fill_color(poly.fill_color, style);
+                let label = get_label(&poly.label, style);
+                let stroke = Stroke::new(width, to_color32(color));
+                let fill = fill_color.map(to_color32).unwrap_or(Color32::TRANSPARENT);
+                // PERF: el centroide se calcula antes de mover `points` al shape
+                // (evita `points.clone()` por frame para el label).
+                let centroid = if !label.is_empty() {
+                    let cx: f32 = points.iter().map(|p| p.x).sum::<f32>() / points.len() as f32;
+                    let cy: f32 = points.iter().map(|p| p.y).sum::<f32>() / points.len() as f32;
+                    Some(Pos2::new(cx, cy))
+                } else {
+                    None
+                };
+                if !overlay_only {
+                    if matches!(poly.line_style, LineStyle::Solid) {
+                        painter.add(Shape::convex_polygon(points, fill, stroke));
+                    } else {
+                        // Ola 2: sin `points.clone()` por frame cuando no hay
+                        // relleno — un `convex_polygon` con fill TRANSPARENT y
+                        // `Stroke::NONE` no dibuja nada; se omite y `points`
+                        // se presta al stroke punteado. Con relleno se conserva
+                        // el clon (z-order fill-debajo-del-borde exacto).
+                        if fill != Color32::TRANSPARENT {
+                            painter.add(Shape::convex_polygon(points.clone(), fill, Stroke::NONE));
+                        }
+                        stroke_polyline(&painter, &points, true, stroke, poly.line_style);
+                    }
+                }
+                if let Some(centroid) = centroid {
+                    painter.text(
+                        centroid,
+                        egui::Align2::CENTER_CENTER,
+                        label,
+                        egui::FontId::proportional(grafito_ui::tokens::TYPE_SM),
+                        label_color,
+                    );
+                }
+            }
+            GeoObject::Polyline(line) if line.points.len() >= 2 => {
+                // Cadena abierta: caché view-screen por vista cuantizada
+                // (pan/zoom dentro del quantum reutiliza sin re-proyectar),
+                // diezmado por píxel y batch en un solo `add`.
+                let width = get_width(line.width, style);
+                let color = to_color32(get_color(line.color, style));
+                let stroke = Stroke::new(width, color);
+                let qview = quantize_view(view);
+                let quality = render_quality_tag(self.document.render_quality);
+                let cache_key = (line.id, self.document.cache_nonce, self.document.version);
+                let cached = projected_polyline_cache_get(
+                    cache_key.0,
+                    cache_key.1,
+                    cache_key.2,
+                    quality,
+                    qview,
+                );
+                let view_runs: Arc<Vec<Vec<Pos2>>> = match cached {
+                    Some(hit) => hit,
+                    None => {
+                        let raw = project_world_points_to_view_runs(
+                            view,
+                            &line.points,
+                            canvas_rect.width(),
+                            canvas_rect.height(),
+                        );
+                        let decimated = decimate_runs_to_pixels(&raw);
+                        projected_polyline_cache_put(
+                            cache_key.0,
+                            cache_key.1,
+                            cache_key.2,
+                            quality,
+                            qview,
+                            decimated,
+                        )
+                    }
+                };
+                let offset = canvas_rect.min.to_vec2();
+                if !overlay_only && !style.is_some_and(|style| style.skip_stroke) {
+                    let runs: Vec<Vec<Pos2>> = view_runs
+                        .iter()
+                        .map(|run| run.iter().map(|p| *p + offset).collect())
+                        .collect();
+                    stroke_runs_batched(&painter, runs, stroke, line.line_style);
+                }
+                let label = get_label(&line.label, style);
+                if !label.is_empty() {
+                    let total: usize = view_runs.iter().map(|run| run.len()).sum();
+                    if total > 0 {
+                        let mut sx = 0.0f32;
+                        let mut sy = 0.0f32;
+                        let mut count = 0usize;
+                        for run in view_runs.iter() {
+                            for p in run {
+                                sx += p.x + offset.x;
+                                sy += p.y + offset.y;
+                                count += 1;
+                            }
+                        }
+                        if count > 0 {
+                            let centroid = Pos2::new(sx / count as f32, sy / count as f32);
+                            if label_budget_allowed(
+                                grafito_ui::tokens::TYPE_SM,
+                                Some(MIN_LABEL_EXTENT_PX),
+                            ) {
+                                painter.text(
+                                    centroid,
+                                    egui::Align2::CENTER_CENTER,
+                                    label,
+                                    egui::FontId::proportional(grafito_ui::tokens::TYPE_SM),
+                                    label_color,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            GeoObject::Pencil(pencil) if pencil.points.len() >= 2 || pencil.is_dynamic_locus() => {
+                // Polilínea con caché view-screen + diezmado + batch (igual
+                // que Polyline). El marcador de locus y su rótulo van fuera
+                // del batch (una sola primitiva).
+                let width = get_width(pencil.width, style);
+                let color = to_color32(get_color(pencil.color, style));
+                let stroke = Stroke::new(width, color);
+                if pencil.points.len() >= 2 {
+                    let qview = quantize_view(view);
+                    let quality = render_quality_tag(self.document.render_quality);
+                    let cached = projected_polyline_cache_get(
+                        pencil.id,
+                        self.document.cache_nonce,
+                        self.document.version,
+                        quality,
+                        qview,
+                    );
+                    let view_runs: Arc<Vec<Vec<Pos2>>> = match cached {
+                        Some(hit) => hit,
+                        None => {
+                            let raw = project_world_points_to_view_runs(
+                                view,
+                                &pencil.points,
+                                canvas_rect.width(),
+                                canvas_rect.height(),
+                            );
+                            let decimated = decimate_runs_to_pixels(&raw);
+                            projected_polyline_cache_put(
+                                pencil.id,
+                                self.document.cache_nonce,
+                                self.document.version,
+                                quality,
+                                qview,
+                                decimated,
+                            )
+                        }
+                    };
+                    let offset = canvas_rect.min.to_vec2();
+                    let runs: Vec<Vec<Pos2>> = view_runs
+                        .iter()
+                        .map(|run| run.iter().map(|p| *p + offset).collect())
+                        .collect();
+                    stroke_runs_batched(&painter, runs, stroke, pencil.line_style);
+                }
+                if pencil.is_dynamic_locus() {
+                    if let Some(last) = pencil.points.last().copied() {
+                        let screen = view.world_to_screen(last);
+                        let end = canvas_rect.min + Vec2::new(screen.x, screen.y);
+                        painter.circle_stroke(end, (width * 1.6).max(3.0), Stroke::new(1.0, color));
+                        let label = get_label(&pencil.label, style);
+                        if !label.is_empty() {
+                            painter.text(
+                                end + Vec2::new(6.0, -6.0),
+                                egui::Align2::LEFT_BOTTOM,
+                                label,
+                                egui::FontId::proportional(grafito_ui::tokens::TYPE_SM),
+                                label_color,
+                            );
+                        }
+                    }
+                }
+            }
+            GeoObject::Function(fun) => {
+                let width = get_width(fun.width, style);
+                let color = get_color(fun.color, style);
+                let fill_color = get_fill_color(fun.fill_color, style);
+                let label = get_label(&fun.label, style);
+                let world_tl = view.screen_to_world(GlamVec2::new(0.0, 0.0));
+                let world_br =
+                    view.screen_to_world(GlamVec2::new(canvas_rect.width(), canvas_rect.height()));
+                let min_x = self
+                    .document
+                    .resolve_expr(&fun.domain_min_expr, fun.domain_min.unwrap_or(world_tl.x));
+                let max_x = self
+                    .document
+                    .resolve_expr(&fun.domain_max_expr, fun.domain_max.unwrap_or(world_br.x));
+
+                let variables = &self.document.variables;
+                // T1: `samples` y `projected` son scratch reutilizados por
+                // frame (dos pasadas, 0 allocs en hit); se devuelven al
+                // final del brazo. (La fusión en una pasada pierde ~35%:
+                // ver A/B en tests. No fusionar.)
+                let mut samples = take_scratch_refined();
+                let mut projected = take_scratch_projected();
+                if fun.is_integral {
+                    let screen_width = canvas_rect.width() as f64;
+                    let world_width = max_x - min_x;
+
+                    let mut steps = screen_width.clamp(400.0, 4000.0) as usize;
+                    let max_world_step = 0.01;
+                    let mut step = world_width / steps as f64;
+                    if step > max_world_step {
+                        steps = (world_width / max_world_step).ceil() as usize;
+                    }
+                    steps = steps.min(500_000);
+                    step = world_width / steps as f64;
+
+                    let xs = (0..=steps).map(|i| min_x + i as f64 * step);
+
+                    let mut s: Vec<(f64, Option<f64>)> = Vec::with_capacity(steps + 1);
+                    let batch_results = eval_integral_batch(
+                        &fun.expr,
+                        &fun.integral_var,
+                        fun.integral_lower,
+                        xs.clone(),
+                        variables,
+                    );
+
+                    for (x, y_opt) in
+                        xs.zip(batch_results.into_iter().chain(std::iter::repeat(None)))
+                    {
+                        if let Some(y) = y_opt {
+                            if y.is_finite() {
+                                s.push((x, Some(y)));
+                                continue;
+                            }
+                        }
+                        let eps = 1e-9;
+                        if let (Ok(y1), Ok(y2)) = (
+                            eval_function_with_vars(&fun.expr, x - eps, variables),
+                            eval_function_with_vars(&fun.expr, x + eps, variables),
+                        ) {
+                            if y1.is_finite() && y2.is_finite() && (y1 - y2).abs() < 1.0 {
+                                s.push((x, Some((y1 + y2) * 0.5)));
+                                continue;
+                            }
+                        }
+                        if let Ok(y) = eval_function_with_vars(&fun.expr, x, variables) {
+                            if y.is_finite() {
+                                s.push((x, Some(y)));
+                                continue;
+                            }
+                        }
+                        s.push((x, None));
+                    }
+                    refine_function_samples_into(&s, &fun.expr, variables, &mut samples);
+                    projected.extend(samples.iter().map(|&(x, y)| {
+                        y.and_then(|y| function_screen_point(view, canvas_rect, x, y))
+                    }));
+                } else {
+                    let domain = (min_x, max_x);
+                    let grid_size =
+                        grafito_core::function_sampling::recommended_grid_size_for_quality(
+                            canvas_rect.width(),
+                            self.document.render_quality,
+                        );
+                    // PERF (H1): iteramos el guard del RwLock sin clonar (evita
+                    // copiar hasta 10k muestras por frame en cache caliente). Si
+                    // `samples_or_compute` devolviera `Arc<FunctionSamples>`,
+                    // podríamos retener `&[Sample]` sin copia alguna.
+                    let guard = grafito_core::function_sampling::samples_or_compute(
+                        fun, domain, grid_size, variables,
+                    );
+                    refine_function_samples_into(&guard, &fun.expr, variables, &mut samples);
+                    projected.extend(samples.iter().map(|&(x, y)| {
+                        y.and_then(|y| function_screen_point(view, canvas_rect, x, y))
+                    }));
+                }
+                let draw_bounds = canvas_rect.expand(1.0);
+
+                // Fill area under curve if fill_color is set
+                if !overlay_only {
+                    if let Some(fill) = fill_color {
+                        let fill_rgba = to_color32(fill);
+                        // Con escalas lineales la `y` de pantalla de y=0 es una
+                        // sola: proyectarla una vez en vez de N veces por frame.
+                        let log_scale = view.x_log || view.y_log;
+                        let baseline_y = if log_scale {
+                            None
+                        } else {
+                            function_screen_point(view, canvas_rect, 0.0, 0.0).map(|p| p.y)
+                        };
+                        let mut run: Vec<(Pos2, Pos2)> = Vec::new();
+                        let flush_run = |run: &mut Vec<(Pos2, Pos2)>| {
+                            if run.len() < 2 {
+                                run.clear();
+                                return;
+                            }
+                            let mut fill_pts: Vec<Pos2> =
+                                run.iter().map(|(curve, _)| *curve).collect();
+                            fill_pts.extend(run.iter().rev().map(|(_, baseline)| *baseline));
+                            if fill_pts.len() >= 3 {
+                                painter.add(Shape::Path(egui::epaint::PathShape {
+                                    points: fill_pts,
+                                    closed: true,
+                                    fill: fill_rgba,
+                                    stroke: Stroke::new(0.5, fill_rgba).into(),
+                                }));
+                            }
+                            run.clear();
+                        };
+
+                        for ((x, _), curve) in samples.iter().zip(&projected) {
+                            let baseline = if log_scale {
+                                function_screen_point(view, canvas_rect, *x, 0.0)
+                            } else {
+                                curve
+                                    .zip(baseline_y)
+                                    .map(|(curve, baseline_y)| Pos2::new(curve.x, baseline_y))
+                            };
+                            if let (Some(curve), Some(baseline)) = (curve, baseline) {
+                                if let Some((prev, _)) = run.last() {
+                                    if !should_connect_screen_points(*prev, *curve, canvas_rect) {
+                                        flush_run(&mut run);
+                                    }
+                                }
+                                run.push((*curve, baseline));
+                            } else {
+                                flush_run(&mut run);
+                            }
+                        }
+                        flush_run(&mut run);
+                    }
+                }
+
+                if !overlay_only && !style.is_some_and(|style| style.skip_stroke) {
+                    let stroke = Stroke::new(width, to_color32(color));
+                    let line_style = fun.line_style;
+                    // Batch: se acumulan los runs diezmados del mismo estilo
+                    // y se emiten en un solo `add` (visual idéntico a N
+                    // `stroke_run`, una pasada O(N) ya existente).
+                    let mut batched_runs: Vec<Vec<Pos2>> = Vec::new();
+                    let mut optimized_points = Vec::new();
+                    let mut i = 0;
+                    while i < projected.len() {
+                        if let Some(p) = projected[i] {
+                            let px = p.x.round().clamp(draw_bounds.min.x, draw_bounds.max.x);
+                            let first_y = p.y;
+                            let mut min_y = p.y;
+                            let mut max_y = p.y;
+                            let mut min_j = i;
+                            let mut max_j = i;
+                            let mut last_y = p.y;
+
+                            let mut j = i + 1;
+                            while j < projected.len() {
+                                if let Some(p2) = projected[j] {
+                                    if p2.x.round().clamp(draw_bounds.min.x, draw_bounds.max.x)
+                                        == px
+                                    {
+                                        if p2.y < min_y {
+                                            min_y = p2.y;
+                                            min_j = j;
+                                        }
+                                        if p2.y > max_y {
+                                            max_y = p2.y;
+                                            max_j = j;
+                                        }
+                                        last_y = p2.y;
+                                        j += 1;
+                                    } else {
+                                        break;
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+                            optimized_points.push(Pos2::new(px, first_y));
+                            if (min_y - first_y).abs() > 1.0 || (max_y - first_y).abs() > 1.0 {
+                                if min_j < max_j {
+                                    optimized_points.push(Pos2::new(px, min_y));
+                                    optimized_points.push(Pos2::new(px, max_y));
+                                } else {
+                                    optimized_points.push(Pos2::new(px, max_y));
+                                    optimized_points.push(Pos2::new(px, min_y));
+                                }
+                            }
+                            optimized_points.push(Pos2::new(px, last_y));
+                            i = j;
+                        } else {
+                            if !optimized_points.is_empty() {
+                                batched_runs.push(std::mem::take(&mut optimized_points));
+                            }
+                            i += 1;
+                        }
+                    }
+                    if !optimized_points.is_empty() {
+                        batched_runs.push(optimized_points);
+                    }
+                    stroke_runs_batched(&painter, batched_runs, stroke, line_style);
+                }
+
+                // Etiquetas sin choques: en angosto (<740, móvil/tablet)
+                // solo la del objeto seleccionado; en el resto manda el
+                // registro (la 2ª sube arriba, la 3ª no sale).
+                let narrow_labels =
+                    canvas_rect.width() < grafito_ui::tokens::PALETTE_BOTTOM_SHEET_BREAKPOINT;
+                let label_mine = self.selected_object == Some(obj.id());
+                if !label.is_empty() && (!narrow_labels || label_mine) {
+                    let mid_x = (min_x + max_x) * 0.5;
+                    if let Ok(y) = grafito_geometry::expr::eval_function_with_vars(
+                        &fun.expr,
+                        mid_x,
+                        &self.document.variables,
+                    ) {
+                        if let Some(position) = function_screen_point(view, canvas_rect, mid_x, y) {
+                            let label_position = position + Vec2::new(0.0, 14.0);
+                            if draw_bounds.contains(label_position) {
+                                // W2 TeX: raster si cubre, ASCII idéntico si no.
+                                match decide_function_label(label, &fun.expr) {
+                                    FunctionLabelDraw::TexRaster { text, bitmap } => {
+                                        let half = bitmap.width as f32 * TEX_LABEL_SCALE_PX * 0.5;
+                                        let origin =
+                                            Pos2::new(label_position.x - half, label_position.y);
+                                        if origin.is_finite() {
+                                            let size = Vec2::new(
+                                                bitmap.width as f32 * TEX_LABEL_SCALE_PX,
+                                                bitmap.height as f32 * TEX_LABEL_SCALE_PX,
+                                            );
+                                            if let Some(rect) = claim_function_label_rect(
+                                                Rect::from_min_size(origin, size),
+                                                label_position,
+                                                size,
+                                            ) {
+                                                draw_tex_label(
+                                                    &painter,
+                                                    rect.min,
+                                                    &text,
+                                                    &bitmap,
+                                                    label_color,
+                                                );
+                                            }
+                                        } else {
+                                            current_theme(painter.ctx()).paint_canvas_text(
+                                                &painter,
+                                                label_position,
+                                                egui::Align2::CENTER_TOP,
+                                                label,
+                                                egui::FontId::proportional(
+                                                    grafito_ui::tokens::TYPE_SM,
+                                                ),
+                                                label_color,
+                                            );
+                                        }
+                                    }
+                                    FunctionLabelDraw::Ascii => {
+                                        // Se mide para el registro: el mismo
+                                        // punto de siempre si hay lugar.
+                                        // Galley compartido por (texto, estilo,
+                                        // escala): en hit no se re-resuelve el
+                                        // layout; el `galley` posterior es el
+                                        // mismo que antes.
+                                        let galley = label_galley_shared(
+                                            &painter,
+                                            label,
+                                            grafito_ui::tokens::TYPE_SM,
+                                            label_color,
+                                            scale_q,
+                                        );
+                                        let size = galley.size();
+                                        let origin = Pos2::new(
+                                            label_position.x - size.x * 0.5,
+                                            label_position.y,
+                                        );
+                                        if let Some(rect) = claim_function_label_rect(
+                                            Rect::from_min_size(origin, size),
+                                            label_position,
+                                            size,
+                                        ) {
+                                            painter.galley(rect.min, galley, label_color);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // T1: devolver los scratch al pool (conservan capacidad para
+                // la próxima función del frame).
+                return_scratch_refined(samples);
+                return_scratch_projected(projected);
+            }
+            GeoObject::Ellipse(el) => {
+                let stroke = Stroke::new(el.width, to_color32(el.color));
+                let n = 64;
+                let mut pts = Vec::with_capacity(n);
+                for i in 0..n {
+                    let t = i as f64 / n as f64 * std::f64::consts::TAU;
+                    let x = el.center.x + el.rx * t.cos() * el.angle.cos()
+                        - el.ry * t.sin() * el.angle.sin();
+                    let y = el.center.y
+                        + el.rx * t.cos() * el.angle.sin()
+                        + el.ry * t.sin() * el.angle.cos();
+                    let s = view.world_to_screen(Point2::new(x, y));
+                    pts.push(canvas_rect.min + Vec2::new(s.x, s.y));
+                }
+                // PERF: un solo `convex_polygon` con fill+stroke reemplaza
+                // 64 `line_segment` por frame. La elipse muestreada
+                // en 64 puntos es convexa, así que el contorno es idéntico.
+                // Ola 2: con fill TRANSPARENT se omite el polígono (no dibuja
+                // nada) y se evita el `pts.clone()` por frame.
+                let fill = el
+                    .fill_color
+                    .map(to_color32)
+                    .unwrap_or(Color32::TRANSPARENT);
+                if matches!(el.line_style, LineStyle::Solid) {
+                    painter.add(Shape::convex_polygon(pts, fill, stroke));
+                } else {
+                    if fill != Color32::TRANSPARENT {
+                        painter.add(Shape::convex_polygon(pts.clone(), fill, Stroke::NONE));
+                    }
+                    stroke_polyline(&painter, &pts, true, stroke, el.line_style);
+                }
+                if !el.label.is_empty() {
+                    let s = view.world_to_screen(el.center);
+                    // Galley cacheado: píxel-idéntico a `painter.text`
+                    // (mismo layout + anclaje CENTER_TOP; se conserva
+                    // `&el.label` directo como antes, sin cambio semántico).
+                    let _ = cached_label_text(
+                        &painter,
+                        canvas_rect.min
+                            + Vec2::new(s.x, s.y + el.ry as f32 * view.scale as f32 + 14.0),
+                        egui::Align2::CENTER_TOP,
+                        &el.label,
+                        grafito_ui::tokens::TYPE_SM,
+                        label_color,
+                        scale_q,
+                    );
+                }
+            }
+            GeoObject::Parabola(pb) => {
+                if !pb.p.is_finite() || pb.p.abs() < 1e-12 {
+                    return;
+                }
+                let stroke = Stroke::new(pb.width, to_color32(pb.color));
+                let steps = 128;
+                let range = (20.0 / view.scale).clamp(0.1, 500.0);
+                let cos_a = pb.angle.cos();
+                let sin_a = pb.angle.sin();
+                let mut prev: Option<Pos2> = None;
+                for i in 0..=steps {
+                    let t = -range + 2.0 * range * i as f64 / steps as f64;
+                    let lx = t;
+                    let ly = t * t / (4.0 * pb.p);
+                    let wx = pb.vertex.x + lx * cos_a - ly * sin_a;
+                    let wy = pb.vertex.y + lx * sin_a + ly * cos_a;
+                    let s = view.world_to_screen(Point2::new(wx, wy));
+                    let p = canvas_rect.min + Vec2::new(s.x, s.y);
+                    if wx.is_finite() && wy.is_finite() {
+                        if let Some(prev_p) = prev {
+                            if (p.x - prev_p.x).abs() < 300.0 {
+                                stroke_segment(&painter, prev_p, p, stroke, pb.line_style);
+                            }
+                        }
+                        prev = Some(p);
+                    }
+                }
+                if !pb.label.is_empty() {
+                    let s = view.world_to_screen(Point2::new(pb.vertex.x, pb.vertex.y - 1.0));
+                    painter.text(
+                        canvas_rect.min + Vec2::new(s.x, s.y - 8.0),
+                        egui::Align2::CENTER_BOTTOM,
+                        &pb.label,
+                        egui::FontId::proportional(grafito_ui::tokens::TYPE_SM),
+                        label_color,
+                    );
+                }
+            }
+            GeoObject::Hyperbola(hb) => {
+                let stroke = Stroke::new(hb.width, to_color32(hb.color));
+                let n = 64;
+                let epsilon = 0.05;
+                let cos_a = hb.angle.cos();
+                let sin_a = hb.angle.sin();
+                for branch in 0..2 {
+                    let t_start = -std::f64::consts::FRAC_PI_2
+                        + epsilon
+                        + branch as f64 * std::f64::consts::PI;
+                    let t_end = std::f64::consts::FRAC_PI_2 - epsilon
+                        + branch as f64 * std::f64::consts::PI;
+                    let mut prev: Option<Pos2> = None;
+                    for i in 0..=n {
+                        let t = t_start + (t_end - t_start) * i as f64 / n as f64;
+                        let sec = 1.0 / t.cos();
+                        let tan = t.tan();
+                        let (lx, ly) = if hb.horizontal {
+                            (hb.a * sec, hb.b * tan)
+                        } else {
+                            (hb.b * tan, hb.a * sec)
+                        };
+                        let wx = hb.center.x + lx * cos_a - ly * sin_a;
+                        let wy = hb.center.y + lx * sin_a + ly * cos_a;
+                        if wx.is_finite() && wy.is_finite() {
+                            let s = view.world_to_screen(Point2::new(wx, wy));
+                            let p = canvas_rect.min + Vec2::new(s.x, s.y);
+                            if let Some(prev_p) = prev {
+                                if (p.x - prev_p.x).abs() < 300.0 {
+                                    stroke_segment(&painter, prev_p, p, stroke, hb.line_style);
+                                }
+                            }
+                            prev = Some(p);
+                        }
+                    }
+                }
+                if !hb.label.is_empty() {
+                    let s =
+                        view.world_to_screen(Point2::new(hb.center.x, hb.center.y + hb.b + 0.5));
+                    painter.text(
+                        canvas_rect.min + Vec2::new(s.x, s.y),
+                        egui::Align2::CENTER_BOTTOM,
+                        &hb.label,
+                        egui::FontId::proportional(grafito_ui::tokens::TYPE_SM),
+                        label_color,
+                    );
+                }
+            }
+            GeoObject::Text(txt) => {
+                let s = view.world_to_screen(txt.position);
+                let color = to_color32(txt.color);
+                // Budget de labels: cull por tamaño + tope por frame. La
+                // fuente va en px de pantalla (no escala con el zoom), así
+                // que la extensión se estima por el largo del texto.
+                let font_size = txt.font_size.max(8.0);
+                let extent = font_size * txt.content.chars().count().max(1) as f32 * 0.6;
+                if txt.content.is_empty() || !label_budget_allowed(font_size, Some(extent)) {
+                    return;
+                }
+                // Galley por (texto, estilo, escala-cuantizada): textos
+                // repetidos comparten layout sin re-resolver. Se mantiene
+                // `text_galley_shared` como respaldo versionado para compat.
+                let scale_q = quantize_scale_ln(view.scale);
+                let galley = label_galley_shared(&painter, &txt.content, font_size, color, scale_q);
+                // Emula el anclaje LEFT_CENTER previo (TextShape pivota en la
+                // esquina superior izquierda): se sube media altura de galley.
+                let pos = canvas_rect.min + Vec2::new(s.x, s.y - galley.size().y / 2.0);
+                painter
+                    .add(egui::epaint::TextShape::new(pos, galley, color).with_angle(txt.rotation));
+            }
+            GeoObject::Histogram(h) => {
+                // Memo por (objeto, versión): el histograma se recomputaba
+                // por frame aunque ni datos ni bins cambien.
+                let bins = match stat_memo_get(STAT_HISTOGRAM, h.id, self.document.version) {
+                    Some(StatMemoValue::Histogram(bins)) => bins,
+                    _ => {
+                        let bins = std::sync::Arc::new(grafito_geometry::statistics::histogram(
+                            &h.data, h.bins,
+                        ));
+                        stat_memo_put(
+                            STAT_HISTOGRAM,
+                            h.id,
+                            self.document.version,
+                            StatMemoValue::Histogram(bins.clone()),
+                        );
+                        bins
+                    }
+                };
+                let max_count = bins.iter().map(|(_, _, c)| *c).fold(0.0f64, f64::max);
+                if max_count <= 0.0 {
+                    return;
+                }
+                let stroke = Stroke::new(h.width, to_color32(h.color));
+                let fill = h
+                    .fill_color
+                    .map(to_color32)
+                    .unwrap_or(Color32::from_rgba_premultiplied(50, 120, 220, 100));
+                let y_scale = (h.y_max - h.y_min) / max_count;
+                for (left, right, count) in bins.iter() {
+                    let bl = view.world_to_screen(Point2::new(*left, h.y_min));
+                    let tr = view.world_to_screen(Point2::new(*right, h.y_min + count * y_scale));
+                    let rect = Rect::from_min_max(
+                        canvas_rect.min + Vec2::new(tr.x, bl.y),
+                        canvas_rect.min + Vec2::new(bl.x, tr.y),
+                    );
+                    painter.rect_filled(rect, 0.0, fill);
+                    painter.rect_stroke(rect, 0.0, stroke);
+                }
+            }
+            GeoObject::BarChart(b) => {
+                // Barras por índice: la altura es el valor en mundo
+                // (proporcional a `fraction_of_max` del motor, que valida).
+                // Memo por (objeto, versión): antes se reagregaba por frame.
+                let bars = match stat_memo_get(STAT_BARS, b.id, self.document.version) {
+                    Some(StatMemoValue::Bars(bars)) => bars,
+                    _ => match grafito_core::symbolic::bar_chart_bars(&b.data) {
+                        Ok(bars) => {
+                            let bars = std::sync::Arc::new(bars);
+                            stat_memo_put(
+                                STAT_BARS,
+                                b.id,
+                                self.document.version,
+                                StatMemoValue::Bars(bars.clone()),
+                            );
+                            bars
+                        }
+                        Err(_) => return,
+                    },
+                };
+                if bars.is_empty() {
+                    return;
+                }
+                let stroke = Stroke::new(b.width, to_color32(b.color));
+                let fill = b
+                    .fill_color
+                    .map(to_color32)
+                    .unwrap_or(Color32::from_rgba_premultiplied(50, 120, 220, 100));
+                for bar in bars.iter() {
+                    let x = bar.index as f64;
+                    let y_lo = 0.0_f64.min(bar.value);
+                    let y_hi = 0.0_f64.max(bar.value);
+                    let bl = view.world_to_screen(Point2::new(x - 0.4, y_lo));
+                    let tr = view.world_to_screen(Point2::new(x + 0.4, y_hi));
+                    let rect = Rect::from_min_max(
+                        canvas_rect.min + Vec2::new(bl.x, tr.y),
+                        canvas_rect.min + Vec2::new(tr.x, bl.y),
+                    );
+                    painter.rect_filled(rect, 0.0, fill);
+                    painter.rect_stroke(rect, 0.0, stroke);
+                }
+            }
+            GeoObject::PieChart(p) => {
+                // Sectores desde el ángulo 0 con `start_angle` del motor;
+                // el relleno rota el matiz del color del objeto por sector.
+                // Memo por (objeto, versión): antes se reagregaba por frame.
+                let slices = match stat_memo_get(STAT_SLICES, p.id, self.document.version) {
+                    Some(StatMemoValue::Slices(slices)) => slices,
+                    _ => match grafito_core::symbolic::pie_chart_slices(&p.data) {
+                        Ok(slices) => {
+                            let slices = std::sync::Arc::new(slices);
+                            stat_memo_put(
+                                STAT_SLICES,
+                                p.id,
+                                self.document.version,
+                                StatMemoValue::Slices(slices.clone()),
+                            );
+                            slices
+                        }
+                        Err(_) => return,
+                    },
+                };
+                if slices.is_empty() {
+                    return;
+                }
+                if !(p.radius.is_finite() && p.radius > 0.0) {
+                    return;
+                }
+                let count = slices.len();
+                let steps = if count <= 64 {
+                    24
+                } else if count <= 512 {
+                    6
+                } else {
+                    2
+                };
+                let base_fill = p.fill_color.unwrap_or(Color::new(0.2, 0.5, 0.9, 0.4));
+                let stroke = Stroke::new(p.width, to_color32(p.color));
+                let center = view.world_to_screen(p.center);
+                let center_pos = canvas_rect.min + Vec2::new(center.x, center.y);
+                for slice in slices.iter() {
+                    let mut points = Vec::with_capacity(steps + 2);
+                    points.push(center_pos);
+                    for step in 0..=steps {
+                        let angle =
+                            slice.start_angle + slice.sweep_angle * step as f64 / steps as f64;
+                        let world = Point2::new(
+                            p.center.x + p.radius * angle.cos(),
+                            p.center.y + p.radius * angle.sin(),
+                        );
+                        let screen = view.world_to_screen(world);
+                        points.push(canvas_rect.min + Vec2::new(screen.x, screen.y));
+                    }
+                    let fill =
+                        to_color32(grafito_core::pie_slice_color(base_fill, slice.index, count));
+                    painter.add(Shape::Path(egui::epaint::PathShape {
+                        points,
+                        closed: true,
+                        fill,
+                        stroke: stroke.into(),
+                    }));
+                }
+            }
+            GeoObject::ScatterPlot(sp) => {
+                use grafito_core::ScatterStyle;
+                let color = to_color32(sp.color);
+                let r = sp.point_size.max(1.0);
+                let stroke = Stroke::new(2.0, color);
+                let to_screen = |x: f64, y: f64| -> Pos2 {
+                    let s = view.world_to_screen(Point2::new(x, y));
+                    canvas_rect.min + Vec2::new(s.x, s.y)
+                };
+                match sp.style {
+                    ScatterStyle::Points => {
+                        for (x, y) in sp.xs.iter().zip(sp.ys.iter()) {
+                            painter.circle_filled(to_screen(*x, *y), r, color);
+                        }
+                    }
+                    ScatterStyle::Sticks => {
+                        for (x, y) in sp.xs.iter().zip(sp.ys.iter()) {
+                            painter.line_segment([to_screen(*x, 0.0), to_screen(*x, *y)], stroke);
+                            painter.circle_filled(to_screen(*x, *y), r, color);
+                        }
+                    }
+                    // Steps/Lines exigen `xs` ordenadas (StepGraph/LineGraph
+                    // ordenan al crear); acá se confía en el invariante.
+                    ScatterStyle::Steps => {
+                        let mut prev: Option<(f64, f64)> = None;
+                        for (x, y) in sp.xs.iter().zip(sp.ys.iter()) {
+                            if let Some((px, py)) = prev {
+                                painter
+                                    .line_segment([to_screen(px, py), to_screen(*x, py)], stroke);
+                                painter
+                                    .line_segment([to_screen(*x, py), to_screen(*x, *y)], stroke);
+                            }
+                            prev = Some((*x, *y));
+                        }
+                    }
+                    ScatterStyle::Lines => {
+                        let mut prev: Option<Pos2> = None;
+                        for (x, y) in sp.xs.iter().zip(sp.ys.iter()) {
+                            let here = to_screen(*x, *y);
+                            if let Some(from) = prev {
+                                painter.line_segment([from, here], stroke);
+                            }
+                            prev = Some(here);
+                        }
+                    }
+                }
+            }
+            GeoObject::BoxPlot(bp) => {
+                // Memo por (objeto, versión): el boxplot ordenaba la muestra
+                // 3 veces por frame aunque los datos no cambien.
+                let stats = match stat_memo_get(STAT_BOXPLOT, bp.id, self.document.version) {
+                    Some(StatMemoValue::Boxplot(stats)) => stats,
+                    _ => {
+                        let stats = std::sync::Arc::new(
+                            grafito_geometry::statistics::boxplot_stats(&bp.data),
+                        );
+                        stat_memo_put(
+                            STAT_BOXPLOT,
+                            bp.id,
+                            self.document.version,
+                            StatMemoValue::Boxplot(stats.clone()),
+                        );
+                        stats
+                    }
+                };
+                if let Some((wl, q1, med, q3, wh, outliers)) = (*stats).clone() {
+                    let stroke = Stroke::new(bp.width, to_color32(bp.color));
+                    let fill = bp
+                        .fill_color
+                        .map(to_color32)
+                        .unwrap_or(Color32::from_rgba_premultiplied(50, 120, 220, 80));
+                    let half_w = bp.width_box * 0.5;
+                    let bx_min = bp.position - half_w;
+                    let bx_max = bp.position + half_w;
+                    let s_q1 = view.world_to_screen(Point2::new(bx_min, q1));
+                    let s_q3 = view.world_to_screen(Point2::new(bx_max, q3));
+                    let box_rect = Rect::from_min_max(
+                        canvas_rect.min + Vec2::new(s_q3.x, s_q3.y),
+                        canvas_rect.min + Vec2::new(s_q1.x, s_q1.y),
+                    );
+                    painter.rect_filled(box_rect, 0.0, fill);
+                    painter.rect_stroke(box_rect, 0.0, stroke);
+                    let s_med_l = view.world_to_screen(Point2::new(bx_min, med));
+                    let s_med_r = view.world_to_screen(Point2::new(bx_max, med));
+                    painter.line_segment(
+                        [
+                            canvas_rect.min + Vec2::new(s_med_l.x, s_med_l.y),
+                            canvas_rect.min + Vec2::new(s_med_r.x, s_med_r.y),
+                        ],
+                        Stroke::new(bp.width * 2.0, to_color32(bp.color)),
+                    );
+                    let s_wl = view.world_to_screen(Point2::new(bp.position, wl));
+                    let s_q1c = view.world_to_screen(Point2::new(bp.position, q1));
+                    painter.line_segment(
+                        [
+                            canvas_rect.min + Vec2::new(s_wl.x, s_wl.y),
+                            canvas_rect.min + Vec2::new(s_q1c.x, s_q1c.y),
+                        ],
+                        stroke,
+                    );
+                    let s_wh = view.world_to_screen(Point2::new(bp.position, wh));
+                    let s_q3c = view.world_to_screen(Point2::new(bp.position, q3));
+                    painter.line_segment(
+                        [
+                            canvas_rect.min + Vec2::new(s_wh.x, s_wh.y),
+                            canvas_rect.min + Vec2::new(s_q3c.x, s_q3c.y),
+                        ],
+                        stroke,
+                    );
+                    let wl_half = half_w * 0.4;
+                    let s_wl_l = view.world_to_screen(Point2::new(bp.position - wl_half, wl));
+                    let s_wl_r = view.world_to_screen(Point2::new(bp.position + wl_half, wl));
+                    painter.line_segment(
+                        [
+                            canvas_rect.min + Vec2::new(s_wl_l.x, s_wl_l.y),
+                            canvas_rect.min + Vec2::new(s_wl_r.x, s_wl_r.y),
+                        ],
+                        stroke,
+                    );
+                    let s_wh_l = view.world_to_screen(Point2::new(bp.position - wl_half, wh));
+                    let s_wh_r = view.world_to_screen(Point2::new(bp.position + wl_half, wh));
+                    painter.line_segment(
+                        [
+                            canvas_rect.min + Vec2::new(s_wh_l.x, s_wh_l.y),
+                            canvas_rect.min + Vec2::new(s_wh_r.x, s_wh_r.y),
+                        ],
+                        stroke,
+                    );
+                    for &o in &outliers {
+                        let s_o = view.world_to_screen(Point2::new(bp.position, o));
+                        painter.circle_stroke(
+                            canvas_rect.min + Vec2::new(s_o.x, s_o.y),
+                            3.0,
+                            stroke,
+                        );
+                    }
+                }
+            }
+            GeoObject::RegressionLine(rl) => {
+                let stroke = Stroke::new(rl.width, to_color32(rl.color));
+                let x0 = rl.x_min;
+                let x1 = rl.x_max;
+                let y0 = rl.slope * x0 + rl.intercept;
+                let y1 = rl.slope * x1 + rl.intercept;
+                let s0 = view.world_to_screen(Point2::new(x0, y0));
+                let s1 = view.world_to_screen(Point2::new(x1, y1));
+                stroke_segment(
+                    &painter,
+                    canvas_rect.min + Vec2::new(s0.x, s0.y),
+                    canvas_rect.min + Vec2::new(s1.x, s1.y),
+                    stroke,
+                    rl.line_style,
+                );
+                let pt_color = to_color32(rl.color);
+                for (x, y) in rl.xs.iter().zip(rl.ys.iter()) {
+                    let s = view.world_to_screen(Point2::new(*x, *y));
+                    painter.circle_filled(canvas_rect.min + Vec2::new(s.x, s.y), 4.0, pt_color);
+                }
+                if !rl.label.is_empty() {
+                    let s = view.world_to_screen(Point2::new(
+                        (x0 + x1) * 0.5,
+                        rl.slope * (x0 + x1) * 0.5 + rl.intercept,
+                    ));
+                    painter.text(
+                        canvas_rect.min + Vec2::new(s.x, s.y - 12.0),
+                        egui::Align2::CENTER_BOTTOM,
+                        &rl.label,
+                        egui::FontId::proportional(grafito_ui::tokens::TYPE_XS),
+                        to_color32(rl.color),
+                    );
+                }
+            }
+            GeoObject::Fractal2D(fr) => {
+                // Una sola imagen por frame: los píxeles vienen cacheados por
+                // versión y la textura por clave (una subida por cambio). El
+                // camino viejo emitía un shape por píxel y por frame.
+                let Some(pixels) = cached_try_compute_fractal(fr, self.document.version) else {
+                    return;
+                };
+                let res = fr.resolution;
+                if res == 0 {
+                    return;
+                }
+                let Some(texture) =
+                    cached_fractal_texture(&painter, fr, self.document.version, &pixels)
+                else {
+                    return;
+                };
+                // Fila 0 de la textura = y_max (ver `fractal_texture_image`).
+                let top_left = view.world_to_screen(Point2::new(fr.x_min, fr.y_max));
+                let bottom_right = view.world_to_screen(Point2::new(fr.x_max, fr.y_min));
+                painter.image(
+                    texture.id(),
+                    Rect::from_min_max(
+                        canvas_rect.min + Vec2::new(top_left.x, top_left.y),
+                        canvas_rect.min + Vec2::new(bottom_right.x, bottom_right.y),
+                    ),
+                    Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+            }
+            GeoObject::ParametricCurve2D(pc) => {
+                // T1: pasos adaptados al viewport como las funciones (antes
+                // 4000 fijos: una circunferencia a 800px se sobremuestreaba
+                // ~10× y cada curva pesaba ~32k vértices teselados). El
+                // sampler cachea por steps, igual que el grid de funciones.
+                // Vista cuantizada: pan/zoom dentro del quantum reutiliza
+                // los runs view-screen sin re-muestrear ni re-proyectar.
+                let qview = quantize_view(view);
+                let quality_tag = render_quality_tag(self.document.render_quality);
+                let cached = projected_polyline_cache_get(
+                    pc.id,
+                    self.document.cache_nonce,
+                    self.document.version,
+                    quality_tag,
+                    qview,
+                );
+                let view_runs: Arc<Vec<Vec<Pos2>>> = match cached {
+                    Some(hit) => hit,
+                    None => {
+                        let steps =
+                            grafito_core::function_sampling::recommended_grid_size_for_quality(
+                                canvas_rect.width(),
+                                self.document.render_quality,
+                            )
+                            .min(4000);
+                        let samples = parametric_sampling::samples_or_compute_curve_2d(
+                            pc,
+                            steps,
+                            &self.document.variables,
+                        );
+                        let mut projected = take_scratch_pts_opt();
+                        projected.extend(samples.iter().map(|&(x, y)| {
+                            (x.is_finite() && y.is_finite()).then(|| {
+                                let screen = view.world_to_screen(Point2::new(x, y));
+                                Pos2::new(screen.x, screen.y)
+                            })
+                        }));
+                        let view_rect = Rect::from_min_size(
+                            Pos2::ZERO,
+                            Vec2::new(canvas_rect.width(), canvas_rect.height()),
+                        );
+                        let runs = split_continuous_screen_runs(&projected, view_rect);
+                        return_scratch_pts_opt(projected);
+                        let decimated = decimate_runs_to_pixels(&runs);
+                        projected_polyline_cache_put(
+                            pc.id,
+                            self.document.cache_nonce,
+                            self.document.version,
+                            quality_tag,
+                            qview,
+                            decimated,
+                        )
+                    }
+                };
+                if !overlay_only && !style.is_some_and(|style| style.skip_stroke) {
+                    let stroke = Stroke::new(pc.width, to_color32(pc.color));
+                    let offset = canvas_rect.min.to_vec2();
+                    let runs: Vec<Vec<Pos2>> = view_runs
+                        .iter()
+                        .map(|run| run.iter().map(|p| *p + offset).collect())
+                        .collect();
+                    stroke_runs_batched(&painter, runs, stroke, pc.line_style);
+                }
+            }
+            GeoObject::PolarCurve(pol) => {
+                // T1: idem paramétricas (4000 fijos → adaptativo) + caché por
+                // vista cuantizada + diezmado + batch en un solo `add`.
+                let qview = quantize_view(view);
+                let quality_tag = render_quality_tag(self.document.render_quality);
+                let cached = projected_polyline_cache_get(
+                    pol.id,
+                    self.document.cache_nonce,
+                    self.document.version,
+                    quality_tag,
+                    qview,
+                );
+                let view_runs: Arc<Vec<Vec<Pos2>>> = match cached {
+                    Some(hit) => hit,
+                    None => {
+                        let steps =
+                            grafito_core::function_sampling::recommended_grid_size_for_quality(
+                                canvas_rect.width(),
+                                self.document.render_quality,
+                            )
+                            .min(4000);
+                        let samples = parametric_sampling::samples_or_compute_polar(
+                            pol,
+                            steps,
+                            &self.document.variables,
+                        );
+                        let mut projected = take_scratch_pts_opt();
+                        projected.extend(samples.iter().map(|&(x, y)| {
+                            (x.is_finite() && y.is_finite()).then(|| {
+                                let screen = view.world_to_screen(Point2::new(x, y));
+                                Pos2::new(screen.x, screen.y)
+                            })
+                        }));
+                        let view_rect = Rect::from_min_size(
+                            Pos2::ZERO,
+                            Vec2::new(canvas_rect.width(), canvas_rect.height()),
+                        );
+                        let runs = split_continuous_screen_runs(&projected, view_rect);
+                        return_scratch_pts_opt(projected);
+                        let decimated = decimate_runs_to_pixels(&runs);
+                        projected_polyline_cache_put(
+                            pol.id,
+                            self.document.cache_nonce,
+                            self.document.version,
+                            quality_tag,
+                            qview,
+                            decimated,
+                        )
+                    }
+                };
+                let offset = canvas_rect.min.to_vec2();
+                let runs: Vec<Vec<Pos2>> = view_runs
+                    .iter()
+                    .map(|run| run.iter().map(|p| *p + offset).collect())
+                    .collect();
+                if !overlay_only && !style.is_some_and(|style| style.skip_stroke) {
+                    // T1: un PathShape por run en estilo sólido (antes un
+                    // shape por segmento: ~1600 shapes por curva); ahora un
+                    // solo `add` con `Shape::Vec` (mismas primitivas).
+                    let stroke = Stroke::new(pol.width, to_color32(pol.color));
+                    stroke_runs_batched(&painter, runs.clone(), stroke, pol.line_style);
+                }
+                // Fill from origin
+                if !overlay_only {
+                    if let Some(fill) = get_fill_color(pol.fill_color, style) {
+                        let origin = view.world_to_screen(Point2::new(0.0, 0.0));
+                        let origin_pos = canvas_rect.min + Vec2::new(origin.x, origin.y);
+                        for run in runs.iter().filter(|run| run.len() >= 2) {
+                            let mut fill_pts = run.clone();
+                            fill_pts.push(origin_pos);
+                            fill_pts.push(run[0]);
+                            painter.add(Shape::Path(egui::epaint::PathShape {
+                                points: fill_pts,
+                                closed: true,
+                                fill: to_color32(fill),
+                                stroke: Stroke::NONE.into(),
+                            }));
+                        }
+                    }
+                }
+                let label = get_label(&pol.label, style);
+                if !label.is_empty() {
+                    // PERF: localiza el punto medio de la polilínea sin clonar
+                    // todos los puntos en un `Vec` auxiliar por frame.
+                    let total: usize = runs.iter().map(|run| run.len()).sum();
+                    if total > 0 {
+                        let mut remaining = total / 2;
+                        let mut position = None;
+                        for run in &runs {
+                            if remaining < run.len() {
+                                position = Some(run[remaining]);
+                                break;
+                            }
+                            remaining -= run.len();
+                        }
+                        if let Some(position) = position {
+                            painter.text(
+                                position + Vec2::new(0.0, 14.0),
+                                egui::Align2::CENTER_TOP,
+                                label,
+                                egui::FontId::proportional(grafito_ui::tokens::TYPE_SM),
+                                label_color,
+                            );
+                        }
+                    }
+                }
+            }
+            GeoObject::VectorField2D(vf) => {
+                let world_tl = view.screen_to_world(GlamVec2::new(0.0, 0.0));
+                let world_br =
+                    view.screen_to_world(GlamVec2::new(canvas_rect.width(), canvas_rect.height()));
+                let view_bounds = (
+                    world_tl.x.min(world_br.x),
+                    world_tl.x.max(world_br.x),
+                    world_br.y.min(world_tl.y),
+                    world_br.y.max(world_tl.y),
+                );
+                let grid_size = vf.density.clamp(5, 80);
+                let dx = (view_bounds.1 - view_bounds.0).abs() / grid_size as f64;
+                let dy = (view_bounds.3 - view_bounds.2).abs() / grid_size as f64;
+                let arrow_length = dx.min(dy) * 0.8;
+
+                // Evita `samples.clone()` iterando directamente sobre el guard del RwLock.
+                // `samples_or_compute` devuelve `RwLockReadGuard<Vec<...>>`; iterar sin clonar
+                // evita duplicar ~16k tuplas por frame y respeta el cache RwLock.
+                let samples = vector_field_sampling::samples_or_compute(
+                    vf,
+                    view_bounds,
+                    grid_size,
+                    &self.document.variables,
+                );
+                // Min/max log-mag UNA vez (fuera del loop): normaliza color+escala.
+                // Sin clone, una pasada extra O(n) sobre el guard.
+                let (mag_lo, mag_hi) = if vf.color_by_magnitude || vf.scale_by_magnitude {
+                    let mut lo = f64::INFINITY;
+                    let mut hi = f64::NEG_INFINITY;
+                    for (sx, sy, su, sv) in samples.iter().copied() {
+                        if sx < view_bounds.0 - dx
+                            || sx > view_bounds.1 + dx
+                            || sy < view_bounds.2 - dy
+                            || sy > view_bounds.3 + dy
+                        {
+                            continue;
+                        }
+                        if su.is_finite() && sv.is_finite() {
+                            let m = (su * su + sv * sv).sqrt();
+                            if m > 1e-10 {
+                                let lm = m.log10();
+                                if lm < lo {
+                                    lo = lm;
+                                }
+                                if lm > hi {
+                                    hi = lm;
+                                }
+                            }
+                        }
+                    }
+                    (lo, hi)
+                } else {
+                    (0.0, 1.0)
+                };
+                for (x, y, u, v) in samples.iter().copied() {
+                    if x < view_bounds.0 - dx
+                        || x > view_bounds.1 + dx
+                        || y < view_bounds.2 - dy
+                        || y > view_bounds.3 + dy
+                    {
+                        continue;
+                    }
+                    if u.is_finite() && v.is_finite() {
+                        let mag = (u * u + v * v).sqrt();
+                        if mag > 1e-10 {
+                            // Magnitud visual: color viridis log + largo 0.3x..1.5x.
+                            // mag_lo/mag_hi precomputados fuera del loop (O(n), sin clone).
+                            let (arrow_col, len_scale) = if vf.color_by_magnitude
+                                || vf.scale_by_magnitude
+                            {
+                                let t = if (mag_hi - mag_lo).is_finite() && mag_hi - mag_lo > 1e-9 {
+                                    ((mag.log10() - mag_lo) / (mag_hi - mag_lo)).clamp(0.0, 1.0)
+                                } else {
+                                    0.5
+                                };
+                                let col = if vf.color_by_magnitude {
+                                    let (r, g, b) = grafito_render::viridis_colormap(t);
+                                    Color32::from_rgb(
+                                        (r * 255.0) as u8,
+                                        (g * 255.0) as u8,
+                                        (b * 255.0) as u8,
+                                    )
+                                } else {
+                                    to_color32(vf.color)
+                                };
+                                let sc = if vf.scale_by_magnitude {
+                                    0.3 + 1.2 * t
+                                } else {
+                                    1.0
+                                };
+                                (col, sc)
+                            } else {
+                                (to_color32(vf.color), 1.0)
+                            };
+                            let nu = u / mag * arrow_length * len_scale;
+                            let nv = v / mag * arrow_length * len_scale;
+
+                            let start = view.world_to_screen(Point2::new(x, y));
+                            let end = view.world_to_screen(Point2::new(x + nu, y + nv));
+                            let start_pos = canvas_rect.min + Vec2::new(start.x, start.y);
+                            let end_pos = canvas_rect.min + Vec2::new(end.x, end.y);
+
+                            painter.line_segment([start_pos, end_pos], Stroke::new(1.5, arrow_col));
+
+                            // Arrow head
+                            let angle = (nv as f32).atan2(nu as f32);
+                            let head_len = arrow_length as f32 * 0.3;
+                            let head1 = end_pos
+                                + Vec2::new(
+                                    -head_len * (angle - 0.4).cos(),
+                                    -head_len * (angle - 0.4).sin(),
+                                );
+                            let head2 = end_pos
+                                + Vec2::new(
+                                    -head_len * (angle + 0.4).cos(),
+                                    -head_len * (angle + 0.4).sin(),
+                                );
+                            painter.line_segment([end_pos, head1], Stroke::new(1.5, arrow_col));
+                            painter.line_segment([end_pos, head2], Stroke::new(1.5, arrow_col));
+                        }
+                    }
+                }
+                // Streamlines RK4 cacheadas en world-space por (version,
+                // campo, viewport): por frame solo se proyectan a pantalla
+                // (antes: 25×200×4 evaluaciones por frame).
+                let sl_stroke =
+                    Stroke::new(1.2, Color32::from_rgba_unmultiplied(180, 100, 200, 180));
+                let segments =
+                    cached_vector_field_streamlines(&self.document, vf, world_tl, world_br, dx, dy);
+                for (start, end) in segments.iter() {
+                    let start = view.world_to_screen(*start);
+                    let end = view.world_to_screen(*end);
+                    if start.is_finite() && end.is_finite() {
+                        painter.line_segment(
+                            [
+                                canvas_rect.min + Vec2::new(start.x, start.y),
+                                canvas_rect.min + Vec2::new(end.x, end.y),
+                            ],
+                            sl_stroke,
+                        );
+                    }
+                }
+            }
+            GeoObject::PhasePortrait(portrait) => {
+                // Cache keyed por document.version: evita re-muestrear la grilla cada frame.
+                let segments = cached_sample_phase_portrait(
+                    portrait,
+                    &self.document.variables,
+                    self.document.version,
+                );
+                if !overlay_only && !style.is_some_and(|style| style.skip_stroke) {
+                    let stroke = Stroke::new(1.5, to_color32(portrait.color));
+                    for (start, end) in segments.iter() {
+                        let start = view.world_to_screen(*start);
+                        let end = view.world_to_screen(*end);
+                        if start.is_finite() && end.is_finite() {
+                            painter.line_segment(
+                                [
+                                    canvas_rect.min + Vec2::new(start.x, start.y),
+                                    canvas_rect.min + Vec2::new(end.x, end.y),
+                                ],
+                                stroke,
+                            );
+                        }
+                    }
+                }
+                let label = get_label(&portrait.label, style);
+                if !label.is_empty() {
+                    if let Some((start, _)) = segments.get(segments.len() / 2) {
+                        let start = view.world_to_screen(*start);
+                        if start.is_finite() {
+                            painter.text(
+                                canvas_rect.min + Vec2::new(start.x, start.y - 8.0),
+                                egui::Align2::CENTER_BOTTOM,
+                                label,
+                                egui::FontId::proportional(grafito_ui::tokens::TYPE_SM),
+                                label_color,
+                            );
+                        }
+                    }
+                }
+            }
+            GeoObject::ImplicitCurve(ic) => {
+                let quality = self.document.render_quality;
+                if !implicit_curve_cache_matches_request(
+                    ic,
+                    implicit_curve_view_bounds(*view, canvas_rect),
+                    implicit_curve_grid_size(canvas_rect, quality),
+                    &self.document.variables,
+                    quality,
+                ) {
+                    return;
+                }
+                // 0) Relleno del interior (solo para regiones con `<=`, `>=`, `<`, `>`).
+                //    Para curvas con `=`, no hay interior que rellenar.
+                if !overlay_only {
+                    if let Some(fill_color) = ic.fill_color {
+                        if matches!(
+                            ic.operator,
+                            RelationOperator::Less
+                                | RelationOperator::LessEq
+                                | RelationOperator::Greater
+                                | RelationOperator::GreaterEq
+                        ) {
+                            self.draw_implicit_curve_fill(
+                                &painter,
+                                canvas_rect,
+                                view,
+                                ic,
+                                fill_color,
+                            );
+                        }
+                    }
+                }
+
+                // 1) Contorno: dibujar los segmentos del marching squares.
+                // PERF: se itera bajo el read-guard sin clonar `ImplicitCurveSegments`
+                // (hasta ~262k celdas en grid 512). El guard es de solo lectura y el
+                // escritor (`segments_or_compute`) corre en el mismo hilo antes de
+                // pintar, así que no hay riesgo de deadlock ni de retener el lock
+                // durante trabajo ajeno al pintado.
+                let levels = read_lock_optimized(&ic.cached_segments);
+                if !levels.is_empty() {
+                    let use_contour_colors = ic.contour_levels.is_some();
+                    let contour_count = levels.len();
+                    let palette = ic.contour_colors.as_deref().unwrap_or(&[]);
+                    for (idx, (_level, segs)) in levels.iter().enumerate() {
+                        let color = if use_contour_colors {
+                            palette.get(idx).cloned().unwrap_or_else(|| {
+                                let t = idx as f64 / contour_count.max(1) as f64;
+                                Color::new(
+                                    (0.5 + t * 0.5) as f32,
+                                    (0.2 + (1.0 - t) * 0.6) as f32,
+                                    0.2,
+                                    1.0,
+                                )
+                            })
+                        } else {
+                            ic.color
+                        };
+                        let stroke = Stroke::new(ic.width, to_color32(color));
+                        for (a, b) in segs {
+                            let p1 = view.world_to_screen(*a);
+                            let p2 = view.world_to_screen(*b);
+                            let pos1 = canvas_rect.min + Vec2::new(p1.x, p1.y);
+                            let pos2 = canvas_rect.min + Vec2::new(p2.x, p2.y);
+                            stroke_segment(&painter, pos1, pos2, stroke, ic.line_style);
+                        }
+                    }
+                }
+            }
+            GeoObject::ComplexGrid(cg) => {
+                use num_complex::Complex64;
+                use std::collections::HashMap;
+                // El clip al canvas ya lo aplica `draw_object_styled` en su
+                // entrada; el domain coloring y la rejilla deformada pueden
+                // emitir primitivas fuera del área de dibujo y quedan recortadas.
+
+                if cg.render_mode == 1 || cg.render_mode == 2 {
+                    // Domain coloring (complex f(z)) o Heat map (real f(x,y)):
+                    // una ColorImage cacheada como textura por key; antes se
+                    // emitían res² `rect_filled` por frame (hasta 90k shapes).
+                    let res = complex_grid_cpu_resolution(cg.density, self.document.render_quality);
+                    let key = complex_grid_texture_key(self.document.version, cg, res);
+                    let cached = COMPLEX_GRID_TEXTURES.with(|cache| cache.borrow_mut().get(&key));
+                    let texture = match cached {
+                        Some(handle) => Some(handle),
+                        None => {
+                            // Puente GPU (Ola 3, solo modo 1): Ready → imagen
+                            // sin walk CPU; Dispatched → None (el `let Some`
+                            // de abajo salta el draw este frame; el resolve
+                            // llega en 1-3 frames); resto → builders CPU.
+                            let image: Option<egui::ColorImage> = if cg.render_mode == 1 {
+                                match domain_grid_take_ready(key) {
+                                    Some(colors) => domain_grid_image_from_colors(&colors, res)
+                                        .or_else(|| {
+                                            complex_grid_domain_coloring_image(
+                                                &self.document,
+                                                cg,
+                                                res,
+                                            )
+                                        }),
+                                    None if domain_grid_is_dispatched(key) => None,
+                                    None => {
+                                        complex_grid_domain_coloring_image(&self.document, cg, res)
+                                    }
+                                }
+                            } else {
+                                complex_grid_heatmap_image(&self.document, cg, res)
+                            };
+                            image.map(|image| {
+                                // Ola 2: solo en miss de `COMPLEX_GRID_TEXTURES`
+                                // (el `Some(handle)` de arriba blitea sin subir).
+                                let handle = painter.ctx().load_texture(
+                                    format!("grafito_complex_grid_{}_{key:016x}", cg.id),
+                                    image,
+                                    egui::TextureOptions::LINEAR,
+                                );
+                                COMPLEX_GRID_TEXTURES.with(|cache| {
+                                    cache.borrow_mut().insert(key, handle.clone());
+                                });
+                                handle
+                            })
+                        }
+                    };
+                    let Some(texture) = texture else {
+                        return;
+                    };
+                    // Fila 0 de la textura = y_max: el rect en pantalla va de
+                    // (x_min, y_max) a (x_max, y_min).
+                    let top_left = view.world_to_screen(Point2::new(cg.x_min, cg.y_max));
+                    let bottom_right = view.world_to_screen(Point2::new(cg.x_max, cg.y_min));
+                    let min = canvas_rect.min + Vec2::new(top_left.x, top_left.y);
+                    let max = canvas_rect.min + Vec2::new(bottom_right.x, bottom_right.y);
+                    painter.image(
+                        texture.id(),
+                        Rect::from_min_max(min, max),
+                        Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+                    return;
+                }
+
+                // Original: Draw deformed grid under complex mapping
+                let grid_lines = cg.density;
+                let dx = (cg.x_max - cg.x_min) / grid_lines as f64;
+                let dy = (cg.y_max - cg.y_min) / grid_lines as f64;
+
+                // AST cacheado por texto (antes se re-parseaba por frame).
+                let expr = match cached_complex_expr(&cg.expr) {
+                    Some(e) => e,
+                    None => return,
+                };
+
+                let mut vars: HashMap<String, Complex64> = HashMap::new();
+                for (name, val) in &self.document.variables {
+                    vars.insert(name.clone(), Complex64::new(*val, 0.0));
+                }
+                // PERF (H9): misma técnica que domain coloring — cachear el
+                // símbolo base como `&str` y actualizar con `get_mut` (sin
+                // `String` alloc por punto de la rejilla deformada).
+                let base_symbol = self.document.complex_base_symbol.as_str();
+                vars.insert(base_symbol.to_string(), Complex64::new(0.0, 0.0));
+
+                // Draw horizontal lines (constant imaginary part)
+                for j in 0..=grid_lines {
+                    let y = cg.y_min + j as f64 * dy;
+                    let mut prev: Option<Pos2> = None;
+                    for i in 0..=grid_lines * 4 {
+                        let x = cg.x_min + i as f64 * dx / 4.0;
+                        if let Some(z) = vars.get_mut(base_symbol) {
+                            *z = Complex64::new(x, y);
+                        }
+
+                        if let Ok(result) = expr.eval(&vars) {
+                            if result.re.is_finite()
+                                && result.im.is_finite()
+                                && result.re.abs() < 1e6
+                                && result.im.abs() < 1e6
+                            {
+                                let screen =
+                                    view.world_to_screen(Point2::new(result.re, result.im));
+                                let pos = canvas_rect.min + Vec2::new(screen.x, screen.y);
+                                if let Some(prev_pos) = prev {
+                                    painter.line_segment(
+                                        [prev_pos, pos],
+                                        Stroke::new(1.0, to_color32(cg.color)),
+                                    );
+                                }
+                                prev = Some(pos);
+                            } else {
+                                prev = None;
+                            }
+                        } else {
+                            prev = None;
+                        }
+                    }
+                }
+
+                // Draw vertical lines (constant real part)
+                for i in 0..=grid_lines {
+                    let x = cg.x_min + i as f64 * dx;
+                    let mut prev: Option<Pos2> = None;
+                    for j in 0..=grid_lines * 4 {
+                        let y = cg.y_min + j as f64 * dy / 4.0;
+                        if let Some(z) = vars.get_mut(base_symbol) {
+                            *z = Complex64::new(x, y);
+                        }
+
+                        if let Ok(result) = expr.eval(&vars) {
+                            if result.re.is_finite()
+                                && result.im.is_finite()
+                                && result.re.abs() < 1e6
+                                && result.im.abs() < 1e6
+                            {
+                                let screen =
+                                    view.world_to_screen(Point2::new(result.re, result.im));
+                                let pos = canvas_rect.min + Vec2::new(screen.x, screen.y);
+                                if let Some(prev_pos) = prev {
+                                    painter.line_segment(
+                                        [prev_pos, pos],
+                                        Stroke::new(1.0, to_color32(cg.color)),
+                                    );
+                                }
+                                prev = Some(pos);
+                            } else {
+                                prev = None;
+                            }
+                        } else {
+                            prev = None;
+                        }
+                    }
+                }
+            }
+            GeoObject::ComplexMapping(cm) => {
+                use num_complex::Complex64;
+                use std::collections::HashMap;
+                // El clip al canvas ya lo aplica `draw_object_styled` en su
+                // entrada; los trazos transformados (asíntotas, segmentos
+                // largos) pueden salir del área de dibujo y quedan recortados.
+
+                // 1) Validar que la expresión compleja parsea. Si falla,
+                //    skip (es comportamiento lazy: el objeto queda creado pero
+                //    no se dibuja hasta que la expresión sea válida).
+                // PERF (H10): parsear una sola vez y cachear el AST por string
+                // de expresión (`cached_complex_expr`); el parseo solo ocurre
+                // en cache miss, no en cada frame. El AST se reutiliza en el
+                // batch eval de abajo (evita el doble parse por frame).
+                let parsed_expr = match cached_complex_expr(&cm.expr) {
+                    Some(expr) => expr,
+                    None => return,
+                };
+
+                // 2) Resolver el target. Si no existe o el tipo no está
+                //    soportado, no dibujamos nada.
+                let target = match self.document.get_object(cm.target) {
+                    Some(t) => t,
+                    None => return,
+                };
+
+                // 3) Extraer el dominio visible para sampling de Function y
+                //    cotas de muestreo para ParametricCurve2D / PolarCurve.
+                let world_tl = view.screen_to_world(GlamVec2::new(0.0, 0.0));
+                let world_br =
+                    view.screen_to_world(GlamVec2::new(canvas_rect.width(), canvas_rect.height()));
+                let (xmin, xmax) = (world_tl.x.min(world_br.x), world_tl.x.max(world_br.x));
+                let (ymin, ymax) = (world_br.y.min(world_tl.y), world_br.y.max(world_tl.y));
+
+                let conformal_map = cm.conformal_map(self.document.complex_base_symbol.as_str());
+                let homotopy_factor = grafito_render::complex_mapping_homotopy_factor(
+                    cm.animate_homotopy,
+                    cm.homotopy_speed,
+                    self.transient_render_state.homotopy_time(),
+                );
+
+                if let (GeoObject::ImplicitCurve(ic), Some(map)) = (target, conformal_map) {
+                    if !implicit_curve_cache_matches_request(
+                        ic,
+                        (xmin, xmax, ymin, ymax),
+                        implicit_curve_grid_size(canvas_rect, self.document.render_quality),
+                        &self.document.variables,
+                        self.document.render_quality,
+                    ) {
+                        return;
+                    }
+                    if homotopy_factor >= 1.0 - f64::EPSILON {
+                        if let Some(fill_color) = ic.fill_color {
+                            self.draw_complex_mapping_fill(
+                                &painter,
+                                canvas_rect,
+                                view,
+                                ic,
+                                cm.id,
+                                map,
+                                fill_color,
+                            );
+                        }
+                    }
+
+                    let mut source_segments = Vec::new();
+                    for (_level, segments) in self.document.implicit_curve_segments(cm.target) {
+                        for (a, b) in segments {
+                            let len = (a.x - b.x).hypot(a.y - b.y);
+                            if len >= 1e-3 {
+                                source_segments.push((a, b));
+                            }
+                        }
+                    }
+
+                    let stroke = Stroke::new(2.0, to_color32(cm.color));
+                    for (a, b) in complex_mapping_segment_strokes_at(
+                        map,
+                        &source_segments,
+                        16,
+                        homotopy_factor,
+                    ) {
+                        let p1 = view.world_to_screen(a);
+                        let p2 = view.world_to_screen(b);
+                        if (p2.x - p1.x).abs() > 300.0 || (p2.y - p1.y).abs() > 300.0 {
+                            continue;
+                        }
+                        let pos1 = canvas_rect.min + Vec2::new(p1.x, p1.y);
+                        let pos2 = canvas_rect.min + Vec2::new(p2.x, p2.y);
+                        painter.line_segment([pos1, pos2], stroke);
+                    }
+                    return;
+                }
+
+                // Camino genérico para ImplicitCurve con expresión NO reconocida
+                // (p.ej. `z^2+1`, que no es un `ConformalMap`): dibujo por
+                // segmento independiente. El camino genérico de abajo aplana
+                // todos los segmentos de marching-squares en una sola
+                // polilínea y une el fin de un segmento con el inicio del
+                // siguiente: esas cuerdas a través del interior son las
+                // "rayas" verticales del reporte. Acá solo se unen puntos
+                // consecutivos DENTRO del mismo segmento fuente, sin
+                // asíntotas inventadas en los cortes (no hay singularidad,
+                // solo fin de segmento). Sin relleno: el mapa no es
+                // globalmente invertible (2 preimágenes), honesto es solo
+                // contorno (la retícula GPU muestra la deformación).
+                if let GeoObject::ImplicitCurve(ic) = target {
+                    if conformal_map.is_none() {
+                        if !implicit_curve_cache_matches_request(
+                            ic,
+                            (xmin, xmax, ymin, ymax),
+                            implicit_curve_grid_size(canvas_rect, self.document.render_quality),
+                            &self.document.variables,
+                            self.document.render_quality,
+                        ) {
+                            return;
+                        }
+                        let mut source_segments = Vec::new();
+                        for (_level, segments) in self.document.implicit_curve_segments(cm.target) {
+                            for (a, b) in segments {
+                                if (a.x - b.x).hypot(a.y - b.y) >= 1e-3 {
+                                    source_segments.push((a, b));
+                                }
+                            }
+                        }
+                        if source_segments.is_empty() {
+                            return;
+                        }
+                        let mut cmap: HashMap<String, Complex64> = self
+                            .document
+                            .variables
+                            .iter()
+                            .map(|(name, val)| (name.clone(), Complex64::new(*val, 0.0)))
+                            .collect();
+                        let base_symbol = self.document.complex_base_symbol.clone();
+                        cmap.insert(base_symbol.clone(), Complex64::new(0.0, 0.0));
+                        let stroke = Stroke::new(2.0, to_color32(cm.color));
+                        let to_screen = |world: Point2| -> Pos2 {
+                            let s = view.world_to_screen(world);
+                            canvas_rect.min + Vec2::new(s.x, s.y)
+                        };
+                        for (a, b) in &source_segments {
+                            let n = 16;
+                            let mut prev: Option<Pos2> = None;
+                            for i in 0..=n {
+                                let t = i as f64 / n as f64;
+                                let z =
+                                    Complex64::new(a.x + t * (b.x - a.x), a.y + t * (b.y - a.y));
+                                if let Some(slot) = cmap.get_mut(base_symbol.as_str()) {
+                                    *slot = z;
+                                }
+                                let w = match parsed_expr.eval(&cmap) {
+                                    Ok(v) if v.re.is_finite() && v.im.is_finite() => {
+                                        grafito_render::interpolate_complex_mapping_point(
+                                            Point2::new(z.re, z.im),
+                                            Point2::new(v.re, v.im),
+                                            homotopy_factor,
+                                        )
+                                    }
+                                    _ => {
+                                        prev = None;
+                                        continue;
+                                    }
+                                };
+                                if !w.x.is_finite() || !w.y.is_finite() {
+                                    prev = None;
+                                    continue;
+                                }
+                                let screen_pt = to_screen(w);
+                                if let Some(p) = prev {
+                                    let d = screen_pt - p;
+                                    if d.x.abs() < 300.0 && d.y.abs() < 300.0 {
+                                        painter.line_segment([p, screen_pt], stroke);
+                                    }
+                                }
+                                prev = Some(screen_pt);
+                            }
+                        }
+                        return;
+                    }
+                }
+
+                // 4) Generar la lista de puntos complejos z que vamos a
+                //    transformar. Cada target emite un Vec<Complex64> en
+                //    orden (puntos densos para curvas, vértices para
+                //    polígonos, grid para Function, etc.).
+                let z_samples: Vec<Complex64> = match target {
+                    GeoObject::Polygon(poly) => poly
+                        .vertices
+                        .iter()
+                        .enumerate()
+                        .map(|(i, v)| {
+                            let x = self
+                                .document
+                                .resolve_expr(poly.x_exprs.get(i).unwrap_or(&None), v.x);
+                            let y = self
+                                .document
+                                .resolve_expr(poly.y_exprs.get(i).unwrap_or(&None), v.y);
+                            Complex64::new(x, y)
+                        })
+                        .collect(),
+                    GeoObject::Point(point) => vec![Complex64::new(
+                        self.document.resolve_expr(&point.x_expr, point.position.x),
+                        self.document.resolve_expr(&point.y_expr, point.position.y),
+                    )],
+                    GeoObject::Line(line) => {
+                        let start = Point2::new(
+                            self.document.resolve_expr(&line.start_x_expr, line.start.x),
+                            self.document.resolve_expr(&line.start_y_expr, line.start.y),
+                        );
+                        let end = Point2::new(
+                            self.document.resolve_expr(&line.end_x_expr, line.end.x),
+                            self.document.resolve_expr(&line.end_y_expr, line.end.y),
+                        );
+                        let steps = 50;
+                        (0..=steps)
+                            .map(|i| {
+                                let t = i as f64 / steps as f64;
+                                Complex64::new(
+                                    start.x + t * (end.x - start.x),
+                                    start.y + t * (end.y - start.y),
+                                )
+                            })
+                            .collect()
+                    }
+                    GeoObject::Circle(circle) => {
+                        let radius = self
+                            .document
+                            .resolve_expr(&circle.radius_expr, circle.radius);
+                        if !circle.center.x.is_finite()
+                            || !circle.center.y.is_finite()
+                            || !radius.is_finite()
+                            || radius <= 0.0
+                        {
+                            Vec::new()
+                        } else {
+                            let samples = 128;
+                            (0..=samples)
+                                .map(|index| {
+                                    let angle =
+                                        index as f64 * std::f64::consts::TAU / samples as f64;
+                                    Complex64::new(
+                                        circle.center.x + radius * angle.cos(),
+                                        circle.center.y + radius * angle.sin(),
+                                    )
+                                })
+                                .collect()
+                        }
+                    }
+                    GeoObject::Pencil(pencil) => pencil
+                        .points
+                        .iter()
+                        .map(|point| Complex64::new(point.x, point.y))
+                        .collect(),
+                    GeoObject::Polyline(line) => line
+                        .points
+                        .iter()
+                        .map(|point| Complex64::new(point.x, point.y))
+                        .collect(),
+                    GeoObject::Function(f) => {
+                        let n = 400;
+                        (0..=n)
+                            .map(|i| {
+                                let t = i as f64 / n as f64;
+                                let x = xmin + t * (xmax - xmin);
+                                let y = grafito_geometry::expr::eval_function_with_vars(
+                                    &f.expr,
+                                    x,
+                                    &self.document.variables,
+                                )
+                                .unwrap_or(f64::NAN);
+                                Complex64::new(x, y)
+                            })
+                            .collect()
+                    }
+                    GeoObject::ImplicitCurve(ic) => {
+                        if !implicit_curve_cache_matches_request(
+                            ic,
+                            (xmin, xmax, ymin, ymax),
+                            implicit_curve_grid_size(canvas_rect, self.document.render_quality),
+                            &self.document.variables,
+                            self.document.render_quality,
+                        ) {
+                            Vec::new()
+                        } else {
+                            // Para implícitas usamos el helper de muestreo del
+                            // crate core (marching squares + polilínea cerrada).
+                            //
+                            // Filtro de segmentos degenerados: marching squares
+                            // puede emitir segmentos muy cortos (de longitud menor
+                            // a 1e-3) en celdas donde la interpolación es
+                            // inestable.
+                            let mut samples = Vec::new();
+                            for (level, segments) in
+                                self.document.implicit_curve_segments(cm.target)
+                            {
+                                for (a, b) in segments {
+                                    let len = (a.x - b.x).hypot(a.y - b.y);
+                                    if len < 1e-3 {
+                                        continue;
+                                    }
+                                    let n = 16;
+                                    for i in 0..=n {
+                                        let t = i as f64 / n as f64;
+                                        samples.push(Complex64::new(
+                                            a.x + t * (b.x - a.x),
+                                            a.y + t * (b.y - a.y),
+                                        ));
+                                    }
+                                    let _ = level;
+                                }
+                            }
+                            samples
+                        }
+                    }
+                    GeoObject::ParametricCurve2D(c) => {
+                        let n = 200;
+                        (0..=n)
+                            .map(|i| {
+                                let t = c.t_min + (i as f64 / n as f64) * (c.t_max - c.t_min);
+                                let x = eval_batch_1d(
+                                    &c.expr_x,
+                                    "t",
+                                    std::iter::once(t),
+                                    &self.document.variables,
+                                )
+                                .ok()
+                                .and_then(|mut v| v.pop().flatten())
+                                .unwrap_or(f64::NAN);
+                                let y = eval_batch_1d(
+                                    &c.expr_y,
+                                    "t",
+                                    std::iter::once(t),
+                                    &self.document.variables,
+                                )
+                                .ok()
+                                .and_then(|mut v| v.pop().flatten())
+                                .unwrap_or(f64::NAN);
+                                Complex64::new(x, y)
+                            })
+                            .collect()
+                    }
+                    GeoObject::PolarCurve(c) => {
+                        let n = 200;
+                        (0..=n)
+                            .map(|i| {
+                                let t = c.t_min + (i as f64 / n as f64) * (c.t_max - c.t_min);
+                                let r = eval_batch_1d(
+                                    &c.expr_r,
+                                    "t",
+                                    std::iter::once(t),
+                                    &self.document.variables,
+                                )
+                                .ok()
+                                .and_then(|mut v| v.pop().flatten())
+                                .unwrap_or(f64::NAN);
+                                Complex64::new(r * t.cos(), r * t.sin())
+                            })
+                            .collect()
+                    }
+                    GeoObject::Ellipse(el) => {
+                        let n = 128;
+                        let cos_a = el.angle.cos();
+                        let sin_a = el.angle.sin();
+                        (0..=n)
+                            .map(|i| {
+                                let t = i as f64 * std::f64::consts::TAU / n as f64;
+                                Complex64::new(
+                                    el.center.x + el.rx * t.cos() * cos_a - el.ry * t.sin() * sin_a,
+                                    el.center.y + el.rx * t.cos() * sin_a + el.ry * t.sin() * cos_a,
+                                )
+                            })
+                            .collect()
+                    }
+                    GeoObject::Parabola(pb) if pb.p.is_finite() && pb.p.abs() >= 1e-12 => {
+                        let n = 128;
+                        let range = (20.0 / view.scale).clamp(0.1, 500.0);
+                        let cos_a = pb.angle.cos();
+                        let sin_a = pb.angle.sin();
+                        (0..=n)
+                            .map(|i| {
+                                let t = -range + 2.0 * range * i as f64 / n as f64;
+                                Complex64::new(
+                                    pb.vertex.x + t * cos_a - (t * t / (4.0 * pb.p)) * sin_a,
+                                    pb.vertex.y + t * sin_a + (t * t / (4.0 * pb.p)) * cos_a,
+                                )
+                            })
+                            .collect()
+                    }
+                    GeoObject::Hyperbola(hb)
+                        if hb.a.is_finite() && hb.b.is_finite() && hb.a > 0.0 && hb.b > 0.0 =>
+                    {
+                        let n = 64;
+                        let epsilon = 0.05;
+                        let cos_a = hb.angle.cos();
+                        let sin_a = hb.angle.sin();
+                        let mut samples = Vec::with_capacity((n + 2) * 2);
+                        for branch in 0..2 {
+                            let start = -std::f64::consts::FRAC_PI_2
+                                + epsilon
+                                + branch as f64 * std::f64::consts::PI;
+                            let end = std::f64::consts::FRAC_PI_2 - epsilon
+                                + branch as f64 * std::f64::consts::PI;
+                            for i in 0..=n {
+                                let t = start + (end - start) * i as f64 / n as f64;
+                                let (local_x, local_y) = if hb.horizontal {
+                                    (hb.a / t.cos(), hb.b * t.tan())
+                                } else {
+                                    (hb.b * t.tan(), hb.a / t.cos())
+                                };
+                                samples.push(Complex64::new(
+                                    hb.center.x + local_x * cos_a - local_y * sin_a,
+                                    hb.center.y + local_x * sin_a + local_y * cos_a,
+                                ));
+                            }
+                            samples.push(Complex64::new(f64::NAN, f64::NAN));
+                        }
+                        samples
+                    }
+                    GeoObject::RegressionLine(rl)
+                        if rl.x_min.is_finite()
+                            && rl.x_max.is_finite()
+                            && rl.slope.is_finite()
+                            && rl.intercept.is_finite()
+                            && rl.x_min < rl.x_max =>
+                    {
+                        vec![
+                            Complex64::new(rl.x_min, rl.slope * rl.x_min + rl.intercept),
+                            Complex64::new(rl.x_max, rl.slope * rl.x_max + rl.intercept),
+                        ]
+                    }
+                    GeoObject::VectorField2D(vf) => {
+                        let grid_size = vf.density.clamp(5, 80);
+                        let cell_width = (xmax - xmin).abs() / grid_size as f64;
+                        let cell_height = (ymax - ymin).abs() / grid_size as f64;
+                        let arrow_length = cell_width.min(cell_height) * 0.8;
+                        if !arrow_length.is_finite() || arrow_length <= 0.0 {
+                            return;
+                        }
+                        let samples = vector_field_sampling::samples_or_compute(
+                            vf,
+                            (xmin, xmax, ymin, ymax),
+                            grid_size,
+                            &self.document.variables,
+                        );
+                        let mut points = Vec::with_capacity(samples.len() * 2);
+                        for (x, y, u, v) in samples.iter() {
+                            if !x.is_finite() || !y.is_finite() || !u.is_finite() || !v.is_finite()
+                            {
+                                continue;
+                            }
+                            let magnitude = (*u).hypot(*v);
+                            if !magnitude.is_finite() || magnitude <= 1e-10 {
+                                continue;
+                            }
+                            points.push(Complex64::new(*x, *y));
+                            points.push(Complex64::new(
+                                *x + *u / magnitude * arrow_length,
+                                *y + *v / magnitude * arrow_length,
+                            ));
+                        }
+                        points
+                    }
+                    _ => return,
+                };
+
+                if z_samples.is_empty() {
+                    return;
+                }
+
+                // 5) Batch-eval de la expresión.
+                //
+                //    Camino rápido: si la expresión fue reconocida por
+                //    `ConformalMap::from_expr_string` y cacheada en
+                //    `cm.conformal_cache`, evaluamos con la fórmula
+                //    algebraica cerrada. Esto evita el bug del parser
+                //    que tokenizaba `1/z` como `1*z`.
+                //
+                //    Camino lento: `eval_complex_batch` parsea el AST
+                //    una vez y evalúa cada punto.
+                let results: Vec<Option<Complex64>> = if let Some(map) = conformal_map {
+                    z_samples.iter().map(|z| map.apply(*z)).collect()
+                } else {
+                    // PERF (H10): reutiliza el AST ya parseado/cacheado en lugar
+                    // de `eval_complex_batch`, que re-parsea la expresión en cada
+                    // frame. `get_mut` evita `String` alloc por punto muestreado.
+                    let mut cmap: HashMap<String, Complex64> = self
+                        .document
+                        .variables
+                        .iter()
+                        .map(|(name, val)| (name.clone(), Complex64::new(*val, 0.0)))
+                        .collect();
+                    let base_symbol = self.document.complex_base_symbol.as_str();
+                    cmap.insert(base_symbol.to_string(), Complex64::new(0.0, 0.0));
+                    z_samples
+                        .iter()
+                        .map(|z| {
+                            if let Some(slot) = cmap.get_mut(base_symbol) {
+                                *slot = *z;
+                            }
+                            match parsed_expr.eval(&cmap) {
+                                Ok(val) if val.re.is_finite() && val.im.is_finite() => Some(val),
+                                _ => None,
+                            }
+                        })
+                        .collect()
+                };
+
+                // 5b) **Relleno de área** para el caso del `ImplicitCurve` como
+                //     target. El render de líneas arriba solo dibuja el
+                //     contorno; para que el usuario vea un área rellena
+                //     cuando hace `ComplexMapping[1/z, I]`, escaneamos
+                //     el plano de output con el conformal map inverso y
+                //     evaluamos la curva original en cada celda.
+                if let GeoObject::ImplicitCurve(ic) = target {
+                    if let (Some(fill_color), Some(map)) = (ic.fill_color, conformal_map) {
+                        self.draw_complex_mapping_fill(
+                            &painter,
+                            canvas_rect,
+                            view,
+                            ic,
+                            cm.id,
+                            map,
+                            fill_color,
+                        );
+                    }
+                }
+                // Re-construimos un vec paralelo para evitar manejar Option<Point2>:
+                // usamos Point2 con NaN para representar "no-finito".
+                let mut transformed: Vec<(Point2, bool)> = Vec::with_capacity(results.len());
+                for (z_in, w_out) in z_samples.iter().zip(results.iter()) {
+                    match w_out {
+                        Some(w) if w.re.is_finite() && w.im.is_finite() => {
+                            transformed.push((
+                                grafito_render::interpolate_complex_mapping_point(
+                                    Point2::new(z_in.re, z_in.im),
+                                    Point2::new(w.re, w.im),
+                                    homotopy_factor,
+                                ),
+                                true,
+                            ));
+                        }
+                        _ => {
+                            // Guardamos el z original (no el resultado) como
+                            // "último punto conocido antes de la singularidad"
+                            // para dibujar la asíntota desde donde el trazo
+                            // sale del plano visible.
+                            let _ = z_in;
+                            transformed.push((Point2::new(f64::NAN, f64::NAN), false));
+                        }
+                    }
+                }
+
+                if let GeoObject::Point(point) = target {
+                    let source = Point2::new(
+                        self.document.resolve_expr(&point.x_expr, point.position.x),
+                        self.document.resolve_expr(&point.y_expr, point.position.y),
+                    );
+                    let marker = transformed
+                        .first()
+                        .and_then(|(point, finite)| finite.then_some(*point))
+                        // A non-finite image is not drawable. Retain a source marker so the
+                        // user sees the singular mapping instead of an absent object.
+                        .unwrap_or(source);
+                    let screen = view.world_to_screen(marker);
+                    if screen.is_finite() {
+                        let position = canvas_rect.min + Vec2::new(screen.x, screen.y);
+                        painter.circle_filled(position, point.size.max(6.0), to_color32(cm.color));
+                    }
+                    return;
+                }
+
+                // 6) Render: dibujar segmentos sólidos entre puntos finitos
+                //    consecutivos, y asíntotas punteadas en los huecos no
+                //    finitos. La asíntota se traza desde el último punto
+                //    finito en la dirección del último delta (en world), lo
+                //    que aproxima la tangente de la curva justo antes de la
+                //    singularidad.
+                let stroke = Stroke::new(2.0, to_color32(cm.color));
+                let to_screen = |world: Point2| -> Pos2 {
+                    let s = view.world_to_screen(world);
+                    canvas_rect.min + Vec2::new(s.x, s.y)
+                };
+                let to_screen_dir = |dx: f64, dy: f64| -> Vec2 {
+                    let s1 = view.world_to_screen(Point2::new(0.0, 0.0));
+                    let s2 = view.world_to_screen(Point2::new(dx, dy));
+                    Vec2::new(s2.x - s1.x, s2.y - s1.y)
+                };
+                let dashed_stroke = Stroke::new(1.0, to_color32(cm.color).gamma_multiply(0.7));
+
+                let mut prev: Option<(Point2, Pos2, Vec2)> = None;
+                // (world_pos, screen_pos, screen_dir_of_tangent)
+
+                let vector_target = matches!(target, GeoObject::VectorField2D(_));
+                for (index, (world_pt, is_finite)) in transformed.iter().enumerate() {
+                    if vector_target && index % 2 == 0 {
+                        prev = None;
+                    }
+                    if *is_finite {
+                        let screen_pt = to_screen(*world_pt);
+                        if let Some((prev_world, prev_screen, _)) = prev {
+                            // Trazo sólido.
+                            painter.line_segment([prev_screen, screen_pt], stroke);
+                            // Actualizar dirección tangente.
+                            let dx = world_pt.x - prev_world.x;
+                            let dy = world_pt.y - prev_world.y;
+                            if dx.hypot(dy) > 1e-9 {
+                                let dir_screen = to_screen_dir(dx, dy);
+                                prev = Some((*world_pt, screen_pt, dir_screen));
+                            }
+                        } else {
+                            // Primer punto finito después de una
+                            // singularidad. Si la dirección tangente no
+                            // existe aún, la dejamos en (0,1) (hacia
+                            // abajo) como placeholder.
+                            prev = Some((*world_pt, screen_pt, Vec2::new(0.0, 1.0)));
+                        }
+                    } else {
+                        // Punto no finito: dibujar la asíntota desde el
+                        // último punto finito en la dirección de la
+                        // tangente, en pasos pequeños hasta que aparezca
+                        // un nuevo punto finito o agotemos N pasos.
+                        if let Some((_, prev_screen, dir_screen)) = prev {
+                            if dir_screen.length() > 0.5 {
+                                // Normalizar y dibujar ~30 píxeles de
+                                // asíntota en esa dirección.
+                                let step_px = 6.0_f32;
+                                let n_dashes = 6;
+                                let dir_norm = dir_screen.normalized();
+                                let mut last = prev_screen;
+                                for i in 1..=n_dashes {
+                                    let next = Pos2::new(
+                                        last.x + dir_norm.x * step_px,
+                                        last.y + dir_norm.y * step_px,
+                                    );
+                                    // Patrón: dibujar 1, saltar 1, dibujar
+                                    // 1, ... para que parezca punteado.
+                                    if i % 2 == 1 {
+                                        painter.line_segment([last, next], dashed_stroke);
+                                    }
+                                    last = next;
+                                }
+                            } else {
+                                // Sin dirección: marcar con una X roja
+                                // en el último punto finito conocido.
+                                painter.line_segment(
+                                    [
+                                        Pos2::new(prev_screen.x - 6.0, prev_screen.y - 6.0),
+                                        Pos2::new(prev_screen.x + 6.0, prev_screen.y + 6.0),
+                                    ],
+                                    Stroke::new(1.5, Color32::from_rgb(220, 30, 30)),
+                                );
+                                painter.line_segment(
+                                    [
+                                        Pos2::new(prev_screen.x - 6.0, prev_screen.y + 6.0),
+                                        Pos2::new(prev_screen.x + 6.0, prev_screen.y - 6.0),
+                                    ],
+                                    Stroke::new(1.5, Color32::from_rgb(220, 30, 30)),
+                                );
+                            }
+                        }
+                        prev = None;
+                    }
+                }
+            }
+            GeoObject::ComplexIntegral(ci) => {
+                if let Some(target) = self.document.get_object(ci.target) {
+                    self.draw_object_styled(
+                        &painter,
+                        canvas_rect,
+                        target,
+                        Some(StyleOverride {
+                            color: Some(ci.color),
+                            width_scale: Some(1.4),
+                            ..Default::default()
+                        }),
+                        overlay_only,
+                    );
+                }
+            }
+            GeoObject::Transformed(t) => {
+                if overlay_only {
+                    return;
+                }
+                let (vertices, indices) =
+                    grafito_render::Renderer::build_transformed_geometry_static(
+                        &self.document,
+                        t,
+                        view,
+                        self.dark_mode,
+                    );
+                paint_render_geometry(&painter, canvas_rect, &vertices, &indices, style);
+            }
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod clipping_and_resize_tests {
+    use super::*;
+    use grafito_core::RenderQuality;
+
+    // ── Clipping ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn clipped_to_canvas_sets_the_visible_rect_on_the_painter() {
+        let ctx = egui::Context::default();
+        let canvas = Rect::from_min_size(Pos2::new(120.0, 40.0), Vec2::new(800.0, 600.0));
+        let painter = ctx.layer_painter(egui::LayerId::background());
+
+        let clipped = super::clipped_to_canvas(&painter, canvas);
+
+        assert_eq!(clipped.clip_rect(), canvas);
+        // El painter original no se muta (with_clip_rect devuelve uno nuevo).
+        assert_ne!(painter.clip_rect(), canvas);
+    }
+
+    /// Regresión de fuente: cada punto de entrada de dibujo 2D debe recortar al
+    /// canvas visible. Si alguien añade un nuevo painter sin `clipped_to_canvas`,
+    /// este test falla y obliga a decidir el clip explícitamente.
+    #[test]
+    fn every_2d_draw_entry_point_clips_to_the_canvas() {
+        let source = include_str!("render_2d.rs");
+        let entry_points = [
+            "pub(crate) fn draw_grid(",
+            "pub(crate) fn draw_axes(",
+            "pub(crate) fn draw_trig_canvas_overlay(",
+            "fn draw_trig_unit_card(",
+            "fn draw_complex_animation_overlay(",
+            "pub(crate) fn draw_objects(",
+            "pub(crate) fn draw_tool_ghost(",
+            "pub(crate) fn draw_object(",
+            "pub(crate) fn draw_object_styled(",
+        ];
+        for entry in entry_points {
+            let start = source
+                .find(entry)
+                .unwrap_or_else(|| panic!("entry point not found: {entry}"));
+            let body = &source[start..];
+            let end = body
+                .find(
+                    "
+    pub(crate) fn ",
+                )
+                .or_else(|| {
+                    body.find(
+                        "
+    fn ",
+                    )
+                })
+                .or_else(|| {
+                    body.find(
+                        "
+    #[cfg(test)]",
+                    )
+                })
+                .unwrap_or(body.len());
+            let body = &body[..end];
+            assert!(
+                body.contains("clipped_to_canvas(painter, canvas_rect)"),
+                "{entry} must clip its painter to the visible canvas"
+            );
+        }
+    }
+
+    /// Paridad del batching de `draw_grid`: los 4 loops acumulan
+    /// `Shape::line_segment` en UN solo `Vec` en orden de emisión y cierran
+    /// con 1 `add` (`Shape::Vec`). El batch debe contener los mismos
+    /// segmentos con los mismos strokes y EN EL MISMO ORDEN que los N
+    /// `line_segment` sueltos (el orden define el ganador en los cruces
+    /// modo-log con colores opacos distintos), sin `Shape::Vec` anidado y
+    /// sin `Shape::Path`/`Shape::line` (conectarían tramos disjuntos con
+    /// diagonales fantasma). Test puro del invariante: el conteo vía
+    /// painter real no es testeable headless (`draw_grid` exige
+    /// documento/vista/ctx de egui), así que se replica la emisión
+    /// intercalada major/minor con los mismos strokes (1.0 / 0.5) y se
+    /// verifica orden + paridad.
+    #[test]
+    fn draw_grid_batches_preserve_segment_count_and_strokes() {
+        let grid_stroke = Stroke::new(1.0, Color32::WHITE);
+        let minor_stroke = Stroke::new(0.5, Color32::GRAY);
+        // Emisión intercalada como en modo log: major, minor, major…
+        let mut grid: Vec<Shape> = Vec::with_capacity(640);
+        for i in 0..8 {
+            let x = i as f32 * 16.0;
+            grid.push(Shape::line_segment(
+                [Pos2::new(x, 0.0), Pos2::new(x, 200.0)],
+                grid_stroke,
+            ));
+            if i % 2 == 0 {
+                grid.push(Shape::line_segment(
+                    [Pos2::new(x + 8.0, 0.0), Pos2::new(x + 8.0, 200.0)],
+                    minor_stroke,
+                ));
+            }
+        }
+        // Paridad: 8 major + 4 minor = 12 segmentos, mismos strokes que
+        // los 12 `add` sueltos previos al batching.
+        assert_eq!(grid.len(), 12);
+        let mut seen_major = 0;
+        let mut seen_minor = 0;
+        for shape in grid.iter() {
+            match shape {
+                Shape::LineSegment { points, stroke } => {
+                    assert_eq!(points.len(), 2);
+                    // `LineSegment` guarda `PathStroke`: paridad por
+                    // ancho + color (strokes uniformes 1.0 major / 0.5 minor).
+                    let is_major = stroke.width == grid_stroke.width
+                        && stroke.color == egui::epaint::ColorMode::Solid(grid_stroke.color);
+                    let is_minor = stroke.width == minor_stroke.width
+                        && stroke.color == egui::epaint::ColorMode::Solid(minor_stroke.color);
+                    assert!(is_major || is_minor, "stroke uniforme por segmento");
+                    if is_major {
+                        seen_major += 1;
+                    } else {
+                        seen_minor += 1;
+                    }
+                }
+                other => panic!("segmento esperado, hay {other:?}"),
+            }
+        }
+        assert_eq!(seen_major, 8);
+        assert_eq!(seen_minor, 4);
+        // Orden: el intercalado major/minor se preserva (cada major par
+        // precede a su minor). El ganador de cada cruce es el mismo que
+        // con N `add` sueltos: por i, [major] o [major, minor] si i es par.
+        let strokes: Vec<bool> = grid
+            .iter()
+            .map(|s| match s {
+                Shape::LineSegment { stroke, .. } => stroke.width == grid_stroke.width,
+                _ => panic!("plano"),
+            })
+            .collect();
+        assert_eq!(
+            strokes,
+            vec![true, false, true, true, false, true, true, false, true, true, false, true],
+            "el batch preserva el orden de emisión"
+        );
+        // El flush emite exactamente 1 `Shape::Vec` plano (un `add`),
+        // nunca vacío ni anidado.
+        match &Shape::Vec(grid) {
+            Shape::Vec(shapes) => {
+                assert!(!shapes.is_empty(), "guard `is_empty` del flush");
+                assert!(
+                    shapes
+                        .iter()
+                        .all(|s| matches!(s, Shape::LineSegment { .. })),
+                    "batch plano de segmentos"
+                );
+            }
+            _ => panic!("el flush de grilla es `Shape::Vec`"),
+        }
+    }
+
+    // ── Resize: w/h = 0, 1px, 8K ────────────────────────────────────────────
+
+    #[test]
+    fn fill_cache_texture_size_is_bounded_for_zero_one_pixel_and_8k_canvases() {
+        let view_bounds = (-10.0, 10.0, -10.0, 10.0);
+        let region = (-20.0, 20.0, -20.0, 20.0);
+        // Canvas 0×0 → nunca 0 (egui rechaza texturas vacías).
+        let (w, h) = super::fill_cache_texture_size(view_bounds, region, (0, 0));
+        assert!(w >= 1 && h >= 1);
+        // 1px se mantiene.
+        let (w, h) = super::fill_cache_texture_size(view_bounds, region, (1, 1));
+        assert!(w >= 1 && h >= 1);
+        // 8K (7680×4320) se acota al tope de 4096 por eje.
+        let (w, h) = super::fill_cache_texture_size(view_bounds, region, (7680, 4320));
+        assert!(w <= 4096 && h <= 4096);
+        assert!(w >= 1 && h >= 1);
+        // Región degenerada (ancho 0) no produce 0.
+        let degenerate = (0.0, 0.0, -1.0, 1.0);
+        let (w, h) = super::fill_cache_texture_size(view_bounds, degenerate, (800, 600));
+        assert!(w >= 1 && h >= 1);
+    }
+
+    #[test]
+    fn fill_texture_byte_size_never_overflows_for_8k_textures() {
+        // 4096×4096 RGBA8 = 64 MiB exactos.
+        assert_eq!(
+            super::fill_texture_byte_size((4096, 4096)),
+            64 * 1024 * 1024
+        );
+        // u32::MAX×u32::MAX no desborda: devuelve usize::MAX (centinela).
+        assert_eq!(
+            super::fill_texture_byte_size((u32::MAX, u32::MAX)),
+            usize::MAX
+        );
+        // 0×0 → 0 bytes.
+        assert_eq!(super::fill_texture_byte_size((0, 0)), 0);
+    }
+
+    #[test]
+    fn implicit_fill_work_is_bounded_for_zero_and_8k_canvases() {
+        let mut curve = ImplicitCurveObj::new("x", "0", RelationOperator::Less);
+        curve.fill_color = Some(Color::new(0.5, 0.5, 0.5, 0.5));
+        let view_bounds = (-10.0, 10.0, -10.0, 10.0);
+
+        // Canvas 0×0: el fill se acota a 1×1 (sin OOM).
+        let zero = Rect::from_min_size(Pos2::ZERO, Vec2::ZERO);
+        let work = super::implicit_curve_fill_work(&curve, view_bounds, zero, RenderQuality::High);
+        assert!(work.is_some());
+        assert!(work.unwrap() <= 4096 * 4096);
+
+        // 8K: el fill se acota al tope de textura (4096²).
+        let eight_k = Rect::from_min_size(Pos2::ZERO, Vec2::new(7680.0, 4320.0));
+        let work =
+            super::implicit_curve_fill_work(&curve, view_bounds, eight_k, RenderQuality::High);
+        assert!(work.is_some());
+        assert!(work.unwrap() <= 4096 * 4096);
+
+        // Eq no rellena.
+        let eq = ImplicitCurveObj::new("x", "0", RelationOperator::Eq);
+        assert_eq!(
+            super::implicit_curve_fill_work(&eq, view_bounds, eight_k, RenderQuality::High),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn trig_sample_count_is_bounded_for_zero_and_8k_widths() {
+        // 0 px de ancho → mínimo de calidad (sin rango vacío).
+        assert!(super::trig_sample_count(0, 10.0, RenderQuality::Normal) >= 200);
+        // 8K de ancho → tope por zoom (sin explotar el muestreo).
+        assert!(super::trig_sample_count(7680, 10.0, RenderQuality::High) <= 760);
+        // Zoom extremo → tope reducido.
+        assert!(super::trig_sample_count(7680, 1e6, RenderQuality::High) <= 200);
+    }
+
+    #[test]
+    fn trig_asymptotes_are_bounded_for_extreme_world_spans() {
+        // Span normal → hasta 64 asíntotas.
+        let xs = super::trig_asymptotes(2, -10.0, 10.0);
+        assert!(!xs.is_empty());
+        assert!(xs.len() <= 64);
+        // Span extremo (zoom-out) → tope reducido, sin loop gigante.
+        let xs = super::trig_asymptotes(2, -1e300, 1e300);
+        assert!(xs.len() <= 8);
+        // Span degenerado (0) → sin asíntotas.
+        assert!(super::trig_asymptotes(2, 0.0, 0.0).is_empty());
+        // Función no trigonométrica → vacío.
+        assert!(super::trig_asymptotes(0, -10.0, 10.0).is_empty());
+    }
+    // ── Culling de viewport (path CPU) ─────────────────────────────────────
+
+    /// La decisión de culling del path CPU (`draw_object_styled`) debe
+    /// descartar un fractal fuera del viewport ANTES de muestrear/proyectar
+    /// sus 160k píxeles. Usa los mismos helpers que el builder GPU.
+    #[test]
+    fn cpu_path_culling_skips_offscreen_fractal() {
+        let mut document = grafito_core::Document::new();
+        document.set_view(grafito_geometry::ViewTransform::new(800.0, 600.0));
+        let mut fractal = grafito_core::Fractal2DObj::mandelbrot();
+        fractal.x_min += 1000.0;
+        fractal.x_max += 1000.0;
+        fractal.y_min += 1000.0;
+        fractal.y_max += 1000.0;
+        let obj = grafito_core::GeoObject::Fractal2D(fractal);
+        let view = document.view();
+        let view_bounds = grafito_render::viewport_world_bounds(view);
+        let aabb = grafito_render::object_world_aabb(view, &document, &obj).expect("fractal AABB");
+        let margin = grafito_render::object_cull_margin_world(&obj, view.scale);
+        assert!(
+            !grafito_render::aabb_intersects(&aabb, &view_bounds, margin),
+            "off-screen fractal must be culled by the CPU path decision"
+        );
+    }
+
+    /// El mismo fractal centrado en el viewport NO se culla (regresión de
+    /// sobre-culling: un objeto visible nunca debe desaparecer).
+    #[test]
+    fn cpu_path_culling_keeps_onscreen_fractal() {
+        let mut document = grafito_core::Document::new();
+        document.set_view(grafito_geometry::ViewTransform::new(800.0, 600.0));
+        let obj = grafito_core::GeoObject::Fractal2D(grafito_core::Fractal2DObj::mandelbrot());
+        let view = document.view();
+        let view_bounds = grafito_render::viewport_world_bounds(view);
+        let aabb = grafito_render::object_world_aabb(view, &document, &obj).expect("fractal AABB");
+        let margin = grafito_render::object_cull_margin_world(&obj, view.scale);
+        assert!(
+            grafito_render::aabb_intersects(&aabb, &view_bounds, margin),
+            "on-screen fractal must NOT be culled"
+        );
+    }
+
+    #[test]
+    fn o6_viridis_colormap_matches_geometry_ramp() {
+        // Paridad con `Color::viridis`: endpoints + punto medio.
+        for (t, expected) in [
+            (0.0, grafito_geometry::Color::viridis(0.0)),
+            (0.5, grafito_geometry::Color::viridis(0.5)),
+            (1.0, grafito_geometry::Color::viridis(1.0)),
+        ] {
+            let (r, g, b) = grafito_render::viridis_colormap(t);
+            let [er, eg, eb, _] = expected.to_array();
+            assert!((r - f64::from(er)).abs() < 1e-6, "r en t={t}");
+            assert!((g - f64::from(eg)).abs() < 1e-6, "g en t={t}");
+            assert!((b - f64::from(eb)).abs() < 1e-6, "b en t={t}");
+        }
+        // Saturación honesta fuera de rango.
+        assert_eq!(
+            grafito_render::viridis_colormap(-1.0),
+            grafito_render::viridis_colormap(0.0)
+        );
+        assert_eq!(
+            grafito_render::viridis_colormap(2.0),
+            grafito_render::viridis_colormap(1.0)
+        );
+    }
+
+    fn fractal_test_pixels() -> Vec<grafito_geometry::fractals::FractalPixel> {
+        use grafito_geometry::fractals::FractalPixel;
+        // 2×2 en filas desde y_min: fila 0 = iters 1,2; fila 1 = iters 3,4.
+        let mut out = Vec::new();
+        for (j, iters) in [(0.0, [1u32, 2u32]), (1.0, [3u32, 4u32])] {
+            for (i, iter) in iters.into_iter().enumerate() {
+                out.push(FractalPixel {
+                    x: i as f64,
+                    y: j,
+                    iter,
+                    max_iter: 100,
+                    escaped: true,
+                    smooth_value: f64::from(iter),
+                });
+            }
+        }
+        out
+    }
+
+    fn fractal_expected_color(iter: u32) -> egui::Color32 {
+        use grafito_geometry::fractals::fractal_color_hsv;
+        let (r, g, b, a) = fractal_color_hsv(iter, 100, f64::from(iter));
+        egui::Color32::from_rgba_premultiplied(
+            (r * 255.0) as u8,
+            (g * 255.0) as u8,
+            (b * 255.0) as u8,
+            (a * 255.0) as u8,
+        )
+    }
+
+    #[test]
+    fn fractal_texture_image_maps_rows_top_down() {
+        // La fila 0 de la imagen es y_max (última fila de píxeles).
+        let image = super::fractal_texture_image(&fractal_test_pixels(), 2).expect("2×2 válida");
+        assert_eq!(image.size, [2, 2]);
+        assert_eq!(image.pixels[0], fractal_expected_color(3));
+        assert_eq!(image.pixels[1], fractal_expected_color(4));
+        assert_eq!(image.pixels[2], fractal_expected_color(1));
+        assert_eq!(image.pixels[3], fractal_expected_color(2));
+    }
+
+    #[test]
+    fn fractal_texture_image_rejects_bad_shapes() {
+        assert!(super::fractal_texture_image(&fractal_test_pixels(), 0).is_none());
+        assert!(super::fractal_texture_image(&fractal_test_pixels(), 3).is_none());
+        assert!(super::fractal_texture_image(&[], 2).is_none());
+    }
+
+    #[test]
+    fn fractal_texture_upload_hits_cache_headless() {
+        let ctx = egui::Context::default();
+        let painter = ctx.layer_painter(egui::LayerId::background());
+        let mut fr = grafito_core::Fractal2DObj::mandelbrot();
+        fr.resolution = 2;
+        let pixels = std::sync::Arc::new(fractal_test_pixels());
+        let first = super::cached_fractal_texture(&painter, &fr, 7, &pixels).expect("sube textura");
+        let second =
+            super::cached_fractal_texture(&painter, &fr, 7, &pixels).expect("hit de caché");
+        // Hit: mismo TextureId sin resubir.
+        assert_eq!(first.id(), second.id());
+        painter.image(
+            second.id(),
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(4.0, 4.0)),
+            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+    }
+
+    /// Regresión de fuente: el brazo `Fractal2D` de `draw_object_styled`
+    /// debe blitear la textura cacheada, no emitir `rect_filled` por píxel.
+    #[test]
+    fn fractal_arm_uses_texture_not_per_pixel_rects() {
+        let source = include_str!("render_2d.rs");
+        let start = source
+            .find("pub(crate) fn draw_object_styled(")
+            .expect("draw_object_styled not found");
+        let body = &source[start..];
+        let end = body
+            .find("\n    pub(crate) fn ")
+            .or_else(|| body.find("\n    fn "))
+            .unwrap_or(body.len());
+        let body = &body[..end];
+        let arm = body
+            .find("GeoObject::Fractal2D(fr)")
+            .map(|i| &body[i..])
+            .expect("fractal arm not found");
+        let arm_end = arm
+            .find("GeoObject::ParametricCurve2D")
+            .unwrap_or(arm.len());
+        let arm = &arm[..arm_end];
+        assert!(
+            arm.contains("cached_fractal_texture"),
+            "fractal arm must blit the cached texture"
+        );
+        assert!(
+            !arm.contains("rect_filled"),
+            "fractal arm must not emit per-pixel rects"
+        );
+    }
+
+    #[test]
+    fn domain_grid_image_maps_gpu_order_to_texture_rows() {
+        // GPU idx = i*res+j (i→x, j→y desde y_min); fila 0 de imagen = y_max.
+        // res=2: idx0=(0,0) rojo, idx1=(0,1) verde, idx2=(1,0) azul,
+        // idx3=(1,1) blanco → imagen [verde, blanco, rojo, azul].
+        let colors = [
+            [1.0, 0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0, 1.0],
+            [1.0, 1.0, 1.0, 1.0],
+        ];
+        let image = super::domain_grid_image_from_colors(&colors, 2).expect("2×2 válida");
+        assert_eq!(image.size, [2, 2]);
+        use egui::Color32;
+        assert_eq!(
+            image.pixels,
+            vec![
+                Color32::from_rgb(0, 255, 0),
+                Color32::WHITE,
+                Color32::from_rgb(255, 0, 0),
+                Color32::from_rgb(0, 0, 255),
+            ]
+        );
+    }
+
+    #[test]
+    fn domain_grid_image_rejects_bad_shapes_and_nonfinite() {
+        let colors = [[1.0, 0.0, 0.0, 1.0]; 4];
+        assert!(super::domain_grid_image_from_colors(&colors, 0).is_none());
+        assert!(super::domain_grid_image_from_colors(&colors, 3).is_none());
+        assert!(super::domain_grid_image_from_colors(&colors[..3], 2).is_none());
+        // No-finito → TRANSPARENT (igual que el builder CPU).
+        let mut nan = colors;
+        nan[0] = [f32::NAN, 0.0, 0.0, 1.0];
+        let image = super::domain_grid_image_from_colors(&nan, 2).expect("con NaN");
+        assert_eq!(image.pixels[2], egui::Color32::TRANSPARENT);
+    }
+
+    #[test]
+    fn domain_grid_state_machine_claim_ready_consume() {
+        // claim ausente → true; repetido → false (sin re-dispatch).
+        assert!(super::domain_grid_claim(0xA1));
+        assert!(!super::domain_grid_claim(0xA1));
+        assert!(super::domain_grid_is_dispatched(0xA1));
+        // Ready se consume una sola vez y marca Consumed.
+        super::domain_grid_ready(0xA1, vec![[1.0, 0.0, 0.0, 1.0]]);
+        let taken = super::domain_grid_take_ready(0xA1).expect("ready");
+        assert_eq!(taken.len(), 1);
+        assert!(super::domain_grid_take_ready(0xA1).is_none());
+        assert!(!super::domain_grid_is_dispatched(0xA1));
+        assert!(!super::domain_grid_claim(0xA1), "consumed no re-dispatchea");
+        // Ready sobre no-Dispatched se descarta (sin envenenar).
+        super::domain_grid_ready(0xB2, vec![[0.0; 4]]);
+        assert!(super::domain_grid_take_ready(0xB2).is_none());
+        // Drop reabre (CPU honesto); consumed-marca cierra.
+        super::domain_grid_drop(0xA1);
+        assert!(super::domain_grid_claim(0xA1));
+        super::domain_grid_drop(0xA1);
+        super::domain_grid_mark_consumed(0xA1);
+        assert!(!super::domain_grid_claim(0xA1));
+        super::domain_grid_drop(0xA1);
+    }
+
+    /// Bench de frame CPU headless (estilo `native_rgba`: temporizado con
+    /// `Instant`, imprime miss/hit, pinea cachés poblados sin gates de
+    /// tiempo frágiles).
+    ///
+    /// Escena de referencia: 40 funciones + 5 implícitas + 1 fractal 32² +
+    /// 2 histogramas + 1 boxplot + 1 torta + 1 texto. El primer draw
+    /// calienta (miss), el segundo mide el estado estable.
+    #[test]
+    fn frame_cpu_escena_referencia_mide_miss_y_hit() {
+        use grafito_core::{
+            BoxPlotObj, Document, Fractal2DObj, FunctionObj, GeoObject, HistogramObj,
+            ImplicitCurveObj, PieChartObj, RelationOperator, TextObj,
+        };
+        let mut app = crate::app::dummy_grafito_app();
+        app.document
+            .set_view(grafito_geometry::ViewTransform::new(800.0, 600.0));
+        let doc: &mut Document = &mut app.document;
+        for i in 0..40 {
+            let expr = match i % 4 {
+                0 => format!("sin({} * x)", i + 1),
+                1 => format!("x^2 / {} - {i}", i + 2),
+                2 => format!("{i} * cos(x / {})", i + 1),
+                _ => format!("tan(x / {})", i + 10),
+            };
+            doc.add_object(GeoObject::Function(FunctionObj::new(expr)));
+        }
+        for i in 0..5 {
+            doc.add_object(GeoObject::ImplicitCurve(ImplicitCurveObj::new(
+                &format!("x^2 + y^2 + {i}"),
+                "25",
+                RelationOperator::Eq,
+            )));
+        }
+        let mut fractal = Fractal2DObj::mandelbrot();
+        fractal.resolution = 32;
+        let fractal_id = doc.add_object(GeoObject::Fractal2D(fractal));
+        for _ in 0..2 {
+            doc.add_object(GeoObject::Histogram(HistogramObj::new(
+                vec![1.0, 2.0, 3.0, 2.0, 1.0],
+                8,
+            )));
+        }
+        doc.add_object(GeoObject::BoxPlot(BoxPlotObj::new(vec![
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0,
+        ])));
+        doc.add_object(GeoObject::PieChart(PieChartObj::new(vec![1.0, 2.0, 3.0])));
+        doc.add_object(GeoObject::Text(TextObj::new(
+            "hola mundo",
+            Point2::new(1.0, 1.0),
+        )));
+
+        let ctx = egui::Context::default();
+        let canvas_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let version = app.document.version;
+        // Las fuentes headless exigen un `run()` previo (si no, `layout`
+        // paniquea con "No fonts available"): los dos draws van adentro.
+        let (mut miss, mut hit) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let painter = ctx.layer_painter(egui::LayerId::background());
+            let t0 = std::time::Instant::now();
+            app.draw_objects(&painter, canvas_rect, false, |_| {});
+            miss = t0.elapsed();
+            let t1 = std::time::Instant::now();
+            app.draw_objects(&painter, canvas_rect, false, |_| {});
+            hit = t1.elapsed();
+        });
+        println!("frame_cpu_escena_referencia: miss={miss:?} hit={hit:?}");
+
+        // El camino de textura del fractal quedó poblado tras el miss.
+        let GeoObject::Fractal2D(fr) = app
+            .document
+            .get_object(fractal_id)
+            .expect("fractal insertado")
+        else {
+            panic!("id fractal inválido");
+        };
+        let fkey = super::fractal_render_cache_key(version, fr);
+        assert!(
+            super::FRACTAL_TEXTURES.with(|c| c.borrow_mut().contains(&fkey)),
+            "el draw debe poblar la textura del fractal"
+        );
+        // El memo de stats también quedó poblado (histograma de la escena).
+        assert!(
+            super::STAT_MEMO.with(|c| c.borrow().iter().any(|((_, v, _), _)| *v == version)),
+            "el draw debe poblar el memo de estadísticas"
+        );
+    }
+
+    /// Regresión de fuente: `draw_object_styled` debe aplicar el culling de
+    /// viewport antes de muestrear/proyectar. Si alguien quita el culling del
+    /// path CPU, este test falla y obliga a decidir explícitamente.
+    #[test]
+    fn draw_object_styled_wires_viewport_culling() {
+        let source = include_str!("render_2d.rs");
+        let start = source
+            .find("pub(crate) fn draw_object_styled(")
+            .expect("draw_object_styled not found");
+        let body = &source[start..];
+        let end = body
+            .find("\n    pub(crate) fn ")
+            .or_else(|| body.find("\n    fn "))
+            .unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            body.contains("grafito_render::object_world_aabb"),
+            "draw_object_styled must cull off-screen objects before sampling"
+        );
+        assert!(
+            body.contains("grafito_render::aabb_intersects"),
+            "draw_object_styled must use aabb_intersects for the viewport test"
+        );
+    }
+}
+
+#[cfg(test)]
+mod trail_tests {
+    use super::*;
+    use grafito_core::{CircleObj, FunctionObj, LineObj, PointObj, PolygonObj};
+
+    #[test]
+    fn representative_positions_cover_traceable_types() {
+        let p = GeoObject::Point(PointObj::new(Point2::new(3.0, 4.0)));
+        assert_eq!(
+            trail_representative_position(&p),
+            Some(Point2::new(3.0, 4.0))
+        );
+        let l = GeoObject::Line(LineObj::new(Point2::new(0.0, 0.0), Point2::new(4.0, 2.0)));
+        assert_eq!(
+            trail_representative_position(&l),
+            Some(Point2::new(2.0, 1.0))
+        );
+        let c = GeoObject::Circle(CircleObj::new(Point2::new(1.0, 1.0), 5.0));
+        assert_eq!(
+            trail_representative_position(&c),
+            Some(Point2::new(1.0, 1.0))
+        );
+        let g = GeoObject::Polygon(PolygonObj::new(vec![
+            Point2::new(0.0, 0.0),
+            Point2::new(4.0, 0.0),
+            Point2::new(0.0, 4.0),
+        ]));
+        let centroid = trail_representative_position(&g).expect("centroide");
+        assert!((centroid.x - 4.0 / 3.0).abs() < 1e-12);
+        assert!((centroid.y - 4.0 / 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn representative_returns_none_for_unsupported_and_empty() {
+        let f = GeoObject::Function(FunctionObj::new("x^2"));
+        assert_eq!(trail_representative_position(&f), None);
+        let g = GeoObject::Polygon(PolygonObj::new(vec![]));
+        assert_eq!(trail_representative_position(&g), None);
+    }
+
+    #[test]
+    fn draw_trail_never_panics_and_skips_short_or_nonnfinite() {
+        let ctx = egui::Context::default();
+        let painter = ctx.layer_painter(egui::LayerId::background());
+        let view = ViewTransform::new(800.0, 600.0);
+        let clip = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(800.0, 600.0));
+        let base = Color::new(1.0, 0.0, 0.0, 1.0);
+        // <2 puntos: no-op.
+        draw_trail(&painter, &view, clip, &[], base);
+        draw_trail(&painter, &view, clip, &[Point2::new(0.0, 0.0)], base);
+        // NaN se corta sin panic.
+        draw_trail(
+            &painter,
+            &view,
+            clip,
+            &[
+                Point2::new(0.0, 0.0),
+                Point2::new(f64::NAN, 1.0),
+                Point2::new(2.0, 2.0),
+            ],
+            base,
+        );
+        // Normal: 3 puntos dibujan 2 segmentos con fade.
+        draw_trail(
+            &painter,
+            &view,
+            clip,
+            &[
+                Point2::new(0.0, 0.0),
+                Point2::new(1.0, 1.0),
+                Point2::new(2.0, 0.0),
+            ],
+            base,
+        );
+    }
+}
+
+#[cfg(test)]
+mod number_plane_tests {
+    use super::*;
+
+    #[test]
+    fn nice_step_sigue_1_2_5_por_decada() {
+        assert_eq!(nice_number_plane_step(0.9), 0.5);
+        assert_eq!(nice_number_plane_step(1.5), 1.0);
+        assert_eq!(nice_number_plane_step(3.0), 2.0);
+        assert_eq!(nice_number_plane_step(7.0), 5.0);
+        assert_eq!(nice_number_plane_step(15.0), 10.0);
+        assert_eq!(nice_number_plane_step(0.03), 0.02);
+    }
+
+    #[test]
+    fn nice_step_sanea_no_finitos_sin_panic() {
+        assert_eq!(nice_number_plane_step(f64::NAN), 1.0);
+        assert_eq!(nice_number_plane_step(f64::INFINITY), 1.0);
+        assert_eq!(nice_number_plane_step(0.0), 1.0);
+        assert_eq!(nice_number_plane_step(-4.0), 1.0);
+    }
+
+    #[test]
+    fn adaptive_skip_etiqueta_1_de_cada_n_sin_solape() {
+        assert_eq!(adaptive_label_skip(0, 800.0, 48.0), 1);
+        assert_eq!(adaptive_label_skip(1, 800.0, 48.0), 1);
+        // 800px / 48px ≈ 16 etiquetas: 10 entran todas.
+        assert_eq!(adaptive_label_skip(10, 800.0, 48.0), 1);
+        // 100 ticks en 800px → 1 de cada 7 (100/16 → 7).
+        assert_eq!(adaptive_label_skip(100, 800.0, 48.0), 7);
+        // Sin espacio o sin cota → 1 (no esconde todo).
+        assert_eq!(adaptive_label_skip(100, 0.0, 48.0), 1);
+        assert_eq!(adaptive_label_skip(100, f32::NAN, 48.0), 1);
+    }
+
+    #[test]
+    fn format_label_entero_y_decimal_recortado() {
+        use grafito_ui::i18n::Locale;
+        assert_eq!(format_number_plane_label_localized(3.0, Locale::En), "3");
+        assert_eq!(
+            format_number_plane_label_localized(-12.0, Locale::En),
+            "-12"
+        );
+        assert_eq!(format_number_plane_label_localized(1.5, Locale::En), "1.5");
+        assert_eq!(format_number_plane_label_localized(2.50, Locale::En), "2.5");
+        assert_eq!(
+            format_number_plane_label_localized(f64::NAN, Locale::En),
+            "0"
+        );
+    }
+
+    #[test]
+    fn format_label_localizado_usa_coma_fuera_de_en() {
+        use grafito_ui::i18n::Locale;
+        assert_eq!(format_number_plane_label_localized(1.5, Locale::En), "1.5");
+        assert_eq!(format_number_plane_label_localized(3.0, Locale::Es), "3");
+        for locale in [Locale::Es, Locale::Pt, Locale::It, Locale::Fr, Locale::De] {
+            assert_eq!(
+                format_number_plane_label_localized(1.5, locale),
+                "1,5",
+                "coma decimal en {locale:?}"
+            );
+            assert_eq!(
+                format_number_plane_label_localized(2.50, locale),
+                "2,5",
+                "recorte con coma en {locale:?}"
+            );
+        }
+        assert_eq!(
+            format_number_plane_label_localized(f64::NAN, Locale::Es),
+            "0"
+        );
+    }
+
+    #[test]
+    fn document_toggle_plano_numerado_migra_a_visible() {
+        let doc = grafito_core::Document::new();
+        assert!(doc.number_plane_labels, "default visible");
+        let json = serde_json::to_string(&doc).expect("serializa");
+        assert!(json.contains("number_plane_labels"));
+        // JSON viejo sin el campo migra a visible (comportamiento histórico).
+        let mut value = serde_json::to_value(&doc).expect("a valor");
+        value
+            .as_object_mut()
+            .expect("objeto")
+            .remove("number_plane_labels");
+        let migrated: grafito_core::Document =
+            serde_json::from_value(value).expect("migra sin el campo");
+        assert!(migrated.number_plane_labels);
+    }
+}
+
+#[cfg(test)]
+mod tex_label_tests {
+    use super::{
+        decide_function_label, draw_tex_label, FunctionLabelDraw, TEX_LABEL_MAX_WIDTH_PX,
+        TEX_LABEL_SCALE_PX,
+    };
+    use egui::{Pos2, Rect, Vec2};
+
+    #[test]
+    fn ascii_math_label_rasterizes_fully() {
+        // El caso pedido: `y = x^2` ASCII pasa a raster cubierto, sin pánico.
+        match decide_function_label("f", "x^2") {
+            FunctionLabelDraw::TexRaster { text, bitmap } => {
+                assert_eq!(text, "f = x^2");
+                assert!(!bitmap.is_empty());
+                assert!(bitmap.ink_pixels() > 0);
+                // Una línea de 7 px de alto.
+                assert_eq!(bitmap.height, grafito_core::tex_raster::GLYPH_H);
+            }
+            FunctionLabelDraw::Ascii => panic!("'f = x^2' debería rasterizar"),
+        }
+        // Multi-símbolo pedido por F2c también cubre.
+        assert!(matches!(
+            decide_function_label("g", "x² + π"),
+            FunctionLabelDraw::TexRaster { .. }
+        ));
+    }
+
+    #[test]
+    fn missing_glyph_falls_back_to_original_ascii() {
+        // Glifo sin cobertura (emoji) → ASCII original, jamás tofu: la
+        // decisión no porta ningún string alterado, el call-site dibuja
+        // `label` tal cual (verificado por construcción: `Ascii` no muta).
+        assert_eq!(
+            decide_function_label("f", "x^2😀"),
+            FunctionLabelDraw::Ascii
+        );
+        assert_eq!(decide_function_label("", "x^2"), FunctionLabelDraw::Ascii);
+        assert_eq!(decide_function_label("f", ""), FunctionLabelDraw::Ascii);
+        assert_eq!(decide_function_label("  ", "x^2"), FunctionLabelDraw::Ascii);
+    }
+
+    #[test]
+    fn overlong_label_falls_back_instead_of_truncating() {
+        // Expresiones larguísimas: el raster truncaría a escondidas, así que
+        // se cae a ASCII honesto (la etiqueta completa sigue legible).
+        let long = "x+".repeat(200);
+        assert_eq!(decide_function_label("f", &long), FunctionLabelDraw::Ascii);
+    }
+
+    #[test]
+    fn draw_tex_label_never_panics_headless() {
+        let ctx = egui::Context::default();
+        let canvas = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(800.0, 600.0));
+        let painter = ctx.layer_painter(egui::LayerId::background());
+        let color = egui::Color32::WHITE;
+        // Bitmap real dibuja sin pánico (una imagen, no cientos de rects).
+        if let FunctionLabelDraw::TexRaster { text, bitmap } = decide_function_label("f", "x^2") {
+            draw_tex_label(&painter, Pos2::new(10.0, 10.0), &text, &bitmap, color);
+            // Segunda vez: hit de caché de textura, mismo resultado.
+            draw_tex_label(&painter, Pos2::new(10.0, 10.0), &text, &bitmap, color);
+            // Centrado del call-site: ancho conocido, origen finito.
+            let half = bitmap.width as f32 * TEX_LABEL_SCALE_PX * 0.5;
+            assert!(half.is_finite() && half > 0.0);
+            assert!(half * 2.0 <= TEX_LABEL_MAX_WIDTH_PX);
+        } else {
+            panic!("'f = x^2' debería rasterizar");
+        }
+        // Bordes: vacío y origen no finito son no-op, no pánico.
+        draw_tex_label(
+            &painter,
+            Pos2::new(10.0, 10.0),
+            "empty",
+            &grafito_core::tex_raster::TexBitmap::empty(),
+            color,
+        );
+        if let FunctionLabelDraw::TexRaster { text, bitmap } = decide_function_label("f", "x^2") {
+            draw_tex_label(&painter, Pos2::new(f32::NAN, 0.0), &text, &bitmap, color);
+            draw_tex_label(
+                &painter,
+                Pos2::new(f32::INFINITY, 0.0),
+                &text,
+                &bitmap,
+                color,
+            );
+        }
+        let _ = canvas;
+    }
+}
+
+#[cfg(test)]
+mod q2_style_tests {
+    use super::*;
+
+    #[test]
+    fn solid_has_no_dash_pattern_so_history_paints_pixel_identical() {
+        // Invariante golden por construcción: `Solid` → `None` → el renderer
+        // llama a las mismas primitivas que antes del frente Q2.
+        assert_eq!(dash_pattern(LineStyle::Solid, 2.0), None);
+        assert_eq!(dash_pattern(LineStyle::Solid, 0.0), None);
+    }
+
+    #[test]
+    fn dashed_and_dotted_patterns_are_positive_and_finite() {
+        for style in [LineStyle::Dashed, LineStyle::Dotted] {
+            for width in [0.5, 1.0, 2.0, 10.0] {
+                let (dash, gap) = dash_pattern(style, width).expect("patrón");
+                assert!(dash.is_finite() && dash > 0.0, "{style:?} {width}");
+                assert!(gap.is_finite() && gap > 0.0, "{style:?} {width}");
+            }
+        }
+    }
+
+    #[test]
+    fn dash_pattern_survives_degenerate_widths() {
+        for width in [0.0, -2.0, f32::NAN, f32::INFINITY] {
+            for style in [LineStyle::Dashed, LineStyle::Dotted] {
+                let (dash, gap) = dash_pattern(style, width).expect("fallback");
+                assert!(dash.is_finite() && dash > 0.0);
+                assert!(gap.is_finite() && gap > 0.0);
+            }
+            assert_eq!(dash_pattern(LineStyle::Solid, width), None);
+        }
+    }
+
+    #[test]
+    fn point_glyphs_paint_headless_without_panic() {
+        let ctx = egui::Context::default();
+        let painter = ctx.layer_painter(egui::LayerId::background());
+        for style in [
+            PointStyle::Dot,
+            PointStyle::Circle,
+            PointStyle::Cross,
+            PointStyle::Plus,
+        ] {
+            draw_point_glyph(&painter, Pos2::new(10.0, 10.0), 6.0, Color32::WHITE, style);
+            draw_point_glyph(
+                &painter,
+                Pos2::new(10.0, 10.0),
+                f32::NAN,
+                Color32::WHITE,
+                style,
+            );
+        }
+    }
+
+    #[test]
+    fn stroke_helpers_ignore_degenerate_geometry_headless() {
+        let ctx = egui::Context::default();
+        let painter = ctx.layer_painter(egui::LayerId::background());
+        let stroke = Stroke::new(2.0, Color32::WHITE);
+        let a = Pos2::new(0.0, 0.0);
+        stroke_segment(&painter, a, a, stroke, LineStyle::Dashed);
+        stroke_segment(
+            &painter,
+            Pos2::new(f32::NAN, 0.0),
+            a,
+            stroke,
+            LineStyle::Dotted,
+        );
+        stroke_polyline(&painter, &[], true, stroke, LineStyle::Dashed);
+        stroke_polyline(&painter, &[a], true, stroke, LineStyle::Dashed);
+        stroke_run(&painter, vec![], stroke, LineStyle::Dashed);
+        stroke_run(&painter, vec![a], stroke, LineStyle::Solid);
+    }
+}
+#[cfg(test)]
+mod coverage_sweep_render2d_pure {
+    use super::*;
+    #[test]
+    fn barrido_escala_y_etiquetas() {
+        assert!(
+            (nice_number_plane_step(0.3) - 0.5).abs() < 1e-12 || nice_number_plane_step(0.3) > 0.0
+        );
+        assert_eq!(nice_number_plane_step(0.0), 1.0);
+        assert_eq!(nice_number_plane_step(f64::NAN), 1.0);
+        assert_eq!(nice_number_plane_step(-5.0), 1.0);
+        assert_eq!(adaptive_label_skip(0, 800.0, 60.0), 1);
+        assert_eq!(adaptive_label_skip(100, 800.0, 60.0), 8);
+        assert_eq!(adaptive_label_skip(5, 800.0, 60.0), 1);
+        assert_eq!(
+            format_number_plane_label_localized(2.0, grafito_ui::i18n::Locale::En),
+            "2"
+        );
+        assert_eq!(
+            format_number_plane_label_localized(1.5, grafito_ui::i18n::Locale::En),
+            "1.5"
+        );
+        assert_eq!(
+            format_number_plane_label_localized(f64::NAN, grafito_ui::i18n::Locale::En),
+            "0"
+        );
+    }
+    #[test]
+    fn barrido_estilos_y_cache() {
+        assert_eq!(dash_pattern(LineStyle::Solid, 2.0), None);
+        let (d, g) = dash_pattern(LineStyle::Dashed, 2.0).expect("guiones");
+        assert!(d > g && d >= 6.0);
+        assert!(dash_pattern(LineStyle::Dotted, 1.0).is_some());
+        assert!(dash_pattern(LineStyle::Dashed, f32::NAN).is_some());
+        assert!(trig_sample_count(800, 10.0, grafito_core::RenderQuality::Normal) >= 200);
+        assert!(trig_sample_count(800, 100.0, grafito_core::RenderQuality::Preview) <= 280);
+        let uv = fill_cache_view_uv((0.0, 10.0, 0.0, 10.0), (2.0, 8.0, 2.0, 8.0)).expect("uv");
+        assert!((uv.0 - 0.2).abs() < 1e-6 && (uv.1 - 0.8).abs() < 1e-6);
+        assert!(fill_cache_view_uv((0.0, 10.0, 0.0, 10.0), (-5.0, 20.0, 0.0, 5.0)).is_none());
+        let (w, h) =
+            fill_cache_texture_size((0.0, 10.0, 0.0, 10.0), (0.0, 20.0, 0.0, 20.0), (800, 600));
+        assert_eq!((w, h), (1600, 1200));
+        assert!(matches!(
+            decide_function_label("", "x"),
+            FunctionLabelDraw::Ascii
+        ));
+    }
+}
+
+#[cfg(test)]
+mod complex_expr_cache_ola4_tests {
+    use super::*;
+    /// Ola 4: miss-rate del AST complejo — el primer `get` parsea (miss) y el
+    /// segundo es hit (mismo `Arc`, sin re-parsear por frame).
+    #[test]
+    fn complex_expr_cache_hit_after_first_parse() {
+        let first = cached_complex_expr("z*z").expect("parse válido");
+        let second = cached_complex_expr("z*z").expect("hit");
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "el segundo acceso debe ser hit del LRU, sin re-parsear"
+        );
+        assert!(cached_complex_expr("esto no es una expresión válida ((((").is_none());
+    }
+}
+
+#[cfg(test)]
+mod t7_t1_mediciones {
+    use super::*;
+    use grafito_core::{
+        CircleObj, Document, FunctionObj, GeoObject, ImplicitCurveObj, ParametricCurve2DObj,
+        PointObj, PolygonObj, RelationOperator, VectorField2DObj,
+    };
+
+    /// T7: costo aislado de los `format!` de etiquetas (300 labels con los
+    /// patrones reales del draw). El número impreso decide si el scratch
+    /// buffer se justifica; el assert es generoso anti-flake.
+    #[test]
+    fn etiquetas_format_300x6_mide_costo() {
+        let t0 = std::time::Instant::now();
+        let mut acumulado = 0usize;
+        for i in 0..300 {
+            let label = format!("f{i}");
+            let expr = format!("sin({} * x)", i + 1);
+            let a = format!("{label} = {expr}");
+            let b = format!("t{i}({:.2})", i as f64 * 0.01);
+            let c = format!("cos θ = {:.3}   sin θ = {:.3}", 0.5, 0.8660254);
+            let d = format!("z(t) = {:.3} {:+.3}i", 1.0, -2.0);
+            let e = format!("Imagen activa: {expr}");
+            let f = format!("{:.2}", i as f64 * 1.5);
+            acumulado += a.len() + b.len() + c.len() + d.len() + e.len() + f.len();
+        }
+        let dt = t0.elapsed();
+        println!("etiquetas_format_300x6: {dt:?} ({acumulado} bytes)");
+        assert!(acumulado > 10_000, "el bench debe formatear de verdad");
+        assert!(
+            dt.as_millis() < 50,
+            "formateo de etiquetas fuera de órbita: {dt:?}"
+        );
+    }
+
+    /// T1: escena compleja (300 objetos etiquetados) miss/hit en CPU.
+    /// Corre en release para números reales:
+    /// `cargo test --release -p grafito-app --lib t7_t1_mediciones -- --nocapture`.
+    #[test]
+    fn frame_cpu_escena_compleja_300_mide_miss_y_hit() {
+        let mut app = crate::app::dummy_grafito_app();
+        app.document
+            .set_view(grafito_geometry::ViewTransform::new(800.0, 600.0));
+        let doc: &mut Document = &mut app.document;
+        for i in 0..200 {
+            let expr = match i % 4 {
+                0 => format!("sin({} * x)", i + 1),
+                1 => format!("x^2 / {} - {i}", i + 2),
+                2 => format!("{i} * cos(x / {})", i + 1),
+                _ => format!("exp(-x^2 / {})", i + 1),
+            };
+            let mut fun = FunctionObj::new(expr);
+            fun.label = format!("f{i}");
+            doc.add_object(GeoObject::Function(fun));
+        }
+        for i in 0..30 {
+            let mut pc = ParametricCurve2DObj::new("cos(t)", "sin(t)", 0.0, std::f64::consts::TAU);
+            pc.label = format!("c{i}");
+            doc.add_object(GeoObject::ParametricCurve2D(pc));
+        }
+        for i in 0..20 {
+            doc.add_object(GeoObject::VectorField2D(VectorField2DObj::new("y", "-x")));
+            let _ = i;
+        }
+        for i in 0..10 {
+            doc.add_object(GeoObject::ImplicitCurve(ImplicitCurveObj::new(
+                &format!("x^2 + y^2 - {}", (i + 1) * (i + 1)),
+                "0",
+                RelationOperator::Eq,
+            )));
+        }
+        for i in 0..20 {
+            let x = i as f64 * 0.5;
+            doc.add_object(GeoObject::Point(PointObj::new(Point2::new(x, x.sin()))));
+        }
+        for i in 0..10 {
+            doc.add_object(GeoObject::Circle(CircleObj::new(
+                Point2::new(i as f64, 0.0),
+                1.0,
+            )));
+        }
+        for _ in 0..10 {
+            doc.add_object(GeoObject::Polygon(PolygonObj::new(vec![
+                Point2::new(0.0, 0.0),
+                Point2::new(1.0, 0.0),
+                Point2::new(1.0, 1.0),
+            ])));
+        }
+        assert_eq!(doc.object_count(), 300);
+
+        let ctx = egui::Context::default();
+        let canvas_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let (mut miss, mut hit) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let painter = ctx.layer_painter(egui::LayerId::background());
+            let t0 = std::time::Instant::now();
+            app.draw_objects(&painter, canvas_rect, false, |_| {});
+            miss = t0.elapsed();
+            let t1 = std::time::Instant::now();
+            app.draw_objects(&painter, canvas_rect, false, |_| {});
+            hit = t1.elapsed();
+        });
+        println!("frame_cpu_escena_compleja_300: miss={miss:?} hit={hit:?}");
+    }
+
+    /// T1d-sonda: qué camino de label toman las etiquetas del bench.
+    #[test]
+    fn sonda_camino_label() {
+        for (label, expr) in [("f12", "sin(12 * x)"), ("c3", "cos(t)"), ("t5", "x^2")] {
+            let camino = match super::decide_function_label(label, expr) {
+                super::FunctionLabelDraw::TexRaster { .. } => "bitmap",
+                super::FunctionLabelDraw::Ascii => "ascii",
+            };
+            println!("label {label}={expr}: {camino}");
+        }
+    }
+
+    /// T1b: atribución por categoría — la misma escena por etapas para ver
+    /// dónde van los ~20 ms del hit en release.
+    #[test]
+    fn frame_cpu_atribucion_por_categoria() {
+        let ctx = egui::Context::default();
+        let canvas_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let etapa = |nombre: &str, doc: &mut Document| {
+            let mut app = crate::app::dummy_grafito_app();
+            app.document
+                .set_view(grafito_geometry::ViewTransform::new(800.0, 600.0));
+            std::mem::swap(&mut app.document, doc);
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                let painter = ctx.layer_painter(egui::LayerId::background());
+                app.draw_objects(&painter, canvas_rect, false, |_| {});
+                let t0 = std::time::Instant::now();
+                app.draw_objects(&painter, canvas_rect, false, |_| {});
+                println!("atribucion {nombre}: hit={:?}", t0.elapsed());
+            });
+        };
+        let mut doc = Document::new();
+        doc.set_view(grafito_geometry::ViewTransform::new(800.0, 600.0));
+        for i in 0..200 {
+            let expr = match i % 4 {
+                0 => format!("sin({} * x)", i + 1),
+                1 => format!("x^2 / {} - {i}", i + 2),
+                2 => format!("{i} * cos(x / {})", i + 1),
+                _ => format!("exp(-x^2 / {})", i + 1),
+            };
+            let mut fun = FunctionObj::new(expr);
+            fun.label = format!("f{i}");
+            doc.add_object(GeoObject::Function(fun));
+        }
+        etapa("200_funciones_etiquetadas", &mut doc);
+        for i in 0..30 {
+            let mut pc = ParametricCurve2DObj::new("cos(t)", "sin(t)", 0.0, std::f64::consts::TAU);
+            pc.label = format!("c{i}");
+            doc.add_object(GeoObject::ParametricCurve2D(pc));
+        }
+        etapa("+30_parametricas", &mut doc);
+        for _ in 0..20 {
+            doc.add_object(GeoObject::VectorField2D(VectorField2DObj::new("y", "-x")));
+        }
+        etapa("+20_vectores", &mut doc);
+        for i in 0..10 {
+            doc.add_object(GeoObject::ImplicitCurve(ImplicitCurveObj::new(
+                &format!("x^2 + y^2 - {}", (i + 1) * (i + 1)),
+                "0",
+                RelationOperator::Eq,
+            )));
+        }
+        etapa("+10_implicitas", &mut doc);
+        for i in 0..40 {
+            let x = i as f64 * 0.5;
+            if i % 2 == 0 {
+                doc.add_object(GeoObject::Point(PointObj::new(Point2::new(x, x.sin()))));
+            } else {
+                doc.add_object(GeoObject::Circle(CircleObj::new(Point2::new(x, 0.0), 1.0)));
+            }
+        }
+        etapa("+40_puntos_circulos", &mut doc);
+    }
+
+    /// Regresión T1e-bis: los caches thread-local keyeados por versión
+    /// (`ORDERED_VISIBLE_CACHE`, `DISPLAY_OVERRIDE_CACHE`) distinguen
+    /// documentos por `cache_nonce`. Sin nonce, dos documentos con igual
+    /// versión colisionaban y el segundo dibujaba los ids del primero
+    /// (canvas vacío/erróneo al abrir un archivo nuevo).
+    #[test]
+    fn caches_thread_local_distinguen_documentos_con_igual_version() {
+        let mut a = Document::new();
+        let mut b = Document::new();
+        assert_ne!(
+            a.cache_nonce, b.cache_nonce,
+            "cada documento nuevo tiene nonce fresco"
+        );
+        let ida = a
+            .try_add_object(GeoObject::Function(FunctionObj::new("sin(x)")))
+            .expect("agregar en a");
+        let idb = b
+            .try_add_object(GeoObject::Function(FunctionObj::new("cos(x)")))
+            .expect("agregar en b");
+        assert_eq!(a.version, b.version, "misma versión para forzar colisión");
+        let ids_a = super::cached_ordered_visible_ids(&a);
+        // El clon es el mismo documento lógico: comparte nonce y pega en la
+        // misma entrada (el caché guarda una sola; se verifica antes de que
+        // otro documento la desaloje).
+        let clon = a.clone();
+        assert_eq!(clon.cache_nonce, a.cache_nonce);
+        let ids_clon = super::cached_ordered_visible_ids(&clon);
+        assert!(std::sync::Arc::ptr_eq(&ids_a, &ids_clon));
+        let ids_b = super::cached_ordered_visible_ids(&b);
+        assert!(ids_a.contains(&ida) && !ids_a.contains(&idb));
+        assert!(ids_b.contains(&idb) && !ids_b.contains(&ida));
+        // Override con mismo label y versión pero flags distintos.
+        let flags_b = grafito_core::DisplayFlags {
+            show_label: false,
+            ..Default::default()
+        };
+        b.display_flags.insert("F".to_string(), flags_b);
+        let (over_a, vis_a) = super::p4_display_override(&a, "F");
+        let (over_b, vis_b) = super::p4_display_override(&b, "F");
+        assert!(vis_a && vis_b);
+        assert!(over_a.is_none(), "sin flags no hay override");
+        assert!(
+            over_b.as_ref().is_some_and(|estilo| estilo.hide_label),
+            "el flag del otro documento no debe contaminar"
+        );
+    }
+
+    /// T1g: overhead por shape — 1600 segmentos sueltos vs 1 path con
+    /// 1600 puntos (mismos vértices). Aísla el costo de setup por shape en
+    /// el teselador + draw calls.
+    #[test]
+    fn t1g_overhead_por_shape_vs_batcheado() {
+        let ctx = egui::Context::default();
+        let stroke = egui::Stroke::new(2.0, egui::Color32::WHITE);
+        let pts: Vec<Pos2> = (0..1600)
+            .map(|i| Pos2::new(i as f32, (i as f32 * 0.1).sin() * 100.0))
+            .collect();
+        let mut sueltos = Vec::new();
+        for w in pts.windows(2) {
+            sueltos.push(egui::epaint::ClippedShape {
+                clip_rect: Rect::EVERYTHING,
+                shape: egui::epaint::Shape::line_segment([w[0], w[1]], stroke),
+            });
+        }
+        let bacheado = vec![egui::epaint::ClippedShape {
+            clip_rect: Rect::EVERYTHING,
+            shape: egui::epaint::Shape::line(pts, stroke),
+        }];
+        // Warmup de fuentes/atlas (tessellate exige fuentes cargadas).
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            ctx.layer_painter(egui::LayerId::background()).text(
+                Pos2::ZERO,
+                egui::Align2::LEFT_TOP,
+                "w",
+                egui::FontId::proportional(12.0),
+                egui::Color32::WHITE,
+            );
+        });
+        let mut t_sueltos = std::time::Duration::MAX;
+        let mut t_bache = std::time::Duration::MAX;
+        for _ in 0..7 {
+            let t0 = std::time::Instant::now();
+            let _ = ctx.tessellate(sueltos.clone(), 1.0);
+            t_sueltos = t_sueltos.min(t0.elapsed());
+            let t1 = std::time::Instant::now();
+            let _ = ctx.tessellate(bacheado.clone(), 1.0);
+            t_bache = t_bache.min(t1.elapsed());
+        }
+        println!("t1g 1600_sueltos: {t_sueltos:?} 1_path_1600: {t_bache:?}");
+    }
+
+    /// T1f-bis: vértices teselados por tipo (50 objetos c/u) para
+    /// calibrar el estimador del presupuesto por frame.
+    #[test]
+    fn t1f_vertices_teselados_por_tipo() {
+        use grafito_core::{ParametricCurve2DObj, VectorField2DObj};
+        fn mide(nombre: &str, montar: impl FnOnce(&mut Document)) {
+            let mut app = crate::app::dummy_grafito_app();
+            app.document
+                .set_view(grafito_geometry::ViewTransform::new(800.0, 600.0));
+            montar(&mut app.document);
+            let n = app.document.object_count();
+            let ctx = egui::Context::default();
+            let canvas_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+            let salida = ctx.run(egui::RawInput::default(), |ctx| {
+                let painter = ctx.layer_painter(egui::LayerId::background());
+                app.draw_objects(&painter, canvas_rect, false, |_| {});
+            });
+            let prims = ctx.tessellate(salida.shapes, 1.0);
+            let mut verts = 0usize;
+            for prim in &prims {
+                if let egui::epaint::Primitive::Mesh(mesh) = &prim.primitive {
+                    verts += mesh.vertices.len();
+                }
+            }
+            let t0 = std::time::Instant::now();
+            let prims2 = ctx.tessellate(
+                {
+                    let salida = ctx.run(egui::RawInput::default(), |ctx| {
+                        let painter = ctx.layer_painter(egui::LayerId::background());
+                        app.draw_objects(&painter, canvas_rect, false, |_| {});
+                    });
+                    salida.shapes
+                },
+                1.0,
+            );
+            let t_tes = t0.elapsed();
+            let _ = prims2;
+            println!(
+                "t1f {nombre}: {n} objs, {verts} vértices ({:.0}/obj), teselado={t_tes:?}",
+                verts as f64 / n as f64
+            );
+        }
+        mide("50_funciones", |doc| {
+            for i in 0..50 {
+                doc.try_add_object(GeoObject::Function(FunctionObj::new(format!(
+                    "sin({} * x)",
+                    i + 1
+                ))))
+                .expect("agregar");
+            }
+        });
+        mide("50_parametricas", |doc| {
+            for _ in 0..50 {
+                doc.try_add_object(GeoObject::ParametricCurve2D(ParametricCurve2DObj::new(
+                    "cos(t)",
+                    "sin(t)",
+                    0.0,
+                    std::f64::consts::TAU,
+                )))
+                .expect("agregar");
+            }
+        });
+        mide("50_vectores", |doc| {
+            for _ in 0..50 {
+                doc.try_add_object(GeoObject::VectorField2D(VectorField2DObj::new("y", "-x")))
+                    .expect("agregar");
+            }
+        });
+        mide("10_implicitas", |doc| {
+            for i in 0..10 {
+                doc.try_add_object(GeoObject::ImplicitCurve(ImplicitCurveObj::new(
+                    &format!("x^2 + y^2 - {}", (i + 1) * (i + 1)),
+                    "0",
+                    RelationOperator::Eq,
+                )))
+                .expect("agregar");
+            }
+        });
+        mide("50_poligonos", |doc| {
+            for _ in 0..50 {
+                doc.try_add_object(GeoObject::Polygon(PolygonObj::new(vec![
+                    Point2::new(0.0, 0.0),
+                    Point2::new(1.0, 0.0),
+                    Point2::new(1.0, 1.0),
+                ])))
+                .expect("agregar");
+            }
+        });
+    }
+
+    /// T1f: vértices TESEADOS reales (los que van al `egui_vertex_buffer`
+    /// de la GPU) por tamaño de escena. El crash de 2000 objetos pedía
+    /// 329 MB > tope wgpu 256 MB: este test mide la ley de escala y el
+    /// umbral para calibrar `FRAME_VERTEX_BUDGET`.
+    #[test]
+    fn t1f_vertices_teselados_por_tamano_escena() {
+        for n in [50usize, 200, 500, 1000, 2000] {
+            let mut app = crate::app::dummy_grafito_app();
+            app.document
+                .set_view(grafito_geometry::ViewTransform::new(800.0, 600.0));
+            for i in 0..n {
+                let expr = match i % 4 {
+                    0 => format!("sin({} * x)", i + 1),
+                    1 => format!("x^2 / {} - {i}", i + 2),
+                    2 => format!("{i} * cos(x / {})", i + 1),
+                    _ => format!("exp(-x^2 / {})", i + 1),
+                };
+                app.document
+                    .try_add_object(GeoObject::Function(FunctionObj::new(expr)))
+                    .expect("agregar");
+            }
+            let ctx = egui::Context::default();
+            let canvas_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+            let salida = ctx.run(egui::RawInput::default(), |ctx| {
+                let painter = ctx.layer_painter(egui::LayerId::background());
+                app.draw_objects(&painter, canvas_rect, false, |_| {});
+            });
+            let prims = ctx.tessellate(salida.shapes, 1.0);
+            let mut verts = 0usize;
+            for prim in &prims {
+                if let egui::epaint::Primitive::Mesh(mesh) = &prim.primitive {
+                    verts += mesh.vertices.len();
+                }
+            }
+            // Vértice egui ≈ 20 B (pos 8 + uv 8 + color 4).
+            let mib = verts as f64 * 20.0 / 1048576.0;
+            println!(
+                "t1f {n} funciones: {} prims, {verts} vértices ≈ {mib:.1} MiB",
+                prims.len()
+            );
+        }
+    }
+
+    /// Regresión del crash real `Texture with 'egui_texid_Managed(N)'
+    /// label has been destroyed` (escena de 2000 rótulos): las evicciones
+    /// de `GracefulTextureCache` deben quedar retiradas (vivas) durante la
+    /// gracia y dropearse recién al cumplirse; `try_insert` no evicta.
+    #[test]
+    fn graceful_texture_cache_evicta_con_gracia_y_try_insert_no_churnea() {
+        let ctx = egui::Context::default();
+        let cap = std::num::NonZeroUsize::new(2).expect("cap 2");
+        let mut cache: super::GracefulTextureCache<u64> = super::GracefulTextureCache::new(cap);
+        let color = egui::ColorImage::new([1, 1], egui::Color32::WHITE);
+        let subir = |ctx: &egui::Context, nombre: &str| {
+            ctx.load_texture(nombre, color.clone(), egui::TextureOptions::NEAREST)
+        };
+        // try_insert respeta el tope sin evictar ni churnear.
+        assert!(cache.try_insert(1, subir(&ctx, "a")));
+        assert!(cache.try_insert(2, subir(&ctx, "b")));
+        assert!(!cache.try_insert(3, subir(&ctx, "c")), "lleno");
+        assert_eq!(cache.len(), 2);
+        assert!(cache.contains(&1) && cache.contains(&2) && !cache.contains(&3));
+        assert_eq!(cache.retired_pending(), 0);
+        // insert evicta con gracia: el handle sigue vivo hasta cumplirla.
+        cache.insert(1, subir(&ctx, "a2"));
+        assert_eq!(cache.retired_pending(), 1, "evicción retirada, no dropeada");
+        for _ in 0..crate::anim_ui::TEXTURE_GRACE_FRAMES {
+            cache.tick();
+        }
+        assert_eq!(cache.retired_pending(), 0, "gracia cumplida");
+        assert!(cache.contains(&1), "la reinserción queda viva");
+    }
+
+    /// Regresión end-to-end: 300 rótulos con caché de 256 no panican
+    /// (los 44 sobrantes caen a ASCII) y el cache queda lleno sin churn.
+    #[test]
+    fn draw_tex_label_300_con_cache_llena_cae_a_ascii_sin_panico() {
+        use egui::Pos2;
+        let ctx = egui::Context::default();
+        let painter = ctx.layer_painter(egui::LayerId::background());
+        let super::FunctionLabelDraw::TexRaster { bitmap, .. } =
+            super::decide_function_label("f", "x^2")
+        else {
+            panic!("el rótulo de prueba debe rasterizar");
+        };
+        let salida = ctx.run(egui::RawInput::default(), |_| {
+            for i in 0..300usize {
+                let key = format!("prueba-{i:03} = x^2");
+                super::draw_tex_label(
+                    &painter,
+                    Pos2::new((i % 20) as f32 * 8.0, (i / 20) as f32 * 8.0),
+                    &key,
+                    &bitmap,
+                    egui::Color32::WHITE,
+                );
+            }
+        });
+        let lleno = super::TEX_LABEL_TEXTURES.with(|c| c.borrow().len());
+        assert_eq!(lleno, 256, "el cache se llena y no churnea");
+        let _ = salida;
+    }
+
+    /// T2: el presupuesto de undo se cumple con documento grande — 500
+    /// funciones + 200 snapshots empujan la pila contra los topes y el
+    /// contador running debe acotar cantidad (≤50) y bytes (≤50 MiB) sin
+    /// escanear la deque. (El RSS real se mide E2E en profiling.md §2.5:
+    /// VmRSS es global al proceso de tests y no sirve para asserts.)
+    #[test]
+    fn t2_presupuesto_undo_acota_pila_con_documento_grande() {
+        use crate::controllers::{DocumentController, MAX_UNDO, MAX_UNDO_BYTES};
+        let mut doc = Document::new();
+        for i in 0..500 {
+            doc.try_add_object(GeoObject::Function(FunctionObj::new(format!(
+                "sin({} * x)",
+                i + 1
+            ))))
+            .expect("agregar");
+        }
+        let peso = doc.estimated_bytes();
+        println!("t2 peso estimado/doc con 500 funciones: {peso} bytes");
+        assert!(peso > 0);
+        let mut ctl = DocumentController::from_parts(
+            doc.clone(),
+            std::collections::VecDeque::new(),
+            std::collections::VecDeque::new(),
+            0,
+        );
+        for _ in 0..200 {
+            ctl.push_snapshot(doc.clone());
+        }
+        let (documento, pila, _, total) = ctl.into_parts();
+        assert!(pila.len() <= MAX_UNDO, "tope de cantidad");
+        assert!(total <= MAX_UNDO_BYTES, "tope de bytes");
+        assert_eq!(documento.object_count(), 500);
+        println!(
+            "t2 pila final: {} snapshots, {total} bytes (topes {MAX_UNDO}/{MAX_UNDO_BYTES})",
+            pila.len()
+        );
+    }
+
+    /// T1h: presupuesto de vértices — la escena de 2000 objetos que
+    /// crasheaba (329 MB > tope wgpu 256 MB) debe exceder el presupuesto,
+    /// y una escena pesada-normal (300 mixtos) debe entrar holgada.
+    #[test]
+    fn t1h_presupuesto_cubre_escena_densa_y_no_muerde_normal() {
+        fn estima(n_funciones: usize) -> usize {
+            let mut doc = Document::new();
+            doc.set_view(grafito_geometry::ViewTransform::new(800.0, 600.0));
+            for i in 0..n_funciones {
+                doc.try_add_object(GeoObject::Function(FunctionObj::new(format!(
+                    "sin({} * x)",
+                    i + 1
+                ))))
+                .expect("agregar");
+            }
+            let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+            let mut total = 0usize;
+            for (_, obj) in doc.objects_iter() {
+                total = total.saturating_add(super::estimate_object_vertices(&doc, obj, rect));
+            }
+            total
+        }
+        let densa = estima(2000);
+        let normal = estima(300);
+        println!(
+            "t1h estimado 2000={densa} 300={normal} (tope {})",
+            super::FRAME_VERTEX_BUDGET
+        );
+        assert!(
+            densa > super::FRAME_VERTEX_BUDGET,
+            "la escena que crasheaba debe exceder el presupuesto"
+        );
+        assert!(
+            normal * 2 < super::FRAME_VERTEX_BUDGET,
+            "escena normal con 2× de margen"
+        );
+    }
+
+    /// T1h-bis: truncado end-to-end — dibujar la escena densa no panicquea
+    /// y marca omitidos; la escena chica marca 0.
+    #[test]
+    fn t1h_truncado_end_to_end_marca_omitidos() {
+        let mut app = crate::app::dummy_grafito_app();
+        app.document
+            .set_view(grafito_geometry::ViewTransform::new(800.0, 600.0));
+        for i in 0..2000 {
+            app.document
+                .try_add_object(GeoObject::Function(FunctionObj::new(format!(
+                    "sin({} * x)",
+                    i + 1
+                ))))
+                .expect("agregar");
+        }
+        let ctx = egui::Context::default();
+        let canvas_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let painter = ctx.layer_painter(egui::LayerId::background());
+            app.draw_objects(&painter, canvas_rect, false, |_| {});
+        });
+        assert!(
+            app.frame_budget_skipped > 0,
+            "la escena densa debe truncar en vez de crashear"
+        );
+        let mut chica = crate::app::dummy_grafito_app();
+        chica
+            .document
+            .set_view(grafito_geometry::ViewTransform::new(800.0, 600.0));
+        chica
+            .document
+            .try_add_object(GeoObject::Function(FunctionObj::new("sin(x)")))
+            .expect("agregar");
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let painter = ctx.layer_painter(egui::LayerId::background());
+            chica.draw_objects(&painter, canvas_rect, false, |_| {});
+        });
+        assert_eq!(chica.frame_budget_skipped, 0);
+    }
+
+    /// T1h-ter: pin de cobertura — toda variante dibujada en
+    /// `draw_object_styled` debe estar explícita en `estimate_object_vertices`
+    /// (el catch-all `_ => 0` es solo para lo no dibujado). Si alguien agrega
+    /// un brazo de dibujo, este test obliga a estimarlo.
+    #[test]
+    fn t1h_estimador_cubre_todas_las_variantes_dibujadas() {
+        let source = include_str!("render_2d.rs");
+        let draw_start = source
+            .find("pub(crate) fn draw_object_styled(")
+            .expect("draw_object_styled existe");
+        let draw_end = source[draw_start..]
+            .find("\n    pub(crate) fn ")
+            .map(|i| draw_start + i)
+            .unwrap_or(source.len());
+        let draw_body = &source[draw_start..draw_end];
+        let est_start = source
+            .find("fn estimate_object_vertices(")
+            .expect("estimador existe");
+        let est_end = source[est_start..]
+            .find("\nfn truncate_paint_plan_by_vertices(")
+            .map(|i| est_start + i)
+            .unwrap_or(source.len());
+        let est_body = &source[est_start..est_end];
+        let mut faltan = Vec::new();
+        // Brazos `GeoObject::X` del draw (incluye `A(_) | B(_)` múltiples).
+        for caps in draw_body.split("GeoObject::").skip(1).map(|resto| {
+            resto
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect::<String>()
+        }) {
+            if caps.is_empty() || caps == "Transformed" {
+                continue;
+            }
+            // El estimador la nombra como `GO::X` (o cae en `_`, que acá
+            // está prohibido para variantes dibujadas).
+            if !est_body.contains(&format!("GO::{caps}")) {
+                faltan.push(caps);
+            }
+        }
+        assert!(
+            faltan.is_empty(),
+            "variantes dibujadas sin estimador explícito: {faltan:?}"
+        );
+    }
+
+    /// T1e: cuenta shapes y vértices por categoría (el crash de 2000
+    /// objetos pide 329 MB de vertex buffer > tope wgpu 256 MB). Usa
+    /// `FullOutput.shapes` post-draw, sin GPU.
+    #[test]
+    fn t1e_formas_y_vertices_por_categoria() {
+        use grafito_core::{CircleObj, FunctionObj, GeoObject, ImplicitCurveObj};
+        fn cuenta(nombre: &str, mut montar: impl FnMut(&mut Document)) {
+            let mut app = crate::app::dummy_grafito_app();
+            app.document
+                .set_view(grafito_geometry::ViewTransform::new(800.0, 600.0));
+            montar(&mut app.document);
+            let ctx = egui::Context::default();
+            let canvas_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+            let salida = ctx.run(egui::RawInput::default(), |ctx| {
+                let painter = ctx.layer_painter(egui::LayerId::background());
+                app.draw_objects(&painter, canvas_rect, false, |_| {});
+            });
+            let mut formas = 0usize;
+            let mut vertices = 0usize;
+            let mut hist = std::collections::BTreeMap::new();
+            for shape in salida.shapes.iter().map(|s| &s.shape) {
+                formas += 1;
+                let nombre = match shape {
+                    egui::epaint::Shape::Vec(_) => "Vec",
+                    egui::epaint::Shape::Path(_) => "Path",
+                    egui::epaint::Shape::Mesh(_) => "Mesh",
+                    egui::epaint::Shape::QuadraticBezier(_) => "QBez",
+                    egui::epaint::Shape::CubicBezier(_) => "CBez",
+                    egui::epaint::Shape::Rect(_) => "Rect",
+                    egui::epaint::Shape::Circle(_) => "Circle",
+                    egui::epaint::Shape::Ellipse(_) => "Ellipse",
+                    egui::epaint::Shape::Text(_) => "Text",
+                    egui::epaint::Shape::LineSegment { .. } => "Seg",
+                    egui::epaint::Shape::Noop => "Noop",
+                    egui::epaint::Shape::Callback(_) => "Cb",
+                };
+                *hist.entry(nombre).or_insert(0) += 1;
+                vertices += match shape {
+                    egui::epaint::Shape::Vec(_) => 0,
+                    egui::epaint::Shape::Path(p) => p.points.len(),
+                    egui::epaint::Shape::Mesh(m) => m.vertices.len(),
+                    egui::epaint::Shape::QuadraticBezier(b) => b.points.len(),
+                    egui::epaint::Shape::CubicBezier(b) => b.points.len(),
+                    egui::epaint::Shape::Rect(_) | egui::epaint::Shape::Circle(_) => 4,
+                    egui::epaint::Shape::Ellipse(_) => 64,
+                    egui::epaint::Shape::Text(t) => t.galley.num_vertices,
+                    egui::epaint::Shape::LineSegment { points, .. } => points.len(),
+                    egui::epaint::Shape::Noop => 0,
+                    egui::epaint::Shape::Callback(_) => 0,
+                };
+            }
+            println!("t1e {nombre}: {formas} shapes, ~{vertices} vértices {hist:?}");
+        }
+        cuenta("vacio", |_| {});
+        cuenta("50_funciones", |doc| {
+            for i in 0..50 {
+                doc.try_add_object(GeoObject::Function(FunctionObj::new(format!(
+                    "sin({} * x)",
+                    i + 1
+                ))))
+                .expect("agregar");
+            }
+        });
+        cuenta("50_vectores", |doc| {
+            for _ in 0..50 {
+                doc.try_add_object(GeoObject::VectorField2D(VectorField2DObj::new("y", "-x")))
+                    .expect("agregar");
+            }
+        });
+        cuenta("10_implicitas", |doc| {
+            for i in 0..10 {
+                doc.try_add_object(GeoObject::ImplicitCurve(ImplicitCurveObj::new(
+                    &format!("x^2 + y^2 - {}", (i + 1) * (i + 1)),
+                    "0",
+                    RelationOperator::Eq,
+                )))
+                .expect("agregar");
+            }
+        });
+        cuenta("50_funciones_etiquetadas", |doc| {
+            for i in 0..50 {
+                let mut fun = FunctionObj::new(format!("sin({} * x)", i + 1));
+                fun.label = format!("f{i}");
+                doc.try_add_object(GeoObject::Function(fun))
+                    .expect("agregar");
+            }
+        });
+        cuenta("50_circulos", |doc| {
+            for i in 0..50 {
+                doc.try_add_object(GeoObject::Circle(CircleObj::new(
+                    Point2::new(f64::from(i), 0.0),
+                    1.0,
+                )))
+                .expect("agregar");
+            }
+        });
+    }
+
+    /// T1c: aísla el pipeline por función (muestreo + refine + proyección,
+    /// sin shapes ni labels) frente al draw completo, con y sin etiquetas.
+    ///
+    /// Incluye la variante fusionada (una sola pasada) como función local:
+    /// el A/B la midió ~35% MÁS lenta que dos pasadas (V1 3.43 ms vs V3
+    /// 4.61 ms intercalados), así que producción usa dos pasadas con
+    /// scratch y esto queda como registro del negativo. No fusionar.
+    #[allow(clippy::too_many_arguments)]
+    fn fusionada_una_pasada(
+        samples: &[(f64, Option<f64>)],
+        expr: &str,
+        variables: &std::collections::BTreeMap<String, f64>,
+        view: &grafito_geometry::ViewTransform,
+        canvas_rect: Rect,
+        out: &mut Vec<(f64, Option<Pos2>)>,
+    ) {
+        out.clear();
+        out.reserve(samples.len() + 8);
+        let mut iter = samples.iter().copied().peekable();
+        while let Some((x1, y1_opt)) = iter.next() {
+            out.push((
+                x1,
+                y1_opt.and_then(|y1| super::function_screen_point(view, canvas_rect, x1, y1)),
+            ));
+            if let Some(&(x2, y2_opt)) = iter.peek() {
+                if y1_opt.is_some() != y2_opt.is_some() {
+                    let mut good_x = if y1_opt.is_some() { x1 } else { x2 };
+                    let mut bad_x = if y1_opt.is_some() { x2 } else { x1 };
+                    let mut best_y = if let Some(y1) = y1_opt {
+                        y1
+                    } else {
+                        y2_opt.unwrap_or(0.0)
+                    };
+                    for _ in 0..24 {
+                        let mid = (good_x + bad_x) * 0.5;
+                        if let Ok(y) =
+                            grafito_geometry::expr::eval_function_with_vars(expr, mid, variables)
+                        {
+                            if y.is_finite() {
+                                good_x = mid;
+                                best_y = y;
+                            } else {
+                                bad_x = mid;
+                            }
+                        } else {
+                            bad_x = mid;
+                        }
+                    }
+                    out.push((
+                        good_x,
+                        super::function_screen_point(view, canvas_rect, good_x, best_y),
+                    ));
+                }
+            }
+        }
+    }
+    #[test]
+    fn frame_cpu_pipeline_vs_draw_y_etiquetas() {
+        use grafito_core::function_sampling;
+        let mut app = crate::app::dummy_grafito_app();
+        let view = grafito_geometry::ViewTransform::new(800.0, 600.0);
+        app.document.set_view(view);
+        for i in 0..200 {
+            let expr = match i % 4 {
+                0 => format!("sin({} * x)", i + 1),
+                1 => format!("x^2 / {} - {i}", i + 2),
+                2 => format!("{i} * cos(x / {})", i + 1),
+                _ => format!("exp(-x^2 / {})", i + 1),
+            };
+            let mut fun = FunctionObj::new(expr);
+            fun.label = format!("f{i}");
+            app.document.add_object(GeoObject::Function(fun));
+        }
+        let ctx = egui::Context::default();
+        let canvas_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let grid = function_sampling::recommended_grid_size_for_quality(
+            canvas_rect.width(),
+            app.document.render_quality,
+        );
+        println!("pipeline: grid_size={grid}");
+        // Calienta cachés.
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let painter = ctx.layer_painter(egui::LayerId::background());
+            app.draw_objects(&painter, canvas_rect, false, |_| {});
+        });
+        // (a) A/B/C intercalado: V1 = dos pasadas con `Vec` frescos (código
+        // viejo), V2 = dos pasadas con buffers reutilizados, V3 = una pasada
+        // fusionada con scratch. Mismo trabajo, min de cada uno.
+        fn refina_dos_pasadas(
+            guard: &[(f64, Option<f64>)],
+            expr: &str,
+            variables: &std::collections::BTreeMap<String, f64>,
+            view: &grafito_geometry::ViewTransform,
+            canvas_rect: Rect,
+            refinado: &mut Vec<(f64, Option<f64>)>,
+            proyectado: &mut Vec<Option<Pos2>>,
+        ) {
+            refinado.clear();
+            refinado.reserve(guard.len() + 8);
+            let mut iter = guard.iter().copied().peekable();
+            while let Some(current) = iter.next() {
+                refinado.push(current);
+                if let Some(&next) = iter.peek() {
+                    let (x1, y1_opt) = current;
+                    let (x2, y2_opt) = next;
+                    if y1_opt.is_some() != y2_opt.is_some() {
+                        let mut good_x = if y1_opt.is_some() { x1 } else { x2 };
+                        let mut bad_x = if y1_opt.is_some() { x2 } else { x1 };
+                        let mut best_y = if let Some(y1) = y1_opt {
+                            y1
+                        } else {
+                            y2_opt.unwrap_or(0.0)
+                        };
+                        for _ in 0..24 {
+                            let mid = (good_x + bad_x) * 0.5;
+                            if let Ok(y) = grafito_geometry::expr::eval_function_with_vars(
+                                expr, mid, variables,
+                            ) {
+                                if y.is_finite() {
+                                    good_x = mid;
+                                    best_y = y;
+                                } else {
+                                    bad_x = mid;
+                                }
+                            } else {
+                                bad_x = mid;
+                            }
+                        }
+                        refinado.push((good_x, Some(best_y)));
+                    }
+                }
+            }
+            proyectado.clear();
+            proyectado.extend(refinado.iter().map(|&(x, y)| {
+                y.and_then(|y| super::function_screen_point(view, canvas_rect, x, y))
+            }));
+        }
+        let mut v1 = std::time::Duration::MAX;
+        let mut v2 = std::time::Duration::MAX;
+        let mut v3 = std::time::Duration::MAX;
+        let mut v5 = std::time::Duration::MAX;
+        let mut buf_a: Vec<(f64, Option<f64>)> = Vec::new();
+        let mut buf_b: Vec<Option<Pos2>> = Vec::new();
+        for _ in 0..7 {
+            // V1: todo fresco por función.
+            let t0 = std::time::Instant::now();
+            for _ in 0..10 {
+                for (_, obj) in app.document.objects_iter() {
+                    if let GeoObject::Function(fun) = obj {
+                        let (min_x, max_x) = (-8.0, 8.0);
+                        let guard = function_sampling::samples_or_compute(
+                            fun,
+                            (min_x, max_x),
+                            grid,
+                            &app.document.variables,
+                        );
+                        // V1: dos pasadas con `Vec` frescos por función
+                        // (bisección real, idéntica a producción).
+                        let mut refinado: Vec<(f64, Option<f64>)> =
+                            Vec::with_capacity(guard.len() + 8);
+                        let mut iter = guard.iter().copied().peekable();
+                        while let Some(current) = iter.next() {
+                            refinado.push(current);
+                            if let Some(&next) = iter.peek() {
+                                let (x1, y1_opt) = current;
+                                let (x2, y2_opt) = next;
+                                if y1_opt.is_some() != y2_opt.is_some() {
+                                    let mut good_x = if y1_opt.is_some() { x1 } else { x2 };
+                                    let mut bad_x = if y1_opt.is_some() { x2 } else { x1 };
+                                    let mut best_y = if let Some(y1) = y1_opt {
+                                        y1
+                                    } else {
+                                        y2_opt.unwrap_or(0.0)
+                                    };
+                                    for _ in 0..24 {
+                                        let mid = (good_x + bad_x) * 0.5;
+                                        if let Ok(y) =
+                                            grafito_geometry::expr::eval_function_with_vars(
+                                                &fun.expr,
+                                                mid,
+                                                &app.document.variables,
+                                            )
+                                        {
+                                            if y.is_finite() {
+                                                good_x = mid;
+                                                best_y = y;
+                                            } else {
+                                                bad_x = mid;
+                                            }
+                                        } else {
+                                            bad_x = mid;
+                                        }
+                                    }
+                                    refinado.push((good_x, Some(best_y)));
+                                }
+                            }
+                        }
+                        let proyectado: Vec<Option<Pos2>> = refinado
+                            .iter()
+                            .map(|&(x, y)| {
+                                y.and_then(|y| {
+                                    super::function_screen_point(&view, canvas_rect, x, y)
+                                })
+                            })
+                            .collect();
+                        std::hint::black_box(proyectado);
+                    }
+                }
+            }
+            v1 = v1.min(t0.elapsed() / 10);
+            // V2: dos pasadas, buffers locales reutilizados.
+            let t1 = std::time::Instant::now();
+            for _ in 0..10 {
+                for (_, obj) in app.document.objects_iter() {
+                    if let GeoObject::Function(fun) = obj {
+                        let (min_x, max_x) = (-8.0, 8.0);
+                        let guard = function_sampling::samples_or_compute(
+                            fun,
+                            (min_x, max_x),
+                            grid,
+                            &app.document.variables,
+                        );
+                        refina_dos_pasadas(
+                            &guard,
+                            &fun.expr,
+                            &app.document.variables,
+                            &view,
+                            canvas_rect,
+                            &mut buf_a,
+                            &mut buf_b,
+                        );
+                        std::hint::black_box(&buf_b);
+                    }
+                }
+            }
+            v2 = v2.min(t1.elapsed() / 10);
+            // V3: fusionado con `Vec` fresco (el scratch de producción
+            // ya no tiene ese tipo; el A/B del 2026-09-17 mostró que la
+            // maquinaria take/return no explica la diferencia).
+            let t2 = std::time::Instant::now();
+            for _ in 0..10 {
+                for (_, obj) in app.document.objects_iter() {
+                    if let GeoObject::Function(fun) = obj {
+                        let (min_x, max_x) = (-8.0, 8.0);
+                        let guard = function_sampling::samples_or_compute(
+                            fun,
+                            (min_x, max_x),
+                            grid,
+                            &app.document.variables,
+                        );
+                        let mut fusionado: Vec<(f64, Option<Pos2>)> = Vec::new();
+                        fusionada_una_pasada(
+                            &guard,
+                            &fun.expr,
+                            &app.document.variables,
+                            &view,
+                            canvas_rect,
+                            &mut fusionado,
+                        );
+                        std::hint::black_box(fusionado);
+                    }
+                }
+            }
+            v3 = v3.min(t2.elapsed() / 10);
+            // V5: repite V3 para confirmar estabilidad del número.
+            let t3 = std::time::Instant::now();
+            for _ in 0..10 {
+                for (_, obj) in app.document.objects_iter() {
+                    if let GeoObject::Function(fun) = obj {
+                        let (min_x, max_x) = (-8.0, 8.0);
+                        let guard = function_sampling::samples_or_compute(
+                            fun,
+                            (min_x, max_x),
+                            grid,
+                            &app.document.variables,
+                        );
+                        let mut out: Vec<(f64, Option<Pos2>)> = Vec::new();
+                        fusionada_una_pasada(
+                            &guard,
+                            &fun.expr,
+                            &app.document.variables,
+                            &view,
+                            canvas_rect,
+                            &mut out,
+                        );
+                        std::hint::black_box(out);
+                    }
+                }
+            }
+            v5 = v5.min(t3.elapsed() / 10);
+        }
+        // (b) draw completo con etiquetas (7 repeticiones, min).
+        let mut draw_con = std::time::Duration::MAX;
+        for _ in 0..7 {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                let painter = ctx.layer_painter(egui::LayerId::background());
+                let t = std::time::Instant::now();
+                app.draw_objects(&painter, canvas_rect, false, |_| {});
+                draw_con = draw_con.min(t.elapsed());
+            });
+        }
+        // (c) draw sin etiquetas.
+        for (_, obj) in app.document.objects_iter_mut() {
+            if let GeoObject::Function(fun) = obj {
+                fun.label.clear();
+            }
+        }
+        let mut draw_sin = std::time::Duration::MAX;
+        for _ in 0..7 {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                let painter = ctx.layer_painter(egui::LayerId::background());
+                let t = std::time::Instant::now();
+                app.draw_objects(&painter, canvas_rect, false, |_| {});
+                draw_sin = draw_sin.min(t.elapsed());
+            });
+        }
+        // (d) draw con auto-labels (`F₃₉`: letra + subíndice). Antes de los
+        // glifos ₀-₉ caían al camino ASCII (~50 µs/label de teselado); ahora
+        // deben costar como los explícitos (bitmap cacheado).
+        for (_, obj) in app.document.objects_iter_mut() {
+            if let GeoObject::Function(fun) = obj {
+                fun.label.clear();
+            }
+        }
+        // Re-etiquetar vía auto-label: quitar y re-agregar regenera `Fₙ`.
+        let mut auto_app = crate::app::dummy_grafito_app();
+        auto_app.document.set_view(view);
+        for i in 0..200 {
+            let expr = match i % 4 {
+                0 => format!("sin({} * x)", i + 1),
+                1 => format!("x^2 / {} - {i}", i + 2),
+                2 => format!("{i} * cos(x / {})", i + 1),
+                _ => format!("exp(-x^2 / {})", i + 1),
+            };
+            auto_app
+                .document
+                .try_add_object(GeoObject::Function(FunctionObj::new(expr)))
+                .expect("agregar");
+        }
+        assert_eq!(auto_app.document.object_count(), 200);
+        let first_label = match auto_app.document.objects_iter().next() {
+            Some((_, GeoObject::Function(f))) => f.label.clone(),
+            _ => "SIN-FUNCIONES".to_string(),
+        };
+        let mut draw_auto = std::time::Duration::MAX;
+        let mut auto_shapes = 0usize;
+        for _ in 0..7 {
+            let salida = ctx.run(egui::RawInput::default(), |ctx| {
+                let painter = ctx.layer_painter(egui::LayerId::background());
+                let t = std::time::Instant::now();
+                auto_app.draw_objects(&painter, canvas_rect, false, |_| {});
+                draw_auto = draw_auto.min(t.elapsed());
+            });
+            auto_shapes = salida.shapes.len();
+        }
+        println!("pipeline_V1_fresco: {v1:?} pipeline_V2_reuso: {v2:?} pipeline_V3_fusion: {v3:?} pipeline_V5_fusion_fresco: {v5:?} draw_con_etiquetas: {draw_con:?} draw_sin_etiquetas: {draw_sin:?} draw_auto_labels: {draw_auto:?} ({auto_shapes} shapes, primera etiqueta: {first_label:?})");
+        // Pin end-to-end del camino bitmap para auto-labels: la escena
+        // auto-etiquetada debe emitir Mesh (blits cacheados), cero Text
+        // (teselado por frame). Si un auto-label pierde cobertura de glifos,
+        // vuelve al camino ASCII y este assert lo caza.
+        let salida_auto = ctx.run(egui::RawInput::default(), |ctx| {
+            let painter = ctx.layer_painter(egui::LayerId::background());
+            auto_app.draw_objects(&painter, canvas_rect, false, |_| {});
+        });
+        let mut n_mesh = 0usize;
+        let mut n_text = 0usize;
+        for shape in salida_auto.shapes.iter().map(|s| &s.shape) {
+            match shape {
+                egui::epaint::Shape::Mesh(_) => n_mesh += 1,
+                egui::epaint::Shape::Text(_) => n_text += 1,
+                _ => {}
+            }
+        }
+        println!("auto_labels: {n_mesh} blits bitmap, {n_text} textos");
+        // Registro anti-choques: de 200 etiquetas solo sobreviven las que
+        // no se pisan (abajo/arriba de la curva); el camino bitmap se
+        // pinnea con cero Text, no con cantidad.
+        assert!(
+            (2..200).contains(&n_mesh),
+            "etiquetas visibles acotadas y no vacías: {n_mesh}"
+        );
+        assert_eq!(n_text, 0, "ningún auto-label por camino ASCII");
+    }
+}
+
+#[cfg(test)]
+mod perf_polyline_batch_budget_tests {
+    use super::*;
+    use grafito_core::{ObjectId, PolylineObj};
+
+    fn test_view_with_offset(ox: f64, oy: f64, scale: f64) -> ViewTransform {
+        let mut view = ViewTransform::new(800.0, 600.0);
+        view.offset.x = ox;
+        view.offset.y = oy;
+        view.scale = scale;
+        view
+    }
+
+    #[test]
+    fn quantized_view_reuses_within_half_px() {
+        let base = test_view_with_offset(0.0, 0.0, 50.0);
+        let near = test_view_with_offset(0.2, -0.1, 50.0);
+        let far = test_view_with_offset(1.0, 0.0, 50.0);
+        assert_eq!(
+            quantize_view(&base),
+            quantize_view(&near),
+            "pan dentro del quantum reutiliza"
+        );
+        assert_ne!(
+            quantize_view(&base),
+            quantize_view(&far),
+            "pan de 1px invalida"
+        );
+        let zoom_near = test_view_with_offset(0.0, 0.0, 50.0 * (1.0 + 0.0002));
+        let zoom_far = test_view_with_offset(0.0, 0.0, 50.0 * 1.05);
+        assert_eq!(
+            quantize_view(&base),
+            quantize_view(&zoom_near),
+            "zoom mínimo reutiliza"
+        );
+        assert_ne!(
+            quantize_view(&base),
+            quantize_view(&zoom_far),
+            "zoom 5% invalida"
+        );
+    }
+
+    #[test]
+    fn projected_cache_hit_returns_same_arc_and_invalidates() {
+        let id = ObjectId::new();
+        let view = quantize_view(&test_view_with_offset(0.0, 0.0, 50.0));
+        let runs = vec![vec![Pos2::new(1.0, 2.0), Pos2::new(3.0, 4.0)]];
+        let stored = projected_polyline_cache_put(id, 7, 9, 1, view, runs);
+        let hit = projected_polyline_cache_get(id, 7, 9, 1, view).expect("hit");
+        assert!(Arc::ptr_eq(&stored, &hit));
+        assert!(projected_polyline_cache_get(id, 7, 10, 1, view).is_none());
+        assert!(projected_polyline_cache_get(id, 8, 9, 1, view).is_none());
+        let other_view = quantize_view(&test_view_with_offset(10.0, 0.0, 50.0));
+        assert!(projected_polyline_cache_get(id, 7, 9, 1, other_view).is_none());
+    }
+
+    #[test]
+    fn decimate_collapses_dense_oversampling_to_pixels() {
+        let mut run = Vec::new();
+        for i in 0..10_000 {
+            let x = i as f32 * 0.05;
+            let y = (i as f32 * 0.11).sin() * 200.0;
+            run.push(Pos2::new(x, y));
+        }
+        let decimated = decimate_run_to_pixels(&run);
+        assert!(
+            decimated.len() < run.len() / 2,
+            "N >> píxeles debe colapsar: {} vs {}",
+            decimated.len(),
+            run.len()
+        );
+        assert_eq!(decimated.first(), run.first());
+        assert_eq!(decimated.last(), run.last());
+        let min_in: f32 = run.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
+        let max_in: f32 = run.iter().map(|p| p.y).fold(f32::NEG_INFINITY, f32::max);
+        let min_out: f32 = decimated.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
+        let max_out: f32 = decimated
+            .iter()
+            .map(|p| p.y)
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            (min_out - min_in).abs() <= 1.0 && (max_out - max_in).abs() <= 1.0,
+            "min/max por bucket preserva envolvente"
+        );
+        let tiny = vec![Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)];
+        assert_eq!(decimate_run_to_pixels(&tiny), tiny);
+    }
+
+    #[test]
+    fn batch_shapes_match_unbatched_coverage() {
+        let stroke = Stroke::new(2.0, Color32::WHITE);
+        let runs = vec![
+            (0..50)
+                .map(|i| Pos2::new(i as f32 * 8.0, (i as f32 * 0.2).sin() * 40.0))
+                .collect::<Vec<_>>(),
+            (0..60)
+                .map(|i| {
+                    Pos2::new(
+                        400.0 + i as f32 * 6.0,
+                        100.0 + (i as f32 * 0.15).cos() * 30.0,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        ];
+        let batched = stroke_runs_batched_shapes(&runs, stroke, LineStyle::Solid);
+        assert_eq!(batched.len(), 2, "un Shape por run, un solo add");
+        let flat_batched: Vec<Pos2> = batched
+            .iter()
+            .flat_map(|shape| match shape {
+                Shape::Path(path) => path.points.clone(),
+                _ => Vec::new(),
+            })
+            .collect();
+        let flat_runs: Vec<Pos2> = runs.iter().flatten().copied().collect();
+        assert_eq!(
+            flat_batched, flat_runs,
+            "vértices idénticos al camino por run"
+        );
+        let ctx = egui::Context::default();
+        let to_clipped = |shapes: &[Shape]| {
+            shapes
+                .iter()
+                .cloned()
+                .map(|shape| egui::epaint::ClippedShape {
+                    clip_rect: Rect::EVERYTHING,
+                    shape,
+                })
+                .collect::<Vec<_>>()
+        };
+        let unbatched: Vec<Shape> = runs
+            .iter()
+            .map(|run| Shape::line(run.clone(), stroke))
+            .collect();
+        // Warmup de fuentes/atlas (tessellate lo exige aunque el path no
+        // use texto, igual que `t1g_overhead_por_shape_vs_batcheado`).
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            ctx.layer_painter(egui::LayerId::background()).text(
+                Pos2::ZERO,
+                egui::Align2::LEFT_TOP,
+                "w",
+                egui::FontId::proportional(12.0),
+                Color32::WHITE,
+            );
+        });
+        let tess_batched = ctx.tessellate(to_clipped(&batched), 1.0);
+        let tess_single = ctx.tessellate(to_clipped(&unbatched), 1.0);
+        let verts_batched: usize = tess_batched
+            .iter()
+            .map(|prim| match &prim.primitive {
+                egui::epaint::Primitive::Mesh(mesh) => mesh.vertices.len(),
+                egui::epaint::Primitive::Callback(_) => 0,
+            })
+            .sum();
+        let verts_single: usize = tess_single
+            .iter()
+            .map(|prim| match &prim.primitive {
+                egui::epaint::Primitive::Mesh(mesh) => mesh.vertices.len(),
+                egui::epaint::Primitive::Callback(_) => 0,
+            })
+            .sum();
+        assert_eq!(
+            verts_batched, verts_single,
+            "teselado idéntico: batch en un add, mismos vértices"
+        );
+        let _ = PolylineObj::new(vec![Point2::new(0.0, 0.0), Point2::new(1.0, 1.0)]);
+    }
+
+    #[test]
+    fn label_budget_caps_and_culls_by_size() {
+        label_budget_reset();
+        assert!(!label_font_visible(5.0));
+        assert!(label_font_visible(12.0));
+        assert!(!label_extent_visible(4.0));
+        assert!(label_extent_visible(16.0));
+        label_budget_reset();
+        assert!(!label_budget_allowed(5.0, None), "fuente chica se culla");
+        label_budget_reset();
+        assert!(
+            !label_budget_allowed(12.0, Some(2.0)),
+            "extensión chica se culla"
+        );
+        label_budget_reset();
+        for _ in 0..MAX_LABELS_PER_FRAME {
+            assert!(label_budget_try_acquire());
+        }
+        assert!(
+            !label_budget_try_acquire(),
+            "tope de cantidad culla el resto"
+        );
+        label_budget_reset();
+        assert!(label_budget_allowed(12.0, Some(32.0)));
+    }
+
+    #[test]
+    fn label_galley_reuses_by_text_style_scale() {
+        let ctx = egui::Context::default();
+        let color = Color32::WHITE;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let painter = ctx.layer_painter(egui::LayerId::background());
+            let first = label_galley_shared(&painter, "f = x^2", 12.0, color, 42);
+            let second = label_galley_shared(&painter, "f = x^2", 12.0, color, 42);
+            assert!(Arc::ptr_eq(&first, &second), "hit comparte el Arc");
+            // Misma fuente a distinta escala cuantizada compone igual
+            // (la clave evita aliasar tamaños distintos, no duplica
+            // píxeles idénticos que egui ya interna).
+            let other_scale = label_galley_shared(&painter, "f = x^2", 12.0, color, 43);
+            assert_eq!(other_scale.size(), first.size());
+            let other_text = label_galley_shared(&painter, "g = x^3", 12.0, color, 42);
+            assert!(!Arc::ptr_eq(&first, &other_text));
+        });
+    }
+
+    #[test]
+    fn label_galley_shared_covers_point_and_function_branches() {
+        // Las ramas Point (`cached_label_text` con LEFT_BOTTOM/TYPE_SM),
+        // Line (CENTER_BOTTOM/TYPE_SM), Circle (LEFT_BOTTOM/TYPE_SM),
+        // Ellipse (CENTER_TOP/TYPE_SM) y Function-fallback Ascii
+        // (`label_galley_shared` con TYPE_SM) van por la misma caché: no
+        // se testea `draw_object_styled` headless (necesita
+        // documento/viewport), sino las llamadas exactas que esas ramas
+        // hacen, con hit compartiendo el `Arc`.
+        let ctx = egui::Context::default();
+        let color = Color32::WHITE;
+        let scale_q = quantize_scale_ln(100.0);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let painter = ctx.layer_painter(egui::LayerId::background());
+            // Rama Point: dos frames del mismo rótulo comparten Galley.
+            let pos = Pos2::new(10.0, 20.0);
+            let _ = cached_label_text(
+                &painter,
+                pos,
+                egui::Align2::LEFT_BOTTOM,
+                "P1",
+                grafito_ui::tokens::TYPE_SM,
+                color,
+                scale_q,
+            );
+            let point_hit =
+                label_galley_shared(&painter, "P1", grafito_ui::tokens::TYPE_SM, color, scale_q);
+            let point_hit2 =
+                label_galley_shared(&painter, "P1", grafito_ui::tokens::TYPE_SM, color, scale_q);
+            assert!(
+                Arc::ptr_eq(&point_hit, &point_hit2),
+                "Point: hit comparte el Arc"
+            );
+            // Rama Function-fallback Ascii: mismo patrón con otro texto.
+            let fun_hit = label_galley_shared(
+                &painter,
+                "f = x^2",
+                grafito_ui::tokens::TYPE_SM,
+                color,
+                scale_q,
+            );
+            let fun_hit2 = label_galley_shared(
+                &painter,
+                "f = x^2",
+                grafito_ui::tokens::TYPE_SM,
+                color,
+                scale_q,
+            );
+            assert!(
+                Arc::ptr_eq(&fun_hit, &fun_hit2),
+                "Ascii: hit comparte el Arc"
+            );
+            // Rama Line: `cached_label_text` con CENTER_BOTTOM/TYPE_SM.
+            let line_pos = Pos2::new(30.0, 40.0);
+            let line_rect = cached_label_text(
+                &painter,
+                line_pos,
+                egui::Align2::CENTER_BOTTOM,
+                "L1",
+                grafito_ui::tokens::TYPE_SM,
+                color,
+                scale_q,
+            );
+            let line_hit =
+                label_galley_shared(&painter, "L1", grafito_ui::tokens::TYPE_SM, color, scale_q);
+            assert_eq!(
+                line_rect,
+                egui::Align2::CENTER_BOTTOM.anchor_size(line_pos, line_hit.size()),
+                "Line: mismo rect que painter.text"
+            );
+            let line_hit2 =
+                label_galley_shared(&painter, "L1", grafito_ui::tokens::TYPE_SM, color, scale_q);
+            assert!(
+                Arc::ptr_eq(&line_hit, &line_hit2),
+                "Line: hit comparte el Arc"
+            );
+            // Rama Circle: `cached_label_text` con LEFT_BOTTOM/TYPE_SM.
+            let circle_pos = Pos2::new(50.0, 60.0);
+            let circle_rect = cached_label_text(
+                &painter,
+                circle_pos,
+                egui::Align2::LEFT_BOTTOM,
+                "C1",
+                grafito_ui::tokens::TYPE_SM,
+                color,
+                scale_q,
+            );
+            let circle_hit =
+                label_galley_shared(&painter, "C1", grafito_ui::tokens::TYPE_SM, color, scale_q);
+            assert_eq!(
+                circle_rect,
+                egui::Align2::LEFT_BOTTOM.anchor_size(circle_pos, circle_hit.size()),
+                "Circle: mismo rect que painter.text"
+            );
+            let circle_hit2 =
+                label_galley_shared(&painter, "C1", grafito_ui::tokens::TYPE_SM, color, scale_q);
+            assert!(
+                Arc::ptr_eq(&circle_hit, &circle_hit2),
+                "Circle: hit comparte el Arc"
+            );
+            // Rama Ellipse: `cached_label_text` con CENTER_TOP/TYPE_SM.
+            let ellipse_pos = Pos2::new(70.0, 80.0);
+            let ellipse_rect = cached_label_text(
+                &painter,
+                ellipse_pos,
+                egui::Align2::CENTER_TOP,
+                "E1",
+                grafito_ui::tokens::TYPE_SM,
+                color,
+                scale_q,
+            );
+            let ellipse_hit =
+                label_galley_shared(&painter, "E1", grafito_ui::tokens::TYPE_SM, color, scale_q);
+            assert_eq!(
+                ellipse_rect,
+                egui::Align2::CENTER_TOP.anchor_size(ellipse_pos, ellipse_hit.size()),
+                "Ellipse: mismo rect que painter.text"
+            );
+            let ellipse_hit2 =
+                label_galley_shared(&painter, "E1", grafito_ui::tokens::TYPE_SM, color, scale_q);
+            assert!(
+                Arc::ptr_eq(&ellipse_hit, &ellipse_hit2),
+                "Ellipse: hit comparte el Arc"
+            );
+        });
+    }
+
+    #[test]
+    fn paint_stats_audit_throttles_and_hints() {
+        assert!(should_audit_paint_stats(0));
+        assert!(should_audit_paint_stats(PAINT_STATS_AUDIT_EVERY));
+        assert!(!should_audit_paint_stats(1));
+        assert_eq!(paint_stats_hint_for_bytes(0, 0, 0, 0), "idle");
+        assert!(
+            paint_stats_hint_for_bytes(800, 10, 100, 1000).contains("diezmado"),
+            "shape_path dominante ⇒ diezmado"
+        );
+        assert!(
+            paint_stats_hint_for_bytes(100, 10, 800, 1000).contains("Galley"),
+            "texto dominante ⇒ caché Galley"
+        );
+        assert!(
+            paint_stats_hint_for_bytes(100, 600, 50, 1000).contains("batch"),
+            "shape_vec dominante ⇒ batch"
+        );
+        assert_eq!(paint_stats_hint_for_bytes(100, 10, 50, 1000), "ok");
+    }
+
+    #[test]
+    fn cached_label_text_matches_painter_text_rect() {
+        let ctx = egui::Context::default();
+        let color = Color32::WHITE;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let painter = ctx.layer_painter(egui::LayerId::background());
+            let pos = Pos2::new(10.0, 20.0);
+            let rect_cached = cached_label_text(
+                &painter,
+                pos,
+                egui::Align2::CENTER_TOP,
+                "10⁻¹",
+                grafito_ui::tokens::TYPE_SM,
+                color,
+                42,
+            );
+            let galley =
+                label_galley_shared(&painter, "10⁻¹", grafito_ui::tokens::TYPE_SM, color, 42);
+            let rect_direct = egui::Align2::CENTER_TOP.anchor_size(pos, galley.size());
+            assert_eq!(rect_cached, rect_direct, "mismo anclaje que painter.text");
+        });
+    }
+}

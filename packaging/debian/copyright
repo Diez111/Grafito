@@ -1,0 +1,14 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: grafito
+Upstream-Contact: Lautaro Agustin Diez <71948453+Diez111@users.noreply.github.com>
+Source: https://github.com/Diez111/Grafito
+
+Files: *
+Copyright: 2024-2026 Grafito Contributors
+License: GPL-3+
+ On Debian systems, the complete text of the GNU General Public License
+ version 3 can be found in "/usr/share/common-licenses/GPL-3".
+
+Files: assets/grafito-icon-*.png
+Copyright: 2024-2026 Grafito Contributors
+License: GPL-3+

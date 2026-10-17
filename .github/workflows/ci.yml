@@ -1,0 +1,640 @@
+name: CI
+
+on:
+  workflow_call:
+    inputs:
+      profile:
+        description: "full (push/PR: todo) o release (tag: gate liviano sin jobs de entorno ni redundantes)"
+        required: false
+        default: full
+        type: string
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: cargo check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        toolchain: ['1.92', stable]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Cache APT packages
+        uses: awalsh128/cache-apt-pkgs-action@7ca5f46d061ad9aa95863cd9b214dd48edef361d # v1.5.0
+        with:
+          packages: build-essential libgmp-dev libmpfr-dev libmpc-dev m4 pkg-config libdbus-1-dev libflint-dev
+          version: 1.0
+      - name: Install C toolchain and system deps (GMP/MPFR and D-Bus)
+        run: sudo apt-get update && sudo apt-get install -y build-essential libgmp-dev libmpfr-dev libmpc-dev m4 pkg-config libdbus-1-dev libflint-dev
+      - name: Cache APT packages (mingw)
+        uses: awalsh128/cache-apt-pkgs-action@7ca5f46d061ad9aa95863cd9b214dd48edef361d # v1.5.0
+        with:
+          packages: mingw-w64
+          version: 1.0
+      - name: Install MinGW for the Windows MSRV check
+        if: matrix.toolchain == '1.92'
+        run: sudo apt-get install -y mingw-w64
+      - uses: dtolnay/rust-toolchain@1482605bfc5719782e1267fd0c0cc350fe7646b8  # stable
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          targets: ${{ matrix.toolchain == '1.92' && 'x86_64-pc-windows-gnu' || '' }}
+      - uses: Swatinem/rust-cache@82a92a6e8fbeee089604da2575dc567ae9ddeaab  # v2.7.5
+      - name: Parse the complete lockfile with the declared MSRV
+        if: matrix.toolchain == '1.92'
+        run: cargo metadata --locked --format-version 1 > /dev/null
+      - run: cargo check --workspace --locked
+      - name: Check the Windows GNU app with the declared MSRV
+        if: matrix.toolchain == '1.92'
+        run: cargo check -p grafito-app --target x86_64-pc-windows-gnu --all-features --locked
+
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      matrix:
+        toolchain: ['1.92', stable]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Cache APT packages
+        uses: awalsh128/cache-apt-pkgs-action@7ca5f46d061ad9aa95863cd9b214dd48edef361d # v1.5.0
+        with:
+          packages: build-essential libgmp-dev libmpfr-dev libmpc-dev m4 pkg-config libdbus-1-dev libflint-dev
+          version: 1.0
+      - name: Install C toolchain and system deps (GMP/MPFR and D-Bus)
+        run: sudo apt-get update && sudo apt-get install -y build-essential libgmp-dev libmpfr-dev libmpc-dev m4 pkg-config libdbus-1-dev libflint-dev
+      - uses: dtolnay/rust-toolchain@1482605bfc5719782e1267fd0c0cc350fe7646b8  # stable
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      - uses: Swatinem/rust-cache@82a92a6e8fbeee089604da2575dc567ae9ddeaab  # v2.7.5
+      - run: cargo test --workspace --all-targets --all-features --locked
+
+  gpu-compute:
+    name: required GPU renderer regressions
+    # Perfil release: lavapipe por software es sensible al entorno del runner;
+    # la cobertura GPU se valida en push/PR (full) y local con lavapipe.
+    if: ${{ inputs.profile != 'release' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GRAFITO_REQUIRE_GPU_TESTS: "1"
+      WGPU_BACKEND: vulkan
+      # Alineado con release.yml: lavapipe necesita readback generoso para no
+      # dar falsos negativos de timeout en runners compartidos.
+      GRAFITO_GPU_READBACK_TIMEOUT_MS: "10000"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Cache APT packages
+        uses: awalsh128/cache-apt-pkgs-action@7ca5f46d061ad9aa95863cd9b214dd48edef361d # v1.5.0
+        with:
+          packages: build-essential libgmp-dev libmpfr-dev libmpc-dev m4 pkg-config libdbus-1-dev libvulkan1 mesa-vulkan-drivers
+          version: 1.0
+      - name: Install C toolchain, system deps, and Vulkan software driver
+        run: sudo apt-get update && sudo apt-get install -y build-essential libgmp-dev libmpfr-dev libmpc-dev m4 pkg-config libdbus-1-dev libvulkan1 mesa-vulkan-drivers
+      - uses: dtolnay/rust-toolchain@1482605bfc5719782e1267fd0c0cc350fe7646b8  # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@82a92a6e8fbeee089604da2575dc567ae9ddeaab  # v2.7.5
+      - name: Run required GPU renderer regressions
+        run: cargo test -p grafito-render --test gpu_compute --locked -- --nocapture
+
+  examples:
+    name: cargo check examples
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Cache APT packages
+        uses: awalsh128/cache-apt-pkgs-action@7ca5f46d061ad9aa95863cd9b214dd48edef361d # v1.5.0
+        with:
+          packages: build-essential libgmp-dev libmpfr-dev libmpc-dev m4 pkg-config libdbus-1-dev
+          version: 1.0
+      - name: Install C toolchain and system deps (GMP/MPFR and D-Bus)
+        run: sudo apt-get update && sudo apt-get install -y build-essential libgmp-dev libmpfr-dev libmpc-dev m4 pkg-config libdbus-1-dev
+      - uses: dtolnay/rust-toolchain@1482605bfc5719782e1267fd0c0cc350fe7646b8  # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@82a92a6e8fbeee089604da2575dc567ae9ddeaab  # v2.7.5
+      - run: cargo check --workspace --examples --locked
+
+  benches:
+    name: cargo check benches
+    # Perfil release: harness --test pesado y sensible a la carga del runner;
+    # se valida en push/PR (full) y local en ambos toolchains.
+    if: ${{ inputs.profile != 'release' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Cache APT packages
+        uses: awalsh128/cache-apt-pkgs-action@7ca5f46d061ad9aa95863cd9b214dd48edef361d # v1.5.0
+        with:
+          packages: build-essential libgmp-dev libmpfr-dev libmpc-dev m4 pkg-config libdbus-1-dev
+          version: 1.0
+      - name: Install C toolchain and system deps (GMP/MPFR and D-Bus)
+        run: sudo apt-get update && sudo apt-get install -y build-essential libgmp-dev libmpfr-dev libmpc-dev m4 pkg-config libdbus-1-dev
+      - uses: dtolnay/rust-toolchain@1482605bfc5719782e1267fd0c0cc350fe7646b8  # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@82a92a6e8fbeee089604da2575dc567ae9ddeaab  # v2.7.5
+      - run: cargo check --workspace --benches --locked
+      - run: cargo bench --workspace --no-run --locked
+      # Gate ligero de regresión: valida que los benches compilan y su harness `--test` pasa.
+      # El job dedicado `bench-regression` extiende esto con baseline `main` y comparación >10%.
+      - run: cargo bench --workspace --benches --locked -- --test
+
+  docs:
+    name: cargo doc
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Cache APT packages
+        uses: awalsh128/cache-apt-pkgs-action@7ca5f46d061ad9aa95863cd9b214dd48edef361d # v1.5.0
+        with:
+          packages: build-essential libgmp-dev libmpfr-dev libmpc-dev m4 pkg-config libdbus-1-dev
+          version: 1.0
+      - name: Install C toolchain and system deps (GMP/MPFR and D-Bus)
+        run: sudo apt-get update && sudo apt-get install -y build-essential libgmp-dev libmpfr-dev libmpc-dev m4 pkg-config libdbus-1-dev
+      - uses: dtolnay/rust-toolchain@1482605bfc5719782e1267fd0c0cc350fe7646b8  # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@82a92a6e8fbeee089604da2575dc567ae9ddeaab  # v2.7.5
+      - run: cargo doc --workspace --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  lint:
+    name: cargo clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        toolchain: ['1.92', stable]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Cache APT packages
+        uses: awalsh128/cache-apt-pkgs-action@7ca5f46d061ad9aa95863cd9b214dd48edef361d # v1.5.0
+        with:
+          packages: build-essential libgmp-dev libmpfr-dev libmpc-dev m4 pkg-config libdbus-1-dev libflint-dev
+          version: 1.0
+      - name: Install C toolchain and system deps (GMP/MPFR and D-Bus)
+        run: sudo apt-get update && sudo apt-get install -y build-essential libgmp-dev libmpfr-dev libmpc-dev m4 pkg-config libdbus-1-dev libflint-dev
+      - uses: dtolnay/rust-toolchain@1482605bfc5719782e1267fd0c0cc350fe7646b8  # stable
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: clippy
+      - uses: Swatinem/rust-cache@82a92a6e8fbeee089604da2575dc567ae9ddeaab  # v2.7.5
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+  release-build:
+    name: cargo build release
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Cache APT packages
+        uses: awalsh128/cache-apt-pkgs-action@7ca5f46d061ad9aa95863cd9b214dd48edef361d # v1.5.0
+        with:
+          packages: build-essential libgmp-dev libmpfr-dev libmpc-dev m4 pkg-config libdbus-1-dev
+          version: 1.0
+      - name: Install C toolchain and system deps (GMP/MPFR and D-Bus)
+        run: sudo apt-get update && sudo apt-get install -y build-essential libgmp-dev libmpfr-dev libmpc-dev m4 pkg-config libdbus-1-dev
+      - uses: dtolnay/rust-toolchain@1482605bfc5719782e1267fd0c0cc350fe7646b8  # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@82a92a6e8fbeee089604da2575dc567ae9ddeaab  # v2.7.5
+      - run: cargo build --workspace --release --locked
+
+  fmt:
+    name: cargo fmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1482605bfc5719782e1267fd0c0cc350fe7646b8  # stable
+        with:
+          toolchain: stable
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  all-targets:
+    name: cargo check all targets and features
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Cache APT packages
+        uses: awalsh128/cache-apt-pkgs-action@7ca5f46d061ad9aa95863cd9b214dd48edef361d # v1.5.0
+        with:
+          packages: build-essential libgmp-dev libmpfr-dev libmpc-dev m4 pkg-config libdbus-1-dev libflint-dev
+          version: 1.0
+      - name: Install C toolchain and system deps (GMP/MPFR and D-Bus)
+        run: sudo apt-get update && sudo apt-get install -y build-essential libgmp-dev libmpfr-dev libmpc-dev m4 pkg-config libdbus-1-dev libflint-dev
+      - uses: dtolnay/rust-toolchain@1482605bfc5719782e1267fd0c0cc350fe7646b8  # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@82a92a6e8fbeee089604da2575dc567ae9ddeaab  # v2.7.5
+      - run: cargo check --workspace --all-targets --all-features --locked
+
+  cross-platform-smoke:
+    name: app smoke (${{ matrix.os }})
+    # Perfil release: redundante con la matriz de build del release
+    # (linux/win/mac compilan y hacen smoke por target).
+    if: ${{ inputs.profile != 'release' }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Cache APT packages
+        if: runner.os == 'Linux'
+        uses: awalsh128/cache-apt-pkgs-action@7ca5f46d061ad9aa95863cd9b214dd48edef361d # v1.5.0
+        with:
+          packages: build-essential libgmp-dev libmpfr-dev libmpc-dev m4 pkg-config libdbus-1-dev
+          version: 1.0
+      - name: Install C toolchain and system deps (GMP/MPFR and D-Bus)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y build-essential libgmp-dev libmpfr-dev libmpc-dev m4 pkg-config libdbus-1-dev
+      - uses: dtolnay/rust-toolchain@1482605bfc5719782e1267fd0c0cc350fe7646b8  # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@82a92a6e8fbeee089604da2575dc567ae9ddeaab  # v2.7.5
+      - run: cargo test -p grafito-app --test app_smoke --locked
+      # MSVC != GNU: el check de Windows en CI regular era solo GNU cruzado
+      # (job `check`); este paso compila el target nativo MSVC real.
+      - name: Check the Windows MSVC app (native target)
+        if: runner.os == 'Windows'
+        run: cargo check -p grafito-app --locked
+
+  supply-chain:
+    name: dependency advisories and policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1482605bfc5719782e1267fd0c0cc350fe7646b8  # stable
+        with:
+          toolchain: stable
+      - name: Cache supply-chain tools
+        id: cache-supply
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
+        with:
+          path: ${{ runner.temp }}/cargo-tools
+          key: supply-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'fuzz/Cargo.lock') }}-audit-0.22.2-deny-0.20.2
+      - name: Install supply-chain tools
+        if: steps.cache-supply.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          tool_root="$RUNNER_TEMP/cargo-tools"
+          cargo install --locked --root "$tool_root" cargo-audit --version 0.22.2
+          cargo install --locked --root "$tool_root" cargo-deny --version 0.20.2
+      - name: Add supply-chain tools to PATH
+        run: echo "$RUNNER_TEMP/cargo-tools/bin" >> "$GITHUB_PATH"
+      - name: Test advisory exception policy
+        run: python3 .github/scripts/test_verify_advisory_exceptions.py
+      - name: Verify reviewed advisory exception boundary
+        run: python3 .github/scripts/verify_advisory_exceptions.py check
+      - name: Audit lockfiles (root + fuzz)
+        # The script constructs the complete argument vectors from one fixed ID
+        # tuple and audits BOTH committed lockfiles: the root workspace graph
+        # and the standalone fuzz workspace (`fuzz/Cargo.lock`), which drifts
+        # silently otherwise (stale geo 0.29.3 / i_overlay 1.9.4).
+        run: python3 .github/scripts/verify_advisory_exceptions.py audit
+      - run: cargo deny --workspace --locked check advisories bans licenses sources
+
+  workflow-lint:
+    name: workflow and shell lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Cache APT packages (shellcheck)
+        uses: awalsh128/cache-apt-pkgs-action@7ca5f46d061ad9aa95863cd9b214dd48edef361d # v1.5.0
+        with:
+          packages: shellcheck
+          version: 1.0
+      - name: Install workflow and shell linters
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          GOBIN="$RUNNER_TEMP/bin" go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7  # pinned
+      - name: Lint GitHub Actions workflows
+        run: ${{ runner.temp }}/bin/actionlint
+      - name: Parse and lint package scripts
+        run: |
+          bash -n packaging/build-deb.sh packaging/build-exe.sh packaging/debian/postinst packaging/debian/prerm packaging/debian/postrm packaging/tests/packaging-fixtures.sh
+          shellcheck --severity=error --shell=bash packaging/build-deb.sh packaging/build-exe.sh packaging/debian/postinst packaging/debian/prerm packaging/debian/postrm packaging/tests/packaging-fixtures.sh
+          bash packaging/tests/packaging-fixtures.sh
+      - name: Verify Debian version mapping
+        shell: bash
+        run: |
+          set -euo pipefail
+          beta="$(packaging/build-deb.sh --print-debian-version 1.2.20-beta)"
+          beta_patch="$(packaging/build-deb.sh --print-debian-version 1.2.20-beta.1)"
+          release_candidate="$(packaging/build-deb.sh --print-debian-version 1.2.20-rc.2)"
+          [[ "$beta" == "1.2.20~beta" ]]
+          [[ "$beta_patch" == "1.2.20~beta.1" ]]
+          [[ "$release_candidate" == "1.2.20~rc.2" ]]
+          dpkg --compare-versions "$beta" lt 1.2.20
+          dpkg --compare-versions "$beta_patch" lt 1.2.20
+          dpkg --compare-versions "$release_candidate" lt 1.2.20
+          dpkg --compare-versions "$beta" lt "$beta_patch"
+          dpkg --compare-versions "$beta_patch" lt "$release_candidate"
+          [[ "$(packaging/build-deb.sh --print-debian-version 1.2.20)" == "1.2.20" ]]
+
+  coverage:
+    name: coverage (llvm-cov 71%)
+    # Costo (~45min por push) vs señal: la verificación completa pasa a local
+    # obligatoria antes de pushear; en CI queda semanal/manual como mutation.
+    # Ver Tasks/ledger por la decisión (minutos de GitHub + flaky bajo carga).
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Cache APT packages
+        uses: awalsh128/cache-apt-pkgs-action@7ca5f46d061ad9aa95863cd9b214dd48edef361d # v1.5.0
+        with:
+          packages: build-essential libgmp-dev libmpfr-dev libmpc-dev m4 pkg-config libdbus-1-dev libflint-dev
+          version: 1.0
+      - name: Install C toolchain and system deps (GMP/MPFR and D-Bus)
+        run: sudo apt-get update && sudo apt-get install -y build-essential libgmp-dev libmpfr-dev libmpc-dev m4 pkg-config libdbus-1-dev libflint-dev
+      - uses: dtolnay/rust-toolchain@1482605bfc5719782e1267fd0c0cc350fe7646b8  # stable
+        with:
+          toolchain: stable
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@82a92a6e8fbeee089604da2575dc567ae9ddeaab  # v2.7.5
+      - name: Cache cargo-llvm-cov
+        id: cache-llvm-cov
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
+        with:
+          path: ${{ runner.temp }}/cargo-llvm-cov
+          key: llvm-cov-0.9.1-${{ runner.os }}
+      - name: Install cargo-llvm-cov
+        if: steps.cache-llvm-cov.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          cargo install --locked --root "${RUNNER_TEMP}/cargo-llvm-cov" cargo-llvm-cov --version 0.9.1
+      - name: Add cargo-llvm-cov to PATH
+        run: echo "${RUNNER_TEMP}/cargo-llvm-cov/bin" >> "$GITHUB_PATH"
+      - name: Generate coverage (lcov)
+        # Exclusiones justificadas (solo cromo sin lógica testeable en este job):
+        # - `grafito-ui/src/icons.rs`: dibujo egui puro (Painter/Rect); sin ramas
+        #   de dominio, solo se ejercita vía smoke headless.
+        # - `grafito-render/src/fill_compute.rs`: pipeline WGSL que exige un
+        #   `wgpu::Device` real; este job NO instala Vulkan a propósito (ver pin
+        #   GPU abajo) y sus regresiones requeridas viven en `gpu-compute`.
+        # PROHIBIDO excluir archivos con lógica (commands, symbolic, app,
+        # panels, render, ast, input, document...): se cubren con tests.
+        run: cargo llvm-cov --workspace --all-targets --all-features --locked --ignore-filename-regex '(grafito-ui/src/icons\.rs|grafito-render/src/fill_compute\.rs)' --lcov --output-path lcov.info
+      - name: Enforce 71% line coverage gate
+        # Recalibrado 2026-09-12: medido 71.18% post-sweep (sin Pou) con las
+        # exclusiones de arriba. Margen fino a propósito: si baja, es que se
+        # agregó código sin probar; subirlo cuando crezca con tests reales.
+        run: cargo llvm-cov --workspace --all-targets --all-features --locked --ignore-filename-regex '(grafito-ui/src/icons\.rs|grafito-render/src/fill_compute\.rs)' --fail-under-lines 71 --summary-only
+      # F5 honesto: SIN fallback `cargo test` en failure().
+      # Por lectura, no por ideologia: el job `test` ya corre la suite completa en
+      # matriz 1.92+stable; un fallback aqui duplicaba ~45min y confundia (en GitHub
+      # Actions el job queda FAILED aunque el paso failure() pase, asi que no
+      # "maquillaba" el gate, solo gastaba minutos). Diagnostico de infra vs test
+      # real se hace mirando que paso fallo (Generate vs Enforce), no re-corriendo.
+      # GPU pin: este job NO instala drivers Vulkan a proposito; los tests
+      # gpu_compute hacen SKIP honesto sin adapter (ver gpu_context_or_skip) y el
+      # gate 71% esta calibrado para esa ruta. Las regresiones GPU requeridas viven
+      # en el job dedicado `gpu-compute` (Vulkan + GRAFITO_REQUIRE_GPU_TESTS=1).
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: coverage-lcov-${{ github.run_id }}-${{ github.run_attempt }}
+          path: lcov.info
+          if-no-files-found: warn
+          retention-days: 14
+
+  bench-regression:
+    # F5 honesto: INFORMATIVO explicito, SIN gate bloqueante >10%.
+    # Por lectura: cada run guarda un baseline fresco (`--save-baseline main`) sin
+    # descargar el artefacto de `main` ni comparar con tolerancia real; el nombre
+    # anterior ("bench regression (>10% gate)") mentia porque ningun paso
+    # comparaba. Los steps son fail-closed (sin `|| true` desde 2026-10-04:
+    # si un bench no compila o panica, el job falla). Comparar >10% de verdad
+    # exigiría baseline estable + comparador (criterion --baseline + critcmp)
+    # y seria flaky entre runners; hasta tenerlo, este job compila, corre
+    # harness --test, imprime numeros base y sube el artefacto. Criterio de
+    # aceptación F5: los benches SSE-truncado (`assistant/benches/sse_truncation.rs`)
+    # + frames nativos (`anim/benches/native_frames.rs`) + `evaluate_cached_hot` /
+    # `miss_w200` (`geometry/benches/expr_bench.rs:30,37`) existen, corren y publican su base.
+    name: bench baselines (informativo, sin gate)
+    # Igual que coverage: ~40min por push; semanal/manual, verificación local.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Cache APT packages
+        uses: awalsh128/cache-apt-pkgs-action@7ca5f46d061ad9aa95863cd9b214dd48edef361d # v1.5.0
+        with:
+          packages: build-essential libgmp-dev libmpfr-dev libmpc-dev m4 pkg-config libdbus-1-dev
+          version: 1.0
+      - name: Install C toolchain and system deps (GMP/MPFR and D-Bus)
+        run: sudo apt-get update && sudo apt-get install -y build-essential libgmp-dev libmpfr-dev libmpc-dev m4 pkg-config libdbus-1-dev
+      - uses: dtolnay/rust-toolchain@1482605bfc5719782e1267fd0c0cc350fe7646b8  # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@82a92a6e8fbeee089604da2575dc567ae9ddeaab  # v2.7.5
+      - name: Build benches (no-run, locked)
+        run: cargo bench --workspace --benches --locked --no-run
+      - name: Run benches with --test harness
+        run: cargo bench --workspace --benches --locked -- --test
+      - name: Save baseline 'main' (informativo, no compara >10%; fail-closed)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Baseline informativo 'main': guarda numeros base, NO evalua >10% (sin gate hasta baseline estable; el harness SI falla si un bench panica)."
+          cargo bench --workspace --benches --locked -- --save-baseline main --test
+          if [ -d target/criterion ]; then
+            echo "criterion baselines present under target/criterion/"
+            find target/criterion -print | head -n 100 || true
+          fi
+          echo "F5: ver numeros base en el log de cada bench (SSE-truncado + frames nativos + evaluate_cached_hot/miss_w200); artefacto subido 7 dias."
+      - name: Upload bench baselines
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: bench-baseline-main-${{ github.run_id }}
+          path: target/criterion/
+          if-no-files-found: warn
+          retention-days: 7
+
+  mutation:
+    # F5: queda SEMANAL/manual a proposito (NO en PR).
+    # Por lectura: `cargo mutants --workspace --timeout 60 --in-place` tarda ~60min,
+    # muta el arbol en su lugar y es flaky para gate de PR; su valor es senal
+    # semanal de calidad, no bloqueo por cambio. Se ejecuta en `schedule` lunes 03:00
+    # y manual via `workflow_dispatch`.
+    name: mutation testing (weekly/manual)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Cache APT packages
+        uses: awalsh128/cache-apt-pkgs-action@7ca5f46d061ad9aa95863cd9b214dd48edef361d # v1.5.0
+        with:
+          packages: build-essential libgmp-dev libmpfr-dev libmpc-dev m4 pkg-config libdbus-1-dev
+          version: 1.0
+      - name: Install C toolchain and system deps (GMP/MPFR and D-Bus)
+        run: sudo apt-get update && sudo apt-get install -y build-essential libgmp-dev libmpfr-dev libmpc-dev m4 pkg-config libdbus-1-dev
+      - uses: dtolnay/rust-toolchain@1482605bfc5719782e1267fd0c0cc350fe7646b8  # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@82a92a6e8fbeee089604da2575dc567ae9ddeaab  # v2.7.5
+        with:
+          cache-all-crates: true
+      - name: Cache cargo-mutants
+        id: cache-mutants
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
+        with:
+          path: ${{ runner.temp }}/cargo-mutants
+          key: mutants-24.11.1-${{ runner.os }}
+      - name: Install cargo-mutants
+        if: steps.cache-mutants.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          cargo install --locked --root "${RUNNER_TEMP}/cargo-mutants" cargo-mutants --version 24.11.1
+      - name: Add cargo-mutants to PATH
+        run: echo "${RUNNER_TEMP}/cargo-mutants/bin" >> "$GITHUB_PATH"
+      - name: Run mutation tests (workspace)
+        run: cargo mutants --workspace --timeout 60 --in-place -- --locked
+
+  package-debian:
+    name: Debian package smoke and lint
+    # Perfil release: redundante con el job debian del release (arma el .deb
+    # que se publica); el smoke/lint sigue en push/PR (full).
+    if: ${{ inputs.profile != 'release' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Cache APT packages
+        uses: awalsh128/cache-apt-pkgs-action@7ca5f46d061ad9aa95863cd9b214dd48edef361d # v1.5.0
+        with:
+          packages: build-essential desktop-file-utils dpkg-dev libgmp-dev libmpfr-dev libmpc-dev lintian m4 pkg-config libdbus-1-dev
+          version: 1.0
+      - name: Install package build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential desktop-file-utils dpkg-dev libgmp-dev libmpfr-dev libmpc-dev lintian m4 pkg-config libdbus-1-dev
+      - uses: dtolnay/rust-toolchain@1482605bfc5719782e1267fd0c0cc350fe7646b8  # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@82a92a6e8fbeee089604da2575dc567ae9ddeaab  # v2.7.5
+      - name: Validate packaging metadata and build the package
+        run: |
+          desktop-file-validate packaging/debian/grafito.desktop
+          packaging/build-deb.sh
+      - name: Verify package metadata, installation, ownership, and lint output
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          packages=(packaging/build/*.deb)
+          (( ${#packages[@]} == 1 )) || { echo "expected exactly one Debian package" >&2; exit 1; }
+          package="${packages[0]}"
+          expected_cargo_version="$(cargo metadata --format-version 1 --no-deps --locked | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          expected_version="$(packaging/build-deb.sh --print-debian-version "$expected_cargo_version")"
+          expected_architecture="$(dpkg --print-architecture)"
+          [[ -n "$expected_version" ]] || { echo "could not read the workspace version" >&2; exit 1; }
+          [[ "$(dpkg-deb -f "$package" Package)" == "grafito" ]]
+          [[ "$(dpkg-deb -f "$package" Version)" == "$expected_version" ]]
+          [[ "$(dpkg-deb -f "$package" Architecture)" == "$expected_architecture" ]]
+          package_depends="$(dpkg-deb -f "$package" Depends)"
+          grep -Eq '(^|,)[[:space:]]*libdbus-1-3([[:space:]]*\([^)]*\))?[[:space:]]*(,|$)' <<< "$package_depends"
+          dpkg-deb --info "$package"
+          package_contents="$(dpkg-deb -c "$package")"
+          control_contents="$(dpkg-deb --ctrl-tarfile "$package" | tar -tvf -)"
+          if grep -Ev '^[-dlcbps][rwxStTs-]{9}[[:space:]]+root/root[[:space:]]+' <<< "$package_contents"; then
+            echo "package contains entries not owned by root:root" >&2
+            exit 1
+          fi
+          if grep -Ev '^[-dlcbps][rwxStTs-]{9}[[:space:]]+root/root[[:space:]]+' <<< "$control_contents"; then
+            echo "package control files are not owned by root:root" >&2
+            exit 1
+          fi
+          grep -Eq '^-rwxr-xr-x[[:space:]]+root/root[[:space:]]+[0-9]+[[:space:]]+.*[[:space:]]+\./usr/bin/grafito$' <<< "$package_contents"
+          grep -Eq '^-rw-r--r--[[:space:]]+root/root[[:space:]]+[0-9]+[[:space:]]+.*[[:space:]]+\./usr/share/applications/grafito.desktop$' <<< "$package_contents"
+          grep -Eq '^-rwxr-xr-x[[:space:]]+root/root[[:space:]]+.*[[:space:]]+\./postinst$' <<< "$control_contents"
+          grep -Eq '^-rwxr-xr-x[[:space:]]+root/root[[:space:]]+.*[[:space:]]+\./prerm$' <<< "$control_contents"
+          grep -Eq '^-rwxr-xr-x[[:space:]]+root/root[[:space:]]+.*[[:space:]]+\./postrm$' <<< "$control_contents"
+          lintian --fail-on error "$package"
+          sudo dpkg --install "$package"
+          installed=1
+          cleanup() {
+            if [[ "${installed:-0}" -eq 1 ]]; then
+              sudo dpkg --purge grafito
+            fi
+          }
+          trap cleanup EXIT
+          [[ -x /usr/bin/grafito ]]
+          /usr/bin/grafito --help
+          [[ "$(dpkg-query -W -f='${Version}' grafito)" == "$expected_version" ]]
+          [[ "$(dpkg-query -W -f='${Architecture}' grafito)" == "$expected_architecture" ]]
+          sudo dpkg --purge grafito
+          installed=0
+          trap - EXIT

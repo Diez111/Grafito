@@ -1,0 +1,111 @@
+# Supply-chain policy enforced by `cargo deny check` in CI.
+# All currently resolved third-party crates originate from crates.io.
+
+[graph]
+all-features = true
+no-default-features = false
+
+[advisories]
+version = 2
+# The first three warnings require parent-library or framework migrations rather
+# than a safe lockfile-only update. The final two entries are time-bounded
+# vulnerability exceptions whose exact graph and expiry are enforced in CI.
+# RUSTSEC-2025-0165 (geo/i_overlay) was resolved via geo 0.29.3→0.33.1 and its
+# ignore removed; `fuzz/Cargo.lock` is audited too so a stale fuzz graph fails.
+# See `.github/SECURITY.md` for the complete reachability analysis.
+ignore = [
+    { id = "RUSTSEC-2025-0141", reason = "Temporary through 2026-12-31; owner: Grafito maintainers. puffin 0.19.1 requires bincode 1.3.3; bincode 1.x has no maintained replacement and puffin 0.20 requires Rust 1.92." },
+    { id = "RUSTSEC-2024-0436", reason = "Temporary through 2026-12-31; owner: Grafito maintainers. simba 0.9.1 requires paste 1.0.15, the latest 1.x release; nalgebra 0.34 requires Rust 1.87, below the workspace MSRV 1.92." },
+    { id = "RUSTSEC-2026-0192", reason = "Temporary through 2026-12-31; owner: Grafito maintainers. eframe 0.29.1 pins owned_ttf_parser 0.25.1 and ttf-parser 0.25.1; remediation requires a coordinated eframe/wgpu framework migration." },
+    { id = "RUSTSEC-2026-0194", reason = "Temporary through 2026-12-31; owner: Grafito maintainers. Affected attribute iteration is reached only when proc macros parse crate-shipped AT-SPI XML at build time; zbus_xml 4 requires quick-xml ^0.30 and wayland-scanner 0.31.11 now uses patched ^0.41, leaving the zbus path blocked for fixed >=0.41. Remove on a compatible zbus_xml release or any reachability change; see .github/SECURITY.md." },
+    { id = "RUSTSEC-2026-0195", reason = "Temporary through 2026-12-31; owner: Grafito maintainers. Neither reviewed consumer invokes NsReader (zbus_xml 4 deserialization uses Reader; wayland-scanner 0.31.11 now uses patched quick-xml 0.41.0), so the vulnerable namespace allocation is not reachable; the zbus path still blocks fixed >=0.41. Remove on a compatible zbus_xml release or any reachability change; see .github/SECURITY.md." },
+]
+
+[bans]
+# multiple-versions is deny so a fourth quick-xml (or any new duplicate) fails.
+# Known coexisting lines are allowlisted explicitly below: quick-xml 0.30.0
+# (zbus_xml 4 requires ^0.30, blocked from >=0.41), 0.41.0 (wayland-scanner
+# 0.31.11, patched) and 0.42.0 (grafito-ggb reviewed direct dep); ecosystem
+# duplicates (windows-sys, syn, calloop) and bincode 1.3.3 keep wildcards/pins.
+# zbus_xml 4 → quick-xml ^0.30 blocks fixed >=0.41; see .github/SECURITY.md.
+# windows-sys, syn, calloop have legitimate multi-major duplicates via windows/wayland/egui ecosystem.
+multiple-versions = "deny"
+skip = [
+    # quick-xml: 0.30.0 (zbus_xml) y 0.41.0 (wayland-scanner) + 0.42.0
+    # (grafito-ggb, dep directa revisada) — RUSTSEC-2026-0194/0195
+    { name = "quick-xml", version-req = "=0.30.0", reason = "quick-xml 0.30.0 required by zbus_xml 4, blocked from 0.41 by RUSTSEC advisories" },
+    { name = "quick-xml", version-req = "=0.41.0", reason = "quick-xml 0.41.0 required by wayland-scanner 0.31.11, coexistence with 0.30.0 is expected" },
+    { name = "quick-xml", version-req = "=0.42.0", reason = "quick-xml 0.42.0 reviewed direct dep of grafito-ggb (streaming .ggb import, bounds + DOCTYPE/ENTITY rejection); see .github/SECURITY.md" },
+    { name = "windows-sys", version-req = "*", reason = "windows-sys multiple versions via windows/egui ecosystem" },
+    { name = "syn", version-req = "*", reason = "syn multiple versions via proc-macro ecosystem" },
+    { name = "calloop", version-req = "*", reason = "calloop multiple versions via wayland/egui ecosystem" },
+    # async/rustix: 1.x (polling 3, wayland 0.31, async-io) convive con 0.38
+    # (winit 0.30 / smithay 0.19); unificar exige un major de winit
+    { name = "rustix", version-req = "=1.1.4", reason = "rustix 1.x via polling/wayland/async line; winit stack keeps 0.38" },
+    { name = "linux-raw-sys", version-req = "=0.12.1", reason = "linux-raw-sys 0.12 follows rustix 1.x; rustix 0.38 keeps 0.4" },
+    { name = "redox_syscall", version-req = "=0.5.18", reason = "redox_syscall 0.5 via parking_lot; winit keeps 0.4.1" },
+    { name = "redox_syscall", version-req = "=0.9.3", reason = "redox_syscall 0.9 via libredox; winit keeps 0.4.1" },
+    # android: ndk-sys 0.6 (winit android-activity) convive con 0.5 (wgpu-hal)
+    { name = "ndk-sys", version-req = "=0.6.0", reason = "ndk-sys 0.6 via winit android-activity; wgpu-hal keeps 0.5" },
+    # wayland: smithay 0.20 (smithay-clipboard de egui-winit) convive con 0.19
+    { name = "smithay-client-toolkit", version-req = "=0.20.0", reason = "sctk 0.20 via smithay-clipboard; winit keeps 0.19.2" },
+    { name = "calloop-wayland-source", version-req = "=0.4.1", reason = "calloop-wayland-source 0.4 follows sctk 0.20; sctk 0.19 keeps 0.3" },
+    # hashbrown triple: 0.15 (wgpu gpu-descriptor) + 0.16 (spade 2.15) + 0.17
+    { name = "hashbrown", version-req = "=0.15.5", reason = "hashbrown 0.15 pinned by wgpu gpu-descriptor" },
+    { name = "hashbrown", version-req = "=0.16.1", reason = "hashbrown 0.16 via spade 2.15 line" },
+    # geometría/render: geo 0.33 (bump RUSTSEC-2025-0165, ver SECURITY.md)
+    { name = "float_next_after", version-req = "=2.0.0", reason = "float_next_after 2.0 via geo 0.33; lyon keeps 1.0" },
+    # imagen/pdf: flate2 trae 0.9, el stack image/png de eframe queda en 0.8
+    { name = "miniz_oxide", version-req = "=0.9.1", reason = "miniz_oxide 0.9 via flate2; image/png stack keeps 0.8.9" },
+    # pdf (printpdf/lopdf, export propio) vs gif/tiff del stack de eframe
+    { name = "weezl", version-req = "=0.2.1", reason = "weezl 0.2 via printpdf/lopdf; gif/tiff keep 0.1.12" },
+    { name = "cbc", version-req = "=0.2.1", reason = "cbc 0.2 via lopdf; secret-service keeps 0.1.2" },
+    # macOS: arboard/webbrowser (egui-winit) traen objc2 0.3, winit queda en 0.2
+    { name = "objc2-app-kit", version-req = "=0.3.2", reason = "objc2-app-kit 0.3 via arboard/webbrowser; winit keeps 0.2.2" },
+    # windows: accesskit trae 0.58, wgpu gpu-allocator queda en 0.52
+    { name = "windows", version-req = "=0.58.0", reason = "windows 0.58 via accesskit; gpu-allocator keeps 0.52" },
+    { name = "windows-core", version-req = "=0.58.0", reason = "windows-core 0.58 via accesskit; windows 0.52 keeps 0.52" },
+]
+# skip-tree: duplicate versions *inside* a third-party subtree are that
+# subtree's upstream unification problem, not ours. Only the duplicate lint
+# is scoped here — advisories/licenses still check every version in the
+# graph. iroh 1.2.0 (transporte P2P del aula, feature aula-iroh) arrastra su
+# propio árbol (reqwest 0.13, quinn/noq, rand 0.9, windows 0.61) que duplica
+# las líneas del ecosistema eframe/wgpu; unificarlo exige un major de iroh.
+skip-tree = [
+    { name = "iroh", reason = "iroh 1.2.0 tree (reqwest 0.13, rand 0.9, windows 0.61) duplicates eframe/wgpu lines; unification needs an iroh major" },
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "GPL-3.0-or-later",
+    # LGPL-3.0 (vía alkahest-cas opt-in → gmp-mpfr-sys/rug, que declaran el
+    # identificador deprecado LGPL-3.0+): compatible con GPL-3.0-or-later
+    # (la obra combinada sigue GPL) y aprobado OSI/FSF.
+    "LGPL-3.0-or-later",
+    "ISC",
+    "LicenseRef-UFL-1.0",
+    "MIT",
+    "MPL-2.0",
+    "OFL-1.1",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+exceptions = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

@@ -1,0 +1,1041 @@
+//! Shared helpers and application configuration.
+//!
+//! Contains color conversion, egui style setup, and persistent config loading
+//! (theme, grid visibility, snap-to-grid) used across the desktop app.
+
+use egui::Color32;
+use grafito_assistant_types::ProviderProfile;
+use grafito_core::persistence::AUTOSAVE_DEBOUNCE_SECS;
+use grafito_geometry::Color;
+
+use crate::snap::SnapConfig;
+
+pub(crate) fn to_color32(c: Color) -> Color32 {
+    Color32::from_rgba_unmultiplied(
+        (c.r * 255.0).clamp(0.0, 255.0) as u8,
+        (c.g * 255.0).clamp(0.0, 255.0) as u8,
+        (c.b * 255.0).clamp(0.0, 255.0) as u8,
+        (c.a * 255.0).clamp(0.0, 255.0) as u8,
+    )
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct AppConfig {
+    pub(crate) dark_mode: bool,
+    pub(crate) show_grid: bool,
+    pub(crate) snap_to_grid: bool,
+    #[serde(default)]
+    pub(crate) snap: SnapConfig,
+    #[serde(default = "default_assistant_provider")]
+    pub(crate) assistant_provider: ProviderProfile,
+    #[serde(default = "default_assistant_model")]
+    pub(crate) assistant_model: String,
+    #[serde(default)]
+    pub(crate) allow_fusion_fallback: bool,
+    /// Plugins habilitados explícitamente por el usuario (manuales).
+    #[serde(default)]
+    pub(crate) enabled_plugins: Vec<String>,
+    /// Plugins automáticos que el usuario desactivó.
+    #[serde(default)]
+    pub(crate) disabled_plugins: Vec<String>,
+    /// Respuestas en línea sin cartel de autorización (permiso completo).
+    #[serde(default = "default_full_permission")]
+    pub(crate) assistant_full_permission: bool,
+    /// Modo agente (loop con herramientas) para el asistente.
+    #[serde(default = "default_agent_mode")]
+    pub(crate) assistant_agent_mode: bool,
+    /// Modo razonador: pide esfuerzo de razonamiento al proveedor.
+    #[serde(default)]
+    pub(crate) assistant_reasoning_enabled: bool,
+    /// Buscar en internet: pre-flight web + tool `web_search` del agente.
+    #[serde(default)]
+    pub(crate) assistant_web_search_enabled: bool,
+    /// Tutor socrático: repreguntas y repair antes de la solución directa.
+    /// Apagado = respuestas directas. Default false (directo por defecto).
+    #[serde(default = "default_socratic_enabled")]
+    pub(crate) assistant_socratic_enabled: bool,
+    /// Onboarding 30s ya visto (Scandinavian, sin laberinto).
+    #[serde(default)]
+    pub(crate) onboarding_completed: bool,
+    /// Opt-in explícito para Aula/red avanzada (loopback F0 sin red).
+    #[serde(default)]
+    pub(crate) advanced_red_opt_in: bool,
+    /// Idioma de la interfaz ES/EN/PT/IT/FR/DE (O2 i18n + W2 PT + frente IT/FR/DE, catálogo `grafito-ui/src/i18n.rs`).
+    /// `#[serde(default)]` conserva configs viejas sin el campo (resuelven a español).
+    #[serde(default)]
+    pub(crate) locale: AppLocale,
+    /// Movimiento reducido (WCAG 2.3.3 Animation from Interactions).
+    ///
+    /// El motor ya existía y estaba testeado (`MotionConfig`), pero la app
+    /// siempre pasaba `default()` — o sea `false`. El mecanismo era decorativo:
+    /// un usuario con disorder vestibular no tenía forma de apagar el
+    /// movimiento. El default lee la preferencia del sistema operativo para que
+    /// funcione sin que el usuario tenga que tocar nada, y el toggle de Ajustes
+    /// deja la decisión explícita cuando se quiere overriding.
+    #[serde(default = "default_reduced_motion")]
+    pub(crate) reduced_motion: bool,
+}
+
+/// Lee la preferencia de movimiento reducido del entorno.
+///
+/// egui 0.29 no expone `prefers-reduced-motion` (no hay `AnimationBehavior`
+/// equivalente), así que se leen las variables de entorno que publican los
+/// gestores de ventanas y shells: `GTK_ENABLE_ANIMATIONS=0` en GTK, y las
+/// variables de GNOME/KDE que describen la preferencia. Una variable de app
+/// propia (`GRAFITO_REDUCED_MOTION`) gana sobre todo lo demás.
+///
+/// Si ninguna está presente, `false`: el comportamiento histórico, y el
+/// toggle de Ajustes queda como camino explícito.
+fn default_reduced_motion() -> bool {
+    if let Ok(value) = std::env::var("GRAFITO_REDUCED_MOTION") {
+        return env_flag_enabled(&value);
+    }
+    // GTK publica `GTK_ENABLE_ANIMATIONS=0` cuando el usuario desactivó las
+    // animaciones: es exactamente la señal que buscamos.
+    if let Ok(value) = std::env::var("GTK_ENABLE_ANIMATIONS") {
+        return !env_flag_enabled(&value);
+    }
+    false
+}
+
+/// Interpreta una flag de entorno: verdadera para `1/true/yes/on`, falsa para
+/// `0/false/no/off` y para cualquier otra cosa (puro, sin I/O).
+fn env_flag_enabled(raw: &str) -> bool {
+    matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn default_full_permission() -> bool {
+    true
+}
+
+const fn default_socratic_enabled() -> bool {
+    false
+}
+
+const fn default_agent_mode() -> bool {
+    true
+}
+
+const fn default_assistant_provider() -> ProviderProfile {
+    ProviderProfile::OpenCodeGo
+}
+
+fn default_assistant_model() -> String {
+    "deepseek-v4-flash".into()
+}
+
+/// Idioma persistido de la interfaz (O2 i18n, catálogo `grafito-ui/src/i18n.rs`).
+///
+/// `Es` por defecto. En instalaciones frescas [`AppConfig::default`] detecta el
+/// idioma del sistema con [`AppLocale::resolve`] (variables `LANGUAGE` →
+/// `LC_ALL` → `LANG` → `LC_MESSAGES`): subtag primario `en` → inglés, `pt` →
+/// portugués, `it` → italiano, `fr` → francés, `de` → alemán; cualquier otro
+/// valor resuelve a español.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum AppLocale {
+    /// Español (idioma por defecto de Grafito).
+    #[default]
+    Es,
+    /// English.
+    En,
+    /// Português (W2: seleccionable en el selector ES/EN/PT, persiste `"pt"`).
+    Pt,
+    /// Italiano (seleccionable en el selector, persiste `"it"`).
+    It,
+    /// Français (seleccionable en el selector, persiste `"fr"`).
+    Fr,
+    /// Deutsch (seleccionable en el selector, persiste `"de"`).
+    De,
+}
+
+impl AppLocale {
+    /// Código BCP-47 persistido en `grafito_config.json` (`"es"` / `"en"` / `"pt"` /
+    /// `"it"` / `"fr"` / `"de"`).
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            AppLocale::Es => "es",
+            AppLocale::En => "en",
+            AppLocale::Pt => "pt",
+            AppLocale::It => "it",
+            AppLocale::Fr => "fr",
+            AppLocale::De => "de",
+        }
+    }
+
+    /// Detecta el idioma del sistema desde el entorno. Sin pánico: ante
+    /// cualquier variable ausente o ilegible se ignora y se sigue con la siguiente.
+    pub(crate) fn resolve() -> Self {
+        let language = std::env::var("LANGUAGE").ok();
+        let lc_all = std::env::var("LC_ALL").ok();
+        let lang = std::env::var("LANG").ok();
+        let lc_messages = std::env::var("LC_MESSAGES").ok();
+        Self::resolve_for_env(
+            language.as_deref(),
+            lc_all.as_deref(),
+            lang.as_deref(),
+            lc_messages.as_deref(),
+        )
+    }
+
+    /// Núcleo testeable de [`AppLocale::resolve`]: la primera etiqueta no vacía
+    /// en orden `LANGUAGE` → `LC_ALL` → `LANG` → `LC_MESSAGES` gana; `LANGUAGE`
+    /// admite lista separada por `':'` (se toma la primera etiqueta útil).
+    /// Solo los subtags primarios `en`/`pt`/`it`/`fr`/`de` (insensibles a
+    /// mayúsculas, sin importar región ni codificación: `en`, `en_US.UTF-8`,
+    /// `pt_BR`…) resuelven a su idioma; todo lo demás (`es`, `C`, `POSIX`,
+    /// vacío, desconocido) resuelve a español.
+    pub(crate) fn resolve_for_env(
+        language: Option<&str>,
+        lc_all: Option<&str>,
+        lang: Option<&str>,
+        lc_messages: Option<&str>,
+    ) -> Self {
+        let candidates = [language, lc_all, lang, lc_messages];
+        let mut i = 0;
+        while i < candidates.len() {
+            if let Some(raw) = candidates[i] {
+                for tag in raw.split(':') {
+                    if tag.trim().is_empty() {
+                        continue;
+                    }
+                    return Self::resolve_for_tag(tag);
+                }
+            }
+            i += 1;
+        }
+        AppLocale::Es
+    }
+
+    /// Subtags primarios `en`/`pt`/`it`/`fr`/`de` resuelven a su idioma; el
+    /// resto a español (default ES).
+    fn resolve_for_tag(tag: &str) -> Self {
+        let without_codeset = tag.split(['.', '@']).next().unwrap_or("");
+        let primary = without_codeset.split(['_', '-']).next().unwrap_or("");
+        let primary = primary.trim();
+        if primary.eq_ignore_ascii_case("en") {
+            AppLocale::En
+        } else if primary.eq_ignore_ascii_case("pt") {
+            AppLocale::Pt
+        } else if primary.eq_ignore_ascii_case("it") {
+            AppLocale::It
+        } else if primary.eq_ignore_ascii_case("fr") {
+            AppLocale::Fr
+        } else if primary.eq_ignore_ascii_case("de") {
+            AppLocale::De
+        } else {
+            AppLocale::Es
+        }
+    }
+
+    /// Convierte al [`grafito_ui::i18n::Locale`] que consume la Piel.
+    pub(crate) const fn as_ui_locale(self) -> grafito_ui::i18n::Locale {
+        match self {
+            AppLocale::Es => grafito_ui::i18n::Locale::Es,
+            AppLocale::En => grafito_ui::i18n::Locale::En,
+            AppLocale::Pt => grafito_ui::i18n::Locale::Pt,
+            AppLocale::It => grafito_ui::i18n::Locale::It,
+            AppLocale::Fr => grafito_ui::i18n::Locale::Fr,
+            AppLocale::De => grafito_ui::i18n::Locale::De,
+        }
+    }
+
+    /// Conversión inversa (el selector ES/EN/PT/IT/FR/DE escribe [`AppConfig::locale`]).
+    pub(crate) const fn from_ui_locale(locale: grafito_ui::i18n::Locale) -> Self {
+        match locale {
+            grafito_ui::i18n::Locale::Es => AppLocale::Es,
+            grafito_ui::i18n::Locale::En => AppLocale::En,
+            grafito_ui::i18n::Locale::Pt => AppLocale::Pt,
+            grafito_ui::i18n::Locale::It => AppLocale::It,
+            grafito_ui::i18n::Locale::Fr => AppLocale::Fr,
+            grafito_ui::i18n::Locale::De => AppLocale::De,
+        }
+    }
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            dark_mode: false,
+            show_grid: true,
+            snap_to_grid: false,
+            snap: SnapConfig::default(),
+            assistant_provider: default_assistant_provider(),
+            assistant_model: default_assistant_model(),
+            allow_fusion_fallback: false,
+            enabled_plugins: Vec::new(),
+            disabled_plugins: Vec::new(),
+            assistant_full_permission: default_full_permission(),
+            assistant_agent_mode: default_agent_mode(),
+            assistant_reasoning_enabled: false,
+            assistant_web_search_enabled: false,
+            assistant_socratic_enabled: default_socratic_enabled(),
+            onboarding_completed: false,
+            advanced_red_opt_in: false,
+            locale: AppLocale::resolve(),
+            reduced_motion: default_reduced_motion(),
+        }
+    }
+}
+
+pub(crate) const LEGACY_CONFIG_NAME: &str = "grafito_config.json";
+pub(crate) const LEGACY_PROFILE_NAME: &str = "grafito_profile.json";
+/// Outbox offline persistida (D2): JSON acotado 128×2048 en user-data dir.
+pub(crate) const OUTBOX_FILE_NAME: &str = "outbox.json";
+
+fn xdg_config_home() -> std::path::PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| {
+            let home = std::env::var_os("HOME").unwrap_or_default();
+            let mut base = std::path::PathBuf::from(home);
+            if base.as_os_str().is_empty() {
+                base = std::path::PathBuf::from(".");
+            }
+            base.push(".config");
+            base
+        })
+}
+
+fn xdg_data_home() -> std::path::PathBuf {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| {
+            let home = std::env::var_os("HOME").unwrap_or_default();
+            let mut base = std::path::PathBuf::from(home);
+            if base.as_os_str().is_empty() {
+                base = std::path::PathBuf::from(".");
+            }
+            base.push(".local/share");
+            base
+        })
+}
+
+/// Intenta migrar el archivo legado `legacy` a `new_path` copiando si el
+/// legado existe y el nuevo no. No borra el legado. No hace I/O si
+/// no es necesario. Ignora errores de I/O (best-effort).
+fn try_migrate_legacy(new_path: &std::path::Path, legacy: &std::path::Path) {
+    if new_path.exists() || !legacy.exists() {
+        return;
+    }
+    // No migrar si el nuevo ya existe o el legado falta.
+    // Crear directorio padre del nuevo si falta, luego copiar.
+    if let Some(parent) = new_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::copy(legacy, new_path);
+}
+
+/// Helpers testeables sin tocar env global: resuelven rutas XDG dado un
+/// `xdg_home` y un `home` explícitos. `None` simula variable no seteada/vacía.
+#[cfg(test)]
+pub(crate) fn xdg_config_path_for(
+    xdg_config_home: Option<&std::path::Path>,
+    home: Option<&std::path::Path>,
+) -> std::path::PathBuf {
+    let base = xdg_config_home
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            let mut b = home
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            if b.as_os_str().is_empty() {
+                b = std::path::PathBuf::from(".");
+            }
+            b.push(".config");
+            b
+        });
+    base.join("grafito").join(LEGACY_CONFIG_NAME)
+}
+
+#[cfg(test)]
+pub(crate) fn xdg_data_path_for(
+    xdg_data_home: Option<&std::path::Path>,
+    home: Option<&std::path::Path>,
+) -> std::path::PathBuf {
+    let base = xdg_data_home
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            let mut b = home
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            if b.as_os_str().is_empty() {
+                b = std::path::PathBuf::from(".");
+            }
+            b.push(".local/share");
+            b
+        });
+    base.join("grafito").join(LEGACY_PROFILE_NAME)
+}
+
+fn config_path() -> std::path::PathBuf {
+    let path = xdg_config_home().join("grafito").join(LEGACY_CONFIG_NAME);
+    try_migrate_legacy(&path, std::path::Path::new(LEGACY_CONFIG_NAME));
+    // Best-effort: asegurar directorio existe para escrituras futuras (no bloquea si falla).
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    path
+}
+
+/// Ruta del perfil pedagógico del estudiante (memoria del tutor).
+pub(crate) fn profile_path() -> std::path::PathBuf {
+    let path = xdg_data_home().join("grafito").join(LEGACY_PROFILE_NAME);
+    try_migrate_legacy(&path, std::path::Path::new(LEGACY_PROFILE_NAME));
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    path
+}
+
+/// Carga el perfil persistido; ante cualquier error devuelve un perfil vacío.
+pub(crate) fn load_profile() -> grafito_profile::StudentProfile {
+    std::fs::read_to_string(profile_path())
+        .ok()
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default()
+}
+
+/// Ruta de la outbox offline persistida (user-data dir, D2).
+pub(crate) fn outbox_path() -> std::path::PathBuf {
+    xdg_data_home().join("grafito").join(OUTBOX_FILE_NAME)
+}
+
+/// Lee la outbox desde una ruta explícita (sin tocar env global, testeable).
+///
+/// `Ok(outbox)` + aviso honesto si el archivo falta (primera corrida, sin
+/// aviso), está corrupto o excede el cap (se descarta, con aviso).
+/// El I/O lo hace el caller en background/arranque, jamás en `Ui::`.
+/// B-A201: `locale` solo localiza el aviso de display; el motor
+/// (`decode_persist`/`notice()`) queda canónico ES a propósito.
+#[cfg(test)]
+pub(crate) fn load_outbox_from_path(
+    path: &std::path::Path,
+) -> (grafito_classroom::OfflineOutbox, Option<String>) {
+    load_outbox_from_path_for(path, grafito_ui::i18n::Locale::Es)
+}
+
+/// Variante localizada de [`load_outbox_from_path`] (B-A201, patrón B-A76
+/// `pedir_con`: wrapper Es intacto, resto vía `classroom_*_for`).
+pub(crate) fn load_outbox_from_path_for(
+    path: &std::path::Path,
+    locale: grafito_ui::i18n::Locale,
+) -> (grafito_classroom::OfflineOutbox, Option<String>) {
+    let json = match std::fs::read_to_string(path) {
+        Ok(json) => json,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return (grafito_classroom::OfflineOutbox::new(), None);
+        }
+        Err(err) => {
+            log::warn!("No se pudo leer {}: {err}", path.display());
+            return (
+                grafito_classroom::OfflineOutbox::new(),
+                Some(crate::classroom::classroom_outbox_read_error_for(locale)),
+            );
+        }
+    };
+    let loaded = grafito_classroom::decode_persist(&json);
+    let aviso = if loaded.corrupt {
+        Some(crate::classroom::classroom_outbox_corrupt_for(locale))
+    } else if loaded.discarded > 0 {
+        Some(crate::classroom::classroom_outbox_discarded_for(
+            loaded.discarded,
+            locale,
+        ))
+    } else {
+        None
+    };
+    (loaded.outbox, aviso)
+}
+
+/// Variante localizada de carga de outbox (B-A201).
+pub(crate) fn load_outbox_for(
+    locale: grafito_ui::i18n::Locale,
+) -> (grafito_classroom::OfflineOutbox, Option<String>) {
+    load_outbox_from_path_for(&outbox_path(), locale)
+}
+
+/// Escribe la outbox en una ruta explícita (JSON acotado, crea el padre).
+///
+/// `Err` honesto con motivo; el caller la invoca en background thread.
+pub(crate) fn save_outbox_to_path(
+    outbox: &grafito_classroom::OfflineOutbox,
+    path: &std::path::Path,
+) -> Result<(), String> {
+    let json = outbox.encode_persist().map_err(|err| format!("{err:?}"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("no se pudo crear {}: {err}", parent.display()))?;
+    }
+    // Atómico (tmp + fsync + rename), no `fs::write`: un corte a mitad de
+    // escritura truncaba `outbox.json` y la cola offline se perdía. El lector
+    // (`load_outbox_from_path`) ya era honesto ante corrupto; ahora el
+    // escritor también es seguro ante corte.
+    crate::export::write_text_atomic(path, &json)
+        .map_err(|err| format!("no se pudo escribir {}: {err}", path.display()))
+}
+
+/// Directorio de plugins del asistente (configurable por entorno).
+pub(crate) fn plugins_dir() -> std::path::PathBuf {
+    std::env::var_os("GRAFITO_PLUGINS_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("plugins"))
+}
+
+/// Directorio de plugins instalados de fábrica (paquete).
+pub(crate) fn system_plugins_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from("/usr/share/grafito/plugins")
+}
+
+/// Directorio de plugins a nivel usuario (instalación sin root).
+pub(crate) fn user_data_plugins_dir() -> std::path::PathBuf {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            let mut base = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+            base.push(".local/share");
+            base
+        })
+        .join("grafito/plugins")
+}
+
+pub(crate) fn load_config() -> AppConfig {
+    let path = config_path();
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => match serde_json::from_str(&contents) {
+            Ok(config) => config,
+            Err(err) => {
+                log::warn!("No se pudo parsear {}: {err}", path.display());
+                AppConfig::default()
+            }
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => AppConfig::default(),
+        Err(err) => {
+            log::warn!("No se pudo leer {}: {err}", path.display());
+            AppConfig::default()
+        }
+    }
+}
+
+pub(crate) fn save_config(config: &AppConfig) {
+    if let Ok(json) = serde_json::to_string_pretty(config) {
+        let path = config_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        // Escritura atómica (tmp + rename): un cierre a mitad de write no
+        // debe truncar las preferencias (antes: `fs::write` no atómico).
+        if let Err(err) = crate::export::write_text_atomic(&path, &json) {
+            log::warn!("No se pudo guardar {}: {err}", path.display());
+        }
+    }
+}
+
+/// Export para tests: expone migración best-effort sin tocar env.
+#[cfg(test)]
+pub(crate) fn migrate_legacy_for_test(new_path: &std::path::Path, legacy: &std::path::Path) {
+    try_migrate_legacy(new_path, legacy);
+}
+
+/// Debounce de autosave para la UI (estado puro, sin I/O ni relojes internos).
+///
+/// El documento se escribe al sidecar `.autosave` (ver
+/// `grafito_core::persistence::{write_autosave_sidecar, AUTOSAVE_DEBOUNCE_SECS}`)
+/// solo tras [`AUTOSAVE_DEBOUNCE_SECS`] segundos sin edición, para no
+/// re-serializar y re-validar el documento en cada keystroke. El caller pasa
+/// `now` explícito (epoch segundos) para que sea testeable y determinista.
+///
+/// Flujo: `mark_dirty(now)` en cada mutación del documento; en el tick
+/// (nunca en `Ui::`), si `should_autosave(now)` → escribir el sidecar en
+/// background thread y llamar `mark_saved()`; tras `write_document_atomic`
+/// exitoso → `mark_saved()` + borrar el sidecar. Recovery al arranque con
+/// `grafito_core::persistence::load_autosave_candidate` + diálogo modal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AutosaveDebouncer {
+    /// Epoch de la última edición pendiente de autosave (`None` = limpio).
+    last_dirty_epoch: Option<u64>,
+    /// Segundos de inactividad requeridos (default [`AUTOSAVE_DEBOUNCE_SECS`]).
+    delay_secs: u64,
+}
+
+impl AutosaveDebouncer {
+    pub(crate) fn new() -> Self {
+        Self {
+            last_dirty_epoch: None,
+            delay_secs: AUTOSAVE_DEBOUNCE_SECS,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_delay(delay_secs: u64) -> Self {
+        Self {
+            last_dirty_epoch: None,
+            delay_secs,
+        }
+    }
+
+    /// Marca el documento como editado en `now_epoch` (reinicia la espera).
+    pub(crate) fn mark_dirty(&mut self, now_epoch: u64) {
+        self.last_dirty_epoch = Some(now_epoch);
+    }
+
+    /// ¿Pasó suficiente inactividad para escribir el sidecar?
+    /// `false` si está limpio. Reloj sesgado (`now < dirty`) → `false`
+    /// (saturating, nunca ofrece con tiempo negativo).
+    pub(crate) fn should_autosave(&self, now_epoch: u64) -> bool {
+        match self.last_dirty_epoch {
+            None => false,
+            Some(dirty) => now_epoch.saturating_sub(dirty) >= self.delay_secs,
+        }
+    }
+
+    /// Limpia el estado tras escribir el sidecar o guardar el documento.
+    pub(crate) fn mark_saved(&mut self) {
+        self.last_dirty_epoch = None;
+    }
+
+    pub(crate) fn is_dirty(&self) -> bool {
+        self.last_dirty_epoch.is_some()
+    }
+}
+
+impl Default for AutosaveDebouncer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dark_mode_roundtrips_through_json() {
+        // Regresión: el toggle de tema debe persistir (los 3 sitios que
+        // cambian `dark_mode` llaman `save_app_config`, que serializa esto).
+        let config = AppConfig {
+            dark_mode: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(
+            json.contains("\"dark_mode\":true"),
+            "dark_mode se serializa"
+        );
+        let back: AppConfig = serde_json::from_str(&json).unwrap();
+        assert!(back.dark_mode, "dark_mode sobrevive al roundtrip");
+    }
+
+    #[test]
+    fn legacy_configuration_defaults_assistant_preferences() {
+        let config: AppConfig =
+            serde_json::from_str(r#"{"dark_mode":false,"show_grid":true,"snap_to_grid":false}"#)
+                .unwrap();
+
+        assert_eq!(config.assistant_provider, ProviderProfile::OpenCodeGo);
+        assert_eq!(config.assistant_model, "deepseek-v4-flash");
+        assert!(!config.allow_fusion_fallback);
+    }
+
+    #[test]
+    fn autosave_debouncer_waits_for_inactivity_then_offers_once() {
+        let mut debouncer = AutosaveDebouncer::with_delay(5);
+        assert!(!debouncer.should_autosave(100), "limpio nunca ofrece");
+        assert!(!debouncer.is_dirty());
+
+        debouncer.mark_dirty(100);
+        assert!(debouncer.is_dirty());
+        assert!(!debouncer.should_autosave(100), "recién editado no ofrece");
+        assert!(!debouncer.should_autosave(104), "4s < 5s no ofrece");
+        assert!(debouncer.should_autosave(105), "5s de inactividad ofrece");
+
+        // Nueva edición reinicia la espera.
+        debouncer.mark_dirty(200);
+        assert!(!debouncer.should_autosave(204));
+        assert!(debouncer.should_autosave(205));
+
+        // Tras guardar queda limpio hasta la próxima edición.
+        debouncer.mark_saved();
+        assert!(!debouncer.is_dirty());
+        assert!(!debouncer.should_autosave(1_000_000));
+    }
+
+    #[test]
+    fn autosave_debouncer_default_delay_matches_core_const() {
+        let debouncer = AutosaveDebouncer::new();
+        assert_eq!(debouncer.delay_secs, AUTOSAVE_DEBOUNCE_SECS);
+        assert_eq!(AutosaveDebouncer::default(), debouncer);
+        // Reloj sesgado hacia atrás nunca ofrece (saturating).
+        let mut skewed = AutosaveDebouncer::with_delay(5);
+        skewed.mark_dirty(100);
+        assert!(!skewed.should_autosave(50));
+        // Delay 0 ofrece de inmediato (útil en tests de integración).
+        let mut immediate = AutosaveDebouncer::with_delay(0);
+        immediate.mark_dirty(77);
+        assert!(immediate.should_autosave(77));
+    }
+
+    #[test]
+    fn xdg_config_path_respects_xdg_config_home() {
+        let xdg = std::path::Path::new("/tmp/xdg_config");
+        let home = std::path::Path::new("/home/user");
+        let path = xdg_config_path_for(Some(xdg), Some(home));
+        assert_eq!(
+            path,
+            std::path::PathBuf::from("/tmp/xdg_config/grafito/grafito_config.json")
+        );
+        // Sin XDG, fallback a HOME/.config
+        let fallback = xdg_config_path_for(None, Some(home));
+        assert_eq!(
+            fallback,
+            std::path::PathBuf::from("/home/user/.config/grafito/grafito_config.json")
+        );
+        // XDG vacío también fallback
+        let empty = xdg_config_path_for(Some(std::path::Path::new("")), Some(home));
+        assert_eq!(empty, fallback);
+    }
+
+    #[test]
+    fn xdg_data_path_respects_xdg_data_home() {
+        let xdg = std::path::Path::new("/tmp/xdg_data");
+        let home = std::path::Path::new("/home/user");
+        let path = xdg_data_path_for(Some(xdg), Some(home));
+        assert_eq!(
+            path,
+            std::path::PathBuf::from("/tmp/xdg_data/grafito/grafito_profile.json")
+        );
+        let fallback = xdg_data_path_for(None, Some(home));
+        assert_eq!(
+            fallback,
+            std::path::PathBuf::from("/home/user/.local/share/grafito/grafito_profile.json")
+        );
+        let empty = xdg_data_path_for(Some(std::path::Path::new("")), Some(home));
+        assert_eq!(empty, fallback);
+    }
+
+    #[test]
+    fn legacy_migration_copies_when_new_missing_and_legacy_exists() {
+        let tmp = std::env::temp_dir().join(format!(
+            "grafito_test_mig_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::create_dir_all(&tmp);
+        let legacy = tmp.join("legacy_grafito_config.json");
+        let new_path = tmp.join("xdg/grafito/grafito_config.json");
+        // Limpiar restos previos
+        let _ = std::fs::remove_file(&new_path);
+        let _ = std::fs::remove_file(&legacy);
+        std::fs::write(&legacy, br#"{"dark_mode":true}"#).expect("write legacy");
+        assert!(legacy.exists());
+        assert!(!new_path.exists());
+        migrate_legacy_for_test(&new_path, &legacy);
+        assert!(new_path.exists(), "migración copia al XDG");
+        assert!(legacy.exists(), "legado no borrado (copiar, no mover)");
+        let content = std::fs::read_to_string(&new_path).expect("read migrated");
+        assert_eq!(content, r#"{"dark_mode":true}"#);
+        // No sobrescribir si el nuevo ya existe
+        std::fs::write(&legacy, br#"{"dark_mode":false}"#).expect("overwrite legacy");
+        migrate_legacy_for_test(&new_path, &legacy);
+        let still = std::fs::read_to_string(&new_path).expect("read not overwritten");
+        assert_eq!(still, r#"{"dark_mode":true}"#, "no sobrescribe existente");
+        // Cleanup
+        let _ = std::fs::remove_file(&legacy);
+        let _ = std::fs::remove_file(&new_path);
+        let _ = std::fs::remove_dir_all(tmp.join("xdg"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn legacy_migration_noop_when_legacy_missing() {
+        let tmp = std::env::temp_dir().join(format!(
+            "grafito_test_mig2_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::create_dir_all(&tmp);
+        let legacy = tmp.join("no_legacy.json");
+        let new_path = tmp.join("new.json");
+        let _ = std::fs::remove_file(&legacy);
+        let _ = std::fs::remove_file(&new_path);
+        migrate_legacy_for_test(&new_path, &legacy);
+        assert!(!new_path.exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn xdg_paths_end_with_grafito_subdir_and_filename() {
+        // Home con forma de su plataforma: en Windows `/home/alice` no es
+        // absoluto (sin prefijo de unidad) y el assert `is_absolute` fallaba
+        // en la matriz MSVC. El contrato (grafito/<archivo> + absoluto) se
+        // verifica igual en ambas.
+        let home = if cfg!(windows) {
+            std::path::Path::new("C:\\Users\\alice")
+        } else {
+            std::path::Path::new("/home/alice")
+        };
+        let cfg = xdg_config_path_for(None, Some(home));
+        assert!(cfg.ends_with("grafito/grafito_config.json"));
+        let data = xdg_data_path_for(None, Some(home));
+        assert!(data.ends_with("grafito/grafito_profile.json"));
+        // No relativo CWD
+        assert!(cfg.is_absolute());
+        assert!(data.is_absolute());
+    }
+
+    #[test]
+    fn locale_resolves_english_primary_subtag_case_insensitively() {
+        for tag in ["en", "EN", " en ", "en_US.UTF-8", "en_GB@euro", "EN-us"] {
+            assert_eq!(
+                AppLocale::resolve_for_env(None, None, Some(tag), None),
+                AppLocale::En,
+                "tag {tag:?} debería resolver a inglés"
+            );
+        }
+    }
+
+    #[test]
+    fn locale_defaults_to_spanish_for_anything_not_english_portuguese_italian_french_or_german() {
+        for tag in [
+            "es",
+            "es_AR.UTF-8",
+            "C",
+            "C.UTF-8",
+            "POSIX",
+            "",
+            "   ",
+            "ru_RU.UTF-8",
+            "ja_JP.UTF-8",
+            "english",
+            "enx",
+            "portugues",
+        ] {
+            assert_eq!(
+                AppLocale::resolve_for_env(None, None, Some(tag), None),
+                AppLocale::Es,
+                "tag {tag:?} debería resolver a español (default)"
+            );
+        }
+        assert_eq!(
+            AppLocale::resolve_for_env(None, None, None, None),
+            AppLocale::Es
+        );
+    }
+
+    #[test]
+    fn locale_resolves_portuguese_primary_subtag() {
+        // W2: el sistema en portugués arranca en PT (cualquier región).
+        for tag in ["pt", "PT", " pt ", "pt_BR", "pt_BR.UTF-8", "pt-PT", "PT-pt"] {
+            assert_eq!(
+                AppLocale::resolve_for_env(None, None, Some(tag), None),
+                AppLocale::Pt,
+                "tag {tag:?} debería resolver a portugués"
+            );
+        }
+        // LANGUAGE lista ':' respeta la primera útil también en PT.
+        assert_eq!(
+            AppLocale::resolve_for_env(Some("pt:es"), Some("en_US.UTF-8"), Some("en"), None),
+            AppLocale::Pt
+        );
+    }
+
+    #[test]
+    fn locale_resolves_italian_french_german_primary_subtags() {
+        // Frente IT/FR/DE: el sistema en italiano/francés/alemán arranca en su
+        // idioma (cualquier región o codificación).
+        for (tag, expected) in [
+            ("it", AppLocale::It),
+            ("IT", AppLocale::It),
+            (" it ", AppLocale::It),
+            ("it_IT", AppLocale::It),
+            ("it_IT.UTF-8", AppLocale::It),
+            ("fr", AppLocale::Fr),
+            ("FR", AppLocale::Fr),
+            ("fr_FR.UTF-8", AppLocale::Fr),
+            ("fr-CA", AppLocale::Fr),
+            ("de", AppLocale::De),
+            ("DE", AppLocale::De),
+            ("de_DE.UTF-8", AppLocale::De),
+            ("de-AT", AppLocale::De),
+        ] {
+            assert_eq!(
+                AppLocale::resolve_for_env(None, None, Some(tag), None),
+                expected,
+                "tag {tag:?} debería resolver a {expected:?}"
+            );
+        }
+        // LANGUAGE lista ':' respeta la primera útil también en IT/FR/DE.
+        assert_eq!(
+            AppLocale::resolve_for_env(Some("it:es"), Some("en_US.UTF-8"), Some("en"), None),
+            AppLocale::It
+        );
+        assert_eq!(
+            AppLocale::resolve_for_env(Some("fr:es"), Some("en_US.UTF-8"), Some("en"), None),
+            AppLocale::Fr
+        );
+        assert_eq!(
+            AppLocale::resolve_for_env(Some("de:es"), Some("en_US.UTF-8"), Some("en"), None),
+            AppLocale::De
+        );
+    }
+
+    #[test]
+    fn locale_env_priority_language_then_lc_all_then_lang_then_lc_messages() {
+        // LANGUAGE (lista ':' = primera útil) gana a todo.
+        assert_eq!(
+            AppLocale::resolve_for_env(Some("en:es"), Some("es_ES.UTF-8"), Some("es"), None),
+            AppLocale::En
+        );
+        assert_eq!(
+            AppLocale::resolve_for_env(Some(":es"), Some("en_US.UTF-8"), Some("en"), None),
+            AppLocale::Es
+        );
+        // LC_ALL gana a LANG; LANG gana a LC_MESSAGES.
+        assert_eq!(
+            AppLocale::resolve_for_env(None, Some("en_US.UTF-8"), Some("es_AR.UTF-8"), None),
+            AppLocale::En
+        );
+        assert_eq!(
+            AppLocale::resolve_for_env(None, None, Some("en_US.UTF-8"), Some("es")),
+            AppLocale::En
+        );
+        assert_eq!(
+            AppLocale::resolve_for_env(None, None, None, Some("en")),
+            AppLocale::En
+        );
+    }
+
+    #[test]
+    fn locale_codes_and_ui_round_trip() {
+        assert_eq!(AppLocale::Es.code(), "es");
+        assert_eq!(AppLocale::En.code(), "en");
+        assert_eq!(AppLocale::Pt.code(), "pt");
+        assert_eq!(AppLocale::It.code(), "it");
+        assert_eq!(AppLocale::Fr.code(), "fr");
+        assert_eq!(AppLocale::De.code(), "de");
+        assert_eq!(AppLocale::default(), AppLocale::Es);
+        assert_eq!(AppLocale::Es.as_ui_locale(), grafito_ui::i18n::Locale::Es);
+        assert_eq!(AppLocale::En.as_ui_locale(), grafito_ui::i18n::Locale::En);
+        assert_eq!(AppLocale::Pt.as_ui_locale(), grafito_ui::i18n::Locale::Pt);
+        assert_eq!(AppLocale::It.as_ui_locale(), grafito_ui::i18n::Locale::It);
+        assert_eq!(AppLocale::Fr.as_ui_locale(), grafito_ui::i18n::Locale::Fr);
+        assert_eq!(AppLocale::De.as_ui_locale(), grafito_ui::i18n::Locale::De);
+        assert_eq!(
+            AppLocale::from_ui_locale(grafito_ui::i18n::Locale::Es),
+            AppLocale::Es
+        );
+        assert_eq!(
+            AppLocale::from_ui_locale(grafito_ui::i18n::Locale::En),
+            AppLocale::En
+        );
+        assert_eq!(
+            AppLocale::from_ui_locale(grafito_ui::i18n::Locale::Pt),
+            AppLocale::Pt
+        );
+        assert_eq!(
+            AppLocale::from_ui_locale(grafito_ui::i18n::Locale::It),
+            AppLocale::It
+        );
+        assert_eq!(
+            AppLocale::from_ui_locale(grafito_ui::i18n::Locale::Fr),
+            AppLocale::Fr
+        );
+        assert_eq!(
+            AppLocale::from_ui_locale(grafito_ui::i18n::Locale::De),
+            AppLocale::De
+        );
+    }
+
+    #[test]
+    fn legacy_configs_without_locale_default_to_spanish_and_persist() {
+        let legacy: AppConfig =
+            serde_json::from_str(r#"{"dark_mode":false,"show_grid":true,"snap_to_grid":false}"#)
+                .unwrap();
+        assert_eq!(legacy.locale, AppLocale::Es);
+        // Round-trip: el campo persiste con su código BCP-47 en minúsculas.
+        let mut updated = legacy;
+        updated.locale = AppLocale::En;
+        let json = serde_json::to_string(&updated).unwrap();
+        assert!(json.contains(r#""locale":"en""#), "JSON inesperado: {json}");
+        let back: AppConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.locale, AppLocale::En);
+        // W2: el portugués persiste como "pt" y vuelve intacto.
+        updated.locale = AppLocale::Pt;
+        let json = serde_json::to_string(&updated).unwrap();
+        assert!(json.contains(r#""locale":"pt""#), "JSON inesperado: {json}");
+        let back: AppConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.locale, AppLocale::Pt);
+        assert_eq!(back.locale.as_ui_locale(), grafito_ui::i18n::Locale::Pt);
+        // Frente IT/FR/DE: cada idioma persiste con su código y vuelve intacto.
+        for (locale, code) in [
+            (AppLocale::It, "it"),
+            (AppLocale::Fr, "fr"),
+            (AppLocale::De, "de"),
+        ] {
+            updated.locale = locale;
+            let json = serde_json::to_string(&updated).unwrap();
+            assert!(
+                json.contains(&format!("\"locale\":\"{code}\"")),
+                "JSON inesperado: {json}"
+            );
+            let back: AppConfig = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.locale, locale);
+            assert_eq!(back.locale.as_ui_locale(), locale.as_ui_locale());
+        }
+    }
+
+    /// Ruta única por test (sin tocar env global ni el outbox real).
+    fn outbox_sandbox(nombre: &str) -> std::path::PathBuf {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "grafito-outbox-test-{}-{}",
+            std::process::id(),
+            nombre
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join(OUTBOX_FILE_NAME)
+    }
+
+    #[test]
+    fn outbox_store_ciclo_guardar_cargar_en_disco() {
+        let path = outbox_sandbox("ciclo");
+        let mut outbox = grafito_classroom::OfflineOutbox::new();
+        outbox.enqueue("chat", "hola", 7).unwrap();
+        save_outbox_to_path(&outbox, &path).unwrap();
+        let (cargada, aviso) = load_outbox_from_path(&path);
+        assert_eq!(cargada.len(), 1);
+        assert!(aviso.is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn outbox_store_faltante_arranca_vacia_sin_aviso() {
+        let path = outbox_sandbox("faltante").join("no-existe.json");
+        let (cargada, aviso) = load_outbox_from_path(&path);
+        assert!(cargada.is_empty());
+        assert!(aviso.is_none());
+    }
+
+    #[test]
+    fn outbox_store_corrupto_descarta_honesto_con_aviso() {
+        let path = outbox_sandbox("corrupto");
+        std::fs::write(&path, "{no json").unwrap();
+        let (cargada, aviso) = load_outbox_from_path(&path);
+        assert!(cargada.is_empty());
+        assert!(aviso.is_some());
+        let _ = std::fs::remove_file(&path);
+    }
+}

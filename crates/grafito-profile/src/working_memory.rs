@@ -1,0 +1,387 @@
+//! Memoria de trabajo — contexto episódico de la sesión actual.
+//!
+//! Guarda el tema actual, pasos intentados y conteo de misconceptions
+//! para que el tutor socrático adapte preguntas y pistas sin tocar la
+//! memoria a largo plazo. Pura, acotada y testeable.
+//!
+//! # Protocolo de sincronización con el asistente (documentación, NO código)
+//!
+//! La fuente de verdad es `StudentProfile::working_memory` (este crate,
+//! capa hoja sin egui). El espejo de solo-lectura para la UI vive en
+//! `AssistantPanelState::working_memory` (`grafito-app/src/assistant.rs`).
+//! Dirección única perfil → asistente, en dos puntos (verificados, propiedad
+//! de otro agente — no duplicar lógica aquí):
+//!
+//! - `assistant.rs:559` (`sync_assistant_for_frame`, pestaña cerrada) y
+//!   `assistant.rs:567` (modo preview): `self.assistant.working_memory =
+//!   self.profile.working_memory.clone()` cada frame. Usa [`WorkingMemory::snapshot`]
+//!   si se migra a helper explícito.
+//! - `assistant.rs:1793-1797` (`record_learning`): cada feedback del usuario
+//!   alimenta la RAM episódica ANTES de clonar al espejo:
+//!   `record_attempt(misconception)` (`""` si acierto, `branch_id` si fallo),
+//!   `set_topic(name)`, `set_session_epoch(epoch)`.
+//!
+//! Invariantes que este crate garantiza (tests abajo):
+//! `snapshot()` es un clon profundo (`BTreeMap` propio); mutar el perfil
+//! después no afecta al espejo ya entregado. La UI nunca debe mutar el
+//! perfil directamente: todo intento pasa por `record_attempt` en el hilo
+//! del asistente y la persistencia va por `spawn_profile_save` (background,
+//! nunca en `Ui::`).
+
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+/// Tope de claves distintas del conteo de misconceptions (acotado de verdad:
+/// etiquetas variables del LLM no pueden hacer crecer el mapa sin cota).
+pub const MAX_KEYS: usize = 32;
+/// Tope de chars por clave de misconception (se trunca por char, UTF-8-safe).
+pub const MAX_KEY_CHARS: usize = 64;
+/// Tope de chars del tema/concepto (se persiste en JSON: nada de strings sin cota).
+pub const MAX_TOPIC_CHARS: usize = 64;
+
+/// Memoria de trabajo de la sesión (RAM episódica).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkingMemory {
+    /// Tema actual en foco (ej. "derivada", "fracciones").
+    pub current_topic: Option<String>,
+    /// Pasos/intentos totales en la sesión.
+    pub steps_tried: u32,
+    /// Conteo por tipo de misconception (ej. "sign" -> 2).
+    /// `BTreeMap` a propósito: serialización estable (claves ordenadas).
+    pub misconception_counts: BTreeMap<String, u8>,
+    /// Epoch de inicio/actualización de la sesión.
+    pub session_epoch: u64,
+    /// Último concepto mencionado/intentado.
+    pub last_concept: Option<String>,
+}
+
+#[allow(clippy::derivable_impls)]
+impl Default for WorkingMemory {
+    fn default() -> Self {
+        Self {
+            current_topic: None,
+            steps_tried: 0,
+            misconception_counts: BTreeMap::new(),
+            session_epoch: 0,
+            last_concept: None,
+        }
+    }
+}
+
+impl WorkingMemory {
+    /// Crea una memoria vacía.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Crea con epoch inicial.
+    pub fn with_epoch(session_epoch: u64) -> Self {
+        Self {
+            session_epoch,
+            ..Self::default()
+        }
+    }
+
+    /// Define el tema actual y actualiza `last_concept`.
+    /// Acotado a [`MAX_TOPIC_CHARS`] chars (se persiste en JSON).
+    pub fn set_topic(&mut self, topic: impl Into<String>) {
+        let t = topic.into();
+        let trimmed = t.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let bounded: String = trimmed.chars().take(MAX_TOPIC_CHARS).collect();
+        self.current_topic = Some(bounded.clone());
+        self.last_concept = Some(bounded);
+    }
+
+    /// Actualiza el epoch de sesión.
+    pub fn set_session_epoch(&mut self, epoch: u64) {
+        self.session_epoch = epoch;
+    }
+
+    /// Registra un intento con posible misconception.
+    ///
+    /// - Incrementa `steps_tried` (saturating).
+    /// - Si `misconception` no vacía, incrementa su contador (cap 255) y actualiza `last_concept`.
+    /// - Si vacía o whitespace, solo cuenta el paso.
+    /// - Acotado de verdad: clave truncada a [`MAX_KEY_CHARS`] chars y máximo
+    ///   [`MAX_KEYS`] claves distintas (una clave nueva con el mapa lleno se
+    ///   descarta: `steps_tried` igual cuenta el paso).
+    pub fn record_attempt(&mut self, misconception: &str) {
+        self.steps_tried = self.steps_tried.saturating_add(1);
+        let m = misconception.trim().to_lowercase();
+        if m.is_empty() {
+            return;
+        }
+        // Normaliza clave: lowercase, sin espacios extra, acotada por chars.
+        let key: String = m.chars().take(MAX_KEY_CHARS).collect();
+        if !self.misconception_counts.contains_key(&key)
+            && self.misconception_counts.len() >= MAX_KEYS
+        {
+            // Mapa lleno con clave nueva: descartar (acotado, determinista).
+            return;
+        }
+        let entry = self.misconception_counts.entry(key.clone()).or_insert(0);
+        *entry = entry.saturating_add(1);
+        self.last_concept = Some(key);
+    }
+
+    /// Limpia el estado episódico (pasos, conteos, tema actual y último concepto).
+    /// Mantiene `session_epoch` para no perder referencia temporal.
+    pub fn clear(&mut self) {
+        self.current_topic = None;
+        self.last_concept = None;
+        self.steps_tried = 0;
+        self.misconception_counts.clear();
+    }
+
+    /// Limpieza total incluyendo epoch.
+    pub fn clear_all(&mut self) {
+        self.clear();
+        self.session_epoch = 0;
+    }
+
+    /// Resumen legible para prompt/debug (acotado).
+    pub fn summary(&self) -> String {
+        use std::fmt::Write as _;
+        let topic = self.current_topic.as_deref().unwrap_or("sin tema");
+        let last = self.last_concept.as_deref().unwrap_or("ninguno");
+        // Capacidad aproximada: cabecera + ~10 chars por clave.
+        let mut s = String::with_capacity(96 + self.misconception_counts.len() * 10);
+        let _ = write!(
+            s,
+            "Tema: {topic}, pasos: {}, último: {last}, sesión: {}",
+            self.steps_tried, self.session_epoch
+        );
+        if self.misconception_counts.is_empty() {
+            s.push_str(", sin misconceptions");
+        } else {
+            s.push_str(", misconceptions: ");
+            let mut pairs: Vec<(&String, &u8)> = self.misconception_counts.iter().collect();
+            pairs.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+            // Escribe directo sin el `Vec<String>` + `join` intermedios.
+            for (i, (k, v)) in pairs.into_iter().enumerate() {
+                if i > 0 {
+                    s.push_str(", ");
+                }
+                s.push_str(k);
+                s.push('=');
+                let _ = write!(s, "{v}");
+            }
+        }
+        s
+    }
+
+    /// Espejo de solo-lectura para la UI (clon profundo).
+    ///
+    /// Punto de sincronización perfil → asistente documentado en el encabezado
+    /// del módulo: el caller clona y la UI lee el espejo sin mutar el perfil.
+    /// Sin pánicos, sin I/O.
+    pub fn snapshot(&self) -> Self {
+        self.clone()
+    }
+
+    /// Conteo total de misconceptions registradas.
+    pub fn total_misconceptions(&self) -> u32 {
+        self.misconception_counts.values().map(|v| *v as u32).sum()
+    }
+
+    /// Misconception más frecuente, si existe.
+    pub fn top_misconception(&self) -> Option<(&String, u8)> {
+        self.misconception_counts
+            .iter()
+            .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
+            .map(|(k, v)| (k, *v))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_is_empty() {
+        let wm = WorkingMemory::new();
+        assert_eq!(wm.steps_tried, 0);
+        assert!(wm.current_topic.is_none());
+        assert!(wm.misconception_counts.is_empty());
+        assert_eq!(wm.session_epoch, 0);
+        assert!(wm.last_concept.is_none());
+    }
+
+    #[test]
+    fn with_epoch_sets_epoch() {
+        let wm = WorkingMemory::with_epoch(999);
+        assert_eq!(wm.session_epoch, 999);
+    }
+
+    #[test]
+    fn set_topic_updates_both() {
+        let mut wm = WorkingMemory::new();
+        wm.set_topic("  derivada  ");
+        assert_eq!(wm.current_topic.as_deref(), Some("derivada"));
+        assert_eq!(wm.last_concept.as_deref(), Some("derivada"));
+        wm.set_topic("   ");
+        // vacío no debe sobrescribir
+        assert_eq!(wm.current_topic.as_deref(), Some("derivada"));
+    }
+
+    #[test]
+    fn record_attempt_increments() {
+        let mut wm = WorkingMemory::new();
+        wm.record_attempt("sign");
+        assert_eq!(wm.steps_tried, 1);
+        assert_eq!(wm.misconception_counts.get("sign"), Some(&1));
+        wm.record_attempt("sign");
+        assert_eq!(wm.misconception_counts.get("sign"), Some(&2));
+        wm.record_attempt("fraction");
+        assert_eq!(wm.steps_tried, 3);
+        assert_eq!(wm.total_misconceptions(), 3);
+    }
+
+    #[test]
+    fn record_attempt_empty_only_steps() {
+        let mut wm = WorkingMemory::new();
+        wm.record_attempt("   ");
+        assert_eq!(wm.steps_tried, 1);
+        assert!(wm.misconception_counts.is_empty());
+        assert!(wm.last_concept.is_none());
+    }
+
+    #[test]
+    fn record_attempt_normalizes_case() {
+        let mut wm = WorkingMemory::new();
+        wm.record_attempt("Sign");
+        wm.record_attempt("SIGN");
+        assert_eq!(wm.misconception_counts.get("sign"), Some(&2));
+        assert_eq!(wm.misconception_counts.len(), 1);
+    }
+
+    #[test]
+    fn clear_resets_episodic() {
+        let mut wm = WorkingMemory::with_epoch(123);
+        wm.set_topic("vectores");
+        wm.record_attempt("concept");
+        wm.record_attempt("sign");
+        assert!(wm.steps_tried > 0);
+        wm.clear();
+        assert_eq!(wm.steps_tried, 0);
+        assert!(wm.current_topic.is_none());
+        assert!(wm.last_concept.is_none());
+        assert!(wm.misconception_counts.is_empty());
+        // epoch se mantiene
+        assert_eq!(wm.session_epoch, 123);
+        wm.clear_all();
+        assert_eq!(wm.session_epoch, 0);
+    }
+
+    #[test]
+    fn summary_contains_info() {
+        let mut wm = WorkingMemory::new();
+        wm.set_topic("fracciones");
+        wm.record_attempt("fraction");
+        let s = wm.summary();
+        assert!(s.contains("fracciones"));
+        assert!(s.contains("pasos: 1"));
+        assert!(s.contains("fraction=1"));
+    }
+
+    #[test]
+    fn summary_empty_topic() {
+        let wm = WorkingMemory::new();
+        let s = wm.summary();
+        assert!(s.contains("sin tema"));
+        assert!(s.contains("sin misconceptions"));
+    }
+
+    #[test]
+    fn top_misconception() {
+        let mut wm = WorkingMemory::new();
+        wm.record_attempt("sign");
+        wm.record_attempt("sign");
+        wm.record_attempt("fraction");
+        let top = wm.top_misconception().expect("debe haber top");
+        assert_eq!(top.0, "sign");
+        assert_eq!(top.1, 2);
+    }
+
+    #[test]
+    fn saturating_u8() {
+        let mut wm = WorkingMemory::new();
+        for _ in 0..300 {
+            wm.record_attempt("sign");
+        }
+        assert_eq!(wm.misconception_counts.get("sign"), Some(&255));
+        assert_eq!(wm.steps_tried, 300);
+    }
+
+    #[test]
+    fn snapshot_is_deep_clone_for_ui_mirror() {
+        // Invariante del protocolo de sync (ver docs del módulo): el espejo
+        // entregado a la UI no debe cambiar si el perfil sigue mutando.
+        let mut wm = WorkingMemory::new();
+        wm.set_topic("derivada");
+        wm.record_attempt("sign");
+        let mirror = wm.snapshot();
+        assert_eq!(mirror, wm);
+        wm.record_attempt("fraction");
+        wm.set_topic("integrales");
+        assert_ne!(mirror, wm, "el espejo debe conservar el estado clonado");
+        assert_eq!(mirror.current_topic.as_deref(), Some("derivada"));
+        assert!(!mirror.misconception_counts.contains_key("fraction"));
+    }
+
+    #[test]
+    fn serde_roundtrip() {
+        let mut wm = WorkingMemory::new();
+        wm.set_topic("matrices");
+        wm.record_attempt("concept");
+        wm.set_session_epoch(42);
+        let json = serde_json::to_string(&wm).expect("serialize");
+        let de: WorkingMemory = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(wm, de);
+    }
+
+    #[test]
+    fn record_attempt_acota_claves_y_largo() {
+        // Regresión FIX 8: 1000 etiquetas variables del LLM no pueden hacer
+        // crecer el mapa sin cota (antes: cualquier string no vacío era clave).
+        let mut wm = WorkingMemory::new();
+        for i in 0..1000u32 {
+            wm.record_attempt(&format!("etiqueta-llm-{i}"));
+        }
+        assert!(
+            wm.misconception_counts.len() <= MAX_KEYS,
+            "mapa sin cota: {} claves",
+            wm.misconception_counts.len()
+        );
+        // Las primeras MAX_KEYS claves sobreviven (determinista: BTreeMap).
+        assert_eq!(wm.misconception_counts.len(), MAX_KEYS);
+        assert!(wm.misconception_counts.contains_key("etiqueta-llm-0"));
+        // Clave larga se trunca por chars (UTF-8-safe), no por bytes.
+        let mut wm2 = WorkingMemory::new();
+        wm2.record_attempt(&"ñ".repeat(500));
+        let key = wm2.misconception_counts.keys().next().expect("clave");
+        assert!(key.chars().count() <= MAX_KEY_CHARS);
+        // El paso se cuenta aunque la etiqueta nueva se descarte por cota.
+        assert_eq!(wm.steps_tried, 1000);
+    }
+
+    #[test]
+    fn set_topic_acota_chars() {
+        // Regresión FIX 8: el tema se persiste en JSON, nada de strings sin cota.
+        let mut wm = WorkingMemory::new();
+        wm.set_topic("á".repeat(500));
+        let topic = wm.current_topic.as_deref().expect("tema");
+        assert!(topic.chars().count() <= MAX_TOPIC_CHARS);
+        assert_eq!(
+            wm.last_concept
+                .as_deref()
+                .expect("concepto")
+                .chars()
+                .count(),
+            topic.chars().count()
+        );
+    }
+}

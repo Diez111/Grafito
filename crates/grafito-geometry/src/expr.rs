@@ -1,0 +1,3366 @@
+use evalexpr::*;
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
+
+use lru::LruCache;
+
+fn safe_sinh(a: f64) -> f64 {
+    if !a.is_finite() {
+        return f64::NAN;
+    }
+    if a.abs() > 710.0 {
+        return f64::INFINITY.copysign(a);
+    }
+    a.sinh()
+}
+
+fn safe_cosh(a: f64) -> f64 {
+    if !a.is_finite() {
+        return f64::NAN;
+    }
+    if a.abs() > 710.0 {
+        return f64::INFINITY;
+    }
+    a.cosh()
+}
+
+fn safe_tanh(a: f64) -> f64 {
+    if a > 20.0 {
+        1.0
+    } else if a < -20.0 {
+        -1.0
+    } else {
+        a.tanh()
+    }
+}
+
+/// Reducción única de argumento trigonométrico para AST y opcodes.
+///
+/// Reduce `x` finito a `[0, TAU)` antes de `sin/cos/tan/sec/csc/cot` para
+/// acotar el error de argumento grande de forma idéntica en ambos paths
+/// (antes cada opcode repetía su propio `rem_euclid` inline y el AST no
+/// reducía, divergiendo en `|x| > 2π`). No-finito se propaga sin tocar.
+#[inline]
+pub fn trig_reduce(x: f64) -> f64 {
+    if x.is_finite() {
+        x.rem_euclid(std::f64::consts::TAU)
+    } else {
+        x
+    }
+}
+
+fn setup_math_context() -> HashMapContext {
+    let mut ctx = HashMapContext::new();
+    let _ = ctx.set_function(
+        "sin".into(),
+        evalexpr::Function::new(|arg| Ok(Value::Float(arg.as_float()?.sin()))),
+    );
+    // Alias español de `sin` (GeoGebra ES usa `sen`): misma semántica.
+    let _ = ctx.set_function(
+        "sen".into(),
+        evalexpr::Function::new(|arg| Ok(Value::Float(arg.as_float()?.sin()))),
+    );
+    let _ = ctx.set_function(
+        "cos".into(),
+        evalexpr::Function::new(|arg| Ok(Value::Float(arg.as_float()?.cos()))),
+    );
+    let _ = ctx.set_function(
+        "tan".into(),
+        evalexpr::Function::new(|arg| Ok(Value::Float(arg.as_float()?.tan()))),
+    );
+    let _ = ctx.set_function(
+        "asin".into(),
+        evalexpr::Function::new(|arg| {
+            let v = arg.as_float()?;
+            let clamped = if v > 1.0 && v < 1.0 + 1e-8 {
+                1.0
+            } else if v < -1.0 && v > -1.0 - 1e-8 {
+                -1.0
+            } else {
+                v
+            };
+            Ok(Value::Float(clamped.asin()))
+        }),
+    );
+    let _ = ctx.set_function(
+        "acos".into(),
+        evalexpr::Function::new(|arg| {
+            let v = arg.as_float()?;
+            let clamped = if v > 1.0 && v < 1.0 + 1e-8 {
+                1.0
+            } else if v < -1.0 && v > -1.0 - 1e-8 {
+                -1.0
+            } else {
+                v
+            };
+            Ok(Value::Float(clamped.acos()))
+        }),
+    );
+    let _ = ctx.set_function(
+        "atan".into(),
+        evalexpr::Function::new(|arg| Ok(Value::Float(arg.as_float()?.atan()))),
+    );
+    let _ = ctx.set_function(
+        "sqrt".into(),
+        evalexpr::Function::new(|arg| {
+            let v = arg.as_float()?;
+            let clamped = if v < 0.0 && v > -1e-8 { 0.0 } else { v };
+            Ok(Value::Float(clamped.sqrt()))
+        }),
+    );
+    let _ = ctx.set_function(
+        "abs".into(),
+        evalexpr::Function::new(|arg| Ok(Value::Float(arg.as_float()?.abs()))),
+    );
+    let _ = ctx.set_function(
+        "exp".into(),
+        evalexpr::Function::new(|arg| Ok(Value::Float(arg.as_float()?.exp()))),
+    );
+    let _ = ctx.set_function(
+        "ln".into(),
+        evalexpr::Function::new(|arg| Ok(Value::Float(arg.as_float()?.ln()))),
+    );
+    let _ = ctx.set_function(
+        "sec".into(),
+        evalexpr::Function::new(|arg| {
+            let c = arg.as_float()?.cos();
+            Ok(Value::Float(if c.abs() < 1e-15 {
+                f64::NAN
+            } else {
+                1.0 / c
+            }))
+        }),
+    );
+    let _ = ctx.set_function(
+        "csc".into(),
+        evalexpr::Function::new(|arg| {
+            let s = arg.as_float()?.sin();
+            Ok(Value::Float(if s.abs() < 1e-15 {
+                f64::NAN
+            } else {
+                1.0 / s
+            }))
+        }),
+    );
+    let _ = ctx.set_function(
+        "cot".into(),
+        evalexpr::Function::new(|arg| {
+            let t = arg.as_float()?.tan();
+            Ok(Value::Float(if t.abs() < 1e-15 {
+                f64::NAN
+            } else {
+                1.0 / t
+            }))
+        }),
+    );
+    let _ = ctx.set_function(
+        "sinh".into(),
+        evalexpr::Function::new(|arg| Ok(Value::Float(safe_sinh(arg.as_float()?)))),
+    );
+    let _ = ctx.set_function(
+        "cosh".into(),
+        evalexpr::Function::new(|arg| Ok(Value::Float(safe_cosh(arg.as_float()?)))),
+    );
+    let _ = ctx.set_function(
+        "tanh".into(),
+        evalexpr::Function::new(|arg| Ok(Value::Float(safe_tanh(arg.as_float()?)))),
+    );
+    let _ = ctx.set_function(
+        "sign".into(),
+        evalexpr::Function::new(|arg| Ok(Value::Float(arg.as_float()?.signum()))),
+    );
+    let _ = ctx.set_function(
+        "floor".into(),
+        evalexpr::Function::new(|arg| Ok(Value::Float(arg.as_float()?.floor()))),
+    );
+    let _ = ctx.set_function(
+        "ceil".into(),
+        evalexpr::Function::new(|arg| Ok(Value::Float(arg.as_float()?.ceil()))),
+    );
+    let _ = ctx.set_function(
+        "round".into(),
+        evalexpr::Function::new(|arg| Ok(Value::Float(arg.as_float()?.round()))),
+    );
+    let _ = ctx.set_function(
+        "asinh".into(),
+        evalexpr::Function::new(|arg| Ok(Value::Float(arg.as_float()?.asinh()))),
+    );
+    let _ = ctx.set_function(
+        "acosh".into(),
+        evalexpr::Function::new(|arg| Ok(Value::Float(arg.as_float()?.acosh()))),
+    );
+    let _ = ctx.set_function(
+        "atanh".into(),
+        evalexpr::Function::new(|arg| Ok(Value::Float(arg.as_float()?.atanh()))),
+    );
+    let _ = ctx.set_function(
+        "heaviside".into(),
+        evalexpr::Function::new(|arg| {
+            Ok(Value::Float(if arg.as_float()? < 0.0 { 0.0 } else { 1.0 }))
+        }),
+    );
+    let _ = ctx.set_function(
+        "step".into(),
+        evalexpr::Function::new(|arg| {
+            Ok(Value::Float(if arg.as_float()? < 0.0 { 0.0 } else { 1.0 }))
+        }),
+    );
+    let _ = ctx.set_function(
+        "cbrt".into(),
+        evalexpr::Function::new(|arg| Ok(Value::Float(arg.as_float()?.cbrt()))),
+    );
+    let _ = ctx.set_function(
+        "re".into(),
+        evalexpr::Function::new(|arg| Ok(Value::Float(arg.as_float()?))),
+    );
+    let _ = ctx.set_function(
+        "real".into(),
+        evalexpr::Function::new(|arg| Ok(Value::Float(arg.as_float()?))),
+    );
+    let _ = ctx.set_function(
+        "im".into(),
+        evalexpr::Function::new(|_| Ok(Value::Float(0.0))),
+    );
+    let _ = ctx.set_function(
+        "imag".into(),
+        evalexpr::Function::new(|_| Ok(Value::Float(0.0))),
+    );
+    let _ = ctx.set_function(
+        "arg".into(),
+        evalexpr::Function::new(|arg| {
+            let v = arg.as_float()?;
+            Ok(Value::Float(if v >= 0.0 {
+                0.0
+            } else {
+                std::f64::consts::PI
+            }))
+        }),
+    );
+    let _ = ctx.set_function(
+        "conj".into(),
+        evalexpr::Function::new(|arg| Ok(Value::Float(arg.as_float()?))),
+    );
+    let _ = ctx.set_function(
+        "conjugate".into(),
+        evalexpr::Function::new(|arg| Ok(Value::Float(arg.as_float()?))),
+    );
+    // Special functions
+    let _ = ctx.set_function(
+        "erf".into(),
+        evalexpr::Function::new(|arg| {
+            Ok(Value::Float(crate::special_functions::erf(arg.as_float()?)))
+        }),
+    );
+    let _ = ctx.set_function(
+        "erfc".into(),
+        evalexpr::Function::new(|arg| {
+            Ok(Value::Float(crate::special_functions::erfc(
+                arg.as_float()?,
+            )))
+        }),
+    );
+    let _ = ctx.set_function(
+        "gamma".into(),
+        evalexpr::Function::new(|arg| {
+            Ok(Value::Float(crate::special_functions::gamma(
+                arg.as_float()?,
+            )))
+        }),
+    );
+    let _ = ctx.set_function(
+        "lngamma".into(),
+        evalexpr::Function::new(|arg| {
+            Ok(Value::Float(crate::special_functions::ln_gamma(
+                arg.as_float()?,
+            )))
+        }),
+    );
+    let _ = ctx.set_function(
+        "lgamma".into(),
+        evalexpr::Function::new(|arg| {
+            Ok(Value::Float(crate::special_functions::ln_gamma(
+                arg.as_float()?,
+            )))
+        }),
+    );
+    let _ = ctx.set_function(
+        "digamma".into(),
+        evalexpr::Function::new(|arg| {
+            Ok(Value::Float(crate::special_functions::digamma(
+                arg.as_float()?,
+            )))
+        }),
+    );
+    let _ = ctx.set_function(
+        "trigamma".into(),
+        evalexpr::Function::new(|arg| {
+            Ok(Value::Float(crate::special_functions::trigamma(
+                arg.as_float()?,
+            )))
+        }),
+    );
+    // Multi-arg functions via tuples
+    let _ = ctx.set_function(
+        "atan2".into(),
+        evalexpr::Function::new(|arg| {
+            let t = arg.as_tuple()?;
+            if t.len() == 2 {
+                Ok(Value::Float(t[0].as_float()?.atan2(t[1].as_float()?)))
+            } else {
+                Err(evalexpr::EvalexprError::wrong_function_argument_amount(
+                    2,
+                    t.len(),
+                ))
+            }
+        }),
+    );
+    let _ = ctx.set_function(
+        "mod".into(),
+        evalexpr::Function::new(|arg| {
+            let t = arg.as_tuple()?;
+            if t.len() == 2 {
+                Ok(Value::Float(t[0].as_float()? % t[1].as_float()?))
+            } else {
+                Err(evalexpr::EvalexprError::wrong_function_argument_amount(
+                    2,
+                    t.len(),
+                ))
+            }
+        }),
+    );
+    let _ = ctx.set_function(
+        "min".into(),
+        evalexpr::Function::new(|arg| {
+            let t = arg.as_tuple()?;
+            if t.len() == 2 {
+                Ok(Value::Float(t[0].as_float()?.min(t[1].as_float()?)))
+            } else {
+                Err(evalexpr::EvalexprError::wrong_function_argument_amount(
+                    2,
+                    t.len(),
+                ))
+            }
+        }),
+    );
+    let _ = ctx.set_function(
+        "max".into(),
+        evalexpr::Function::new(|arg| {
+            let t = arg.as_tuple()?;
+            if t.len() == 2 {
+                Ok(Value::Float(t[0].as_float()?.max(t[1].as_float()?)))
+            } else {
+                Err(evalexpr::EvalexprError::wrong_function_argument_amount(
+                    2,
+                    t.len(),
+                ))
+            }
+        }),
+    );
+    let _ = ctx.set_function(
+        "clamp".into(),
+        evalexpr::Function::new(|arg| {
+            let t = arg.as_tuple()?;
+            if t.len() == 3 {
+                let value = t[0].as_float()?;
+                let lower = t[1].as_float()?;
+                let upper = t[2].as_float()?;
+                crate::ast::checked_clamp(value, lower, upper)
+                    .map(Value::Float)
+                    .ok_or_else(|| {
+                        evalexpr::EvalexprError::CustomMessage(
+                            "clamp requires finite bounds where lower <= upper".into(),
+                        )
+                    })
+            } else {
+                Err(evalexpr::EvalexprError::wrong_function_argument_amount(
+                    3,
+                    t.len(),
+                ))
+            }
+        }),
+    );
+    let _ = ctx.set_function(
+        "beta".into(),
+        evalexpr::Function::new(|arg| {
+            let t = arg.as_tuple()?;
+            if t.len() == 2 {
+                Ok(Value::Float(crate::special_functions::beta(
+                    t[0].as_float()?,
+                    t[1].as_float()?,
+                )))
+            } else {
+                Err(evalexpr::EvalexprError::wrong_function_argument_amount(
+                    2,
+                    t.len(),
+                ))
+            }
+        }),
+    );
+    let _ = ctx.set_function(
+        "besselj".into(),
+        evalexpr::Function::new(|arg| {
+            let t = arg.as_tuple()?;
+            if t.len() == 2 {
+                let order = crate::special_functions::parse_bessel_order(t[0].as_float()?);
+                let input = t[1].as_float()?;
+                Ok(Value::Float(order.map_or(f64::NAN, |order| {
+                    crate::special_functions::bessel_j(order, input)
+                })))
+            } else {
+                Err(evalexpr::EvalexprError::wrong_function_argument_amount(
+                    2,
+                    t.len(),
+                ))
+            }
+        }),
+    );
+    let _ = ctx.set_function(
+        "bessely".into(),
+        evalexpr::Function::new(|arg| {
+            let t = arg.as_tuple()?;
+            if t.len() == 2 {
+                let order = crate::special_functions::parse_bessel_order(t[0].as_float()?);
+                let input = t[1].as_float()?;
+                Ok(Value::Float(order.map_or(f64::NAN, |order| {
+                    crate::special_functions::bessel_y(order, input)
+                })))
+            } else {
+                Err(evalexpr::EvalexprError::wrong_function_argument_amount(
+                    2,
+                    t.len(),
+                ))
+            }
+        }),
+    );
+    let _ = ctx.set_function(
+        "besseli".into(),
+        evalexpr::Function::new(|arg| {
+            let t = arg.as_tuple()?;
+            if t.len() == 2 {
+                let order = crate::special_functions::parse_bessel_order(t[0].as_float()?);
+                let input = t[1].as_float()?;
+                Ok(Value::Float(order.map_or(f64::NAN, |order| {
+                    crate::special_functions::bessel_i(order, input)
+                })))
+            } else {
+                Err(evalexpr::EvalexprError::wrong_function_argument_amount(
+                    2,
+                    t.len(),
+                ))
+            }
+        }),
+    );
+    let _ = ctx.set_function(
+        "log".into(),
+        evalexpr::Function::new(|arg| {
+            let t = arg.as_tuple()?;
+            if t.len() == 2 {
+                Ok(Value::Float(t[0].as_float()?.log(t[1].as_float()?)))
+            } else {
+                Err(evalexpr::EvalexprError::wrong_function_argument_amount(
+                    2,
+                    t.len(),
+                ))
+            }
+        }),
+    );
+    let _ = ctx.set_value("pi".into(), Value::Float(std::f64::consts::PI));
+    let _ = ctx.set_value("tau".into(), Value::Float(std::f64::consts::TAU));
+    let _ = ctx.set_value("e".into(), Value::Float(std::f64::consts::E));
+    ctx
+}
+
+fn split_args_depth0(s: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut depth = 0;
+    let mut start = 0;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                args.push(s[start..i].trim().to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    args.push(s[start..].trim().to_string());
+    args
+}
+
+fn replace_standalone_var(expr: &str, var: &str, value: f64) -> String {
+    let var_chars: Vec<char> = var.chars().collect();
+    let expr_chars: Vec<char> = expr.chars().collect();
+    let vs = if value == value.trunc() && value.is_finite() {
+        format!("{:.1}", value)
+    } else {
+        value.to_string()
+    };
+    let mut result = String::new();
+    let mut i = 0;
+    while i < expr_chars.len() {
+        if i + var_chars.len() <= expr_chars.len()
+            && expr_chars[i..i + var_chars.len()] == var_chars[..]
+        {
+            let prev = i.checked_sub(1).map(|index| expr_chars[index]);
+            // Un dígito antes del nombre no lo bloquea: `2x` es producto
+            // implícito. Un char de identificador después sí bloquea: `x2`
+            // es otra variable, no `x` multiplicada por 2.
+            let prev_is_bound = prev.is_none_or(|c| !c.is_ascii_alphabetic() && c != '_');
+            let next = expr_chars.get(i + var_chars.len()).copied();
+            let next_is_bound = next.is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_');
+            if prev_is_bound && next_is_bound {
+                // `2x` con x=1 debe dar `2*1.0`, no `21.0`: sin el `*`
+                // explícito la sustitución fusiona el literal con el dígito.
+                if prev.is_some_and(|c| c.is_ascii_digit() || c == ')' || c == ']') {
+                    result.push('*');
+                }
+                result.push_str(&vs);
+                i += var_chars.len();
+                continue;
+            }
+        }
+        result.push(expr_chars[i]);
+        i += 1;
+    }
+    result
+}
+
+const MAX_SUM_PRODUCT_TERMS: usize = 2_000;
+const MAX_EXPANDED_EXPR_LEN: usize = 50_000;
+
+/// Largo máximo de expresión aceptada por `evaluate` y los paths batch/compilados.
+///
+/// Espeja el `MAX_EXPR_LENGTH` 2000 de `function_sampling`/`implicit_curve`.
+/// F10-FIX (SIGABRT en producción): `evaluate` con ~16KB (`"x+".repeat(8000)`)
+/// desbordaba la pila (workers de 2MB) dentro de `evalexpr::build_operator_tree`
+/// —un stack overflow aborta el proceso y `catch_unwind` no lo atrapa.
+pub const MAX_EXPR_LENGTH: usize = 2000;
+
+/// Profundidad máxima de paréntesis anidados aceptada antes de parsear.
+///
+/// Espeja `MAX_AST_DEPTH` 256 de `ast`: lo más profundo daría `Err` en
+/// `parse_ast` de todos modos; se rechaza acá para no depender del slow-path
+/// `evalexpr` (recursivo) con entradas que `parse_ast` ya descartó.
+pub const MAX_EXPR_NESTING: usize = 256;
+
+/// Racha máxima de operadores ASCII encadenados (`+-*/^` seguidos) aceptada
+/// antes de parsear. Ninguna expresión legítima la roza; una racha kilométrica
+/// sólo aparece en payloads hostiles o corruptos.
+pub const MAX_EXPR_OPERATOR_RUN: usize = 256;
+
+/// Guarda de presupuesto F10-FIX: `Ok` si la expresión puede evaluarse sin
+/// riesgo de stack overflow, `Err` honesto en caso contrario.
+///
+/// Recorrido O(n) sin alloc y sin recursión sobre bytes (los delimitadores
+/// son ASCII, así que el escaneo por bytes nunca parte un scalar UTF-8).
+/// Llamar ANTES de `parse_ast`/`preprocess_expr`/`build_operator_tree`.
+fn check_expr_budget(expr: &str) -> Result<(), String> {
+    if expr.len() > MAX_EXPR_LENGTH {
+        return Err(format!(
+            "Expression exceeds maximum {MAX_EXPR_LENGTH} bytes (got {})",
+            expr.len()
+        ));
+    }
+    let mut depth: usize = 0;
+    let mut op_run: usize = 0;
+    for byte in expr.bytes() {
+        match byte {
+            b'(' => {
+                depth += 1;
+                op_run = 0;
+                if depth > MAX_EXPR_NESTING {
+                    return Err(format!(
+                        "Expression exceeds maximum nesting depth {MAX_EXPR_NESTING}"
+                    ));
+                }
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                op_run = 0;
+            }
+            b'+' | b'-' | b'*' | b'/' | b'^' => {
+                op_run += 1;
+                if op_run > MAX_EXPR_OPERATOR_RUN {
+                    return Err(format!(
+                        "Expression exceeds maximum chained operators {MAX_EXPR_OPERATOR_RUN}"
+                    ));
+                }
+            }
+            _ => op_run = 0,
+        }
+    }
+    Ok(())
+}
+
+fn find_standalone_sum_product(expr: &str) -> Option<(usize, usize, bool)> {
+    let patterns: &[(&str, bool)] = &[("sum(", false), ("product(", true), ("prod(", true)];
+    for (byte_offset, _) in expr.char_indices() {
+        for &(pat, is_prod) in patterns {
+            if expr[byte_offset..].starts_with(pat) {
+                let is_standalone =
+                    byte_offset == 0 || !expr.as_bytes()[byte_offset - 1].is_ascii_alphabetic();
+                if is_standalone {
+                    let open_paren = byte_offset + pat.len() - 1;
+                    if let Some(close) = find_matching_close(expr, open_paren) {
+                        return Some((byte_offset, close, is_prod));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn expand_sum_product_once(expr: &str) -> Option<String> {
+    let (func_start, close, is_product) = find_standalone_sum_product(expr)?;
+    let op = if is_product { "*" } else { "+" };
+    let open = expr[func_start..].find('(')? + func_start;
+    let inside = &expr[open + 1..close];
+    let args = split_args_depth0(inside);
+    if args.len() != 4 {
+        return None;
+    }
+
+    let body = &args[0];
+    let var = &args[1];
+    let start: i64 = args[2].trim().parse().ok()?;
+    let end: i64 = args[3].trim().parse().ok()?;
+    if var.is_empty() {
+        return None;
+    }
+
+    let num_terms = usize::try_from(end.abs_diff(start).checked_add(1)?).ok()?;
+    if num_terms > MAX_SUM_PRODUCT_TERMS {
+        return None;
+    }
+
+    let step: i64 = if end >= start { 1 } else { -1 };
+    let mut terms = Vec::with_capacity(num_terms);
+    let mut expanded_len = func_start.checked_add(expr.len().checked_sub(close + 1)?)?;
+    let mut val = start;
+    loop {
+        let substituted = replace_standalone_var(body, var, val as f64);
+        let separator_len = if terms.is_empty() { 0 } else { op.len() };
+        let term_len = substituted.len().checked_add(2)?;
+        expanded_len = expanded_len
+            .checked_add(separator_len)?
+            .checked_add(term_len)?;
+        if expanded_len > MAX_EXPANDED_EXPR_LEN {
+            return None;
+        }
+        terms.push(format!("({})", substituted));
+        if val == end {
+            break;
+        }
+        val += step;
+    }
+
+    let expanded = terms.join(op);
+    let prefix = &expr[..func_start];
+    let suffix = &expr[close + 1..];
+    Some(format!("{}{}{}", prefix, expanded, suffix))
+}
+
+/// Encuentra el byte offset del paréntesis de cierre que corresponde
+/// al paréntesis de apertura en `open` (también byte offset).
+/// Retorna el byte offset del `)`, o None si no se encuentra.
+fn find_matching_close(s: &str, open: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if open >= bytes.len() || bytes[open] != b'(' {
+        return None;
+    }
+    let mut depth: i32 = 0;
+    // Iteramos sobre bytes (no chars) porque los paréntesis son ASCII
+    // y esto es más simple. Para UTF-8, los paréntesis `(` y `)` siempre
+    // son 1 byte.
+    for (i, &b) in bytes.iter().enumerate().skip(open) {
+        match b {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn expand_sum_product(expr: &str) -> String {
+    let mut s = expr.to_string();
+    while s.len() <= MAX_EXPANDED_EXPR_LEN {
+        if let Some(expanded) = expand_sum_product_once(&s) {
+            if expanded.len() == s.len() {
+                break;
+            }
+            s = expanded;
+        } else {
+            break;
+        }
+    }
+    s
+}
+
+pub fn preprocess_expr(expr: &str) -> String {
+    let mut s = normalize_bracketed_function_calls(&expand_sum_product(expr));
+
+    // Replace LaTeX rac{A}{B} with ((A)/(B))
+    // We will do a simple iterative replacement finding rac
+    while let Some(idx) = s.find("\\frac{") {
+        let mut brace_count = 1;
+        let mut end_a = 0;
+        let start_a = idx + 6;
+        for (i, c) in s[start_a..].char_indices() {
+            if c == '{' {
+                brace_count += 1;
+            } else if c == '}' {
+                brace_count -= 1;
+            }
+            if brace_count == 0 {
+                end_a = start_a + i;
+                break;
+            }
+        }
+
+        let start_b_search = end_a + 1;
+        if start_b_search < s.len() && s[start_b_search..].starts_with("{") {
+            let start_b = start_b_search + 1;
+            let mut brace_count = 1;
+            let mut end_b = 0;
+            for (i, c) in s[start_b..].char_indices() {
+                if c == '{' {
+                    brace_count += 1;
+                } else if c == '}' {
+                    brace_count -= 1;
+                }
+                if brace_count == 0 {
+                    end_b = start_b + i;
+                    break;
+                }
+            }
+            if end_a > 0 && end_b > 0 {
+                let part_a = &s[start_a..end_a];
+                let part_b = &s[start_b..end_b];
+                let replacement = format!("(({})/({}))", part_a, part_b);
+                s.replace_range(idx..end_b + 1, &replacement);
+                continue;
+            }
+        }
+        // If we couldn't parse it properly, just break to avoid infinite loop
+        break;
+    }
+
+    // Replace \sqrt{A} with sqrt(A)
+    while let Some(idx) = s.find("\\sqrt{") {
+        let mut brace_count = 1;
+        let mut end_a = 0;
+        let start_a = idx + 6;
+        for (i, c) in s[start_a..].char_indices() {
+            if c == '{' {
+                brace_count += 1;
+            } else if c == '}' {
+                brace_count -= 1;
+            }
+            if brace_count == 0 {
+                end_a = start_a + i;
+                break;
+            }
+        }
+        if end_a > 0 {
+            let part_a = &s[start_a..end_a];
+            let replacement = format!("sqrt({})", part_a);
+            s.replace_range(idx..end_a + 1, &replacement);
+            continue;
+        }
+        break;
+    }
+
+    let replaced = s
+        .replace("cos^(-1)", "acos")
+        .replace("sin^(-1)", "asin")
+        .replace("tan^(-1)", "atan")
+        .replace("π", "pi")
+        .replace("\\pi", "pi")
+        .replace("\\sin", "sin")
+        .replace("\\sen", "sen")
+        .replace("\\cos", "cos")
+        .replace("\\tan", "tan")
+        .replace("\\ln", "ln")
+        .replace("\\log", "log")
+        // **Superscripts Unicode**: x², y², etc. Se reemplazan al cargar
+        // archivos .json o cualquier expresión que no pase por el
+        // command processor. Sin esto, el AST no se puede parsear y el
+        // render falla silenciosamente.
+        .replace("x²", "x^2")
+        .replace("y²", "y^2")
+        .replace("z²", "z^2")
+        .replace("t²", "t^2")
+        .replace("r²", "r^2")
+        .replace("a²", "a^2")
+        .replace("b²", "b^2")
+        .replace("c²", "c^2")
+        .replace("n²", "n^2")
+        .replace("θ²", "θ^2")
+        .replace("φ²", "φ^2")
+        .replace("x³", "x^3")
+        .replace("y³", "y^3")
+        .replace("z³", "z^3")
+        .replace("√", "sqrt")
+        .replace("|x|", "abs(x)")
+        .replace("·", "*")
+        .replace("f'(x)", "deriv(f(x))")
+        .replace("g'(x)", "deriv(g(x))")
+        .replace("h'(x)", "deriv(h(x))")
+        // Remove accidental '*' after function names (e.g. if user types acos*(x))
+        .replace("acos*(", "acos(")
+        .replace("asin*(", "asin(")
+        .replace("atan*(", "atan(")
+        .replace("sin*(", "sin(")
+        .replace("cos*(", "cos(")
+        .replace("tan*(", "tan(")
+        .replace("log*(", "log(")
+        .replace("ln*(", "ln(")
+        .replace("sqrt*(", "sqrt(")
+        .replace("abs*(", "abs(")
+        .replace("exp*(", "exp(");
+
+    let mut res = String::new();
+    let chars: Vec<char> = replaced.chars().collect();
+    for i in 0..chars.len() {
+        res.push(chars[i]);
+        if i + 1 < chars.len() {
+            let c1 = chars[i];
+            let c2 = chars[i + 1];
+            if c1.is_ascii_digit()
+                && c2.is_ascii_alphabetic()
+                && !starts_scientific_exponent(&chars, i + 1)
+            {
+                res.push('*');
+            }
+            if c1 == ')' && c2.is_ascii_alphabetic() {
+                res.push('*');
+            }
+            if c1 == ')' && c2.is_ascii_digit() {
+                res.push('*');
+            }
+            if c1.is_ascii_digit() && c2 == '(' && (i == 0 || !chars[i - 1].is_ascii_alphabetic()) {
+                res.push('*');
+            }
+            if c1 == ')' && c2 == '(' {
+                res.push('*');
+            }
+        }
+    }
+    res
+}
+
+fn starts_scientific_exponent(chars: &[char], exponent_index: usize) -> bool {
+    if !matches!(chars.get(exponent_index), Some('e' | 'E')) {
+        return false;
+    }
+    let mut digit_index = exponent_index + 1;
+    if matches!(chars.get(digit_index), Some('+' | '-')) {
+        digit_index += 1;
+    }
+    chars
+        .get(digit_index)
+        .is_some_and(|character| character.is_ascii_digit())
+}
+
+/// Convierte `Sin[x]` en `Sin(x)` sólo para llamadas matemáticas conocidas.
+///
+/// Los comandos de Grafito usan corchetes, pero las expresiones internas usan
+/// paréntesis. Limitar la conversión a este vocabulario evita reinterpretar
+/// índices, listas u otros textos entre corchetes como llamadas matemáticas.
+fn normalize_bracketed_function_calls(expr: &str) -> String {
+    let mut normalized = String::with_capacity(expr.len());
+    let mut brackets = Vec::new();
+    let mut offset = 0;
+
+    while offset < expr.len() {
+        let rest = &expr[offset..];
+        let Some(character) = rest.chars().next() else {
+            break;
+        };
+        if character.is_ascii_alphabetic() {
+            let end = rest
+                .char_indices()
+                .find_map(|(index, candidate)| (!candidate.is_ascii_alphabetic()).then_some(index))
+                .unwrap_or(rest.len());
+            let name = &rest[..end];
+            normalized.push_str(name);
+            offset += end;
+
+            if expr[offset..].starts_with('[') && is_known_math_function(name) {
+                normalized.push('(');
+                brackets.push(true);
+                offset += 1;
+            }
+            continue;
+        }
+
+        match character {
+            '[' => {
+                normalized.push('[');
+                brackets.push(false);
+            }
+            ']' => {
+                if brackets.pop().unwrap_or(false) {
+                    normalized.push(')');
+                } else {
+                    normalized.push(']');
+                }
+            }
+            _ => normalized.push(character),
+        }
+        offset += character.len_utf8();
+    }
+
+    normalized
+}
+
+fn is_known_math_function(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "abs"
+            | "acos"
+            | "acosh"
+            | "asin"
+            | "asinh"
+            | "atan"
+            | "atan2"
+            | "atanh"
+            | "bessel_i"
+            | "bessel_j"
+            | "bessel_y"
+            | "besseli"
+            | "besselj"
+            | "bessely"
+            | "beta"
+            | "cbrt"
+            | "ceil"
+            | "clamp"
+            | "cos"
+            | "cosh"
+            | "cot"
+            | "csc"
+            | "digamma"
+            | "erf"
+            | "erfc"
+            | "exp"
+            | "floor"
+            | "gamma"
+            | "heaviside"
+            | "ln"
+            | "lngamma"
+            | "log"
+            | "max"
+            | "min"
+            | "piecewise"
+            | "round"
+            | "sec"
+            | "sen"
+            | "sign"
+            | "sin"
+            | "sinh"
+            | "sqrt"
+            | "tan"
+            | "tanh"
+            | "trigamma"
+    )
+}
+
+/// Capacidad del LRU de expresiones compiladas: 128 (NO subir sin medir).
+///
+/// Medición 2026-09-23 (`benches/cache_probe.rs`, temporal, borrado tras
+/// medir; round-robin `evaluate_cached` sobre W expresiones distintas,
+/// criterion, release):
+/// - W=64 (realista): 128 → 10.22µs; 512 → 9.97µs (−2.4%, ruido); 1024 →
+///   10.23µs (+0.1%). Sin ganancia: Δ < 3% en todos los casos.
+/// - W=200/600 (sintéticos, exceden 128 a propósito): 512/1024 ganan 50×+,
+///   pero ningún path real genera ese working set: `expand`/`factor`/
+///   Groebner operan sobre AST, no sobre este cache de strings; los
+///   consumidores de `evaluate_cached` (`function_sampling`, probes de
+///   polo) evalúan 1 expresión N veces o decenas como máximo.
+///
+/// Cada entrada retiene un `Arc<CompiledExpr>` (AST + opcodes): 512/1024
+/// multiplican la memoria retenida sin beneficio real. Conclusión: se queda
+/// en 128. Si un perfil futuro muestra un working set real > 128 con
+/// `miss` dominando, reabrir con datos (igual que `docs/profiling.md` hizo
+/// con mimalloc y `-march=native`).
+const MAX_COMPILED_EXPR_CACHE: usize = 128;
+// F14.4.3: construcción `const` sin `unsafe`: el cap es literal > 0 y el
+// `panic!` de la rama imposible se evalúa en compilación, nunca en runtime.
+const COMPILED_EXPR_CACHE_SIZE: NonZeroUsize = match NonZeroUsize::new(MAX_COMPILED_EXPR_CACHE) {
+    Some(v) => v,
+    None => panic!("MAX_COMPILED_EXPR_CACHE must be nonzero"),
+};
+
+thread_local! {
+    /// Cache LRU de expresiones compiladas, clave normalizada (trimmed).
+    ///
+    /// Almacenar `None` indica que la expresión falló al compilar y debe usar
+    /// el path lento interpretado. Acotado a 128 entradas
+    /// (`MAX_COMPILED_EXPR_CACHE`) con desalojo LRU real: el presupuesto de
+    /// memoria está acotado y las expresiones calientes evitan re-parsear.
+    static COMPILED_EXPR_CACHE: RefCell<LruCache<String, Option<std::sync::Arc<CompiledExpr>>>> =
+        RefCell::new(LruCache::new(COMPILED_EXPR_CACHE_SIZE));
+}
+
+/// Evaluate a mathematical expression, reusing a previously compiled form when
+/// available.
+///
+/// This is the preferred path for callers that evaluate the same expression
+/// repeatedly with different variable values (e.g. bound geometry parameters,
+/// parametric samples). The first call compiles and caches the expression;
+/// subsequent calls skip tokenisation/parsing/pre-processing.
+pub fn evaluate_cached(expr: &str, vars: &[(String, f64)]) -> Result<f64, String> {
+    // F10-FIX: la guarda va antes del cache para no envenenarlo con claves hostiles
+    // y antes de `CompiledExpr::new` (cuyo slow-path `evalexpr` es el que overflowea).
+    check_expr_budget(expr)?;
+    if crate::precision::is_high_precision_mode() {
+        return evaluate(expr, vars);
+    }
+    COMPILED_EXPR_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        // P2-perf: lookup por `&str` sin alocar en hit (el `to_owned` solo
+        // en miss frío); antes cada probe pagaba 1 `String` + hash.
+        let trimmed = expr.trim();
+        if let Some(cached) = cache.get(trimmed).cloned() {
+            match cached {
+                Some(compiled) => compiled.eval(vars),
+                None => evaluate(expr, vars),
+            }
+        } else {
+            // `Arc`: el hit clona el puntero (barato) en vez de todo el AST+opcodes.
+            let key = trimmed.to_owned();
+            let compiled = CompiledExpr::new(&key, &BTreeMap::new())
+                .ok()
+                .map(std::sync::Arc::new);
+            let result = match &compiled {
+                Some(c) => c.eval(vars),
+                None => evaluate(expr, vars),
+            };
+            cache.put(key, compiled);
+            result
+        }
+    })
+}
+
+/// Variante de un solo variable para probes calientes (`eval_sample`,
+/// intersecciones): cero allocs en hit — ni `String` de clave (lookup por
+/// `&str`) ni `Vec` de vars (mapeo directo a v1/v2/v3 en `eval_one`).
+/// Semántica idéntica a `evaluate_cached(expr, &[(name, value)])`.
+pub fn evaluate_cached_one(expr: &str, name: &str, value: f64) -> Result<f64, String> {
+    check_expr_budget(expr)?;
+    if crate::precision::is_high_precision_mode() {
+        return evaluate(expr, &[(name.to_owned(), value)]);
+    }
+    COMPILED_EXPR_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let trimmed = expr.trim();
+        if let Some(cached) = cache.get(trimmed).cloned() {
+            match cached {
+                Some(compiled) => compiled.eval_one(name, value),
+                None => evaluate(expr, &[(name.to_owned(), value)]),
+            }
+        } else {
+            let key = trimmed.to_owned();
+            let compiled = CompiledExpr::new(&key, &BTreeMap::new())
+                .ok()
+                .map(std::sync::Arc::new);
+            let result = match &compiled {
+                Some(c) => c.eval_one(name, value),
+                None => evaluate(expr, &[(name.to_owned(), value)]),
+            };
+            cache.put(key, compiled);
+            result
+        }
+    })
+}
+
+/// Longitud del cache LRU solo para tests (determinista, sin sleeps).
+#[cfg(test)]
+pub(crate) fn compiled_expr_cache_len_for_tests() -> usize {
+    COMPILED_EXPR_CACHE.with(|cache| cache.borrow().len())
+}
+
+/// ¿Sigue `key` (trimmed) en el cache? Solo para tests de desalojo.
+#[cfg(test)]
+pub(crate) fn compiled_expr_cache_contains_for_tests(key: &str) -> bool {
+    COMPILED_EXPR_CACHE.with(|cache| cache.borrow().contains(&key.trim().to_owned()))
+}
+
+/// Vacía el cache LRU. Solo para tests (el `thread_local!` se comparte
+/// entre tests del mismo hilo; sin esto el desalojo no es determinista).
+#[cfg(test)]
+pub(crate) fn clear_compiled_expr_cache_for_tests() {
+    COMPILED_EXPR_CACHE.with(|cache| cache.borrow_mut().clear());
+}
+
+/// Evaluate a mathematical expression string with given variable values.
+pub fn evaluate(expr: &str, vars: &[(String, f64)]) -> Result<f64, String> {
+    // F10-FIX (SIGABRT): rechazar ANTES de `build_operator_tree` (~evalexpr,
+    // recursivo). Un stack overflow aborta el proceso; `catch_unwind` no lo atrapa.
+    check_expr_budget(expr)?;
+    crate::ast::validate_numeric_literals(expr)?;
+    let expr = preprocess_expr(expr);
+
+    if crate::precision::is_high_precision_mode() {
+        if let Ok(ast) = crate::ast::parse_ast(&expr) {
+            let mut vars_map = std::collections::HashMap::new();
+            for (k, v) in vars {
+                vars_map.insert(k.clone(), crate::dd::DD::from_f64(*v));
+            }
+            let res = ast.eval_dd(&vars_map);
+            if res.hi.is_finite() {
+                return Ok(res.to_f64());
+            }
+        }
+    }
+
+    // FAST PATH: try custom AST parser first
+    let vars_map: std::collections::BTreeMap<String, f64> =
+        vars.iter().map(|(k, v)| (k.clone(), *v)).collect();
+    let ignore: Vec<&str> = vars.iter().map(|(k, _)| k.as_str()).collect();
+    if let Ok(mut ast) = crate::ast::parse_ast(&expr) {
+        ast = ast.substitute_vars(&vars_map, &ignore).simplify();
+        // For 1-var functions, use eval_at
+        if vars.is_empty() {
+            let result = ast.eval_2d("__x", 0.0, "__y", 0.0);
+            if result.is_finite() {
+                return Ok(result);
+            }
+        } else if vars.len() == 1 {
+            let (var, val) = &vars[0];
+            let result = ast.eval_at(var, *val);
+            if result.is_finite() {
+                return Ok(result);
+            }
+        } else if vars.len() == 2 {
+            let (v1, x1) = &vars[0];
+            let (v2, x2) = &vars[1];
+            let result = ast.eval_2d(v1, *x1, v2, *x2);
+            if result.is_finite() {
+                return Ok(result);
+            }
+        } else if vars.len() == 3 {
+            let (v1, x1) = &vars[0];
+            let (v2, x2) = &vars[1];
+            let (v3, x3) = &vars[2];
+            let result = ast.eval_3d(v1, *x1, v2, *x2, v3, *x3);
+            if result.is_finite() {
+                return Ok(result);
+            }
+        }
+    }
+
+    // SLOW PATH FALLBACK: evalexpr
+    let mut ctx = setup_math_context();
+    for (name, val) in vars {
+        if let Err(e) = ctx.set_value(name.clone(), Value::from(*val)) {
+            return Err(format!("Variable error: {}", e));
+        }
+    }
+    match eval_with_context(&expr, &ctx) {
+        Ok(Value::Float(n)) => Ok(n),
+        Ok(Value::Int(n)) => Ok(n as f64),
+        Ok(other) => Err(format!(
+            "Expression did not evaluate to a number: {:?}",
+            other
+        )),
+        Err(e) => Err(format!("Evaluation error: {}", e)),
+    }
+}
+
+/// Evaluate a function f(x) expression.
+pub fn eval_function(expr: &str, x: f64) -> Result<f64, String> {
+    evaluate(expr, &[("x".to_string(), x)])
+}
+
+/// Evaluate expression with a named variable (not necessarily "x").
+pub fn eval_function_var(expr: &str, var: &str, val: f64) -> Result<f64, String> {
+    evaluate(expr, &[(var.to_string(), val)])
+}
+
+/// Evaluate a function f(x) with additional variables.
+pub fn eval_function_with_vars(
+    expr: &str,
+    x: f64,
+    vars: &std::collections::BTreeMap<String, f64>,
+) -> Result<f64, String> {
+    eval_function_batch(expr, std::iter::once(x), vars).and_then(|mut res| {
+        if let Some(Some(val)) = res.pop() {
+            Ok(val)
+        } else {
+            Err("Evaluation failed".to_string())
+        }
+    })
+}
+
+/// Umbral F10-D (perf medido): batches cuyo `size_hint` inferior queda debajo
+/// se evalúan escalares para no pagar el spawn de rayon (~10µs). Probe
+/// N=4000 `sin(x)+x^2-cos(2x)`: 267µs seq → 146µs par8 (1.83x).
+const RAYON_BATCH_THRESHOLD: usize = 1024;
+
+/// Evalúa un AST ya sustituido/simplificado sobre un Vec, en paralelo.
+/// `collect` preserva el orden → resultado idéntico al loop escalar.
+///
+/// Compila a opcodes planos UNA vez por llamada (no por muestra): el loop
+/// por elemento corre la pila sin walk recursivo ni allocs. Si el AST usa
+/// nodos sin opcode, cae al walk de siempre (paridad exacta verificada en
+/// `flat_matches_walk_en_muestreo_adversarial`).
+fn eval_prepared_1d_par(ast: &crate::ast::Expr, var_name: &str, xs: Vec<f64>) -> Vec<Option<f64>> {
+    use rayon::prelude::*;
+    let flat = compile_flat_ops(ast, var_name, "", "");
+    let chunk = (xs.len() / rayon::current_num_threads().max(1)).max(64);
+    xs.par_chunks(chunk)
+        .map(|c| {
+            c.iter()
+                .map(|&x| {
+                    if let Some(ops) = &flat {
+                        // Mapeo idéntico al walk: NaN → None, Inf → Some.
+                        let raw = eval_opcodes_flat_raw(ops, x, 0.0, 0.0);
+                        if raw.is_nan() {
+                            None
+                        } else {
+                            Some(raw)
+                        }
+                    } else {
+                        let res = ast.eval_at(var_name, x);
+                        if res.is_nan() {
+                            None
+                        } else {
+                            Some(res)
+                        }
+                    }
+                })
+                .collect::<Vec<Option<f64>>>()
+        })
+        .collect::<Vec<Vec<Option<f64>>>>()
+        .concat()
+}
+
+/// Variante 2D del batch paralelo (domain coloring, implícitas, superficies).
+/// Mismo esquema que la 1D: opcodes una vez, walk solo como fallback.
+fn eval_prepared_2d_par(
+    ast: &crate::ast::Expr,
+    var1_name: &str,
+    var2_name: &str,
+    pts: Vec<(f64, f64)>,
+) -> Vec<Option<f64>> {
+    use rayon::prelude::*;
+    let flat = compile_flat_ops(ast, var1_name, var2_name, "");
+    let chunk = (pts.len() / rayon::current_num_threads().max(1)).max(64);
+    pts.par_chunks(chunk)
+        .map(|c| {
+            c.iter()
+                .map(|&(v1, v2)| {
+                    if let Some(ops) = &flat {
+                        let raw = eval_opcodes_flat_raw(ops, v1, v2, 0.0);
+                        if raw.is_nan() {
+                            None
+                        } else {
+                            Some(raw)
+                        }
+                    } else {
+                        let res = ast.eval_2d(var1_name, v1, var2_name, v2);
+                        if res.is_nan() {
+                            None
+                        } else {
+                            Some(res)
+                        }
+                    }
+                })
+                .collect::<Vec<Option<f64>>>()
+        })
+        .collect::<Vec<Vec<Option<f64>>>>()
+        .concat()
+}
+
+pub fn eval_batch_1d(
+    expr: &str,
+    var_name: &str,
+    xs: impl Iterator<Item = f64> + Clone,
+    vars: &std::collections::BTreeMap<String, f64>,
+) -> Result<Vec<Option<f64>>, String> {
+    // F10-FIX: este path tiene su propio slow-path `build_operator_tree`
+    // (ver abajo); la guarda va a la entrada, antes de `preprocess_expr`.
+    check_expr_budget(expr)?;
+    let expr_clean = expr.trim();
+    if expr_clean.starts_with("deriv(") && expr_clean.ends_with(')') {
+        let inner = &expr_clean[6..expr_clean.len() - 1];
+        let eps = f64::EPSILON.sqrt();
+        let xs_vec: Vec<f64> = xs.collect();
+        let hs: Vec<f64> = xs_vec.iter().map(|&x| eps * x.abs().max(1.0)).collect();
+        let xs1: Vec<f64> = xs_vec.iter().zip(&hs).map(|(&x, &h)| x + h).collect();
+        let xs2: Vec<f64> = xs_vec.iter().zip(&hs).map(|(&x, &h)| x - h).collect();
+        let res1 = eval_batch_1d(inner, var_name, xs1.into_iter(), vars)?;
+        let res2 = eval_batch_1d(inner, var_name, xs2.into_iter(), vars)?;
+
+        let mut results = Vec::with_capacity(res1.len());
+        for ((y1, y2), h) in res1.into_iter().zip(res2).zip(hs) {
+            if let (Some(y1), Some(y2)) = (y1, y2) {
+                results.push(Some((y1 - y2) / (2.0 * h)));
+            } else {
+                results.push(None);
+            }
+        }
+        return Ok(results);
+    }
+
+    let expr_clean = preprocess_expr(expr_clean);
+
+    if crate::precision::is_high_precision_mode() {
+        if let Ok(mut ast) = crate::ast::parse_ast(&expr_clean) {
+            ast = ast.substitute_vars(vars, &[var_name]).simplify();
+            let mut results = Vec::new();
+            let mut vars_map = std::collections::HashMap::new();
+            for (k, v) in vars {
+                vars_map.insert(k.clone(), crate::dd::DD::from_f64(*v));
+            }
+            for x in xs {
+                vars_map.insert(var_name.to_string(), crate::dd::DD::from_f64(x));
+                let res = ast.eval_dd(&vars_map);
+                if res.hi.is_finite() {
+                    results.push(Some(res.to_f64()));
+                } else {
+                    results.push(None);
+                }
+            }
+            return Ok(results);
+        }
+    }
+
+    // FAST PATH: try to parse with our custom AST
+    if let Ok(mut ast) = crate::ast::parse_ast(&expr_clean) {
+        ast = ast.substitute_vars(vars, &[var_name]).simplify();
+        if xs.size_hint().0 >= RAYON_BATCH_THRESHOLD {
+            return Ok(eval_prepared_1d_par(&ast, var_name, xs.collect()));
+        }
+        // Opcodes una vez (no walk por muestra); fallback al walk si el AST
+        // usa nodos sin opcode. Mapeo NaN → None idéntico en ambos.
+        let flat = compile_flat_ops(&ast, var_name, "", "");
+        let mut results = Vec::new();
+        for x in xs {
+            if let Some(ops) = &flat {
+                let raw = eval_opcodes_flat_raw(ops, x, 0.0, 0.0);
+                if raw.is_nan() {
+                    results.push(None);
+                } else {
+                    results.push(Some(raw));
+                }
+            } else {
+                let res = ast.eval_at(var_name, x);
+                if res.is_nan() {
+                    results.push(None);
+                } else {
+                    results.push(Some(res));
+                }
+            }
+        }
+        return Ok(results);
+    }
+
+    // SLOW PATH FALLBACK: evalexpr
+    let tree =
+        evalexpr::build_operator_tree(&expr_clean).map_err(|e| format!("Compile error: {}", e))?;
+    let mut ctx = setup_math_context();
+
+    for (name, val) in vars {
+        if name != var_name {
+            if let Err(e) = ctx.set_value(name.clone(), Value::from(*val)) {
+                return Err(format!("Variable error: {}", e));
+            }
+        }
+    }
+
+    let mut results = Vec::new();
+    for x in xs {
+        if ctx.set_value(var_name.to_string(), Value::from(x)).is_err() {
+            results.push(None);
+            continue;
+        }
+        match tree.eval_with_context(&ctx) {
+            Ok(Value::Float(n)) => results.push(Some(n)),
+            Ok(Value::Int(n)) => results.push(Some(n as f64)),
+            _ => results.push(None),
+        }
+    }
+    Ok(results)
+}
+
+pub fn eval_batch_2d(
+    expr: &str,
+    var1_name: &str,
+    var2_name: &str,
+    points: impl Iterator<Item = (f64, f64)>,
+    vars: &std::collections::BTreeMap<String, f64>,
+) -> Result<Vec<Option<f64>>, String> {
+    // F10-FIX: idem `eval_batch_1d` (slow-path `build_operator_tree` propio).
+    check_expr_budget(expr)?;
+    let expr_clean = expr.trim();
+    let expr_clean = preprocess_expr(expr_clean);
+
+    if crate::precision::is_high_precision_mode() {
+        if let Ok(mut ast) = crate::ast::parse_ast(&expr_clean) {
+            ast = ast
+                .substitute_vars(vars, &[var1_name, var2_name])
+                .simplify();
+            let mut results = Vec::new();
+            let mut vars_map = std::collections::HashMap::new();
+            for (k, v) in vars {
+                vars_map.insert(k.clone(), crate::dd::DD::from_f64(*v));
+            }
+            for (v1, v2) in points {
+                vars_map.insert(var1_name.to_string(), crate::dd::DD::from_f64(v1));
+                vars_map.insert(var2_name.to_string(), crate::dd::DD::from_f64(v2));
+                let res = ast.eval_dd(&vars_map);
+                if res.hi.is_finite() {
+                    results.push(Some(res.to_f64()));
+                } else {
+                    results.push(None);
+                }
+            }
+            return Ok(results);
+        }
+    }
+
+    // FAST PATH: try to parse with our custom AST
+    if let Ok(mut ast) = crate::ast::parse_ast(&expr_clean) {
+        ast = ast
+            .substitute_vars(vars, &[var1_name, var2_name])
+            .simplify();
+        if points.size_hint().0 >= RAYON_BATCH_THRESHOLD {
+            return Ok(eval_prepared_2d_par(
+                &ast,
+                var1_name,
+                var2_name,
+                points.collect(),
+            ));
+        }
+        let mut results = Vec::new();
+        for (v1, v2) in points {
+            let res = ast.eval_2d(var1_name, v1, var2_name, v2);
+            if res.is_nan() {
+                results.push(None);
+            } else {
+                results.push(Some(res));
+            }
+        }
+        return Ok(results);
+    }
+
+    // SLOW PATH FALLBACK: evalexpr
+    let tree =
+        evalexpr::build_operator_tree(&expr_clean).map_err(|e| format!("Compile error: {}", e))?;
+    let mut ctx = setup_math_context();
+
+    for (name, val) in vars {
+        if name != var1_name && name != var2_name {
+            if let Err(e) = ctx.set_value(name.clone(), Value::from(*val)) {
+                return Err(format!("Variable error: {}", e));
+            }
+        }
+    }
+
+    let mut results = Vec::new();
+    for (v1, v2) in points {
+        if ctx
+            .set_value(var1_name.to_string(), Value::from(v1))
+            .is_err()
+            || ctx
+                .set_value(var2_name.to_string(), Value::from(v2))
+                .is_err()
+        {
+            results.push(None);
+            continue;
+        }
+        match tree.eval_with_context(&ctx) {
+            Ok(Value::Float(n)) => results.push(Some(n)),
+            Ok(Value::Int(n)) => results.push(Some(n as f64)),
+            _ => results.push(None),
+        }
+    }
+    Ok(results)
+}
+
+/// Batch evaluate a function for multiple x values.
+pub fn eval_function_batch(
+    expr: &str,
+    xs: impl Iterator<Item = f64> + Clone,
+    vars: &std::collections::BTreeMap<String, f64>,
+) -> Result<Vec<Option<f64>>, String> {
+    eval_batch_1d(expr, "x", xs, vars)
+}
+
+/// Batch evaluate a surface f(x, y) for multiple (x, y) points.
+pub fn eval_surface_batch(
+    expr: &str,
+    pts: impl Iterator<Item = (f64, f64)>,
+    vars: &std::collections::BTreeMap<String, f64>,
+) -> Result<Vec<Option<f64>>, String> {
+    eval_batch_2d(expr, "x", "y", pts, vars)
+}
+
+/// Parse and check if expression is valid.
+pub fn validate(expr: &str) -> bool {
+    eval_function(expr, 0.0).is_ok()
+}
+
+/// Parse, preprocess, substitute variables, and simplify a function expression
+/// into a reusable AST. This avoids re-parsing the expression for every sample
+/// point during rendering — critical for sum()-expanded functions.
+pub fn prepare_function_ast(
+    expr: &str,
+    vars: &std::collections::BTreeMap<String, f64>,
+    ignore: &[&str],
+) -> Result<crate::ast::Expr, String> {
+    let expr_clean = preprocess_expr(expr);
+    let mut ast = crate::ast::parse_ast(&expr_clean).map_err(|e| format!("Parse error: {}", e))?;
+    ast = ast.substitute_vars(vars, ignore).simplify();
+    Ok(ast)
+}
+
+/// A pre-parsed expression that can be evaluated many times without
+/// re-tokenising or re-parsing the original string.
+///
+/// The fast path uses Grafito's native AST. If the expression cannot be parsed
+/// by the native AST (e.g. it uses evalexpr-only syntax), it falls back to a
+/// pre-built evalexpr operator tree. Constants supplied at compile time are
+/// substituted once.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Opcode {
+    PushConst(f64),
+    PushVar1,
+    PushVar2,
+    PushVar3,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Pow,
+    Neg,
+    Sin,
+    Cos,
+    Tan,
+    Asin,
+    Acos,
+    Atan,
+    Exp,
+    Ln,
+    Log,
+    Sqrt,
+    Abs,
+    Sinh,
+    Cosh,
+    Tanh,
+    Floor,
+    Ceil,
+    Round,
+    Sec,
+    Csc,
+    Cot,
+    Asinh,
+    Acosh,
+    Atanh,
+    Sign,
+    Heaviside,
+    Cbrt,
+    Atan2,
+    Modulo,
+    Min,
+    Max,
+    Clamp,
+    Erf,
+    Erfc,
+    Gamma,
+    LnGamma,
+    Digamma,
+    Trigamma,
+    Beta,
+    BesselJ,
+    BesselY,
+    BesselI,
+    Lt,
+    Gt,
+    Le,
+    Ge,
+    Eq,
+    Ne,
+}
+
+pub fn compile_ast(
+    ast: &crate::ast::Expr,
+    ops: &mut Vec<Opcode>,
+    v1: &str,
+    v2: &str,
+    v3: &str,
+) -> bool {
+    use crate::ast::Expr::*;
+    match ast {
+        Const(c) => ops.push(Opcode::PushConst(*c)),
+        Var(v) => {
+            if v == v1 {
+                ops.push(Opcode::PushVar1);
+            } else if v == v2 {
+                ops.push(Opcode::PushVar2);
+            } else if v == v3 {
+                ops.push(Opcode::PushVar3);
+            } else {
+                return false;
+            }
+        }
+        Add(a, b) => {
+            if !compile_ast(a, ops, v1, v2, v3) || !compile_ast(b, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Add);
+        }
+        Sub(a, b) => {
+            if !compile_ast(a, ops, v1, v2, v3) || !compile_ast(b, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Sub);
+        }
+        Mul(a, b) => {
+            if !compile_ast(a, ops, v1, v2, v3) || !compile_ast(b, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Mul);
+        }
+        Div(a, b) => {
+            if !compile_ast(a, ops, v1, v2, v3) || !compile_ast(b, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Div);
+        }
+        Pow(a, b) => {
+            if !compile_ast(a, ops, v1, v2, v3) || !compile_ast(b, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Pow);
+        }
+        Neg(u) => {
+            if !compile_ast(u, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Neg);
+        }
+        Sin(u) => {
+            if !compile_ast(u, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Sin);
+        }
+        Cos(u) => {
+            if !compile_ast(u, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Cos);
+        }
+        Tan(u) => {
+            if !compile_ast(u, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Tan);
+        }
+        Asin(u) => {
+            if !compile_ast(u, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Asin);
+        }
+        Acos(u) => {
+            if !compile_ast(u, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Acos);
+        }
+        Atan(u) => {
+            if !compile_ast(u, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Atan);
+        }
+        Exp(u) => {
+            if !compile_ast(u, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Exp);
+        }
+        Ln(u) => {
+            if !compile_ast(u, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Ln);
+        }
+        Log(u) => {
+            if !compile_ast(u, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Log);
+        }
+        Sqrt(u) => {
+            if !compile_ast(u, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Sqrt);
+        }
+        Abs(u) => {
+            if !compile_ast(u, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Abs);
+        }
+        Sinh(u) => {
+            if !compile_ast(u, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Sinh);
+        }
+        Cosh(u) => {
+            if !compile_ast(u, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Cosh);
+        }
+        Tanh(u) => {
+            if !compile_ast(u, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Tanh);
+        }
+        Floor(u) => {
+            if !compile_ast(u, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Floor);
+        }
+        Ceil(u) => {
+            if !compile_ast(u, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Ceil);
+        }
+        Round(u) => {
+            if !compile_ast(u, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Round);
+        }
+        Sec(u) => {
+            if !compile_ast(u, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Sec);
+        }
+        Csc(u) => {
+            if !compile_ast(u, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Csc);
+        }
+        Cot(u) => {
+            if !compile_ast(u, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Cot);
+        }
+        Asinh(u) => {
+            if !compile_ast(u, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Asinh);
+        }
+        Acosh(u) => {
+            if !compile_ast(u, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Acosh);
+        }
+        Atanh(u) => {
+            if !compile_ast(u, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Atanh);
+        }
+        Sign(u) => {
+            if !compile_ast(u, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Sign);
+        }
+        Heaviside(u) => {
+            if !compile_ast(u, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Heaviside);
+        }
+        Cbrt(u) => {
+            if !compile_ast(u, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Cbrt);
+        }
+        Atan2(a, b) => {
+            if !compile_ast(a, ops, v1, v2, v3) || !compile_ast(b, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Atan2);
+        }
+        Modulo(a, b) => {
+            if !compile_ast(a, ops, v1, v2, v3) || !compile_ast(b, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Modulo);
+        }
+        Min(a, b) => {
+            if !compile_ast(a, ops, v1, v2, v3) || !compile_ast(b, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Min);
+        }
+        Max(a, b) => {
+            if !compile_ast(a, ops, v1, v2, v3) || !compile_ast(b, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Max);
+        }
+        Clamp(x, lo, hi) => {
+            if !compile_ast(x, ops, v1, v2, v3)
+                || !compile_ast(lo, ops, v1, v2, v3)
+                || !compile_ast(hi, ops, v1, v2, v3)
+            {
+                return false;
+            }
+            ops.push(Opcode::Clamp);
+        }
+        Erf(u) => {
+            if !compile_ast(u, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Erf);
+        }
+        Erfc(u) => {
+            if !compile_ast(u, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Erfc);
+        }
+        Gamma(u) => {
+            if !compile_ast(u, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Gamma);
+        }
+        LnGamma(u) => {
+            if !compile_ast(u, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::LnGamma);
+        }
+        Digamma(u) => {
+            if !compile_ast(u, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Digamma);
+        }
+        Trigamma(u) => {
+            if !compile_ast(u, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Trigamma);
+        }
+        Beta(a, b) => {
+            if !compile_ast(a, ops, v1, v2, v3) || !compile_ast(b, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Beta);
+        }
+        BesselJ(a, b) => {
+            if !compile_ast(a, ops, v1, v2, v3) || !compile_ast(b, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::BesselJ);
+        }
+        BesselY(a, b) => {
+            if !compile_ast(a, ops, v1, v2, v3) || !compile_ast(b, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::BesselY);
+        }
+        BesselI(a, b) => {
+            if !compile_ast(a, ops, v1, v2, v3) || !compile_ast(b, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::BesselI);
+        }
+        Lt(a, b) => {
+            if !compile_ast(a, ops, v1, v2, v3) || !compile_ast(b, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Lt);
+        }
+        Gt(a, b) => {
+            if !compile_ast(a, ops, v1, v2, v3) || !compile_ast(b, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Gt);
+        }
+        Le(a, b) => {
+            if !compile_ast(a, ops, v1, v2, v3) || !compile_ast(b, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Le);
+        }
+        Ge(a, b) => {
+            if !compile_ast(a, ops, v1, v2, v3) || !compile_ast(b, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Ge);
+        }
+        Eq(a, b) => {
+            if !compile_ast(a, ops, v1, v2, v3) || !compile_ast(b, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Eq);
+        }
+        Ne(a, b) => {
+            if !compile_ast(a, ops, v1, v2, v3) || !compile_ast(b, ops, v1, v2, v3) {
+                return false;
+            }
+            ops.push(Opcode::Ne);
+        }
+        _ => {
+            return false;
+        }
+    }
+    true
+}
+
+#[derive(Clone)]
+pub struct CompiledExpr {
+    ast: Option<crate::ast::Expr>,
+    tree: Option<evalexpr::Node>,
+    ops: Option<ValidatedOps>,
+    var_names: Vec<String>,
+}
+
+/// Tamaño de la pila del intérprete plano (ver `validate_opcode_stack`:
+/// el mismo número acota la profundidad validada y la pila real).
+const FLAT_STACK_SIZE: usize = 256;
+
+/// Opcodes con disciplina de pila verificada una vez.
+///
+/// La validación estática (`validate_opcode_stack`: sin underflow,
+/// profundidad ≤ `FLAT_STACK_SIZE`, cierre en 1 valor) prueba que el
+/// intérprete nunca lee sin escribir ni sale de la pila. Por eso el
+/// intérprete NO inicializa la pila por evaluación (un `memset` de 2 KiB
+/// medido en ~15 ns/eval fijos) y NO chequea bounds por acceso.
+///
+/// Solo se construye validado (`compile_flat_ops` / `CompiledExpr::new`;
+/// campo privado): es la única forma sound de obtenerlo.
+#[derive(Debug, Clone)]
+pub struct ValidatedOps {
+    ops: Vec<Opcode>,
+}
+
+impl ValidatedOps {
+    /// Vista para el intérprete y la medición.
+    pub fn as_slice(&self) -> &[Opcode] {
+        &self.ops
+    }
+
+    /// Cantidad de opcodes (para heurísticas de camino, no para corrección).
+    pub fn len(&self) -> usize {
+        self.ops.len()
+    }
+
+    /// `true` si no hay opcodes (nunca ocurre tras compilar con éxito).
+    pub fn is_empty(&self) -> bool {
+        self.ops.is_empty()
+    }
+}
+
+/// Resultado del intérprete plano de opcodes.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum FlatOutcome {
+    /// La pila cerró en un valor (`stack[0]`; puede ser no finito).
+    Value(f64),
+    /// `clamp` con cotas no finitas o invertidas (el walk da `NaN` ahí).
+    ClampError,
+}
+
+/// Intérprete plano de opcodes con pila fija, sin allocs.
+///
+/// Cuerpo movido byte a byte desde `CompiledExpr::eval` (única copia):
+/// mismo despacho, mismos gates (`Div` NaN si `|den| < 1e-300`,
+/// `trig_reduce`, `safe_*`, Sec/Csc/Cot), mismo `Clamp` estricto.
+///
+/// CONTRATO: `ops` debe venir validado ([`ValidatedOps`] o validación en
+/// `new`). La disciplina estática prueba que cada lectura fue precedida
+/// por su escritura y que `sp` siempre está en `[0, FLAT_STACK_SIZE)`, por
+/// eso la pila NO se inicializa por evaluación (un `memset` de 2 KiB medido
+/// en ~15 ns/eval fijos) y NO hay bounds checks por acceso.
+/// `f64: Copy` sin `Drop` y aritmética f64 sin pánicos: sin lecturas sin
+/// inicializar ni valores sin dropear en ningún camino.
+/// Si `sp != 1` al final (imposible validado), `NaN` honesto en vez de pánico.
+fn run_opcodes_flat(ops: &ValidatedOps, v1: f64, v2: f64, v3: f64) -> FlatOutcome {
+    let ops = ops.as_slice();
+    thread_local! {
+        // Pila reutilizada por evaluación: evita el `memset` de 2 KiB por
+        // llamada (medido en ~15 ns/eval fijos). Sound sin `unsafe`: cada
+        // slot se escribe antes de leerse por disciplina validada, y no hay
+        // reentrancia (el intérprete no se llama a sí mismo; cada hilo
+        // rayon tiene su propio buffer).
+        static FLAT_STACK: std::cell::RefCell<[f64; FLAT_STACK_SIZE]> =
+            const { std::cell::RefCell::new([0.0; FLAT_STACK_SIZE]) };
+    }
+    FLAT_STACK.with(|cell| {
+        let mut stack = cell.borrow_mut();
+        let mut sp = 0usize;
+        for op in ops {
+            match op {
+                Opcode::PushConst(c) => {
+                    stack[sp] = *c;
+                    sp += 1;
+                }
+                Opcode::PushVar1 => {
+                    stack[sp] = v1;
+                    sp += 1;
+                }
+                Opcode::PushVar2 => {
+                    stack[sp] = v2;
+                    sp += 1;
+                }
+                Opcode::PushVar3 => {
+                    stack[sp] = v3;
+                    sp += 1;
+                }
+                Opcode::Add => {
+                    sp -= 1;
+                    stack[sp - 1] += stack[sp];
+                }
+                Opcode::Sub => {
+                    sp -= 1;
+                    stack[sp - 1] -= stack[sp];
+                }
+                Opcode::Mul => {
+                    sp -= 1;
+                    stack[sp - 1] *= stack[sp];
+                }
+                Opcode::Div => {
+                    // Paridad con el AST nativo (`ast::Expr::eval_at`):
+                    // `Div` con `|den| < 1e-300` es NaN, nunca Inf.
+                    // El `/` crudo de f64 propagaba un Inf intermedio
+                    // (p. ej. `1/(1/x)` en x=0 devolvía Ok(0.0) vía
+                    // `1/Inf`), divergiendo del AST y filtrando un
+                    // valor finito falso; el gate final `is_finite`
+                    // lo convierte en Err igualmente.
+                    sp -= 1;
+                    let den = stack[sp];
+                    let num = stack[sp - 1];
+                    stack[sp - 1] = if den.abs() < 1e-300 {
+                        f64::NAN
+                    } else {
+                        num / den
+                    };
+                }
+                Opcode::Pow => {
+                    sp -= 1;
+                    stack[sp - 1] = stack[sp - 1].powf(stack[sp]);
+                }
+                Opcode::Neg => {
+                    stack[sp - 1] = -stack[sp - 1];
+                }
+                Opcode::Sin => {
+                    stack[sp - 1] = trig_reduce(stack[sp - 1]).sin();
+                }
+                Opcode::Cos => {
+                    stack[sp - 1] = trig_reduce(stack[sp - 1]).cos();
+                }
+                Opcode::Tan => {
+                    stack[sp - 1] = trig_reduce(stack[sp - 1]).tan();
+                }
+                Opcode::Asin => {
+                    stack[sp - 1] = stack[sp - 1].asin();
+                }
+                Opcode::Acos => {
+                    stack[sp - 1] = stack[sp - 1].acos();
+                }
+                Opcode::Atan => {
+                    stack[sp - 1] = stack[sp - 1].atan();
+                }
+                Opcode::Exp => {
+                    stack[sp - 1] = stack[sp - 1].exp();
+                }
+                Opcode::Ln => {
+                    stack[sp - 1] = stack[sp - 1].ln();
+                }
+                Opcode::Log => {
+                    stack[sp - 1] = stack[sp - 1].log10();
+                }
+                Opcode::Sqrt => {
+                    stack[sp - 1] = stack[sp - 1].sqrt();
+                }
+                Opcode::Abs => {
+                    stack[sp - 1] = stack[sp - 1].abs();
+                }
+                Opcode::Sinh => {
+                    stack[sp - 1] = safe_sinh(stack[sp - 1]);
+                }
+                Opcode::Cosh => {
+                    stack[sp - 1] = safe_cosh(stack[sp - 1]);
+                }
+                Opcode::Tanh => {
+                    stack[sp - 1] = safe_tanh(stack[sp - 1]);
+                }
+                Opcode::Floor => {
+                    stack[sp - 1] = stack[sp - 1].floor();
+                }
+                Opcode::Ceil => {
+                    stack[sp - 1] = stack[sp - 1].ceil();
+                }
+                Opcode::Round => {
+                    stack[sp - 1] = stack[sp - 1].round();
+                }
+                Opcode::Sec => {
+                    let c = trig_reduce(stack[sp - 1]).cos();
+                    stack[sp - 1] = if c.abs() < 1e-15 { f64::NAN } else { 1.0 / c };
+                }
+                Opcode::Csc => {
+                    let s = trig_reduce(stack[sp - 1]).sin();
+                    stack[sp - 1] = if s.abs() < 1e-15 { f64::NAN } else { 1.0 / s };
+                }
+                Opcode::Cot => {
+                    let t = trig_reduce(stack[sp - 1]).tan();
+                    stack[sp - 1] = if t.abs() < 1e-15 { f64::NAN } else { 1.0 / t };
+                }
+                Opcode::Asinh => {
+                    stack[sp - 1] = stack[sp - 1].asinh();
+                }
+                Opcode::Acosh => {
+                    stack[sp - 1] = stack[sp - 1].acosh();
+                }
+                Opcode::Atanh => {
+                    stack[sp - 1] = stack[sp - 1].atanh();
+                }
+                Opcode::Sign => {
+                    stack[sp - 1] = stack[sp - 1].signum();
+                }
+                Opcode::Heaviside => {
+                    stack[sp - 1] = if stack[sp - 1] >= 0.0 { 1.0 } else { 0.0 };
+                }
+                Opcode::Cbrt => {
+                    stack[sp - 1] = stack[sp - 1].cbrt();
+                }
+                Opcode::Atan2 => {
+                    sp -= 1;
+                    stack[sp - 1] = stack[sp - 1].atan2(stack[sp]);
+                }
+                Opcode::Modulo => {
+                    sp -= 1;
+                    stack[sp - 1] %= stack[sp];
+                }
+                Opcode::Min => {
+                    sp -= 1;
+                    stack[sp - 1] = stack[sp - 1].min(stack[sp]);
+                }
+                Opcode::Max => {
+                    sp -= 1;
+                    stack[sp - 1] = stack[sp - 1].max(stack[sp]);
+                }
+                Opcode::Clamp => {
+                    sp -= 2;
+                    match crate::ast::checked_clamp(stack[sp - 1], stack[sp], stack[sp + 1]) {
+                        Some(clamped) => stack[sp - 1] = clamped,
+                        None => return FlatOutcome::ClampError,
+                    }
+                }
+                Opcode::Erf => {
+                    stack[sp - 1] = crate::special_functions::erf(stack[sp - 1]);
+                }
+                Opcode::Erfc => {
+                    stack[sp - 1] = crate::special_functions::erfc(stack[sp - 1]);
+                }
+                Opcode::Gamma => {
+                    stack[sp - 1] = crate::special_functions::gamma(stack[sp - 1]);
+                }
+                Opcode::LnGamma => {
+                    stack[sp - 1] = crate::special_functions::ln_gamma(stack[sp - 1]);
+                }
+                Opcode::Digamma => {
+                    stack[sp - 1] = crate::special_functions::digamma(stack[sp - 1]);
+                }
+                Opcode::Trigamma => {
+                    stack[sp - 1] = crate::special_functions::trigamma(stack[sp - 1]);
+                }
+                Opcode::Beta => {
+                    sp -= 1;
+                    stack[sp - 1] = crate::special_functions::beta(stack[sp - 1], stack[sp]);
+                }
+                Opcode::BesselJ => {
+                    sp -= 1;
+                    stack[sp - 1] = crate::ast::bessel_order(stack[sp - 1])
+                        .map_or(f64::NAN, |order| {
+                            crate::special_functions::bessel_j(order, stack[sp])
+                        });
+                }
+                Opcode::BesselY => {
+                    sp -= 1;
+                    stack[sp - 1] = crate::ast::bessel_order(stack[sp - 1])
+                        .map_or(f64::NAN, |order| {
+                            crate::special_functions::bessel_y(order, stack[sp])
+                        });
+                }
+                Opcode::BesselI => {
+                    sp -= 1;
+                    stack[sp - 1] = crate::ast::bessel_order(stack[sp - 1])
+                        .map_or(f64::NAN, |order| {
+                            crate::special_functions::bessel_i(order, stack[sp])
+                        });
+                }
+                Opcode::Lt => {
+                    sp -= 1;
+                    stack[sp - 1] = if stack[sp - 1] < stack[sp] { 1.0 } else { 0.0 };
+                }
+                Opcode::Gt => {
+                    sp -= 1;
+                    stack[sp - 1] = if stack[sp - 1] > stack[sp] { 1.0 } else { 0.0 };
+                }
+                Opcode::Le => {
+                    sp -= 1;
+                    stack[sp - 1] = if stack[sp - 1] <= stack[sp] { 1.0 } else { 0.0 };
+                }
+                Opcode::Ge => {
+                    sp -= 1;
+                    stack[sp - 1] = if stack[sp - 1] >= stack[sp] { 1.0 } else { 0.0 };
+                }
+                Opcode::Eq => {
+                    sp -= 1;
+                    stack[sp - 1] = if (stack[sp - 1] - stack[sp]).abs() < 1e-9 {
+                        1.0
+                    } else {
+                        0.0
+                    };
+                }
+                Opcode::Ne => {
+                    sp -= 1;
+                    stack[sp - 1] = if (stack[sp - 1] - stack[sp]).abs() >= 1e-9 {
+                        1.0
+                    } else {
+                        0.0
+                    };
+                }
+            }
+        }
+        if sp == 1 {
+            FlatOutcome::Value(stack[0])
+        } else {
+            FlatOutcome::Value(f64::NAN)
+        }
+    })
+}
+
+/// Ejecuta opcodes validados con valores directos: `Some` si el resultado
+/// es finito. Sin `Vec` ni `String` por muestra (para samplers de miles de
+/// puntos). `None` honesto si no finito, clamp inválido o pila degenerada.
+pub fn eval_opcodes_flat(ops: &ValidatedOps, v1: f64, v2: f64, v3: f64) -> Option<f64> {
+    match run_opcodes_flat(ops, v1, v2, v3) {
+        FlatOutcome::Value(v) if v.is_finite() => Some(v),
+        _ => None,
+    }
+}
+
+/// Versión cruda: el f64 tal cual (`NaN` si no finito/clamp/pila).
+/// Replica el mapeo del walk en caminos batch (`NaN → None`, pero conserva
+/// `Inf` como `Some`, igual que `eval_prepared_1d_par`).
+pub fn eval_opcodes_flat_raw(ops: &ValidatedOps, v1: f64, v2: f64, v3: f64) -> f64 {
+    match run_opcodes_flat(ops, v1, v2, v3) {
+        FlatOutcome::Value(v) => v,
+        FlatOutcome::ClampError => f64::NAN,
+    }
+}
+
+/// Compila un AST ya sustituido/simplificado a opcodes validados una vez.
+/// `None` si usa nodos sin opcode (el llamante conserva el walk).
+/// Los nombres de barrido van posicionales (`"x"`, `"x"/"y"`, `"t"`).
+pub fn compile_flat_ops(
+    ast: &crate::ast::Expr,
+    v1: &str,
+    v2: &str,
+    v3: &str,
+) -> Option<ValidatedOps> {
+    let mut ops = Vec::new();
+    if !compile_ast(ast, &mut ops, v1, v2, v3) {
+        return None;
+    }
+    if validate_opcode_stack(&ops, FLAT_STACK_SIZE).is_err() {
+        return None;
+    }
+    Some(ValidatedOps { ops })
+}
+
+impl CompiledExpr {
+    /// Compile an expression, substituting the supplied constants.
+    pub fn new(
+        expr: &str,
+        constants: &std::collections::BTreeMap<String, f64>,
+    ) -> Result<Self, String> {
+        // F10-FIX: slow-path `build_operator_tree` propio (ver abajo).
+        check_expr_budget(expr)?;
+        crate::ast::validate_numeric_literals(expr)?;
+        let expr_clean = preprocess_expr(expr);
+
+        if let Ok(mut ast) = crate::ast::parse_ast(&expr_clean) {
+            ast = ast.substitute_vars(constants, &[]).simplify();
+
+            let mut ops = Vec::new();
+            let mut var_names = Vec::new();
+            let mut success = false;
+
+            let mut vars_set = std::collections::HashSet::new();
+            ast.get_variables(&mut vars_set);
+            // Ordenar: HashSet itera en orden arbitrario y v1/v2/v3 alimentan
+            // los opcodes posicionales; sin sort, `x+y` y `y+x` compilan distinto.
+            let mut vars_list: Vec<String> = vars_set.into_iter().collect();
+            vars_list.sort();
+            if vars_list.len() <= 3 {
+                let v1 = vars_list.first().map(|s| s.as_str()).unwrap_or("");
+                let v2 = vars_list.get(1).map(|s| s.as_str()).unwrap_or("");
+                let v3 = vars_list.get(2).map(|s| s.as_str()).unwrap_or("");
+                if compile_ast(&ast, &mut ops, v1, v2, v3) {
+                    // Validar UNA vez acá (no por eval): pila inválida →
+                    // sin opcodes, el `eval` cae al AST (igual que antes).
+                    if validate_opcode_stack(&ops, FLAT_STACK_SIZE).is_ok() {
+                        success = true;
+                        var_names = vars_list.clone();
+                    } else {
+                        ops.clear();
+                    }
+                }
+            }
+
+            return Ok(Self {
+                ast: Some(ast),
+                tree: None,
+                ops: if success {
+                    Some(ValidatedOps { ops })
+                } else {
+                    None
+                },
+                var_names,
+            });
+        }
+
+        let tree = evalexpr::build_operator_tree(&expr_clean)
+            .map_err(|e| format!("Compile error: {}", e))?;
+        Ok(Self {
+            ast: None,
+            tree: Some(tree),
+            ops: None,
+            var_names: Vec::new(),
+        })
+    }
+
+    /// Evaluate the compiled expression with the given variable values.
+    /// The variable names must match those supplied at construction time.
+    ///
+    /// Hot loop sin alloc: pila fija `[0.0; 256]` en `run_opcodes_flat`,
+    /// despacho por opcode sin `HashMap`/`String` por operación (como máximo
+    /// un barrido lineal sobre ≤3 variables) y pila validada una vez al
+    /// compilar (nunca por eval). Un resultado no finito (`NaN` de `Div`
+    /// 1/0, `Inf` de `Pow` desbordado) cae al path AST/evalexpr y, si tampoco
+    /// es finito, retorna `Err`: nunca se devuelve `Inf` silencioso.
+    /// Evaluación de una sola variable sin allocs: mapea `name` directo a
+    /// v1/v2/v3 (comparaciones `&str`, sin slice ni mapa). Mismo fallthrough
+    /// no-finito → AST que `eval`.
+    pub fn eval_one(&self, name: &str, val: f64) -> Result<f64, String> {
+        if let Some(ops) = &self.ops {
+            let mut v1 = 0.0;
+            let mut v2 = 0.0;
+            let mut v3 = 0.0;
+            if !self.var_names.is_empty() && name == self.var_names[0] {
+                v1 = val;
+            } else if self.var_names.len() > 1 && name == self.var_names[1] {
+                v2 = val;
+            } else if self.var_names.len() > 2 && name == self.var_names[2] {
+                v3 = val;
+            }
+            match run_opcodes_flat(ops, v1, v2, v3) {
+                FlatOutcome::Value(v) if v.is_finite() => return Ok(v),
+                FlatOutcome::Value(_) => {}
+                FlatOutcome::ClampError => {
+                    return Err("clamp requires finite bounds where lower <= upper".to_string());
+                }
+            }
+        }
+        // Sin opcodes o resultado no finito: cae al AST con un solo par
+        // (cold path; el hot con opcodes ya retornó sin alocar).
+        self.eval(&[(name.to_owned(), val)])
+    }
+
+    pub fn eval(&self, vars: &[(String, f64)]) -> Result<f64, String> {
+        if let Some(ops) = &self.ops {
+            // Pila validada una vez al compilar (`new`/`compile_flat_ops`).
+            let mut v1 = 0.0;
+            let mut v2 = 0.0;
+            let mut v3 = 0.0;
+
+            for (name, val) in vars {
+                if !self.var_names.is_empty() && name == &self.var_names[0] {
+                    v1 = *val;
+                } else if self.var_names.len() > 1 && name == &self.var_names[1] {
+                    v2 = *val;
+                } else if self.var_names.len() > 2 && name == &self.var_names[2] {
+                    v3 = *val;
+                }
+            }
+
+            match run_opcodes_flat(ops, v1, v2, v3) {
+                FlatOutcome::Value(v) if v.is_finite() => return Ok(v),
+                // No finito → fall through al AST/evalexpr (igual que antes).
+                FlatOutcome::Value(_) => {}
+                FlatOutcome::ClampError => {
+                    return Err("clamp requires finite bounds where lower <= upper".to_string());
+                }
+            }
+        }
+
+        if let Some(ast) = &self.ast {
+            match vars.len() {
+                1 => {
+                    let (var, val) = &vars[0];
+                    let result = ast.eval_at(var, *val);
+                    if result.is_finite() {
+                        return Ok(result);
+                    }
+                }
+                2 => {
+                    let (v1, x1) = &vars[0];
+                    let (v2, x2) = &vars[1];
+                    let result = ast.eval_2d(v1, *x1, v2, *x2);
+                    if result.is_finite() {
+                        return Ok(result);
+                    }
+                }
+                3 => {
+                    let (v1, x1) = &vars[0];
+                    let (v2, x2) = &vars[1];
+                    let (v3, x3) = &vars[2];
+                    let result = ast.eval_3d(v1, *x1, v2, *x2, v3, *x3);
+                    if result.is_finite() {
+                        return Ok(result);
+                    }
+                }
+                _ => {
+                    let vars_map: BTreeMap<String, f64> =
+                        vars.iter().map(|(k, v)| (k.clone(), *v)).collect();
+                    let substituted = ast.clone().substitute_vars(&vars_map, &[]).simplify();
+                    if let crate::ast::Expr::Const(result) = substituted {
+                        if result.is_finite() {
+                            return Ok(result);
+                        }
+                    }
+                }
+            }
+        }
+
+        if self.tree.is_some() {
+            return self.eval_tree(vars);
+        }
+
+        Err("Compiled expression has no evaluator".to_string())
+    }
+
+    /// Camino lento del árbol evalexpr, compartido por `eval`/`eval_1var`
+    /// para no duplicar el bloque (ni re-correr el loop plano al caer acá).
+    fn eval_tree(&self, vars: &[(String, f64)]) -> Result<f64, String> {
+        if let Some(tree) = &self.tree {
+            let mut ctx = setup_math_context();
+            for (name, val) in vars {
+                if let Err(e) = ctx.set_value(name.clone(), Value::from(*val)) {
+                    return Err(format!("Variable error: {}", e));
+                }
+            }
+            return match tree.eval_with_context(&ctx) {
+                Ok(Value::Float(n)) => Ok(n),
+                Ok(Value::Int(n)) => Ok(n as f64),
+                Ok(other) => Err(format!(
+                    "Expression did not evaluate to a number: {:?}",
+                    other
+                )),
+                Err(e) => Err(format!("Evaluation error: {}", e)),
+            };
+        }
+
+        Err("Compiled expression has no evaluator".to_string())
+    }
+
+    /// Evalúa con UNA variable sin alocar `Vec` ni clonar `String` por
+    /// muestra (el camino caliente de samplers: miles de puntos). Misma
+    /// resolución posicional que `eval` + mismos fallbacks (AST de 1 var,
+    /// árbol evalexpr); solo cambia que no hay slice que armar.
+    pub fn eval_1var(&self, var: &str, val: f64) -> Result<f64, String> {
+        if let Some(ops) = &self.ops {
+            let mut v1 = 0.0;
+            let mut v2 = 0.0;
+            let mut v3 = 0.0;
+            if !self.var_names.is_empty() && var == self.var_names[0] {
+                v1 = val;
+            } else if self.var_names.len() > 1 && var == self.var_names[1] {
+                v2 = val;
+            } else if self.var_names.len() > 2 && var == self.var_names[2] {
+                v3 = val;
+            }
+            match run_opcodes_flat(ops, v1, v2, v3) {
+                FlatOutcome::Value(v) if v.is_finite() => return Ok(v),
+                FlatOutcome::Value(_) => {}
+                FlatOutcome::ClampError => {
+                    return Err("clamp requires finite bounds where lower <= upper".to_string());
+                }
+            }
+        }
+        if let Some(ast) = &self.ast {
+            let result = ast.eval_at(var, val);
+            if result.is_finite() {
+                return Ok(result);
+            }
+        }
+        // Camino lento (árbol evalexpr): una alloc, raro en la práctica.
+        if self.tree.is_some() {
+            return self.eval_tree(&[(var.to_string(), val)]);
+        }
+        Err("Compiled expression has no evaluator".to_string())
+    }
+
+    /// Convenience: evaluate a single-variable compiled expression.
+    pub fn eval_at(&self, var: &str, val: f64) -> Result<f64, String> {
+        self.eval_1var(var, val)
+    }
+}
+
+fn validate_opcode_stack(ops: &[Opcode], max_depth: usize) -> Result<(), String> {
+    let mut depth = 0usize;
+    for op in ops {
+        match op {
+            Opcode::PushConst(_) | Opcode::PushVar1 | Opcode::PushVar2 | Opcode::PushVar3 => {
+                depth += 1;
+                if depth > max_depth {
+                    return Err("Expression stack limit exceeded".into());
+                }
+            }
+            Opcode::Clamp => {
+                if depth < 3 {
+                    return Err("Expression stack underflow".into());
+                }
+                depth -= 2;
+            }
+            Opcode::Add
+            | Opcode::Sub
+            | Opcode::Mul
+            | Opcode::Div
+            | Opcode::Pow
+            | Opcode::Atan2
+            | Opcode::Modulo
+            | Opcode::Min
+            | Opcode::Max
+            | Opcode::Beta
+            | Opcode::BesselJ
+            | Opcode::BesselY
+            | Opcode::BesselI
+            | Opcode::Lt
+            | Opcode::Gt
+            | Opcode::Le
+            | Opcode::Ge
+            | Opcode::Eq
+            | Opcode::Ne => {
+                if depth < 2 {
+                    return Err("Expression stack underflow".into());
+                }
+                depth -= 1;
+            }
+            _ => {
+                if depth < 1 {
+                    return Err("Expression stack underflow".into());
+                }
+            }
+        }
+    }
+    if depth == 1 {
+        Ok(())
+    } else {
+        Err("Expression stack did not finish with one value".into())
+    }
+}
+
+/// Compile an expression with the given constants and evaluate it once.
+pub fn evaluate_compiled(expr: &str, vars: &[(String, f64)]) -> Result<f64, String> {
+    let constants: std::collections::BTreeMap<String, f64> =
+        vars.iter().map(|(k, v)| (k.clone(), *v)).collect();
+    let compiled = CompiledExpr::new(expr, &constants)?;
+    compiled.eval(vars)
+}
+
+/// Evaluate a pre-parsed AST at a batch of x values.
+pub fn eval_parsed_batch(
+    ast: &crate::ast::Expr,
+    var_name: &str,
+    xs: impl Iterator<Item = f64>,
+) -> Vec<Option<f64>> {
+    xs.map(|x| {
+        let res = ast.eval_at(var_name, x);
+        if res.is_nan() {
+            None
+        } else {
+            Some(res)
+        }
+    })
+    .collect()
+}
+
+/// Evaluate ∫[lower → x] integrand(var) d(var) for each x value.
+/// Uses Gauss-Legendre 5-point quadrature with adaptive subdivision.
+pub fn eval_integral_batch(
+    integrand: &str,
+    int_var: &str,
+    lower: f64,
+    xs: impl Iterator<Item = f64> + Clone,
+    vars: &std::collections::BTreeMap<String, f64>,
+) -> Vec<Option<f64>> {
+    // Prepare the integrand AST once
+    let expr_clean = preprocess_expr(integrand);
+    let prepared = crate::ast::parse_ast(&expr_clean)
+        .map(|ast| ast.substitute_vars(vars, &[int_var]).simplify());
+
+    let prepared = match prepared {
+        Ok(p) => p,
+        Err(_) => return xs.map(|_| None).collect(),
+    };
+    // Opcodes una vez (no walk por nodo de cuadratura: 80 evals por x).
+    let flat = compile_flat_ops(&prepared, int_var, "", "");
+
+    fn adaptive_integrate(
+        prepared: &crate::ast::Expr,
+        flat: Option<&ValidatedOps>,
+        int_var: &str,
+        a: f64,
+        b: f64,
+        depth: u32,
+    ) -> Option<f64> {
+        if depth == 0 {
+            let nodes = [
+                -0.906179845938664,
+                -0.538469310105683,
+                0.0,
+                0.538469310105683,
+                0.906179845938664,
+            ];
+            let weights = [
+                0.236926885056189,
+                0.478628670499366,
+                0.568888888888889,
+                0.478628670499366,
+                0.236926885056189,
+            ];
+            let mid = (a + b) * 0.5;
+            let half = (b - a) * 0.5;
+            let mut sum = 0.0;
+            for (&xi, &wi) in nodes.iter().zip(weights.iter()) {
+                let t = mid + half * xi;
+                // Plano primero; nodos no finitos se saltean igual que antes.
+                let val = flat
+                    .and_then(|ops| eval_opcodes_flat(ops, t, 0.0, 0.0))
+                    .or_else(|| {
+                        let v = prepared.eval_at(int_var, t);
+                        v.is_finite().then_some(v)
+                    });
+                if let Some(val) = val {
+                    sum += wi * val;
+                }
+            }
+            return Some(sum * half);
+        }
+        let mid = (a + b) * 0.5;
+        let left = adaptive_integrate(prepared, flat, int_var, a, mid, depth - 1)?;
+        let right = adaptive_integrate(prepared, flat, int_var, mid, b, depth - 1)?;
+        Some(left + right)
+    }
+
+    // Paralelo por x (orden preservado por `collect`): cada integral es
+    // independiente (todas parten de `lower`).
+    use rayon::prelude::*;
+    let xs_vec: Vec<f64> = xs.collect();
+    xs_vec
+        .into_par_iter()
+        .map(|x| {
+            if x < lower {
+                adaptive_integrate(&prepared, flat.as_ref(), int_var, x, lower, 4).map(|v| -v)
+            } else if (x - lower).abs() < 1e-12 {
+                Some(0.0)
+            } else {
+                adaptive_integrate(&prepared, flat.as_ref(), int_var, lower, x, 4)
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    /// Paridad flat-vs-walk en muestreo adversarial (Ola 2 B1).
+    ///
+    /// El fast path plano solo es válido si acuerda con el walk en los
+    /// GAPS (finito vs no-finito: ahí vive la forma visible de la curva).
+    /// En valores se exige cercanía; en trigonometría de argumento gigante
+    /// el plano es más preciso a propósito (`trig_reduce`), así que esos
+    /// casos solo pinean gaps.
+    #[test]
+    fn flat_matches_walk_en_muestreo_adversarial() {
+        // (expresión, exacta: true = también cercanía 1e-9, false = solo gaps)
+        let casos: &[(&str, bool)] = &[
+            ("sin(x)", true),
+            ("cos(x)", true),
+            ("x^2 - 2", true),
+            ("x^3 - 2*x + 1", true),
+            ("exp(x)", true),
+            ("log(x)", true),
+            ("sqrt(x)", true),
+            ("1/x", false),
+            ("tan(x)", false),
+            ("x^x", false),
+            ("1/(1/x)", false),
+            ("exp(700*x)", false),
+            ("sinh(500)", false),
+            ("sec(x)", false),
+            ("csc(x)", false),
+            ("cot(x)", false),
+            ("asin(x)", true),
+            ("acos(x)", true),
+            ("atan(x)", true),
+            ("clamp(x,-1,2)", true),
+            ("clamp(x,2,1)", true),
+            ("max(x,sin(x))", true),
+            ("min(x,cos(x))", true),
+            ("erf(x)", true),
+            ("gamma(x+1)", true),
+            ("atan2(x,1)", true),
+            ("0^0", true),
+            ("(-8)^(1/3)", true),
+            ("log(-1)", true),
+            ("sqrt(x^2-1)", false),
+            ("x>0", true),
+            ("abs(x-1)", true),
+            ("sin(1e16*x)", false),
+        ];
+        let mut normales = Vec::new();
+        for i in 0..=2000 {
+            normales.push(-10.0 + 20.0 * f64::from(i) / 2000.0);
+        }
+        let bordes = [
+            0.0,
+            -0.0,
+            1e-300,
+            -1e-300,
+            5e-324,
+            1e300,
+            -1e300,
+            f64::MIN_POSITIVE,
+            std::f64::consts::FRAC_PI_2 - 1e-12,
+            std::f64::consts::FRAC_PI_2 + 1e-12,
+            std::f64::consts::PI - 1e-12,
+            1e16,
+            -1e16,
+        ];
+        let vars_vacias = std::collections::BTreeMap::new();
+        for (expr_str, exacta) in casos {
+            let mut ast = crate::ast::parse_ast(&preprocess_expr(expr_str))
+                .unwrap_or_else(|e| panic!("parsea en batería: {expr_str}: {e}"));
+            ast = ast.substitute_vars(&vars_vacias, &["x"]).simplify();
+            let ops = compile_flat_ops(&ast, "x", "", "")
+                .unwrap_or_else(|| panic!("compila en batería: {expr_str}"));
+            for x in normales.iter().copied().chain(bordes) {
+                let walk = ast.eval_at("x", x);
+                let flat = eval_opcodes_flat_raw(&ops, x, 0.0, 0.0);
+                assert_eq!(
+                    flat.is_finite(),
+                    walk.is_finite(),
+                    "gap finito en {expr_str} x={x}: flat={flat} walk={walk}"
+                );
+                assert_eq!(
+                    flat.is_nan(),
+                    walk.is_nan(),
+                    "gap NaN en {expr_str} x={x}: flat={flat} walk={walk}"
+                );
+            }
+            // Cercanía solo en rango normal: con argumento gigante el plano
+            // (`trig_reduce`) es más preciso que el libm crudo a propósito.
+            if *exacta {
+                for x in normales.iter().copied() {
+                    let walk = ast.eval_at("x", x);
+                    if !walk.is_finite() {
+                        continue;
+                    }
+                    let flat = eval_opcodes_flat_raw(&ops, x, 0.0, 0.0);
+                    let tol = 1e-9 * 1.0f64.max(walk.abs()).max(flat.abs());
+                    assert!(
+                        (flat - walk).abs() <= tol,
+                        "deriva en {expr_str} x={x}: flat={flat} walk={walk}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Paridad 2D (implícitas, campos, paramétricas): acuerdo de gaps en
+    /// malla con diagonal singular incluida (`1/(x-y)`).
+    #[test]
+    fn flat_matches_walk_2d_en_malla_singular() {
+        let casos = ["x*y", "x/y", "sin(x)*cos(y)", "1/(x-y)", "x^2+y^2-1"];
+        let vars_vacias = std::collections::BTreeMap::new();
+        for expr_str in casos {
+            let mut ast = crate::ast::parse_ast(&preprocess_expr(expr_str))
+                .unwrap_or_else(|e| panic!("parsea en batería: {expr_str}: {e}"));
+            ast = ast.substitute_vars(&vars_vacias, &["x", "y"]).simplify();
+            let ops = compile_flat_ops(&ast, "x", "y", "")
+                .unwrap_or_else(|| panic!("compila en batería: {expr_str}"));
+            for i in 0..=40 {
+                for j in 0..=40 {
+                    let x = -2.0 + 4.0 * f64::from(i) / 40.0;
+                    let y = -2.0 + 4.0 * f64::from(j) / 40.0;
+                    let walk = ast.eval_2d("x", x, "y", y);
+                    let flat = eval_opcodes_flat_raw(&ops, x, y, 0.0);
+                    assert_eq!(
+                        flat.is_finite(),
+                        walk.is_finite(),
+                        "gap 2D en {expr_str} ({x},{y}): flat={flat} walk={walk}"
+                    );
+                }
+            }
+        }
+    }
+    /// Ola 4 P0: el LRU de 128 (`MAX_COMPILED_EXPR_CACHE`) desaloja de verdad.
+    ///
+    /// Determinista y sin sleeps: vacía el cache del hilo, inserta 129
+    /// expresiones distintas por el path cacheado y verifica tope + víctima
+    /// LRU (la primera insertada) + superviviente (la última).
+    #[test]
+    fn compiled_expr_cache_evicts_lru_past_128() {
+        clear_compiled_expr_cache_for_tests();
+        assert_eq!(MAX_COMPILED_EXPR_CACHE, 128);
+        for i in 0..=128 {
+            let expr = format!("{i}+1");
+            let got = evaluate_cached(&expr, &[]).expect("expr numérica válida");
+            assert_eq!(got, (i + 1) as f64, "expr {expr}");
+        }
+        assert_eq!(compiled_expr_cache_len_for_tests(), 128);
+        assert!(
+            !compiled_expr_cache_contains_for_tests("0+1"),
+            "la primera insertada debió ser desalojada (LRU)"
+        );
+        assert!(
+            compiled_expr_cache_contains_for_tests("128+1"),
+            "la última insertada debe seguir en el cache"
+        );
+        clear_compiled_expr_cache_for_tests();
+        assert_eq!(compiled_expr_cache_len_for_tests(), 0);
+    }
+
+    #[test]
+    fn evaluate_cached_one_matches_slice_api() {
+        // P2-perf: `evaluate_cached_one` (cero allocs en hit) debe acordar
+        // bit a bit con `evaluate_cached(expr, &[(name, value)])` en todos
+        // los caminos (opcodes, AST, evalexpr, errores).
+        clear_compiled_expr_cache_for_tests();
+        for expr in [
+            "sin(x) + x^2 - cos(2*x)",
+            "x^3 - 2*x^2 + x - 5",
+            "exp(x)/ (1 + exp(x))",
+            "x^y + y",
+            "1/0",
+            "no_es_funcion(x",
+        ] {
+            for x in [-3.5, 0.0, 1.0, 2.25] {
+                let sliced = evaluate_cached(expr, &[("x".to_string(), x)]);
+                let one = evaluate_cached_one(expr, "x", x);
+                assert_eq!(sliced.ok(), one.ok(), "mismatch en {expr:?} x={x}");
+            }
+        }
+        // Nombre que no es variable de la expresión: ambas APIs acuerdan
+        // (la variable ausente vale 0 en opcodes).
+        let sliced = evaluate_cached("x + 1", &[("y".to_string(), 5.0)]);
+        let one = evaluate_cached_one("x + 1", "y", 5.0);
+        assert_eq!(sliced.ok(), one.ok());
+        clear_compiled_expr_cache_for_tests();
+    }
+    #[test]
+    fn batch_par_sobre_umbral_coincide_con_escalar_punto_a_punto() {
+        // F10-D: el path rayon (>=1024) debe ser determinista y acordar con
+        // el evaluador puntual. N=1500 cruza RAYON_BATCH_THRESHOLD.
+        // Desde Ola 2 el batch corre opcodes planos (más precisos en trig
+        // por `trig_reduce`, 1 ulp de diferencia documentada): con trig se
+        // exige acuerdo de gaps + tolerancia; con álgebra pura, bit a bit.
+        let vars = BTreeMap::new();
+        let n = RAYON_BATCH_THRESHOLD + 476;
+        let xs: Vec<f64> = (0..n)
+            .map(|i| -10.0 + 20.0 * (i as f64) / (n as f64))
+            .collect();
+        let got = eval_batch_1d("sin(x) + x^2 - cos(2*x)", "x", xs.iter().copied(), &vars)
+            .expect("batch");
+        assert_eq!(got.len(), n);
+        // Determinista: dos corridas idénticas bit a bit.
+        let got2 = eval_batch_1d("sin(x) + x^2 - cos(2*x)", "x", xs.iter().copied(), &vars)
+            .expect("batch2");
+        assert_eq!(got, got2, "el batch rayon debe ser determinista");
+        for (i, &x) in xs.iter().enumerate() {
+            let expected = evaluate("sin(x) + x^2 - cos(2*x)", &[("x".to_string(), x)]).ok();
+            match (got[i], expected) {
+                (Some(a), Some(b)) => {
+                    assert_eq!(
+                        a.is_finite(),
+                        b.is_finite(),
+                        "gap en x={x}: batch={a} escalar={b}"
+                    );
+                    if a.is_finite() && b.is_finite() {
+                        let tol = 1e-12 * 1.0f64.max(a.abs()).max(b.abs());
+                        assert!(
+                            (a - b).abs() <= tol,
+                            "deriva en x={x}: batch={a} escalar={b}"
+                        );
+                    }
+                }
+                (a, b) => assert_eq!(a.is_none(), b.is_none(), "gap None en x={x}"),
+            }
+        }
+        // Álgebra pura (sin trig): bit a bit contra el escalar.
+        let got_alg =
+            eval_batch_1d("x^3 - 2*x^2 + x - 5", "x", xs.iter().copied(), &vars).expect("batch");
+        for (i, &x) in xs.iter().enumerate() {
+            let expected = evaluate("x^3 - 2*x^2 + x - 5", &[("x".to_string(), x)]).ok();
+            assert_eq!(got_alg[i], expected, "mismatch álgebra en x={x}");
+        }
+    }
+    #[test]
+    fn batch_2d_par_sobre_umbral_coincide_con_punto_a_punto() {
+        let vars = BTreeMap::new();
+        let n = RAYON_BATCH_THRESHOLD + 100;
+        let pts: Vec<(f64, f64)> = (0..n)
+            .map(|i| (i as f64 * 0.01, (i as f64 * 0.02).sin()))
+            .collect();
+        let got =
+            eval_batch_2d("x^2 + y^2", "x", "y", pts.iter().copied(), &vars).expect("batch2d");
+        assert_eq!(got.len(), n);
+        for (i, &(x, y)) in pts.iter().enumerate() {
+            let expected =
+                evaluate("x^2 + y^2", &[("x".to_string(), x), ("y".to_string(), y)]).ok();
+            assert_eq!(got[i], expected, "mismatch en ({x},{y})");
+        }
+    }
+    #[test]
+    fn batch_chico_bajo_umbral_sigue_escalar_y_correcto() {
+        // N=10 < umbral: path escalar intacto, mismo resultado.
+        let vars = BTreeMap::new();
+        let got = eval_batch_1d("x^2", "x", [1.0, 2.0, 3.0].into_iter(), &vars).expect("batch");
+        assert_eq!(got, vec![Some(1.0), Some(4.0), Some(9.0)]);
+    }
+    #[test]
+    fn test_eval_syntax() {
+        println!("sin(1.0): {:?}", eval_function("sin(1.0)", 1.0));
+        println!("math::sin(1.0): {:?}", eval_function("math::sin(1.0)", 1.0));
+        println!("x^2 at 2.0: {:?}", eval_function("x^2", 2.0));
+        println!("x^2 at 2.5: {:?}", eval_function("x^2", 2.5));
+        println!(
+            "cos^(-1)(1-abs(x))-π at 0.5: {:?}",
+            eval_function("cos^(-1)(1-abs(x))-π", 0.5)
+        );
+    }
+    fn insert_implicit_multiplication(text: &str) -> String {
+        let mut res = String::new();
+        let chars: Vec<char> = text.chars().collect();
+        for i in 0..chars.len() {
+            res.push(chars[i]);
+            if i + 1 < chars.len() {
+                let c1 = chars[i];
+                let c2 = chars[i + 1];
+                if c1.is_ascii_digit() && c2.is_ascii_alphabetic() {
+                    res.push('*');
+                }
+                if c1 == ')' && c2.is_ascii_alphabetic() {
+                    res.push('*');
+                }
+                if c1 == ')' && c2.is_ascii_digit() {
+                    res.push('*');
+                }
+                if c1.is_ascii_digit()
+                    && c2 == '('
+                    && (i == 0 || !chars[i - 1].is_ascii_alphabetic())
+                {
+                    res.push('*');
+                } // 3( but not atan2(
+                if c1 == ')' && c2 == '(' {
+                    res.push('*');
+                }
+            }
+        }
+        res
+    }
+
+    #[test]
+    fn test_implicit_mul() {
+        println!("2x -> {}", insert_implicit_multiplication("2x"));
+        println!("2(x+1) -> {}", insert_implicit_multiplication("2(x+1)"));
+        println!(
+            "(x+1)(x-1) -> {}",
+            insert_implicit_multiplication("(x+1)(x-1)")
+        );
+        println!("sin(x) -> {}", insert_implicit_multiplication("sin(x)"));
+        println!("2sin(x) -> {}", insert_implicit_multiplication("2sin(x)"));
+    }
+
+    #[test]
+    fn test_sum_expansion() {
+        // sum(n^2, n, 1, 5) = 1+4+9+16+25 = 55
+        assert!((eval_function("sum(n^2, n, 1, 5)", 0.0).unwrap() - 55.0).abs() < 0.01);
+        // sum(1/n, n, 1, 4) = 1 + 1/2 + 1/3 + 1/4 ≈ 2.08333
+        let v = eval_function("sum(1/n, n, 1, 4)", 0.0).unwrap();
+        assert!((v - 2.08333333).abs() < 0.01, "got {}", v);
+        // product(i, i, 1, 4) = 24
+        assert!((eval_function("product(i, i, 1, 4)", 0.0).unwrap() - 24.0).abs() < 0.01);
+        // sum(sin(n*x)/n, n, 1, 3) at x=0.5
+        let v = eval_function("sum(sin(n*x)/n, n, 1, 3)", 0.5).unwrap();
+        assert!((v - 1.23266).abs() < 0.01, "got {}", v);
+        // Negative range: sum(n, n, -2, 2) = 0
+        assert!((eval_function("sum(n, n, -2, 2)", 0.0).unwrap() - 0.0).abs() < 0.01);
+        // Sum with x: f(x) = sum(n*x, n, 1, 3) = x + 2x + 3x = 6x, at x=2 = 12
+        assert!((eval_function("sum(n*x, n, 1, 3)", 2.0).unwrap() - 12.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn implicit_product_substitution_keeps_operator_and_identifier_bounds() {
+        // `2x` con x=1..3 es 2+4+6, nunca `21.0`+`22.0`+`23.0` (=66).
+        assert!((eval_function("sum(2x, x, 1, 3)", 0.0).unwrap() - 12.0).abs() < 1e-9);
+        assert!((eval_function("product(2n, n, 1, 3)", 0.0).unwrap() - 48.0).abs() < 1e-9);
+        // `x2` es un identificador distinto: no se sustituye.
+        assert_eq!(replace_standalone_var("x2", "x", 1.0), "x2");
+        assert_eq!(replace_standalone_var("2x", "x", 2.0), "2*2.0");
+    }
+
+    #[test]
+    fn finite_sum_and_product_never_drop_terms_using_an_unrelated_x_value() {
+        let sum = eval_function("sum(x^n, n, 1, 50)", 2.0).unwrap();
+        let expected_sum = 2.0_f64.powi(51) - 2.0;
+        assert_eq!(sum, expected_sum);
+
+        let product = eval_function("product(x^n, n, 1, 45)", 1.1).unwrap();
+        let expected_product = 1.1_f64.powi(45 * 46 / 2);
+        assert!((product / expected_product - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn finite_sum_expansion_stops_before_exceeding_its_output_budget() {
+        let expression = format!("sum({}, i, 1, 2000)", "x".repeat(100));
+
+        assert_eq!(expand_sum_product(&expression), expression);
+    }
+
+    #[test]
+    fn compiled_expr_substitutes_constants() {
+        let constants = BTreeMap::from([("a".to_string(), 2.0)]);
+        let compiled = CompiledExpr::new("a*x", &constants).unwrap();
+        let value = compiled.eval(&[("x".to_string(), 3.0)]).unwrap();
+        assert!((value - 6.0).abs() < 1e-12, "got {value}");
+    }
+
+    #[test]
+    fn all_expression_evaluators_preserve_invalid_bessel_order_domain_failures() {
+        for expression in [
+            "besselj(0/0, x)",
+            "bessely(1.5, x)",
+            "besseli(1/0, x)",
+            "besselj(1001, x)",
+            "bessely(-2147483648, x)",
+        ] {
+            let vars = [("x".to_string(), 1.0)];
+            if let Ok(value) = evaluate(expression, &vars) {
+                assert!(
+                    value.is_nan(),
+                    "evalexpr fallback leaked a finite value for {expression}"
+                );
+            }
+            if let Ok(value) = CompiledExpr::new(expression, &BTreeMap::new())
+                .unwrap()
+                .eval(&vars)
+            {
+                assert!(
+                    value.is_nan(),
+                    "compiled evaluator leaked a finite value for {expression}"
+                );
+            }
+        }
+
+        let vars = [("x".to_string(), 1.0)];
+        assert_eq!(
+            evaluate("besselj(2, x)", &vars).unwrap(),
+            crate::special_functions::bessel_j(2, 1.0)
+        );
+    }
+
+    #[test]
+    fn compiled_opcode_division_by_zero_propagates_nan_like_the_native_ast() {
+        let vars = [("x".to_string(), 0.0)];
+        // AST nativo: 1/(1/0) es NaN (ver `ast::Expr::eval_at`).
+        let ast = crate::ast::parse_ast("1/(1/x)").expect("parse");
+        assert!(ast.eval_at("x", 0.0).is_nan());
+        // El opcode debe coincidir: antes devolvía Ok(0.0) vía Inf intermedio.
+        let nested = CompiledExpr::new("1/(1/x)", &BTreeMap::new()).expect("compile");
+        assert!(nested.eval(&vars).is_err());
+        // Caso simple: 1/0 nunca puede ser Ok(Inf).
+        let simple = CompiledExpr::new("1/x", &BTreeMap::new()).expect("compile");
+        assert!(simple.eval(&vars).is_err());
+    }
+
+    #[test]
+    fn preprocesses_known_mathematica_style_function_calls() {
+        assert_eq!(
+            preprocess_expr("Sin[x] / (x^2 + 1) + Cos[t]"),
+            "Sin(x) / (x^2 + 1) + Cos(t)"
+        );
+        assert_eq!(
+            preprocess_expr("max[Sin[x], Cos[x]]"),
+            "max(Sin(x), Cos(x))"
+        );
+    }
+
+    #[test]
+    fn evaluates_trigamma() {
+        let value = evaluate("trigamma(1)", &[]).unwrap();
+        assert!((value - std::f64::consts::PI.powi(2) / 6.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn hyperbolic_evaluator_preserves_finite_values_until_f64_overflow() {
+        assert!(evaluate("sinh(700.0)", &[]).unwrap().is_finite());
+        assert!(evaluate("cosh(700.0)", &[]).unwrap().is_finite());
+    }
+
+    #[test]
+    fn invalid_clamp_bounds_return_errors_without_panicking() {
+        let invalid = "clamp(x, 2, 1)";
+        let vars = [("x".to_string(), 0.0)];
+
+        assert!(evaluate(invalid, &vars).is_err());
+        assert!(evaluate_cached(invalid, &vars).is_err());
+        assert!(std::panic::catch_unwind(|| {
+            crate::ast::parse_ast("clamp(0, 2, 1)").unwrap().simplify()
+        })
+        .is_ok());
+    }
+}
+
+// ── F10 hostile fuzz (solo tests, sin tocar prod) ─────────────────────────
+// RAW sin catch/should_panic: el harness muestra el pánico crudo con backtrace.
+#[cfg(test)]
+mod hostile_crash_f10 {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn hostile_expr_vacia_operadores_unicode() {
+        let empty_vars: Vec<(String, f64)> = vec![];
+        // Vacío / blancos: Err, no panic
+        assert!(evaluate("", &empty_vars).is_err());
+        assert!(evaluate("   ", &empty_vars).is_err());
+        assert!(evaluate("\n\t ", &empty_vars).is_err());
+        // Solo operadores / parens sueltos
+        for expr in [
+            "+", "++", "***", "///", "(((", ")))", "(()", "()(", "+-*/^", "==", "!=",
+        ] {
+            let _ = evaluate(expr, &empty_vars);
+            let _ = evaluate_cached(expr, &empty_vars);
+            let _ = validate(expr);
+            let vars = BTreeMap::new();
+            let _ = prepare_function_ast(expr, &vars, &[]);
+        }
+        // Unicode partido / emojis multi-byte: jamás panic
+        for expr in [
+            "x + \u{1F600}",
+            "\u{e9}",
+            "\u{e9}\u{e9}\u{e9}",
+            "😀😀😀",
+            "x² + y²",
+            "sin(é)",
+            "x\u{0301}",
+            "\u{200B}",
+        ] {
+            let _ = evaluate(expr, &[("x".to_string(), 1.0)]);
+            let _ = evaluate_cached(expr, &[("x".to_string(), 1.0)]);
+            let _ = validate(expr);
+            let vars = BTreeMap::new();
+            let _ = prepare_function_ast(expr, &vars, &["x"]);
+        }
+    }
+
+    #[test]
+    fn hostile_parens_10k() {
+        // NOTA F10-FIX: 10k parens daban SIGABRT por stack overflow (los
+        // `hostile_stack_overflow_*` de abajo lo cubren ya como `Err` verde).
+        // Acá versión media (1k parens + 300 mid) que corre en la suite.
+        let deep = format!("{}x{}", "(".repeat(1_000), ")".repeat(1_000));
+        let vars: Vec<(String, f64)> = vec![("x".to_string(), 1.0)];
+        let _ = evaluate(&deep, &vars);
+        let _ = evaluate_cached(&deep, &vars);
+        let _ = validate(&deep);
+        let map = BTreeMap::new();
+        let _ = prepare_function_ast(&deep, &map, &["x"]);
+        let _ = crate::ast::parse_ast(&deep);
+        // Profundidad media 300 (sobre MAX_AST_DEPTH 256 pero bajo tokens): debe dar Err
+        let mid = format!("{}x{}", "(".repeat(300), ")".repeat(300));
+        let _ = evaluate(&mid, &vars);
+        let _ = crate::ast::parse_ast(&mid);
+    }
+
+    #[test]
+    fn hostile_strings_200kb() {
+        // Versión media (5k "x+" = 10KB, 5k parens): la original de 100k
+        // "x+" (200KB) y 50k parens daban SIGABRT (cubiertas por
+        // `hostile_stack_overflow_*` como `Err`). 5k corre sin voltear la suite.
+        let big_x = "x+".repeat(5_000); // 10KB
+        let vars: Vec<(String, f64)> = vec![("x".to_string(), 1.0)];
+        let _ = evaluate(&big_x, &vars);
+        let _ = evaluate_cached(&big_x, &vars);
+        let _ = validate(&big_x);
+        let map = BTreeMap::new();
+        let _ = prepare_function_ast(&big_x, &map, &["x"]);
+        let big_paren = format!("{}1{}", "(".repeat(5_000), ")".repeat(5_000));
+        let _ = evaluate(&big_paren, &[]);
+        let _ = crate::ast::parse_ast(&big_paren);
+        let big_emoji = "\u{1F600}".repeat(5_000);
+        let _ = evaluate(&big_emoji, &[]);
+        let _ = validate(&big_emoji);
+    }
+
+    // ── F10-FIX: ya no abortan (la guarda de presupuesto rechaza con `Err`
+    // honesto antes de `build_operator_tree`). Tests verdes normales: el solo
+    // hecho de completarse prueba que no hay SIGABRT.
+    #[test]
+    fn hostile_stack_overflow_xplus_8k() {
+        // 16KB: antes umbral de overflow (7k ok, 8k abortaba en workers 2MB).
+        let s = "x+".repeat(8_000);
+        let vars = vec![("x".to_string(), 1.0)];
+        assert!(evaluate(&s, &vars).is_err());
+        assert!(evaluate_cached(&s, &vars).is_err());
+    }
+
+    #[test]
+    fn hostile_stack_overflow_paren_8k() {
+        let s = format!("{}1{}", "(".repeat(8_000), ")".repeat(8_000));
+        assert!(evaluate(&s, &[]).is_err());
+    }
+
+    #[test]
+    fn hostile_stack_overflow_paren_10k_x() {
+        let s = format!("{}x{}", "(".repeat(10_000), ")".repeat(10_000));
+        let vars = vec![("x".to_string(), 1.0)];
+        assert!(evaluate(&s, &vars).is_err());
+    }
+
+    #[test]
+    fn hostile_budget_guards_below_byte_cap() {
+        // Bajo el cap de 2000 bytes pero sobre nesting/rachas: también `Err`.
+        // 900 parens = 1801 bytes (<2000) con profundidad 900 (>256).
+        let deep = format!("{}1{}", "(".repeat(900), ")".repeat(900));
+        assert!(deep.len() < MAX_EXPR_LENGTH);
+        assert!(evaluate(&deep, &[]).is_err());
+        // Racha de 300 '+' (<2000 bytes) → `Err` por racha, no por largo.
+        let chained = "+".repeat(300);
+        assert!(chained.len() < MAX_EXPR_LENGTH);
+        assert!(evaluate(&chained, &[]).is_err());
+        // Límite: 1000 términos `1+1+…` (1999 bytes) sigue evaluando honesto.
+        let boundary = vec!["1"; 1000].join("+");
+        assert_eq!(boundary.len(), 1999);
+        assert_eq!(evaluate(&boundary, &[]), Ok(1000.0));
+    }
+
+    #[test]
+    fn hostile_batch_y_compiled_rechazan_16k() {
+        // Los slow-paths propios de batch/compilado también tienen guarda.
+        use std::collections::BTreeMap as Map;
+        let big = "x+".repeat(8_000);
+        let vars = Map::new();
+        assert!(eval_batch_1d(&big, "x", vec![1.0].into_iter(), &vars).is_err());
+        assert!(eval_function_batch(&big, vec![1.0].into_iter(), &vars).is_err());
+        assert!(CompiledExpr::new(&big, &vars).is_err());
+    }
+
+    #[test]
+    fn hostile_cas_rangos_degenerados() {
+        let map = BTreeMap::new();
+        // solve_expression con rangos degenerados / NaN / inf
+        for (a, b) in [
+            (0.0, 0.0),
+            (f64::NAN, 1.0),
+            (0.0, f64::NAN),
+            (f64::NAN, f64::NAN),
+            (f64::INFINITY, 1.0),
+            (0.0, f64::INFINITY),
+            (f64::NEG_INFINITY, f64::INFINITY),
+            (f64::INFINITY, f64::INFINITY),
+        ] {
+            let _ = crate::cas::solve_expression("x^2", 1.0, &map, a, b);
+            let _ = crate::cas::solve_expression("", 0.0, &map, a, b);
+            let _ = crate::cas::solve_expression("+++", 0.0, &map, a, b);
+        }
+        // solve con expr hostil y rango sano
+        for expr in [
+            "",
+            "   ",
+            "+++",
+            "***",
+            "(((",
+            "\u{1F600}",
+            &"(".repeat(10_000),
+        ] {
+            let _ = crate::cas::solve_expression(expr, 0.0, &map, -10.0, 10.0);
+        }
+        // gruntz / laurent / buchberger hostiles
+        let _ = crate::cas::gruntz_limit("", "x", 0.0);
+        let _ = crate::cas::gruntz_limit("+++", "x", 0.0);
+        let _ = crate::cas::gruntz_limit(&"(".repeat(10_000), "x", 0.0);
+        let _ = crate::cas::gruntz_limit("x^2", "", 0.0);
+        let _ = crate::cas::gruntz_limit("x^2", "x", f64::NAN);
+        let _ = crate::cas::gruntz_limit("x^2", "x", f64::INFINITY);
+        let _ = crate::cas::gruntz_limit_infinite("x^2", "x", true);
+        let _ = crate::cas::gruntz_limit_infinite("", "x", false);
+        let _ = crate::cas::laurent_residue("1/x", "x", 0.0, 4);
+        let _ = crate::cas::laurent_residue("", "x", 0.0, 4);
+        let _ = crate::cas::laurent_residue("+++", "", f64::NAN, usize::MAX);
+        let _ = crate::cas::laurent_principal_part("1/x", "x", 0.0, 4);
+        let _ = crate::cas::laurent_principal_part("", "", f64::NAN, usize::MAX);
+        let _ = crate::cas::buchberger_basis(&["x^2".to_string()], &["x".to_string()]);
+        let _ = crate::cas::buchberger_basis(&["".to_string()], &["".to_string()]);
+        let _: Result<_, _> =
+            crate::cas::buchberger_basis(&["+++ ".to_string()], &["\u{1F600}".to_string()]);
+    }
+
+    #[test]
+    fn hostile_eval_batch_y_compiled() {
+        let vars = BTreeMap::new();
+        // batches con x NaN/inf
+        let xs = vec![0.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1.0];
+        let _ = eval_batch_1d("x^2", "x", xs.clone().into_iter(), &vars);
+        let _ = eval_batch_1d("", "x", xs.clone().into_iter(), &vars);
+        let _ = eval_batch_1d("+++", "x", xs.clone().into_iter(), &vars);
+        let _ = eval_function_batch("x^2", xs.clone().into_iter(), &vars);
+        let _ = eval_function_batch("", xs.into_iter(), &vars);
+        // compiled con expr hostil
+        let _ = evaluate_compiled("", &[]);
+        let _ = evaluate_compiled("+++", &[]);
+        let _ = evaluate_compiled(&"(".repeat(10_000), &[]);
+    }
+}

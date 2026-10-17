@@ -1,0 +1,709 @@
+#![allow(unknown_lints, float_literal_f32_fallback)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+#![allow(deprecated)]
+#![allow(clippy::uninlined_format_args)]
+//! Aplicación de escritorio Grafito — raíz de módulos.
+//!
+//! La lógica de la aplicación está dividida en módulos específicos:
+//! `app`, `canvas`, `input`, `ui`, `commands` y `utils`. Los helpers de
+//! renderizado legado y el despachador de herramientas permanecen como
+//! módulos internos del crate.
+
+pub(crate) mod algebra;
+#[allow(dead_code)]
+// TODO P2: remover cuando anim_native se integre al pipeline activo (usado en tests de animación nativa)
+pub(crate) mod anim_native;
+#[allow(dead_code)]
+// TODO P2: remover cuando anim_ui cache de texturas se active en prod (usado en tests)
+pub(crate) mod anim_ui;
+pub(crate) mod app;
+pub(crate) mod assistant;
+pub(crate) mod assistant_credentials;
+pub(crate) mod assistant_jobs;
+pub(crate) mod assistant_media;
+pub(crate) mod assistant_preflight;
+pub(crate) mod canvas;
+pub(crate) mod celebration;
+pub(crate) mod classroom;
+pub(crate) mod colab_link;
+pub(crate) mod colab_panel;
+pub(crate) mod commands;
+pub(crate) mod complex_contour;
+pub mod controllers;
+pub(crate) mod export;
+#[allow(dead_code)]
+// A4 + P1b: slot background cableado (campo en GrafitoApp + `poll` por update
+// + productor `maybe_submit_implicit_slot` en `app.rs` + render de `last_valid`
+// en `render_3d.rs` con gate anti-fantasma). El comando A1 eager queda como
+// fallback honesto fail-closed. `cancel` sigue sin llamador prod (API P2 para
+// el futuro inspector live-preview de alta resolución), testeado headless.
+// El `allow` cubre ese resto muerto en prod, no el módulo entero.
+pub(crate) mod implicit_surface_compute;
+pub(crate) mod indicate;
+pub(crate) mod input;
+#[allow(dead_code)]
+// D3: pipeline testeado headless; D1-bis cablea el TextEdit en panels.rs (prohibido en D3).
+pub(crate) mod inspector_edit;
+pub(crate) mod keyboard;
+pub(crate) mod lifecycle;
+pub(crate) mod manim_orchestrator;
+pub(crate) mod ocr_cli;
+pub(crate) mod panels;
+pub mod render_2d;
+pub(crate) mod render_3d;
+pub(crate) mod sheet_layout;
+pub(crate) mod shot;
+pub(crate) mod snap;
+pub(crate) mod solver_nl;
+pub(crate) mod spreadsheet;
+pub(crate) mod stt_cli;
+pub(crate) mod teaching_ui;
+pub(crate) mod tool_dispatcher;
+pub mod tools_panel;
+pub(crate) mod tts_cli;
+pub(crate) mod ui;
+pub(crate) mod usage_log;
+pub(crate) mod utils;
+pub(crate) mod view_flags;
+pub(crate) mod whiteboard_clipboard;
+pub(crate) mod whiteboard_formula;
+pub(crate) mod whiteboard_png;
+pub(crate) mod whiteboard_ui;
+
+#[cfg(test)]
+mod tests;
+
+/// Cantidad de muestras MSAA usada por el renderizador GPU y la superficie de eframe.
+pub const MSAA_SAMPLES: u16 = 4;
+
+/// Modo de vista 2D/3D actual — **valor derivado, no fuente canónica**.
+///
+/// Se conserva por compatibilidad con el código existente. La fuente canónica
+/// es [`Perspective`]; este enum es un cache derivado vía
+/// [`Perspective::view_mode`] / [`Perspective::canvas_mode`]. En
+/// `GrafitoApp` el campo `current_view` se sincroniza automáticamente en
+/// `GrafitoApp::set_perspective` (`current_view = perspective.view_mode()`)
+/// y se verifica con `debug_assert_eq!(current_view, perspective.view_mode())`.
+/// No almacenar `ViewMode` de forma independiente: derivar siempre de la
+/// `Perspective` activa cuando sea posible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    D2,
+    D3,
+}
+
+impl ViewMode {
+    /// Deriva el modo de vista desde la perspectiva canónica.
+    ///
+    /// Equivalente a `perspective.view_mode()` — atajo para la consolidación
+    /// ViewMode/CanvasMode/Perspective donde `Perspective` es la única fuente.
+    pub const fn from_perspective(perspective: Perspective) -> Self {
+        perspective.view_mode()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Sistema de Perspectivas (estilo GeoGebra Perspectives)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Perspectivas de Grafito — **fuente canónica única** para el modo de vista.
+///
+/// Análogas a las *Perspectives* de GeoGebra. `Perspective` es la única fuente
+/// de verdad para el estado de vista: [`Perspective::canvas_mode`] y
+/// [`Perspective::view_mode`] derivan [`CanvasMode`] y [`ViewMode`]. No
+/// almacenar `ViewMode`/`CanvasMode` de forma independiente; en `GrafitoApp`
+/// `current_view` es un cache sincronizado por `set_perspective` con
+/// `debug_assert_eq!(current_view, perspective.view_mode())`.
+///
+/// Cada perspectiva define un `layout` que controla el modo del canvas, los
+/// paneles visibles, los grupos de herramientas de la toolbar, el teclado
+/// matemático y la herramienta por defecto.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Perspective {
+    /// Geometría 2D euclidiana.
+    #[default]
+    Geometry2D,
+    /// Sólidos y superficies 3D.
+    Geometry3D,
+    /// Álgebra y CAS simbólico.
+    AlgebraCas,
+    /// Cálculo: derivadas, integrales, límites.
+    Calculus,
+    /// Probabilidad y distribuciones.
+    Probability,
+    /// Estadística y regresión.
+    Statistics,
+    /// Números complejos y mapeos conformes.
+    Complex,
+    /// Fractales, atractores y EDOs.
+    Dynamics,
+    /// Hoja de cálculo + análisis de datos.
+    DataAnalysis,
+    /// Física: laboratorios de dinámica y ramas (canvas 2D).
+    Fisica,
+    /// Modo examen restringido.
+    Exam,
+}
+
+impl Perspective {
+    /// Devuelve todas las perspectivas en orden, útil para construir selectores.
+    pub const ALL: [Perspective; 11] = [
+        Perspective::Geometry2D,
+        Perspective::Geometry3D,
+        Perspective::AlgebraCas,
+        Perspective::Calculus,
+        Perspective::Probability,
+        Perspective::Statistics,
+        Perspective::Complex,
+        Perspective::Dynamics,
+        Perspective::DataAnalysis,
+        Perspective::Fisica,
+        Perspective::Exam,
+    ];
+
+    /// Nombre largo, legible para el usuario.
+    pub const fn title(&self) -> &'static str {
+        match self {
+            Perspective::Geometry2D => "Geometría 2D",
+            Perspective::Geometry3D => "Geometría 3D",
+            Perspective::AlgebraCas => "Álgebra y CAS",
+            Perspective::Calculus => "Cálculo",
+            Perspective::Probability => "Probabilidad",
+            Perspective::Statistics => "Estadística",
+            Perspective::Complex => "Complejos",
+            Perspective::Dynamics => "Dinámica",
+            Perspective::DataAnalysis => "Análisis de datos",
+            Perspective::Fisica => "Física",
+            Perspective::Exam => "Examen",
+        }
+    }
+
+    /// Etiqueta corta (2-3 caracteres) para el selector visual del sidebar.
+    pub const fn short_label(&self) -> &'static str {
+        match self {
+            Perspective::Geometry2D => "G2",
+            Perspective::Geometry3D => "G3",
+            Perspective::AlgebraCas => "AL",
+            Perspective::Calculus => "Cλ",
+            Perspective::Probability => "P",
+            Perspective::Statistics => "S",
+            Perspective::Complex => "i",
+            Perspective::Dynamics => "Dn",
+            Perspective::DataAnalysis => "D",
+            Perspective::Fisica => "F",
+            Perspective::Exam => "E",
+        }
+    }
+
+    /// Etiqueta del atajo (`Ctrl+Shift+X`): dígitos 1..9,0 para las diez
+    /// clásicas y `F` para Física (los dígitos estaban agotados).
+    pub const fn shortcut_label(&self) -> &'static str {
+        match self {
+            Perspective::Geometry2D => "1",
+            Perspective::Geometry3D => "2",
+            Perspective::AlgebraCas => "3",
+            Perspective::Calculus => "4",
+            Perspective::Probability => "5",
+            Perspective::Statistics => "6",
+            Perspective::Complex => "7",
+            Perspective::Dynamics => "8",
+            Perspective::DataAnalysis => "9",
+            Perspective::Fisica => "F",
+            Perspective::Exam => "0",
+        }
+    }
+
+    /// Modo del canvas (2D, 3D o 2D reducido) asociado a la perspectiva.
+    ///
+    /// Fuente canónica para [`CanvasMode`]; [`Perspective::view_mode`] colapsa
+    /// este valor a [`ViewMode`]. No duplicar como campo independiente.
+    pub const fn canvas_mode(&self) -> CanvasMode {
+        match self {
+            Perspective::Geometry2D => CanvasMode::D2,
+            Perspective::Geometry3D => CanvasMode::D3,
+            Perspective::AlgebraCas => CanvasMode::SmallD2,
+            Perspective::Calculus => CanvasMode::D2,
+            Perspective::Probability => CanvasMode::SmallD2,
+            Perspective::Statistics => CanvasMode::D2,
+            Perspective::Complex => CanvasMode::D2,
+            Perspective::Dynamics => CanvasMode::D3,
+            Perspective::DataAnalysis => CanvasMode::D2,
+            Perspective::Fisica => CanvasMode::D2,
+            Perspective::Exam => CanvasMode::D2,
+        }
+    }
+
+    /// Deriva el `ViewMode` (D2/D3) usado por el resto de la aplicación.
+    ///
+    /// Fuente canónica para [`ViewMode`]; `GrafitoApp::current_view` debe ser
+    /// idéntico a este valor y se sincroniza en `GrafitoApp::set_perspective`.
+    /// Delegado a `self.canvas_mode().view_mode()` para que `CanvasMode` sea la
+    /// única definición del colapso `SmallD2 → D2`.
+    pub const fn view_mode(&self) -> ViewMode {
+        self.canvas_mode().view_mode()
+    }
+
+    /// Construye el [`PerspectiveLayout`] que define qué mostrar para esta
+    /// perspectiva.
+    pub fn layout(&self) -> PerspectiveLayout {
+        use grafito_ui::toolbar::ToolGroupId as G;
+        use grafito_ui::Tool;
+        match self {
+            Perspective::Geometry2D => PerspectiveLayout {
+                title: Self::title(self),
+                icon: Self::short_label(self),
+                canvas_mode: CanvasMode::D2,
+                left_panel: LeftPanelContent::Algebra,
+                right_panel: Some(RightPanelContent::ConstructionProtocol),
+                visible_tool_groups: &[
+                    G::Move,
+                    G::Point,
+                    G::Line,
+                    G::Circle,
+                    G::Polygon,
+                    G::Pencil,
+                    G::Eraser,
+                    G::Conic,
+                    G::Measure,
+                    G::Constraint,
+                    G::Boolean,
+                ],
+                show_math_keyboard: false,
+                show_input_bar: true,
+                default_tool: Tool::Select,
+            },
+            Perspective::Geometry3D => PerspectiveLayout {
+                title: Self::title(self),
+                icon: Self::short_label(self),
+                canvas_mode: CanvasMode::D3,
+                left_panel: LeftPanelContent::Algebra,
+                right_panel: Some(RightPanelContent::Properties),
+                visible_tool_groups: &[G::Move, G::ThreeD, G::FourD, G::Pencil, G::Eraser],
+                show_math_keyboard: false,
+                show_input_bar: true,
+                default_tool: Tool::Select,
+            },
+            Perspective::AlgebraCas => PerspectiveLayout {
+                title: Self::title(self),
+                icon: Self::short_label(self),
+                canvas_mode: CanvasMode::SmallD2,
+                left_panel: LeftPanelContent::AlgebraAndCas,
+                right_panel: None,
+                visible_tool_groups: &[G::Move, G::Curve, G::Analysis],
+                show_math_keyboard: false,
+                show_input_bar: true,
+                default_tool: Tool::Function,
+            },
+            Perspective::Calculus => PerspectiveLayout {
+                title: Self::title(self),
+                icon: Self::short_label(self),
+                canvas_mode: CanvasMode::D2,
+                left_panel: LeftPanelContent::Algebra,
+                right_panel: None,
+                visible_tool_groups: &[G::Move, G::Curve, G::Analysis, G::Circle],
+                show_math_keyboard: false,
+                show_input_bar: true,
+                default_tool: Tool::Function,
+            },
+            Perspective::Probability => PerspectiveLayout {
+                title: Self::title(self),
+                icon: Self::short_label(self),
+                canvas_mode: CanvasMode::SmallD2,
+                left_panel: LeftPanelContent::Stats,
+                right_panel: None,
+                visible_tool_groups: &[G::Move, G::Advanced],
+                show_math_keyboard: false,
+                show_input_bar: true,
+                default_tool: Tool::Select,
+            },
+            Perspective::Statistics => PerspectiveLayout {
+                title: Self::title(self),
+                icon: Self::short_label(self),
+                canvas_mode: CanvasMode::D2,
+                left_panel: LeftPanelContent::Stats,
+                right_panel: Some(RightPanelContent::Regression),
+                visible_tool_groups: &[G::Move, G::Advanced, G::Measure],
+                show_math_keyboard: false,
+                show_input_bar: true,
+                default_tool: Tool::Select,
+            },
+            Perspective::Complex => PerspectiveLayout {
+                title: Self::title(self),
+                icon: Self::short_label(self),
+                canvas_mode: CanvasMode::D2,
+                left_panel: LeftPanelContent::Complex,
+                right_panel: Some(RightPanelContent::DomainColoring),
+                visible_tool_groups: &[G::Move, G::Advanced],
+                show_math_keyboard: false,
+                show_input_bar: false,
+                default_tool: Tool::Select,
+            },
+            Perspective::Dynamics => PerspectiveLayout {
+                title: Self::title(self),
+                icon: Self::short_label(self),
+                canvas_mode: CanvasMode::D3,
+                left_panel: LeftPanelContent::Attractor,
+                right_panel: Some(RightPanelContent::Parameters),
+                visible_tool_groups: &[G::Move, G::Dynamics, G::ThreeD],
+                show_math_keyboard: false,
+                show_input_bar: true,
+                default_tool: Tool::Select,
+            },
+            Perspective::DataAnalysis => PerspectiveLayout {
+                title: Self::title(self),
+                icon: Self::short_label(self),
+                canvas_mode: CanvasMode::D2,
+                left_panel: LeftPanelContent::Data,
+                right_panel: Some(RightPanelContent::Regression),
+                visible_tool_groups: &[G::Move, G::Advanced],
+                show_math_keyboard: false,
+                show_input_bar: true,
+                default_tool: Tool::Select,
+            },
+            // Física: laboratorio con panel propio (parámetros a la vista
+            // en el drawer) y canvas 2D completo. Se deja `D2` a propósito:
+            // `SmallD2` achica el canvas para convivir con paneles densos
+            // (Álgebra/CAS, Probabilidad) pero los laboratorios dibujan
+            // diagramas que necesitan todo el ancho — trayectorias,
+            // campos, ondas — y el panel de Física ya vive en el drawer
+            // sin robarle área al dibujo. La derecha queda `None` (igual
+            // que antes): los parámetros viven a la izquierda, no hay
+            // protocolo ni regresión que mostrar. `Measure` se agrega para
+            // medir sobre lo simulado (alcances, distancias).
+            Perspective::Fisica => PerspectiveLayout {
+                title: Self::title(self),
+                icon: Self::short_label(self),
+                canvas_mode: CanvasMode::D2,
+                left_panel: LeftPanelContent::Fisica,
+                right_panel: None,
+                visible_tool_groups: &[G::Move, G::Curve, G::Dynamics, G::Measure],
+                show_math_keyboard: false,
+                show_input_bar: true,
+                default_tool: Tool::Select,
+            },
+            Perspective::Exam => PerspectiveLayout {
+                title: Self::title(self),
+                icon: Self::short_label(self),
+                canvas_mode: CanvasMode::D2,
+                left_panel: LeftPanelContent::Algebra,
+                right_panel: None,
+                visible_tool_groups: &[G::Move, G::Point, G::Line, G::Circle, G::Polygon],
+                show_math_keyboard: false,
+                show_input_bar: true,
+                default_tool: Tool::Select,
+            },
+        }
+    }
+}
+
+/// Modo del canvas asociado a una perspectiva — **valor derivado, no fuente canónica**.
+///
+/// Derivado exclusivamente de [`Perspective::canvas_mode`]. No almacenar de
+/// forma independiente: `Perspective` es la única fuente de verdad. `ViewMode`
+/// a su vez se deriva de este valor vía [`Perspective::view_mode`]
+/// (`D2|SmallD2 → D2`, `D3 → D3`). `Perspective::layout().canvas_mode` ya
+/// coincide con `Perspective::canvas_mode()` para cada variante.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanvasMode {
+    /// Canvas 2D a pantalla completa.
+    D2,
+    /// Canvas 3D a pantalla completa.
+    D3,
+    /// Canvas 2D reducido (comparte espacio con paneles, p.ej. Álgebra/CAS).
+    SmallD2,
+}
+
+impl CanvasMode {
+    /// Deriva el modo de canvas desde la perspectiva canónica.
+    pub const fn from_perspective(perspective: Perspective) -> Self {
+        perspective.canvas_mode()
+    }
+
+    /// Colapsa el modo de canvas a la vista binaria 2D/3D.
+    pub const fn view_mode(self) -> ViewMode {
+        match self {
+            CanvasMode::D2 | CanvasMode::SmallD2 => ViewMode::D2,
+            CanvasMode::D3 => ViewMode::D3,
+        }
+    }
+}
+
+/// Rango de ancho disponible para el shell de escritorio.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShellWidthClass {
+    Compact,
+    Medium,
+    Wide,
+}
+
+/// Pestaña activa del dock contextual compartido por Inspector y Asistente en 3D.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum WorkspaceDockTab {
+    #[default]
+    Inspector,
+    Assistant,
+}
+
+/// Política responsive para los drawers persistentes y la entrada de comandos.
+///
+/// El modo compacto prioriza el canvas; el medio conserva sólo el drawer
+/// izquierdo junto al asistente permanente; el ancho permite además un drawer
+/// contextual cuando todavía queda espacio de trabajo suficiente.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ShellLayout {
+    pub width_class: ShellWidthClass,
+    pub show_sidebar: bool,
+    pub show_left_drawer: bool,
+    pub show_right_drawer: bool,
+    pub show_bottom_input: bool,
+}
+
+impl ShellLayout {
+    // The rail, the default 260 px workspace drawer, the assistant, and a
+    // useful 760 px canvas first fit together at this breakpoint.
+    const CANVAS_FOCUS_MAX_WIDTH: f32 = 1_360.0;
+    // 68 px rail + drawers + the assistant need a 640 px canvas before the
+    // contextual drawer may coexist with the permanent chat panel.
+    const WIDE_MIN_WIDTH: f32 = 1680.0;
+    const SIDEBAR_MIN_WIDTH: f32 = 420.0;
+
+    pub(crate) fn for_viewport(
+        width: f32,
+        perspective: Perspective,
+        sidebar_tab: usize,
+        right_drawer_available: bool,
+        right_drawer_open: bool,
+        left_drawer_open: bool,
+    ) -> Self {
+        let width = width.max(0.0);
+        let width_class = if width < Self::CANVAS_FOCUS_MAX_WIDTH {
+            ShellWidthClass::Compact
+        } else if width < Self::WIDE_MIN_WIDTH {
+            ShellWidthClass::Medium
+        } else {
+            ShellWidthClass::Wide
+        };
+        let show_left_drawer = width_class != ShellWidthClass::Compact && left_drawer_open;
+        let show_right_drawer =
+            width_class == ShellWidthClass::Wide && right_drawer_available && right_drawer_open;
+        let left_drawer_has_input = show_left_drawer && matches!(sidebar_tab, 0 | 2);
+        let show_bottom_input = if show_left_drawer {
+            perspective.layout().show_input_bar && !left_drawer_has_input
+        } else {
+            // El input del drawer no existe en compacto; incluso Complejos
+            // necesita una única entrada visible para completar comandos.
+            true
+        };
+
+        Self {
+            width_class,
+            // Keep the rail visible when its drawer is closed so users can
+            // restore a workspace panel without sacrificing the whole canvas.
+            show_sidebar: width_class != ShellWidthClass::Compact
+                && width >= Self::SIDEBAR_MIN_WIDTH,
+            show_left_drawer,
+            show_right_drawer,
+            show_bottom_input,
+        }
+    }
+
+    /// Expone el drawer de trabajo bajo demanda sin perder el canvas-focus
+    /// layout de los viewports compactos.
+    pub(crate) fn with_compact_left_drawer(mut self, open: bool, sidebar_tab: usize) -> Self {
+        if self.width_class == ShellWidthClass::Compact && open {
+            self.show_left_drawer = true;
+            // Algebra and CAS already contain the shared command editor.
+            self.show_bottom_input = !matches!(sidebar_tab, 0 | 2);
+        }
+        self
+    }
+
+    /// Nivel 0 móvil (<480): el drawer no se pinta y su entrada es
+    /// inalcanzable; la Entrada inferior es la única visible y va siempre.
+    /// Sin esto, un `compact_drawer_open` colgado con tab 0/2 dejaba el
+    /// canvas a pantalla completa sin ninguna Entrada (drawer oculto +
+    /// barra suprimida). Puro y testeable headless.
+    pub(crate) fn with_nivel0(mut self, nivel0: bool) -> Self {
+        if nivel0 {
+            self.show_bottom_input = true;
+        }
+        self
+    }
+}
+
+/// Contenido del panel izquierdo según la perspectiva.
+///
+/// Tabs del sidebar (5 + Aula): 0=Álgebra, 1=Herram., 2=Datos, 3=Prob.,
+/// 4=Vista. `Vista` no tiene contenido asociado: es el tab visual puro.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeftPanelContent {
+    /// Vista de álgebra (objetos, variables, comandos).
+    Algebra,
+    /// Panel CAS (cálculo simbólico) — oculto, todo en Álgebra.
+    #[allow(dead_code)]
+    Cas,
+    /// Álgebra + CAS combinados (álgebra como tab por defecto).
+    AlgebraAndCas,
+    /// Estadística / probabilidad (tab Prob.).
+    Stats,
+    /// Hoja de cálculo + tablas del documento (tab Datos).
+    Data,
+    /// Números complejos / mapeos conformes.
+    Complex,
+    /// Atractores / parámetros dinámicos.
+    Attractor,
+    /// Laboratorios de física (parámetros del lab a la vista: v0,
+    /// ángulo, g y los que correspondan a cada rama). Vive en el tab
+    /// Herram., con dibujo propio (`panels::draw_fisica_panel`).
+    Fisica,
+    /// Herramientas de construcción.
+    Tools,
+}
+
+impl LeftPanelContent {
+    /// Mapea el contenido declarado al índice del tab del sidebar (5 tabs
+    /// armonizados: 0=Álgebra, 1=Herram., 2=Datos, 3=Prob., 4=Vista —
+    /// CAS oculto en Datos por compatibilidad histórica).
+    pub const fn default_sidebar_tab(self) -> usize {
+        match self {
+            LeftPanelContent::Algebra
+            | LeftPanelContent::AlgebraAndCas
+            | LeftPanelContent::Complex => 0,
+            LeftPanelContent::Tools | LeftPanelContent::Attractor | LeftPanelContent::Fisica => 1,
+            LeftPanelContent::Cas | LeftPanelContent::Data => 2,
+            LeftPanelContent::Stats => 3,
+        }
+    }
+
+    /// Etiqueta corta del tab para el rail y el menú Paneles.
+    pub const fn sidebar_label(self) -> &'static str {
+        match self {
+            LeftPanelContent::Algebra
+            | LeftPanelContent::AlgebraAndCas
+            | LeftPanelContent::Complex
+            | LeftPanelContent::Cas => "Álgebra",
+            LeftPanelContent::Tools | LeftPanelContent::Attractor => "Herram.",
+            LeftPanelContent::Fisica => "Física",
+            LeftPanelContent::Data => "Datos",
+            LeftPanelContent::Stats => "Prob.",
+        }
+    }
+}
+
+/// Perspectivas cuyo tab Prob. dibuja el panel de probabilidad y estadística
+/// (`panels::draw_statistics_panel`) en vez del panel de álgebra.
+///
+/// Onda 2: pinnea la entrada visible del panel — si una perspectiva declara
+/// `LeftPanelContent::Stats`, esta función debe devolver `true` para ella
+/// (regla visible ⇒ botón, test `panel_tabs_datos_prob_con_entrada_visible`).
+/// Análisis de datos vive en el tab Datos (`LeftPanelContent::Data`).
+///
+/// Solo la usan los tests de mapeo perspectiva→tab (ya no hay subtítulos por
+/// perspectiva tras la limpieza de headers redundantes).
+#[allow(dead_code)]
+pub(crate) const fn uses_statistics_panel(perspective: Perspective) -> bool {
+    matches!(
+        perspective,
+        Perspective::Statistics | Perspective::Probability
+    )
+}
+
+/// Perspectivas cuyo tab Datos dibuja la hoja de cálculo vinculada
+/// (`panels::draw_data_panel`): solo Análisis de datos.
+/// Solo la usan los tests (ver arriba).
+#[allow(dead_code)]
+pub(crate) const fn uses_data_panel(perspective: Perspective) -> bool {
+    matches!(perspective, Perspective::DataAnalysis)
+}
+
+/// Contenido del panel derecho según la perspectiva.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RightPanelContent {
+    /// Propiedades del objeto seleccionado.
+    Properties,
+    /// Protocolo de construcción.
+    ConstructionProtocol,
+    /// Regresión y ajustes.
+    Regression,
+    /// Domain coloring / visualización compleja.
+    DomainColoring,
+    /// Parámetros de simulación dinámica.
+    Parameters,
+    /// Animación trigonométrica (círculo unitario).
+    TrigAnimation,
+}
+
+/// Geometry 3D supports one dock instead of two competing right-side columns.
+pub(crate) fn geometry_utility_dock_available(
+    perspective: Perspective,
+    right_panel: Option<RightPanelContent>,
+    width_class: ShellWidthClass,
+) -> bool {
+    perspective == Perspective::Geometry3D
+        && matches!(right_panel, Some(RightPanelContent::Properties))
+        && width_class != ShellWidthClass::Compact
+}
+
+/// Returns whether the Geometry 3D dock is currently reserving screen space.
+pub(crate) fn uses_geometry_utility_dock(
+    perspective: Perspective,
+    right_panel: Option<RightPanelContent>,
+    width_class: ShellWidthClass,
+    dock_open: bool,
+) -> bool {
+    geometry_utility_dock_available(perspective, right_panel, width_class) && dock_open
+}
+
+/// The compact Geometry 3D utility is opened on demand from the Panels menu.
+pub(crate) fn uses_compact_geometry_utility_dock(
+    perspective: Perspective,
+    width_class: ShellWidthClass,
+    dock_open: bool,
+) -> bool {
+    perspective == Perspective::Geometry3D && width_class == ShellWidthClass::Compact && dock_open
+}
+
+/// Definición estática de qué mostrar para una [`Perspective`].
+///
+/// `visible_tool_groups` usa [`grafito_ui::toolbar::ToolGroupId`] en lugar de
+/// una slice anidada de `ToolEntry` para preservar la asociación entre cada
+/// grupo y su icono vectorial, manteniendo además el renderizado libre de
+/// asignaciones.
+pub struct PerspectiveLayout {
+    /// Título legible de la perspectiva.
+    pub title: &'static str,
+    /// Etiqueta corta / icono textual.
+    pub icon: &'static str,
+    /// Modo del canvas.
+    pub canvas_mode: CanvasMode,
+    /// Contenido del panel izquierdo.
+    pub left_panel: LeftPanelContent,
+    /// Contenido del panel derecho (`None` lo oculta).
+    pub right_panel: Option<RightPanelContent>,
+    /// Grupos de herramienta visibles en la toolbar.
+    pub visible_tool_groups: &'static [grafito_ui::toolbar::ToolGroupId],
+    /// Si se muestra el teclado matemático virtual.
+    pub show_math_keyboard: bool,
+    /// Si se muestra la barra de entrada.
+    pub show_input_bar: bool,
+    /// Herramienta por defecto al entrar en la perspectiva.
+    pub default_tool: grafito_ui::Tool,
+}
+
+pub use app::run_app;
+pub(crate) use app::GrafitoApp;
+pub(crate) use app::PendingAction;
+// Desbloqueo mínimo para `benches/native_rgba.rs` (tarea F2c): solo lo que el
+// bench mide (dispatcher + consts de budgets + componer); el módulo sigue
+// privado, nada más se expone.
+pub use anim_native::{
+    componer_grupo_nativo, estimate_frames_bytes, render_anim_by_template,
+    GIF_EXPORT_MAX_FILE_BYTES, GIF_EXPORT_MAX_FRAMES, GIF_EXPORT_MAX_TOTAL_PIXELS,
+    NATIVE_ANIM_FRAME_COUNT, NATIVE_BYTES_PER_PIXEL, NATIVE_FRAME_BYTES_ESTIMADO_640X480,
+    NATIVE_MAX_SET_BYTES, NATIVE_TEMPLATES,
+};
+pub use app::{
+    grafito_build_date, grafito_git_hash, grafito_version_string, handle_version_args,
+    print_grafito_help, print_grafito_version,
+};
+pub(crate) use utils::to_color32;

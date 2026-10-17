@@ -1,0 +1,843 @@
+//! On-screen math keyboard docked at the bottom of the central area.
+//!
+//! Provides tabbed key pads (numeric, function, alphabetic, 3D shortcuts) and
+//! dispatches typed text to the active input field.
+
+use crate::GrafitoApp;
+use egui::Color32;
+use grafito_ui::icons::{action_icon_button, Icon};
+use grafito_ui::theme::{current_theme, KeyboardKeyRole};
+
+pub(crate) const MATH_KEYBOARD_HEIGHT: f32 = 208.0;
+// Compacta a 44 px: tecla 28 + aire 8+8 (piso táctil 24, Scandinavian quiet).
+pub(crate) const MATH_KEYBOARD_COMPACT_HEIGHT: f32 = 44.0;
+/// Alto exacto del panel teclado completo (única fuente): táctil <480
+/// suma (44-32) px por fila de teclas. La burbuja Mili lo usa para
+/// apilarse encima sin taparlo (antes quedaba dentro del teclado).
+/// `keyboard_tab == 4` (FIS) tiene 2 filas de grilla, el resto 3;
+/// +1 = fila inferior fija (ans/0/Del/Enter).
+pub(crate) fn math_keyboard_panel_h(keyboard_tab: usize, viewport_width: f32) -> f32 {
+    let narrow_kb = viewport_width < grafito_ui::tokens::MOBILE_LEVEL0_MAX_W;
+    let key_h = if narrow_kb {
+        44.0
+    } else {
+        grafito_ui::tokens::KEYBOARD_KEY_H
+    };
+    let kb_key_rows = if keyboard_tab == 4 { 2 + 1 } else { 3 + 1 };
+    if narrow_kb {
+        MATH_KEYBOARD_HEIGHT + (key_h - grafito_ui::tokens::KEYBOARD_KEY_H) * kb_key_rows as f32
+    } else {
+        MATH_KEYBOARD_HEIGHT
+    }
+}
+const MATH_KEYBOARD_EDGE_MARGIN: f32 = 12.0;
+const MATH_KEYBOARD_KEY_GAP: f32 = 4.0;
+const MATH_KEYBOARD_COLUMNS: f32 = 8.0;
+
+const ALPHABETIC_KEY_ROWS: &[&[(&str, &str)]] = &[
+    &[
+        ("q", "q"),
+        ("w", "w"),
+        ("e", "e"),
+        ("r", "r"),
+        ("t", "t"),
+        ("y", "y"),
+        ("u", "u"),
+        ("i", "i"),
+    ],
+    &[
+        ("a", "a"),
+        ("s", "s"),
+        ("d", "d"),
+        ("f", "f"),
+        ("g", "g"),
+        ("h", "h"),
+        ("j", "j"),
+        ("k", "k"),
+    ],
+    &[
+        ("z", "z"),
+        ("x", "x"),
+        ("c", "c"),
+        ("v", "v"),
+        ("b", "b"),
+        ("n", "n"),
+        ("m", "m"),
+        (",", ","),
+    ],
+];
+
+pub(crate) fn keyboard_insertion(tab: usize, label: &str) -> Option<&'static str> {
+    if tab != 2 {
+        return None;
+    }
+    ALPHABETIC_KEY_ROWS
+        .iter()
+        .flat_map(|row| row.iter())
+        .find_map(|(key_label, insertion)| (*key_label == label).then_some(*insertion))
+}
+
+/// Inserta texto del teclado en pantalla en el campo con foco: borrador de
+/// la pregunta del asistente si su editor lo tiene, si no a la barra de
+/// comandos. Antes todo iba a la barra aunque el usuario estuviera
+/// escribiendo su pregunta (el teclado "no servía" en el chat).
+fn insert_keyboard_text(app: &mut GrafitoApp, text: &str) {
+    if app.assistant.composer_focused {
+        app.assistant.problem.push_str(text);
+    } else {
+        app.input_text.push_str(text);
+    }
+}
+
+/// Borra un char del mismo campo donde insertaría (simetría honesta).
+fn erase_keyboard_char(app: &mut GrafitoApp) {
+    if app.assistant.composer_focused {
+        app.assistant.problem.pop();
+    } else {
+        app.input_text.pop();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MathKeyboardLayout {
+    Hidden,
+    Compact,
+    Full,
+}
+
+impl MathKeyboardLayout {
+    pub(crate) const fn height(self) -> f32 {
+        match self {
+            Self::Hidden => 0.0,
+            Self::Compact => MATH_KEYBOARD_COMPACT_HEIGHT,
+            Self::Full => MATH_KEYBOARD_HEIGHT,
+        }
+    }
+}
+
+pub(crate) const fn math_keyboard_layout(
+    keyboard_visible: bool,
+    keyboard_expanded: bool,
+    _viewport_height: f32,
+) -> MathKeyboardLayout {
+    if !keyboard_visible {
+        MathKeyboardLayout::Hidden
+    } else if keyboard_expanded {
+        MathKeyboardLayout::Full
+    } else {
+        MathKeyboardLayout::Compact
+    }
+}
+
+fn keyboard_button_width(available_width: f32) -> f32 {
+    let usable_width = (available_width - (MATH_KEYBOARD_EDGE_MARGIN * 2.0)).max(0.0);
+    ((usable_width - ((MATH_KEYBOARD_COLUMNS - 1.0) * MATH_KEYBOARD_KEY_GAP) - 10.0)
+        / MATH_KEYBOARD_COLUMNS)
+        .clamp(18.0, 65.0)
+}
+
+fn keyboard_grid_padding(available_width: f32, button_width: f32) -> f32 {
+    let usable_width = (available_width - (MATH_KEYBOARD_EDGE_MARGIN * 2.0)).max(0.0);
+    let grid_width = (button_width * MATH_KEYBOARD_COLUMNS)
+        + (MATH_KEYBOARD_KEY_GAP * (MATH_KEYBOARD_COLUMNS - 1.0));
+    MATH_KEYBOARD_EDGE_MARGIN + ((usable_width - grid_width) / 2.0).max(0.0)
+}
+
+fn draw_compact_math_keyboard(app: &mut GrafitoApp, ctx: &egui::Context) {
+    let theme = current_theme(ctx);
+    // Hairline superior del sistema (nunca Frame con borde total: los bordes
+    // laterales/inferiores quedaban medio clipados al borde de la ventana).
+    egui::TopBottomPanel::bottom("math_keyboard")
+        .show_separator_line(true)
+        .exact_height(MATH_KEYBOARD_COMPACT_HEIGHT)
+        .frame(egui::Frame::none().fill(theme.panel_bg))
+        .show(ctx, |ui| {
+            ui.spacing_mut().item_spacing.x = grafito_ui::tokens::SPACE_SM;
+            // Chips de 32 px en panel de 44: 6 px de aire arriba y abajo,
+            // fila ópticamente centrada (nada pegado al hairline).
+            let chip_h = grafito_ui::tokens::KEYBOARD_KEY_H;
+            ui.add_space((MATH_KEYBOARD_COMPACT_HEIGHT - chip_h) / 2.0);
+            // A 320 la fila mínima (6x32+3x32+gaps ≈ 368) excede el viewport:
+            // scroll horizontal como los tabs del Full (el target 32 compacto
+            // no se achica; el Full ya usa 44 de ancho con el mismo patrón).
+            egui::ScrollArea::horizontal()
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.horizontal_centered(|ui| {
+                        ui.add_space(grafito_ui::tokens::SPACE_SM);
+                        // Sin etiqueta "Teclado": los chips se explican solos y el
+                        // texto competía con la barra sin aportar nada.
+                        // Ancho adaptativo: reserva iconos y reparte el resto
+                        // entre las 6 teclas (32..40 px: casi cuadradas con 32 de alto,
+                        // nunca pastillas achatadas).
+                        let reserve = 3.0 * grafito_ui::tokens::KEYBOARD_KEY_H
+                            + 9.0 * grafito_ui::tokens::SPACE_SM;
+                        let chip_w = ((ui.available_width() - reserve) / 6.0).clamp(
+                            grafito_ui::tokens::KEYBOARD_KEY_H,
+                            grafito_ui::tokens::KEYBOARD_CHIP_W_MAX,
+                        );
+                        for (label, insertion) in [
+                            ("x", "x"),
+                            ("y", "y"),
+                            ("π", "π"),
+                            ("(", "("),
+                            (")", ")"),
+                            ("+", "+"),
+                        ] {
+                            let (rect, resp) = ui.allocate_exact_size(
+                                egui::vec2(chip_w, chip_h),
+                                egui::Sense::click(),
+                            );
+                            resp.widget_info(|| {
+                                egui::WidgetInfo::labeled(
+                                    egui::WidgetType::Button,
+                                    true,
+                                    format!("Insertar {label}"),
+                                )
+                            });
+                            if ui.is_rect_visible(rect) {
+                                let visuals = theme.keyboard_key_visuals(
+                                    KeyboardKeyRole::Standard,
+                                    resp.hovered(),
+                                );
+                                ui.painter().rect(
+                                    rect,
+                                    grafito_ui::tokens::RADIUS_SM,
+                                    visuals.background,
+                                    visuals.border,
+                                );
+                                ui.painter().text(
+                                    rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    label,
+                                    egui::FontId::proportional(grafito_ui::tokens::TYPE_BASE),
+                                    visuals.text,
+                                );
+                            }
+                            // A11Y: anillo + teclado (el chip se dibuja a mano).
+                            if resp.has_focus() {
+                                theme.paint_focus_ring(ui.painter(), rect);
+                            }
+                            if resp.clicked()
+                                || (resp.has_focus()
+                                    && ui.input(|i| {
+                                        i.key_pressed(egui::Key::Enter)
+                                            || i.key_pressed(egui::Key::Space)
+                                    }))
+                            {
+                                insert_keyboard_text(app, insertion);
+                            }
+                        }
+                        // Acciones con el mismo lenguaje de chips: borrar (Delete),
+                        // ejecutar (Enter sage) y expandir (Standard con chevron).
+                        let actions: &[(Icon, KeyboardKeyRole, &str)] = &[
+                            (Icon::Delete, KeyboardKeyRole::Delete, "Borrar entrada"),
+                            (Icon::Play, KeyboardKeyRole::Enter, "Ejecutar entrada"),
+                            (
+                                Icon::ChevronUp,
+                                KeyboardKeyRole::Standard,
+                                "Expandir teclado completo",
+                            ),
+                        ];
+                        for (icon, role, tip) in actions {
+                            let (rect, resp) = ui.allocate_exact_size(
+                                egui::vec2(grafito_ui::tokens::KEYBOARD_KEY_H, chip_h),
+                                egui::Sense::click(),
+                            );
+                            let resp = resp.on_hover_text(*tip);
+                            resp.widget_info(|| {
+                                egui::WidgetInfo::labeled(egui::WidgetType::Button, true, *tip)
+                            });
+                            if ui.is_rect_visible(rect) {
+                                let visuals = theme.keyboard_key_visuals(*role, resp.hovered());
+                                ui.painter().rect(
+                                    rect,
+                                    grafito_ui::tokens::RADIUS_SM,
+                                    visuals.background,
+                                    visuals.border,
+                                );
+                                // Icono en recuadro cuadrado centrado: nunca estirado
+                                // por el aspect del chip.
+                                let side =
+                                    rect.width().min(rect.height()) - grafito_ui::tokens::SPACE_SM;
+                                let icon_rect = egui::Rect::from_center_size(
+                                    rect.center(),
+                                    egui::vec2(side, side),
+                                );
+                                grafito_ui::icons::draw_icon(
+                                    ui.painter(),
+                                    icon_rect,
+                                    *icon,
+                                    visuals.text,
+                                );
+                            }
+                            // A11Y: anillo + teclado (botón dibujado a mano).
+                            if resp.has_focus() {
+                                theme.paint_focus_ring(ui.painter(), rect);
+                            }
+                            if resp.clicked()
+                                || (resp.has_focus()
+                                    && ui.input(|i| {
+                                        i.key_pressed(egui::Key::Enter)
+                                            || i.key_pressed(egui::Key::Space)
+                                    }))
+                            {
+                                match *tip {
+                                    "Borrar entrada" => erase_keyboard_char(app),
+                                    "Ejecutar entrada" => {
+                                        app.submit_input_text(ui.ctx().input(|input| input.time));
+                                    }
+                                    _ => app.keyboard_expanded = true,
+                                }
+                            }
+                        }
+                        ui.add_space(grafito_ui::tokens::SPACE_SM);
+                    });
+                });
+        });
+}
+
+pub(crate) fn draw_math_keyboard(
+    app: &mut GrafitoApp,
+    ctx: &egui::Context,
+    layout: MathKeyboardLayout,
+) {
+    if layout == MathKeyboardLayout::Hidden {
+        return;
+    }
+    if layout == MathKeyboardLayout::Compact {
+        draw_compact_math_keyboard(app, ctx);
+        return;
+    }
+
+    let theme = current_theme(ctx);
+    let panel_bg = theme.panel_bg;
+    // Táctil <480: teclas a 44 px de alto (riel mínimo) y panel más alto
+    // en la misma medida (filas × 12 px). Desktop 32/208 intacto.
+    // Solo FIS tiene 2 filas de grilla; el resto 3 (alfabético: 3). El
+    // +1 es la fila inferior fija (ans/0/Del/Enter).
+    let narrow_kb = ctx.screen_rect().width() < grafito_ui::tokens::MOBILE_LEVEL0_MAX_W;
+    let key_h = if narrow_kb {
+        44.0
+    } else {
+        grafito_ui::tokens::KEYBOARD_KEY_H
+    };
+    // `panel_h` vive en `math_keyboard_panel_h` (única fuente: la
+    // burbuja Mili lo reusa para apilarse encima del teclado).
+    // ─── 4. MATH KEYBOARD — docked bottom panel (central area only) ──────────────
+    let panel_h = math_keyboard_panel_h(app.keyboard_tab, ctx.screen_rect().width());
+    egui::TopBottomPanel::bottom("math_keyboard")
+        .show_separator_line(true)
+        .exact_height(panel_h)
+        .frame(egui::Frame::none().fill(panel_bg))
+        .show(ctx, |ui| {
+            ui.add_space(6.0);
+            ui.horizontal_centered(|ui| {
+                ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                    // Tab bar con scroll en angosto (5 tabs + expandir
+                    // no entran a 320): mismo patrón `kb_row` de las filas.
+                    let mut draw_tabs = |ui: &mut egui::Ui| {
+                        ui.horizontal(|ui| {
+                            // Tab Física: constantes + laboratorios verificados
+                            // (mismo patrón que 3D: etiqueta corta → comando).
+                            for (i, lbl) in ["123", "f(x)", "ABC", "3D", "FIS"].iter().enumerate() {
+                                let active = app.keyboard_tab == i;
+                                let c = if active {
+                                    theme.keyboard_tab_active_text
+                                } else {
+                                    theme.keyboard_tab_inactive
+                                };
+                                let fbg = if active {
+                                    theme.keyboard_tab_active_bg
+                                } else {
+                                    Color32::TRANSPARENT
+                                };
+                                let r = egui::Frame::none()
+                                    .fill(fbg)
+                                    .rounding(6.0)
+                                    .inner_margin(egui::Margin::symmetric(8.0, 3.0))
+                                    .show(ui, |ui| {
+                                        ui.label(
+                                            egui::RichText::new(*lbl)
+                                                .size(grafito_ui::tokens::TYPE_SM)
+                                                .color(c)
+                                                .strong(),
+                                        );
+                                    })
+                                    .response;
+                                let response =
+                                    ui.interact(r.rect, ui.id().with(i), egui::Sense::click());
+                                response.widget_info(|| {
+                                    egui::WidgetInfo::labeled(egui::WidgetType::Button, true, *lbl)
+                                });
+                                // A11Y: anillo + teclado en tabs.
+                                if response.has_focus() {
+                                    theme.paint_focus_ring(ui.painter(), r.rect);
+                                }
+                                if response.clicked()
+                                    || (response.has_focus()
+                                        && ui.input(|i| {
+                                            i.key_pressed(egui::Key::Enter)
+                                                || i.key_pressed(egui::Key::Space)
+                                        }))
+                                {
+                                    app.keyboard_tab = i;
+                                }
+                                ui.add_space(grafito_ui::tokens::SPACE_XS);
+                            }
+                            if app.keyboard_expanded
+                                && action_icon_button(
+                                    ui,
+                                    Icon::ChevronDown,
+                                    theme.text_secondary,
+                                    "Usar teclado compacto",
+                                )
+                                .clicked()
+                            {
+                                app.keyboard_expanded = false;
+                            }
+                        });
+                    };
+                    if narrow_kb {
+                        egui::ScrollArea::horizontal()
+                            .id_salt("kb_tabs")
+                            .scroll_bar_visibility(
+                                egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                            )
+                            .show(ui, &mut draw_tabs);
+                    } else {
+                        draw_tabs(ui);
+                    }
+                    ui.add_space(5.0);
+
+                    let btn_w = keyboard_button_width(ui.available_width()).max(if narrow_kb {
+                        // Teclas 44 de ancho en angosto (32 < piso táctil):
+                        // las filas ya tienen scroll horizontal, el target
+                        // no se negocia. Desktop intacto (max con 0).
+                        44.0
+                    } else {
+                        0.0
+                    });
+                    let sp = MATH_KEYBOARD_KEY_GAP;
+                    // Centra la grilla dentro del canvas y conserva un margen mínimo
+                    // antes del asistente acoplado.
+                    let pad = keyboard_grid_padding(ui.available_width(), btn_w);
+
+                    // Fila con guarda angosta: scroll horizontal por fila
+                    // (antes la grilla se recortaba sin salida). Desktop:
+                    // directo, intacto. Closure y no macro: la macro
+                    // higiénica no liga el `ui` del cuerpo al parámetro
+                    // interno (E0500); el closure sí liga sus parámetros.
+                    let kb_row =
+                        |ui: &mut egui::Ui, id: egui::Id, draw: &mut dyn FnMut(&mut egui::Ui)| {
+                            if narrow_kb {
+                                egui::ScrollArea::horizontal()
+                                    .id_salt(id)
+                                    .scroll_bar_visibility(
+                                        egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                                    )
+                                    .show(ui, draw);
+                            } else {
+                                ui.horizontal(draw);
+                            }
+                        };
+                    macro_rules! kb {
+                        ($ui:expr, $t:expr, $i:expr) => {{
+                            let (r, resp) = $ui.allocate_exact_size(
+                                egui::vec2(btn_w, key_h),
+                                egui::Sense::click(),
+                            );
+                            // Solo cuando difieren: la inserción completa
+                            // (`VelocidadOnda[…]`) vive en el hover. Sin eco
+                            // cuando etiqueta == inserción (`1` → `1`).
+                            let resp = if $t != $i {
+                                resp.on_hover_text($i)
+                            } else {
+                                resp
+                            };
+                            resp.widget_info(|| {
+                                egui::WidgetInfo::labeled(egui::WidgetType::Button, true, $t)
+                            });
+                            if $ui.is_rect_visible(r) {
+                                let visuals = theme.keyboard_key_visuals(
+                                    KeyboardKeyRole::Standard,
+                                    resp.hovered(),
+                                );
+                                $ui.painter().rect(
+                                    r,
+                                    grafito_ui::tokens::RADIUS_XS,
+                                    visuals.background,
+                                    visuals.border,
+                                );
+                                $ui.painter().text(
+                                    r.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    $t,
+                                    // Piso 11 (no 10): TYPE_XS es el mínimo legible del sistema.
+                                    egui::FontId::proportional((btn_w * 0.4).clamp(11.0, 15.0)),
+                                    visuals.text,
+                                );
+                            }
+                            // A11Y: anillo + teclado (tecla dibujada a mano).
+                            if resp.has_focus() {
+                                theme.paint_focus_ring($ui.painter(), r);
+                            }
+                            if resp.clicked()
+                                || (resp.has_focus()
+                                    && $ui.input(|i| {
+                                        i.key_pressed(egui::Key::Enter)
+                                            || i.key_pressed(egui::Key::Space)
+                                    }))
+                            {
+                                insert_keyboard_text(
+                                    app,
+                                    keyboard_insertion(app.keyboard_tab, $t).unwrap_or($i),
+                                );
+                            }
+                        }};
+                    }
+
+                    let key_rows: &[&[(&str, &str)]] = match app.keyboard_tab {
+                        0 => &[
+                            &[
+                                ("x", "x"),
+                                ("y", "y"),
+                                ("z", "z"),
+                                ("i", "i"),
+                                ("7", "7"),
+                                ("8", "8"),
+                                ("9", "9"),
+                                ("/", "/"),
+                            ],
+                            &[
+                                ("x²", "^2"),
+                                ("v/", "sqrt("),
+                                ("^", "^"),
+                                ("|", "abs("),
+                                ("4", "4"),
+                                ("5", "5"),
+                                ("6", "6"),
+                                ("*", "*"),
+                            ],
+                            &[
+                                ("π", "π"),
+                                ("e", "e"),
+                                ("<", "<"),
+                                ("+", "+"),
+                                ("1", "1"),
+                                ("2", "2"),
+                                ("3", "3"),
+                                ("-", "-"),
+                            ],
+                        ],
+                        1 => &[
+                            &[
+                                ("sin", "sin("),
+                                ("cos", "cos("),
+                                ("tan", "tan("),
+                                ("asin", "asin("),
+                                ("acos", "acos("),
+                                ("atan", "atan("),
+                                ("log", "log("),
+                                ("ln", "ln("),
+                            ],
+                            &[
+                                ("sec", "sec("),
+                                ("csc", "csc("),
+                                ("cot", "cot("),
+                                ("!", "!"),
+                                ("deg", "deg"),
+                                ("rad", "rad"),
+                                ("f", "f"),
+                                ("g", "g"),
+                            ],
+                            &[
+                                ("<", "<"),
+                                (">", ">"),
+                                ("(", "("),
+                                (")", ")"),
+                                ("1", "1"),
+                                ("2", "2"),
+                                ("3", "3"),
+                                ("-", "-"),
+                            ],
+                        ],
+                        2 => ALPHABETIC_KEY_ROWS,
+                        3 => &[
+                            &[
+                                ("Lorz", "Lorenz[10, 28, 2.66]"),
+                                ("Ross", "Rossler[0.2, 0.2, 5.7]"),
+                                ("Aiza", "Aizawa[0.95, 0.7, 0.6, 3.5, 0.25, 0.1]"),
+                                ("Dadr", "Dadras[3, 2.7, 1.7, 2, 9]"),
+                                ("Sph", "Sphere[0,0,0,5]"),
+                                ("Cub", "Cube[0,0,0,5]"),
+                                ("P3D", "Point3D[1,1,1]"),
+                                ("S3D", "Segment3D[0,0,0,1,1,1]"),
+                            ],
+                            &[
+                                ("Hal", "Halvorsen[2.0]"),
+                                ("Thom", "Thomas[0.208186]"),
+                                ("Chen", "Chen[35, 3, 28]"),
+                                ("Chua", "Chua[15.6, 28, -1.14, -0.71]"),
+                                ("Cyl", "Cylinder[0,0,0,2,5]"),
+                                ("Con", "Cone[0,0,0,3,5]"),
+                                ("Tor", "Torus[0,0,0,4,1]"),
+                                ("Moeb", "Moebius[2,1]"),
+                            ],
+                            &[
+                                ("<", "<"),
+                                (">", ">"),
+                                ("(", "("),
+                                (")", ")"),
+                                ("[", "["),
+                                ("]", "]"),
+                                ("{", "{"),
+                                ("}", "}"),
+                            ],
+                        ],
+                        // FIS: constantes SI + 5 laboratorios verificados e2e.
+                        // Etiqueta de 3 letras, inserción exacta al campo.
+                        _ => &[
+                            &[
+                                ("g", "9.81"),
+                                ("G", "6.674e-11"),
+                                ("c", "299792458"),
+                                ("h", "6.626e-34"),
+                                ("e", "1.602e-19"),
+                                ("k", "1.381e-23"),
+                                ("me", "9.109e-31"),
+                                ("Na", "6.022e23"),
+                            ],
+                            &[
+                                ("Onda", "VelocidadOnda[2.0, 3.0]"),
+                                ("Grav", "LeyGravitacion[5.972e24, 7.342e22, 3.844e8]"),
+                                ("Bohr", "EnergiaBohr[2]"),
+                                ("Cent", "AceleracionCentripeta[20, 50]"),
+                                ("Cant", "CantidadMovimiento[1000, 20]"),
+                                ("pi", "pi"),
+                                ("^", "^"),
+                                ("v/", "sqrt("),
+                            ],
+                        ],
+                    };
+                    for (ri, row) in key_rows.iter().enumerate() {
+                        kb_row(ui, egui::Id::new(("kb_row", ri)), &mut |ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            ui.add_space(pad);
+                            for (t, i) in *row {
+                                kb!(ui, *t, *i);
+                                ui.add_space(sp);
+                            }
+                        });
+                        ui.add_space(sp);
+                    }
+                    kb_row(ui, egui::Id::new("kb_bottom"), &mut |ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        ui.add_space(pad);
+                        kb!(ui, "ans", "ans");
+                        ui.add_space(sp);
+                        kb!(ui, ".", ".");
+                        ui.add_space(sp);
+                        kb!(ui, "0", "0");
+                        ui.add_space(sp);
+                        kb!(ui, "(", "(");
+                        ui.add_space(sp);
+                        kb!(ui, ")", ")");
+                        ui.add_space(sp);
+                        kb!(ui, "=", "=");
+                        ui.add_space(sp);
+                        // Backspace
+                        {
+                            let (r, resp) = ui.allocate_exact_size(
+                                egui::vec2(btn_w, key_h),
+                                egui::Sense::click(),
+                            );
+                            resp.widget_info(|| {
+                                egui::WidgetInfo::labeled(
+                                    egui::WidgetType::Button,
+                                    true,
+                                    "Borrar entrada",
+                                )
+                            });
+                            let visuals =
+                                theme.keyboard_key_visuals(KeyboardKeyRole::Delete, resp.hovered());
+                            ui.painter().rect(
+                                r,
+                                grafito_ui::tokens::RADIUS_XS,
+                                visuals.background,
+                                visuals.border,
+                            );
+                            ui.painter().text(
+                                r.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "Del",
+                                // Misma escala que la macro (btn_w*0.4): el fijo
+                                // TYPE_SM desbordaba a 320 con btn_w 32.
+                                egui::FontId::proportional((btn_w * 0.4).clamp(11.0, 15.0)),
+                                visuals.text,
+                            );
+                            if resp.clicked() {
+                                erase_keyboard_char(app);
+                            }
+                        }
+                        ui.add_space(sp);
+                        // Enter
+                        {
+                            let (r, resp) = ui.allocate_exact_size(
+                                egui::vec2(btn_w, key_h),
+                                egui::Sense::click(),
+                            );
+                            resp.widget_info(|| {
+                                egui::WidgetInfo::labeled(
+                                    egui::WidgetType::Button,
+                                    true,
+                                    "Ejecutar entrada",
+                                )
+                            });
+                            let visuals =
+                                theme.keyboard_key_visuals(KeyboardKeyRole::Enter, resp.hovered());
+                            ui.painter().rect(
+                                r,
+                                grafito_ui::tokens::RADIUS_XS,
+                                visuals.background,
+                                visuals.border,
+                            );
+                            ui.painter().text(
+                                r.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "Enter",
+                                // Misma escala que la macro (ver Del).
+                                egui::FontId::proportional((btn_w * 0.4).clamp(11.0, 15.0)),
+                                visuals.text,
+                            );
+                            if resp.clicked() {
+                                let time = ui.ctx().input(|i| i.time);
+                                app.submit_input_text(time);
+                            }
+                        }
+                    });
+                    ui.add_space(grafito_ui::tokens::SPACE_MD);
+                });
+            });
+        });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        erase_keyboard_char, insert_keyboard_text, keyboard_button_width, keyboard_grid_padding,
+        keyboard_insertion, math_keyboard_layout, math_keyboard_panel_h, MathKeyboardLayout,
+        MATH_KEYBOARD_COMPACT_HEIGHT, MATH_KEYBOARD_EDGE_MARGIN, MATH_KEYBOARD_HEIGHT,
+    };
+
+    #[test]
+    fn keyboard_collapses_before_it_crowds_short_viewports() {
+        assert_eq!(
+            math_keyboard_layout(false, false, 900.0),
+            MathKeyboardLayout::Hidden
+        );
+        assert_eq!(
+            math_keyboard_layout(true, false, 759.0),
+            MathKeyboardLayout::Compact
+        );
+        assert_eq!(
+            math_keyboard_layout(true, false, 1_080.0),
+            MathKeyboardLayout::Compact
+        );
+        assert_eq!(
+            math_keyboard_layout(true, true, 600.0),
+            MathKeyboardLayout::Full
+        );
+        assert_eq!(
+            math_keyboard_layout(true, false, 600.0).height(),
+            MATH_KEYBOARD_COMPACT_HEIGHT
+        );
+    }
+
+    #[test]
+    fn keyboard_panel_h_unica_fuente_para_burbuja() {
+        // La burbuja Mili se apila encima con este alto exacto: si el
+        // panel crece y el helper no, la burbuja queda adentro.
+        assert_eq!(math_keyboard_panel_h(0, 1366.0), MATH_KEYBOARD_HEIGHT);
+        // Angosto: +12 px por fila (FIS 3 filas, resto 4).
+        assert_eq!(math_keyboard_panel_h(4, 320.0), MATH_KEYBOARD_HEIGHT + 36.0);
+        assert_eq!(math_keyboard_panel_h(0, 320.0), MATH_KEYBOARD_HEIGHT + 48.0);
+    }
+
+    #[test]
+    fn alphabetic_comma_key_inserts_a_comma() {
+        assert_eq!(keyboard_insertion(2, ","), Some(","));
+    }
+
+    #[test]
+    fn keyboard_inserts_into_the_focused_field() {
+        let mut app = crate::app::dummy_grafito_app();
+        app.input_text.clear();
+        app.assistant.problem.clear();
+        // Sin foco en el composer: va a la barra de comandos.
+        app.assistant.composer_focused = false;
+        insert_keyboard_text(&mut app, "x^2");
+        assert_eq!(app.input_text, "x^2");
+        assert!(app.assistant.problem.is_empty());
+        erase_keyboard_char(&mut app);
+        erase_keyboard_char(&mut app);
+        erase_keyboard_char(&mut app);
+        assert!(app.input_text.is_empty());
+        // Con foco en el composer: va al borrador de la pregunta.
+        app.assistant.composer_focused = true;
+        insert_keyboard_text(&mut app, "derivá");
+        assert_eq!(app.assistant.problem, "derivá");
+        assert!(app.input_text.is_empty());
+        for _ in 0.."derivá".chars().count() {
+            erase_keyboard_char(&mut app);
+        }
+        assert!(app.assistant.problem.is_empty());
+    }
+
+    #[test]
+    fn keyboard_full_layout_uses_only_its_required_control_height() {
+        assert_eq!(MATH_KEYBOARD_HEIGHT, 208.0);
+    }
+
+    #[test]
+    fn keyboard_compact_leaves_room_for_chips_and_air() {
+        // 44 = tecla 28 + aire 8+8 (piso táctil 24, Scandinavian quiet).
+        assert_eq!(MATH_KEYBOARD_COMPACT_HEIGHT, 44.0);
+    }
+
+    #[test]
+    fn keyboard_centers_the_grid_with_a_docked_panel_margin() {
+        assert_eq!(MATH_KEYBOARD_EDGE_MARGIN, 12.0);
+        for width in [480.0, 640.0, 960.0] {
+            let button_width = keyboard_button_width(width);
+            assert!(keyboard_grid_padding(width, button_width) >= MATH_KEYBOARD_EDGE_MARGIN);
+        }
+    }
+}
+#[cfg(test)]
+mod coverage_sweep_keyboard_extra {
+    use super::*;
+    #[test]
+    fn barrido_insercion_y_layout() {
+        assert_eq!(keyboard_insertion(2, "q"), Some("q"));
+        assert_eq!(keyboard_insertion(2, "m"), Some("m"));
+        assert_eq!(keyboard_insertion(2, ","), Some(","));
+        assert_eq!(keyboard_insertion(0, "q"), None);
+        assert_eq!(keyboard_insertion(2, "NOPE"), None);
+        assert_eq!(
+            math_keyboard_layout(false, true, 900.0),
+            MathKeyboardLayout::Hidden
+        );
+        assert_eq!(
+            math_keyboard_layout(true, true, 900.0),
+            MathKeyboardLayout::Full
+        );
+        assert_eq!(
+            math_keyboard_layout(true, false, 900.0),
+            MathKeyboardLayout::Compact
+        );
+        assert_eq!(MathKeyboardLayout::Hidden.height(), 0.0);
+        assert!(keyboard_button_width(800.0) >= 18.0 && keyboard_button_width(800.0) <= 65.0);
+        assert!(keyboard_grid_padding(800.0, 40.0) >= MATH_KEYBOARD_EDGE_MARGIN);
+    }
+}

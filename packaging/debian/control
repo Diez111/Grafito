@@ -1,0 +1,30 @@
+Source: grafito
+Section: graphics
+Priority: optional
+# Contacto de empaquetado. Para vulnerabilidades NO usar esta dirección:
+# ver .github/SECURITY.md (diezprocapoxd@gmail.com, 48h ack / 7 días assessment).
+Maintainer: Lautaro Agustin Diez <71948453+Diez111@users.noreply.github.com>
+Homepage: https://github.com/Diez111/Grafito
+
+Package: grafito
+Section: graphics
+Priority: optional
+Architecture: any
+Depends: ${shlibs:Depends}
+Maintainer: Lautaro Agustin Diez <71948453+Diez111@users.noreply.github.com>
+Description: Calculadora gráfica matemática interactiva
+ Grafito es una calculadora gráfica matemática moderna y de alto
+ rendimiento escrita en Rust. Soporta graficación 2D y 3D, curvas
+ paramétricas e implícitas, mapeos conformes algebraicos, resolución
+ de ecuaciones diferenciales, análisis simbólico (raíces, extremos,
+ integrales, tangentes, curvatura) y mucho más.
+ .
+ Características:
+  - Graficación 2D y 3D de funciones
+  - Curvas paramétricas, polares e implícitas
+  - Mapeos conformes algebraicos (1/z, z^n, exp, log, Möbius, etc.)
+  - Perspectivas para Geometría, Álgebra, Cálculo, Estadística, Complejos,
+    Dinámica, Datos y Examen
+  - CAS simbólico, restricciones numéricas, construcción geométrica
+  - Cómputo GPU (wgpu) con fallback CPU
+Homepage: https://github.com/Diez111/Grafito

@@ -1,0 +1,1962 @@
+//! Paleta de comandos de Grafito — búsqueda rápida bilingüe con Ctrl+K.
+//!
+//! Las acciones de UI muestran su etiqueta en español rioplatense (`name`)
+//! pero despachan con una clave estable en inglés (`selection_key`) para no
+//! romper `GrafitoApp::apply_palette_command` (grafito-app/src/app.rs),
+//! que matchea `"Point Tool"`, `"Save"`, etc. La búsqueda es bilingüe:
+//! `keywords` guarda alias en inglés + español y el filtro también revisa
+//! `syntax_hint` con [`fuzzy_match`] (subsecuencia en orden, sin tildes).
+
+use crate::i18n::{palette_action, palette_count, palette_footer, t, Locale};
+use crate::tokens::{
+    PALETTE_BOTTOM_SHEET_BREAKPOINT, PALETTE_DETAIL_INDENT, PALETTE_LIST_MIN_HEIGHT,
+    PALETTE_LIST_RESERVED, PALETTE_MAX_WIDTH, PALETTE_MIN_WIDTH, PALETTE_PAGE_STEP, PALETTE_POS_X,
+    PALETTE_POS_Y, PALETTE_SEARCH_ICON, PALETTE_SHEET_BOTTOM_GAP, PALETTE_SHEET_CHROME_RESERVE,
+    PALETTE_SHEET_MAX_FRACTION, PALETTE_VIEWPORT_MARGIN, SPACE_LG, SPACE_SM, SPACE_XS, TYPE_BASE,
+    TYPE_SM, TYPE_XS,
+};
+use grafito_command::command_registry;
+
+pub use command_registry::CommandSpec;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaletteCommand {
+    /// Etiqueta visible (español rioplatense para las acciones de UI).
+    pub name: &'static str,
+    pub category: &'static str,
+    pub syntax_hint: &'static str,
+    pub help: &'static str,
+    /// Clave estable de despacho: lo que [`CommandPaletteState::show`]
+    /// devuelve al elegir el comando. Para acciones UI es el nombre
+    /// histórico en inglés; para comandos del registry es `palette_label`.
+    pub selection_key: &'static str,
+    /// Alias bilingües (inglés + español) sólo para la búsqueda.
+    pub keywords: &'static str,
+    /// Slug del catálogo i18n (`palette_action`) para las 16 acciones UI
+    /// localizadas (sin entradas de Estudio desde J1);
+    /// `None` en comandos del registry (conservan su etiqueta).
+    locale_slug: Option<&'static str>,
+    insertion: Option<&'static str>,
+    command_id: Option<&'static str>,
+}
+
+impl PaletteCommand {
+    fn registered(spec: &'static CommandSpec) -> Self {
+        Self {
+            name: spec.palette_label,
+            category: spec.category,
+            // F10-FIX (OOB latente): `signatures` vacío (imposible vía macro
+            // `command!`, posible a mano) → fallback honesto al canónico en
+            // vez de `signatures[0]` (index OOB → panic).
+            syntax_hint: spec
+                .signatures
+                .first()
+                .map_or(spec.canonical, |sig| sig.syntax),
+            help: spec.help,
+            selection_key: spec.palette_label,
+            keywords: spec.id,
+            locale_slug: None,
+            insertion: Some(spec.insertion),
+            command_id: Some(spec.id),
+        }
+    }
+
+    pub fn input_template(&self) -> Option<String> {
+        self.insertion.map(str::to_owned)
+    }
+
+    pub fn is_registered(&self) -> bool {
+        self.command_id.is_some()
+    }
+
+    pub fn registered_spec(&self) -> Option<&'static CommandSpec> {
+        self.command_id.and_then(command_registry::by_id)
+    }
+
+    /// Nombre visible en el idioma pedido. Las 16 acciones UI localizadas
+    /// resuelven vía catálogo i18n (ES idéntico a `name`); el registry y las
+    /// J1: sin entradas de Estudio.
+    fn localized_name(&self, locale: Locale) -> &'static str {
+        match self.locale_slug {
+            Some(slug) => {
+                let label = palette_action(slug, locale);
+                if label.is_empty() {
+                    self.name
+                } else {
+                    label
+                }
+            }
+            None => self.name,
+        }
+    }
+
+    /// Copia con el nombre visible localizado (clave de despacho intacta).
+    fn with_locale(&self, locale: Locale) -> Self {
+        Self {
+            name: self.localized_name(locale),
+            ..*self
+        }
+    }
+}
+
+const UI_ACTIONS: &[PaletteCommand] = &[
+    PaletteCommand {
+        name: "Herramienta Punto",
+        category: "Herramientas",
+        syntax_hint: "Clic en el lienzo | (x, y)",
+        help: "Activa la herramienta para crear puntos.",
+        selection_key: "Point Tool",
+        locale_slug: Some("point"),
+        keywords: "point tool punto",
+        insertion: None,
+        command_id: None,
+    },
+    PaletteCommand {
+        name: "Herramienta Recta",
+        category: "Herramientas",
+        syntax_hint: "Clic en dos puntos | A = (x1, y1), B = (x2, y2)",
+        help: "Activa la herramienta para crear rectas.",
+        selection_key: "Line Tool",
+        locale_slug: Some("line"),
+        keywords: "line tool recta linea",
+        insertion: None,
+        command_id: None,
+    },
+    PaletteCommand {
+        name: "Herramienta Circunferencia",
+        category: "Herramientas",
+        syntax_hint: "Clic en el centro y en el borde",
+        help: "Activa la herramienta para crear circunferencias.",
+        selection_key: "Circle Tool",
+        locale_slug: Some("circle"),
+        keywords: "circle tool circunferencia circulo",
+        insertion: None,
+        command_id: None,
+    },
+    PaletteCommand {
+        name: "Herramienta Polígono",
+        category: "Herramientas",
+        syntax_hint: "Clic en los vértices",
+        help: "Activa la herramienta para crear polígonos.",
+        selection_key: "Polygon Tool",
+        locale_slug: Some("polygon"),
+        keywords: "polygon tool poligono",
+        insertion: None,
+        command_id: None,
+    },
+    PaletteCommand {
+        name: "Herramienta Función",
+        category: "Herramientas",
+        syntax_hint: "f(x) = expresión",
+        help: "Activa la herramienta para crear funciones.",
+        selection_key: "Function Tool",
+        locale_slug: Some("function"),
+        keywords: "function tool funcion",
+        insertion: None,
+        command_id: None,
+    },
+    PaletteCommand {
+        name: "Lápiz",
+        category: "Herramientas",
+        syntax_hint: "Mantené el clic y arrastrá para dibujar a mano alzada",
+        help: "Activa el lápiz de dibujo libre.",
+        selection_key: "Pencil",
+        locale_slug: Some("pencil"),
+        keywords: "pencil lapiz dibujo mano alzada",
+        insertion: None,
+        command_id: None,
+    },
+    PaletteCommand {
+        name: "Borrador",
+        category: "Herramientas",
+        syntax_hint: "Clic o arrastrá para borrar objetos",
+        help: "Activa el borrador.",
+        selection_key: "Eraser",
+        locale_slug: Some("eraser"),
+        keywords: "eraser borrador goma borrar",
+        insertion: None,
+        command_id: None,
+    },
+    PaletteCommand {
+        name: "Guardar",
+        category: "Archivo",
+        syntax_hint: "Guarda el documento actual",
+        help: "Abre el diálogo para guardar el documento.",
+        selection_key: "Save",
+        locale_slug: Some("save"),
+        keywords: "save guardar documento",
+        insertion: None,
+        command_id: None,
+    },
+    PaletteCommand {
+        name: "Exportar SVG",
+        category: "Archivo",
+        syntax_hint: "Exporta gráficos vectoriales",
+        help: "Exporta el documento como SVG.",
+        selection_key: "Export SVG",
+        locale_slug: Some("export_svg"),
+        keywords: "export svg exportar vectorial",
+        insertion: None,
+        command_id: None,
+    },
+    PaletteCommand {
+        name: "Exportar PNG",
+        category: "Archivo",
+        syntax_hint: "Exporta una imagen raster",
+        help: "Exporta el documento como PNG.",
+        selection_key: "Export PNG",
+        locale_slug: Some("export_png"),
+        keywords: "export png exportar imagen raster",
+        insertion: None,
+        command_id: None,
+    },
+    PaletteCommand {
+        name: "Exportar TikZ",
+        category: "Archivo",
+        syntax_hint: "Exporta código LaTeX TikZ",
+        help: "Exporta el documento como TikZ.",
+        selection_key: "Export TikZ",
+        locale_slug: Some("export_tikz"),
+        keywords: "export tikz exportar latex",
+        insertion: None,
+        command_id: None,
+    },
+    PaletteCommand {
+        name: "Encuadrar todo",
+        category: "Vista",
+        syntax_hint: "Ajusta todos los objetos a la vista",
+        help: "Ajusta el encuadre al contenido del documento.",
+        selection_key: "Zoom to Fit",
+        locale_slug: Some("zoom_fit"),
+        keywords: "zoom fit encuadrar ajustar vista",
+        insertion: None,
+        command_id: None,
+    },
+    PaletteCommand {
+        name: "Alternar cuadrícula",
+        category: "Vista",
+        syntax_hint: "Muestra u oculta la cuadrícula",
+        help: "Alterna la cuadrícula del lienzo.",
+        selection_key: "Toggle Grid",
+        locale_slug: Some("toggle_grid"),
+        keywords: "toggle grid cuadricula grilla",
+        insertion: None,
+        command_id: None,
+    },
+    PaletteCommand {
+        name: "Alternar modo oscuro",
+        category: "Vista",
+        syntax_hint: "Cambia entre tema claro y oscuro",
+        help: "Alterna el tema de la aplicación.",
+        selection_key: "Toggle Dark Mode",
+        locale_slug: Some("toggle_dark"),
+        keywords: "toggle dark mode tema oscuro claro noche",
+        insertion: None,
+        command_id: None,
+    },
+    PaletteCommand {
+        name: "Indicar selección",
+        category: "Vista",
+        syntax_hint: "Hace latir la selección ~1.2 s",
+        help: "Resalta el objeto seleccionado con un pulso breve en el lienzo.",
+        selection_key: "Indicate Selection",
+        locale_slug: Some("indicate_selection"),
+        keywords: "indicate selection indicar seleccion resaltar latir highlight pulso",
+        insertion: None,
+        command_id: None,
+    },
+    PaletteCommand {
+        name: "Desarrollo por pasos",
+        category: "Asistente",
+        syntax_hint: "StepByStep[op]",
+        help: "Prepara StepByStep en la entrada para ver la traza con revelado progresivo.",
+        selection_key: "Step by Step",
+        locale_slug: Some("step_by_step"),
+        keywords: "step by step desarrollo pasos visor trace stepwise",
+        insertion: None,
+        command_id: None,
+    },
+    // J1 (2026-10-11): Estudio recortado del producto (pizarra +
+    // matemática/física + Mili). Sin entradas de estudio en la paleta.
+];
+
+/// Dobla tildes y diéresis del español a su vocal base para que la búsqueda
+/// sea insensible a acentos ("lapiz" encuentra "Lápiz"). Asume minúsculas.
+/// Pública porque el autocompletado del input (grafito-app) la reutiliza.
+pub fn fold_spanish(lower: &str) -> String {
+    lower
+        .chars()
+        .map(|c| match c {
+            'á' | 'à' | 'ä' | 'â' => 'a',
+            'é' | 'è' | 'ë' | 'ê' => 'e',
+            'í' | 'ì' | 'ï' | 'î' => 'i',
+            'ó' | 'ò' | 'ö' | 'ô' => 'o',
+            'ú' | 'ù' | 'ü' | 'û' => 'u',
+            'ñ' => 'n',
+            'ç' => 'c',
+            other => other,
+        })
+        .collect()
+}
+
+/// Dobla a minúsculas + pliega tildes en una sola pasada (una alloc).
+/// Byte a byte idéntico a `fold_spanish(&s.to_lowercase())`: `to_lowercase`
+/// es el mismo mapeo Unicode aplicado char por char antes del doblado.
+fn fold_spanish_lower(s: &str) -> String {
+    s.chars()
+        .flat_map(char::to_lowercase)
+        .map(|c| match c {
+            'á' | 'à' | 'ä' | 'â' => 'a',
+            'é' | 'è' | 'ë' | 'ê' => 'e',
+            'í' | 'ì' | 'ï' | 'î' => 'i',
+            'ó' | 'ò' | 'ö' | 'ô' => 'o',
+            'ú' | 'ù' | 'ü' | 'û' => 'u',
+            'ñ' => 'n',
+            'ç' => 'c',
+            other => other,
+        })
+        .collect()
+}
+
+/// Búsqueda difusa "contiene en orden": el query coincide si aparece como
+/// subcadena (vía rápida) o como subsecuencia en orden dentro del objetivo.
+///
+/// Insensible a mayúsculas y a tildes; ignora espacios en el pase difuso
+/// para que "darkmode" encuentre "dark mode" y viceversa.
+pub fn fuzzy_match(query: &str, target: &str) -> bool {
+    fuzzy_match_folded(&fold_spanish(&query.to_lowercase()), target)
+}
+
+/// Núcleo de [`fuzzy_match`] con el query ya normalizado
+/// (`fold_spanish` + minúsculas + trim pendiente).
+///
+/// Separa el costo por query (una vez) del costo por objetivo (una vez por
+/// comando y campo): el filtro de la paleta evalúa ~600 comandos × 5 campos
+/// por keystroke, así que plegar el query en cada llamada multiplicaba las
+/// allocs por ~3000. Además el pase difuso no aloca: recorre `chars` sin
+/// compactar a `Vec` (mismo resultado que la versión con `Vec<char>`).
+fn fuzzy_match_folded(folded_query: &str, target: &str) -> bool {
+    let query = folded_query.trim();
+    if query.is_empty() {
+        return true;
+    }
+    fuzzy_match_both_folded(query, &fold_spanish_lower(target))
+}
+
+/// [`fuzzy_match_folded`] con ambos lados ya normalizados. El filtro de la
+/// paleta pliega los campos una vez por comando (no una por token).
+fn fuzzy_match_both_folded(query: &str, folded_target: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    if folded_target.contains(query) {
+        return true;
+    }
+    // Subsecuencia en orden ignorando blancos, sin `Vec` intermedio: los
+    // blancos del objetivo se saltan al vuelo y los del query no consumen
+    // objetivo (idéntico a compactar ambos antes de comparar).
+    let mut remaining = query.chars().filter(|c| !c.is_whitespace());
+    let mut want = remaining.next();
+    if want.is_none() {
+        return true;
+    }
+    for tc in folded_target.chars() {
+        if tc.is_whitespace() {
+            continue;
+        }
+        if Some(tc) == want {
+            want = remaining.next();
+            if want.is_none() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub fn all_commands() -> Vec<PaletteCommand> {
+    let mut commands = UI_ACTIONS.to_vec();
+    commands.extend(command_registry::palette_commands().map(PaletteCommand::registered));
+    commands
+}
+
+/// Todos los comandos con el nombre visible en el idioma pedido (mismo orden
+/// que [`all_commands`]; claves de despacho intactas). ES idéntico al actual.
+pub fn all_commands_localized(locale: Locale) -> Vec<PaletteCommand> {
+    let mut commands: Vec<PaletteCommand> = UI_ACTIONS
+        .iter()
+        .map(|action| action.with_locale(locale))
+        .collect();
+    commands.extend(command_registry::palette_commands().map(PaletteCommand::registered));
+    commands
+}
+
+// ── Custom tools en la paleta (W2, superficie API) ──
+//
+// El store vive en la app (ver `CustomToolStore` en
+// `grafito-command/src/ggbscript.rs`); la app aún no lo instancia (BLOCKER
+// W2 documentado: falta campo en `GrafitoApp` + brazo en
+// `apply_palette_command` + diálogo `.ggt`, todo en archivos fuera de este
+// frente). Lo que sí queda cerrado aquí, sin fantasma:
+//
+// - Solo se expone lo validado: el store solo guarda `parse_tool_json` /
+//   `define_tool_json` (versión, nombre, cotas, allowlist), así que cada
+//   entrada existe en el registry y ejecuta.
+// - El `template` une pasos con `"\n"`: `process_input` ejecuta el batch
+//   línea por línea (`try_handle_batch_input` en `commands.rs`) con el mismo
+//   presupuesto compartido. El test `custom_tool_templates_execute_batch`
+//   lo prueba contra un documento real.
+// - `PaletteCommand` guarda `&'static str` y los nombres custom son runtime:
+//   por eso la entrada es un struct propio con `String`, no un
+//   `PaletteCommand` a medias.
+
+/// Una custom tool lista para mostrar en paleta/toolbar (datos propios, sin
+/// `&'static`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomToolPaletteEntry {
+    /// Nombre validado de la herramienta (`MAX_GGT_NAME_LEN`, ASCII).
+    pub name: String,
+    /// Línea mostrable (`CustomToolStore::describe`, formato de `LoadTool`).
+    pub detail: String,
+    /// Pasos unidos con `"\n"`: se inserta en la entrada y `process_input`
+    /// lo ejecuta como batch (misma allowlist, mismo presupuesto).
+    pub template: String,
+    /// Texto de búsqueda: nombre + pasos (bilingüe por construcción, los
+    /// pasos son canónicos del registry).
+    pub keywords: String,
+}
+
+impl CustomToolPaletteEntry {
+    /// ¿Coincide `query` (mismas reglas que el filtro de la paleta: cada
+    /// palabra debe aparecer como subcadena o subsecuencia en orden en algún
+    /// campo, sin tildes)?
+    pub fn matches_query(&self, query: &str) -> bool {
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            return true;
+        }
+        let tokens: Vec<String> = trimmed.split_whitespace().map(fold_spanish_lower).collect();
+        let folded = [
+            fold_spanish_lower(self.name.as_str()),
+            fold_spanish_lower(self.detail.as_str()),
+            fold_spanish_lower(self.keywords.as_str()),
+        ];
+        tokens.iter().all(|token| {
+            folded
+                .iter()
+                .any(|haystack| fuzzy_match_both_folded(token, haystack))
+        })
+    }
+}
+
+/// Una entrada por herramienta del store, en orden de carga. Vacío si el
+/// store está vacío (la UI no muestra sección custom entonces).
+pub fn custom_tool_entries(
+    store: &grafito_command::ggbscript::CustomToolStore,
+) -> Vec<CustomToolPaletteEntry> {
+    store
+        .list()
+        .iter()
+        .map(|tool| {
+            let detail = store.describe(&tool.name).unwrap_or_default();
+            let template = tool.steps.join("\n");
+            // Nombre + pasos separados por un blanco, byte a byte igual que
+            // `name + " " + steps.join(" ")` pero sin el `String` temporal
+            // del `join(" ")` intermedio (la app lo alimenta cada frame).
+            let mut keywords = String::with_capacity(tool.name.len() + 1 + template.len());
+            keywords.push_str(&tool.name);
+            keywords.push(' ');
+            for (i, step) in tool.steps.iter().enumerate() {
+                if i > 0 {
+                    keywords.push(' ');
+                }
+                keywords.push_str(step);
+            }
+            CustomToolPaletteEntry {
+                name: tool.name.clone(),
+                detail,
+                template,
+                keywords,
+            }
+        })
+        .collect()
+}
+
+/// Filtra entradas custom con la query de la paleta (mismas reglas).
+pub fn filter_custom_tool_entries(
+    entries: &[CustomToolPaletteEntry],
+    query: &str,
+) -> Vec<CustomToolPaletteEntry> {
+    entries
+        .iter()
+        .filter(|entry| entry.matches_query(query))
+        .cloned()
+        .collect()
+}
+
+#[derive(Default)]
+pub struct CommandPaletteState {
+    pub open: bool,
+    pub search: String,
+    pub selected_index: usize,
+    /// Herramientas personalizadas (`.ggt`) que la app alimenta cada frame;
+    /// se muestran en sección propia y despachan como `CustomTool:{nombre}`.
+    pub custom_tools: Vec<CustomToolPaletteEntry>,
+    /// Recientes internos (MRU en memoria, sin I/O): se alimentan solos en
+    /// cada despacho desde `show_*`; la lista los sube cuando no hay búsqueda.
+    pub mru: MruPalette,
+    /// Última búsqueda vista: al cambiar resetea `selected_index` para que
+    /// el cursor nunca quede perdido fuera de la lista filtrada.
+    pub prev_search: String,
+    /// La app lo prende en la perspectiva Física: la sección Dinámica
+    /// sube primera (estable, el resto intacto). Piel pura, sin I/O.
+    pub fisica_first: bool,
+}
+
+/// Prefijo de despacho de una herramienta personalizada en la paleta.
+/// Los nombres de comandos del registry son alfanuméricos, así que el
+/// prefijo con `:` no colisiona jamás con un comando real.
+pub const CUSTOM_TOOL_SELECTION_PREFIX: &str = "CustomTool:";
+
+/// Recientes de la paleta (MRU en memoria, sin I/O ni persistencia).
+/// La app lo alimenta con cada despacho; el filtro lo usa para ordenar.
+#[derive(Debug, Clone, Default)]
+pub struct MruPalette {
+    entries: std::collections::VecDeque<String>,
+}
+
+impl MruPalette {
+    /// Capacidad del MRU: 8 recientes bastan sin tapar la búsqueda.
+    pub const CAP: usize = 8;
+
+    /// Registra una clave de despacho (`selection_key`). Sin duplicados.
+    pub fn record(&mut self, selection_key: &str) {
+        let key = selection_key.trim();
+        if key.is_empty() {
+            return;
+        }
+        self.entries.retain(|item| item != key);
+        self.entries.push_front(key.to_owned());
+        while self.entries.len() > Self::CAP {
+            self.entries.pop_back();
+        }
+    }
+
+    /// Claves recientes, de más a menos reciente.
+    pub fn recent(&self) -> Vec<String> {
+        self.entries.iter().cloned().collect()
+    }
+
+    /// ¿Está `key` entre los recientes? Vía rápida sin clonar la lista (el
+    /// draw la consulta por comando y por frame).
+    pub fn contains(&self, key: &str) -> bool {
+        self.entries.iter().any(|item| item == key)
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// Ordena comandos: recientes primero (en orden MRU), resto intacto.
+    pub fn apply_order(&self, commands: &[PaletteCommand]) -> Vec<PaletteCommand> {
+        if self.entries.is_empty() {
+            return commands.to_vec();
+        }
+        let mut ordered = Vec::with_capacity(commands.len());
+        for key in &self.entries {
+            if let Some(cmd) = commands.iter().find(|cmd| cmd.selection_key == key) {
+                ordered.push(*cmd);
+            }
+        }
+        for cmd in commands {
+            if !ordered
+                .iter()
+                .any(|item| item.selection_key == cmd.selection_key)
+            {
+                ordered.push(*cmd);
+            }
+        }
+        ordered
+    }
+}
+
+/// Orden Física de la paleta: los comandos de categoría "Dinámica"
+/// (los laboratorios) suben primeros, estables; el resto conserva su
+/// orden. Puro, sin I/O: `group_by_category` ya preserva aparición, así
+/// que la sección Dinámica queda primera sin rediseño.
+pub fn dinamica_first(commands: Vec<PaletteCommand>) -> Vec<PaletteCommand> {
+    let mut dinamica = Vec::new();
+    let mut resto = Vec::new();
+    for cmd in commands {
+        if cmd.category == "Dinámica" {
+            dinamica.push(cmd);
+        } else {
+            resto.push(cmd);
+        }
+    }
+    dinamica.extend(resto);
+    dinamica
+}
+
+/// Tooltip rico de un comando: qué es + sintaxis + ayuda, en 3 líneas.
+/// Lo usa el hover de la paleta para que ningún comando sea críptico.
+pub fn rich_tooltip_for(cmd: &PaletteCommand) -> String {
+    format!("{}\n{}\n{}", cmd.name, cmd.syntax_hint, cmd.help)
+}
+
+/// Ancho de la paleta dejando un margen seguro para ventanas estrechas.
+pub fn palette_window_width(viewport_width: f32) -> f32 {
+    (viewport_width - PALETTE_VIEWPORT_MARGIN).clamp(PALETTE_MIN_WIDTH, PALETTE_MAX_WIDTH)
+}
+
+/// Presentación de la paleta según viewport: flotante arriba (desktop) o
+/// sheet abajo (móvil, alcance del pulgar). Pura y pineada: el filtro no
+/// cambia, solo el contenedor (cero pantallas funcionales nuevas).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PalettePresentation {
+    Floating,
+    BottomSheet,
+}
+
+pub fn palette_presentation(viewport_width: f32) -> PalettePresentation {
+    if viewport_width < PALETTE_BOTTOM_SHEET_BREAKPOINT {
+        PalettePresentation::BottomSheet
+    } else {
+        PalettePresentation::Floating
+    }
+}
+
+/// Chips de rama de la paleta (S5): las 8 facetas `· rama` que viven en los
+/// `help` del registry. UI-only a propósito: el registry no se toca
+/// (anti-colisión de alias). Un tap filtra por la rama; otro tap limpia.
+/// El test pinnea que cada chip encuentra ≥1 comando (si una faceta se
+/// borra del help, el chip muere con ella en vez de mentir).
+pub const PALETTE_BRANCH_CHIPS: &[&str] = &[
+    "mecanica",
+    "electromagnetismo",
+    "ondas",
+    "termodinamica",
+    "fluidos",
+    "gravitacion",
+    "cuantica",
+    "quimica",
+];
+
+/// Altura máxima de la lista: en sheet, fracción del viewport (media hoja);
+/// flotante, todo el alto menos el cromo. Pura y pineada.
+/// El piso MIN es deliberado, no ilusorio: en viewports cortos el
+/// presupuesto cae bajo el cromo real (search + chips ≈ 100 px, menor que
+/// RESERVED 168) y sin piso la lista colapsaría a 0. Con piso, a 400 px:
+/// sheet 248 − lista 120 − cromo 100 = 28 px de aire. Apenas, sin desborde.
+pub fn palette_list_max_height(viewport_height: f32, sheet: bool) -> f32 {
+    let budget = if sheet {
+        // Doble techo: fracción (media hoja) Y viewport − cromo total.
+        // En viewports cortos el segundo manda: sin esto el ancla abajo
+        // recorta la búsqueda y la lista muestra 1 fila.
+        (viewport_height * PALETTE_SHEET_MAX_FRACTION - PALETTE_LIST_RESERVED)
+            .min(viewport_height - PALETTE_SHEET_CHROME_RESERVE)
+    } else {
+        viewport_height - PALETTE_LIST_RESERVED
+    };
+    budget.max(PALETTE_LIST_MIN_HEIGHT)
+}
+
+impl CommandPaletteState {
+    /// Abre la paleta reseteando búsqueda y cursor (F18.1: unifica los 3
+    /// call sites — atajo Ctrl+K, menú Herramientas y botón de la top bar —
+    /// en un solo punto; puro, sin I/O ni egui).
+    pub fn open_palette(&mut self) {
+        self.open = true;
+        self.search.clear();
+        self.selected_index = 0;
+    }
+
+    /// Filtra bilingüe (español + inglés) sobre nombre, categoría,
+    /// `syntax_hint`, ayuda y alias. Cada palabra del query debe coincidir
+    /// (subcadena o difusa en orden) en al menos un campo.
+    pub fn filtered_commands(&self) -> Vec<PaletteCommand> {
+        Self::filter_in(&all_commands(), &self.search)
+    }
+
+    /// Filtro bilingüe con nombres visibles en el idioma pedido (ver
+    /// [`CommandPaletteState::filtered_commands`]). ES idéntico al actual.
+    pub fn filtered_commands_localized(&self, locale: Locale) -> Vec<PaletteCommand> {
+        Self::filter_in(&all_commands_localized(locale), &self.search)
+    }
+
+    /// Filtrado con recientes MRU primero (sin búsqueda: todo ordenado MRU).
+    /// La app pasa su [`MruPalette`] alimentado en cada despacho.
+    pub fn filtered_commands_mru(&self, mru: &MruPalette) -> Vec<PaletteCommand> {
+        mru.apply_order(&self.filtered_commands())
+    }
+
+    /// Núcleo del filtro bilingüe (español + inglés) sobre nombre, categoría,
+    /// `syntax_hint`, ayuda y alias. Cada palabra del query debe coincidir
+    /// (subcadena o difusa en orden) en al menos un campo.
+    fn filter_in(all: &[PaletteCommand], search: &str) -> Vec<PaletteCommand> {
+        let trimmed = search.trim();
+        if trimmed.is_empty() {
+            return all.to_vec();
+        }
+        // Query plegado una vez y campos plegados una vez por comando (no
+        // una por token): multi-token antes repetía los 5 `fold` por token.
+        let tokens: Vec<String> = trimmed.split_whitespace().map(fold_spanish_lower).collect();
+        all.iter()
+            .copied()
+            .filter(|cmd| {
+                let folded = [
+                    fold_spanish_lower(cmd.name),
+                    fold_spanish_lower(cmd.category),
+                    fold_spanish_lower(cmd.syntax_hint),
+                    fold_spanish_lower(cmd.help),
+                    fold_spanish_lower(cmd.keywords),
+                ];
+                tokens.iter().all(|token| {
+                    folded
+                        .iter()
+                        .any(|haystack| fuzzy_match_both_folded(token, haystack))
+                })
+            })
+            .collect()
+    }
+
+    /// Índice siguiente con wrap-around para Up/Down. Puro, sin I/O.
+    /// `down=true` avanza, `down=false` retrocede. `None` si vacío.
+    pub fn nav_wrapped(current: usize, len: usize, down: bool) -> Option<usize> {
+        if len == 0 {
+            return None;
+        }
+        let last = len - 1;
+        Some(if down {
+            if current >= last {
+                0
+            } else {
+                current + 1
+            }
+        } else if current == 0 {
+            last
+        } else {
+            current - 1
+        })
+    }
+
+    pub fn clamp_selected_index(&mut self) {
+        let len = self.filtered_commands().len();
+        self.clamp_to(len);
+    }
+
+    fn clamp_to(&mut self, len: usize) {
+        if len == 0 {
+            self.selected_index = 0;
+        } else {
+            self.selected_index = self.selected_index.min(len - 1);
+        }
+    }
+
+    /// Agrupa comandos por categoría preservando el orden de aparición.
+    /// Puro, sin I/O: la paleta dibuja una sección serena por grupo en vez
+    /// de una lista plana de 600+ filas idénticas.
+    pub fn group_by_category(
+        commands: &[PaletteCommand],
+    ) -> Vec<(&'static str, Vec<PaletteCommand>)> {
+        let mut groups: Vec<(&'static str, Vec<PaletteCommand>)> = Vec::new();
+        for cmd in commands {
+            match groups.iter_mut().find(|(cat, _)| *cat == cmd.category) {
+                Some((_, list)) => list.push(*cmd),
+                None => groups.push((cmd.category, vec![*cmd])),
+            }
+        }
+        groups
+    }
+
+    /// Salto de página clamped (PageUp/PageDown). Puro, sin I/O.
+    /// `delta` en filas (negativo sube); `None` si vacío.
+    pub fn nav_page(current: usize, len: usize, delta: isize) -> Option<usize> {
+        if len == 0 {
+            return None;
+        }
+        let next = (current as isize + delta).clamp(0, len as isize - 1);
+        Some(next as usize)
+    }
+
+    pub fn show(&mut self, ctx: &egui::Context) -> Option<String> {
+        self.show_localized(ctx, Locale::Es)
+    }
+
+    /// Paleta con textos en el idioma pedido (título, vacío y pie vía catálogo
+    /// i18n; nombres de acciones vía [`all_commands_localized`]). ES idéntico
+    /// a [`CommandPaletteState::show`]; las claves de despacho no cambian.
+    ///
+    /// Diseño Scandinavian: ventana sin barra de título, búsqueda protagonista
+    /// con pista localizada, fila de estado con conteo vivo + limpiar,
+    /// secciones por categoría con aire (sin separadores), fila seleccionada
+    /// con detalle plegable (sintaxis + ayuda) y tooltip en hover sin mover
+    /// el layout. Recientes (MRU) arriba solo sin búsqueda. Piel pura.
+    pub fn show_localized(&mut self, ctx: &egui::Context, locale: Locale) -> Option<String> {
+        if !self.open {
+            return None;
+        }
+
+        // Cursor nunca perdido: al cambiar la búsqueda se vuelve al inicio.
+        if self.prev_search != self.search {
+            self.prev_search = self.search.clone();
+            self.selected_index = 0;
+        }
+
+        let all = all_commands_localized(locale);
+        let total = all.len();
+        let filtered = Self::filter_in(&all, &self.search);
+        // Física primero: la sección Dinámica sube (estable) antes del
+        // MRU, así los laboratorios abren la lista en su perspectiva.
+        let filtered = if self.fisica_first {
+            dinamica_first(filtered)
+        } else {
+            filtered
+        };
+        // Sin búsqueda, los recientes suben primero (sin duplicados).
+        let display: Vec<PaletteCommand> = if self.search.trim().is_empty() {
+            self.mru.apply_order(&filtered)
+        } else {
+            filtered
+        };
+        self.clamp_to(display.len());
+
+        // ── Navegación por teclado (antes de dibujar, para auto-scroll) ──
+        let mut navigated = false;
+        if !display.is_empty() {
+            let len = display.len();
+            let mut next = self.selected_index;
+            ctx.input(|i| {
+                if i.key_pressed(egui::Key::ArrowDown) {
+                    next = Self::nav_wrapped(next, len, true).unwrap_or(next);
+                } else if i.key_pressed(egui::Key::ArrowUp) {
+                    next = Self::nav_wrapped(next, len, false).unwrap_or(next);
+                } else if i.key_pressed(egui::Key::Home) {
+                    next = 0;
+                } else if i.key_pressed(egui::Key::End) {
+                    next = len - 1;
+                } else if i.key_pressed(egui::Key::PageDown) {
+                    next = Self::nav_page(next, len, PALETTE_PAGE_STEP as isize).unwrap_or(next);
+                } else if i.key_pressed(egui::Key::PageUp) {
+                    next = Self::nav_page(next, len, -(PALETTE_PAGE_STEP as isize)).unwrap_or(next);
+                } else {
+                    return;
+                }
+                navigated = next != self.selected_index;
+            });
+            self.selected_index = next;
+        }
+        let searching = !self.search.trim().is_empty();
+        // Filas recientes: cabecera del MRU que abre la lista sin búsqueda.
+        // `contains` evita clonar las 8 claves a un `Vec` por frame.
+        let mut recent_count = 0;
+        if !searching {
+            for cmd in &display {
+                if self.mru.contains(cmd.selection_key) {
+                    recent_count += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        let mut selected_command: Option<String> = None;
+        let mut dismissed = false;
+        let mut open = self.open;
+        let screen_rect = ctx.screen_rect();
+        // Móvil (<740): sheet abajo al alcance del pulgar; desktop: flotante
+        // arriba como siempre. Solo cambia el contenedor, nunca el filtro.
+        let sheet = palette_presentation(screen_rect.width()) == PalettePresentation::BottomSheet;
+        let window = egui::Window::new(t("palette.title", locale))
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(palette_window_width(screen_rect.width()))
+            .max_width(palette_window_width(screen_rect.width()));
+        let window = if sheet {
+            // + safe_inset_bottom: con nav por gestos (32 px) los últimos
+            // ~24 px del sheet quedaban tras la barra del sistema.
+            window.anchor(
+                egui::Align2::CENTER_BOTTOM,
+                egui::vec2(
+                    0.0,
+                    -PALETTE_SHEET_BOTTOM_GAP - crate::tokens::safe_inset_bottom(),
+                ),
+            )
+        } else {
+            window.default_pos([PALETTE_POS_X, PALETTE_POS_Y])
+        };
+        // El título vive solo como id estable de ventana (memoria de posición).
+        window.show(ctx, |ui| {
+            let theme = crate::theme::current_theme(ui.ctx());
+            // ── Búsqueda protagonista ──
+            ui.horizontal(|ui| {
+                let (search_rect, _) = ui.allocate_exact_size(
+                    egui::vec2(PALETTE_SEARCH_ICON, PALETTE_SEARCH_ICON),
+                    egui::Sense::hover(),
+                );
+                if ui.is_rect_visible(search_rect) {
+                    crate::icons::draw_icon(
+                        ui.painter(),
+                        search_rect,
+                        crate::icons::Icon::Search,
+                        theme.text_secondary,
+                    );
+                }
+                // Sheet: la X de cierre (44px) vive en la fila; la
+                // búsqueda cede su ancho para no desbordar. Campo a 44 px
+                // de alto (la X vecina es 44×44; a ~22 px quedaba desbalanceado).
+                // Desktop intacto (ancho infinito + altura natural).
+                let search_w = if sheet {
+                    (ui.available_width()
+                        - crate::tokens::HIT_TARGET_AULA
+                        - ui.spacing().item_spacing.x)
+                        .max(80.0)
+                } else {
+                    f32::INFINITY
+                };
+                let search_edit = egui::TextEdit::singleline(&mut self.search)
+                    .hint_text(t("palette.search_hint", locale))
+                    .desired_width(search_w);
+                let response = if sheet {
+                    ui.add_sized(
+                        egui::vec2(search_w, crate::tokens::HIT_TARGET_AULA),
+                        search_edit,
+                    )
+                } else {
+                    ui.add(search_edit)
+                };
+                if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    if let Some(cmd) = display.get(self.selected_index) {
+                        selected_command = Some(cmd.selection_key.to_string());
+                    }
+                }
+                // En táctil no hay Esc: X explícita de 44px.
+                if sheet
+                    && crate::icons::action_icon_button_sized(
+                        ui,
+                        crate::icons::Icon::Close,
+                        theme.text_secondary,
+                        t("classroom.close", locale),
+                        egui::vec2(44.0, 44.0),
+                    )
+                    .clicked()
+                {
+                    dismissed = true;
+                }
+                // Pide foco SOLO mientras no lo tenga. La llamada incondicional de antes
+                // reclamaba el foco cada frame: un `Tab` movía el foco al
+                // siguiente widget y el frame siguiente lo devolvía, así
+                // que el teclado quedaba atrapado dentro de la ventana
+                // (WCAG 2.1.2) sin ningún camino de salida — el cierre
+                // dependía solo de `Escape` o del clic fuera.
+                // Sin autofoco en sheet: en Android el IME cubre búsqueda
+                // + lista. En desktop se mantiene (teclado físico).
+                if !sheet && !response.has_focus() {
+                    response.request_focus();
+                }
+            });
+
+            // ── Chips de rama: descubrimiento, un tap filtra. Antes
+            // solo sheet y en desktop la física quedaba invisible.
+            // Misma fila en ambas presentaciones (el filtro no cambia).
+            {
+                egui::ScrollArea::horizontal()
+                    .auto_shrink([true, false])
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            for chip in PALETTE_BRANCH_CHIPS {
+                                let active = self.search.trim() == *chip;
+                                // Sheet táctil: 44 px de alto (el
+                                // `selectable_label` queda en ~20 px).
+                                // Desktop: altura natural, intacto.
+                                let chip_resp = if sheet {
+                                    let galley = ui.fonts(|f| {
+                                        f.layout_no_wrap(
+                                            (*chip).to_owned(),
+                                            egui::FontId::proportional(crate::tokens::TYPE_SM),
+                                            egui::Color32::WHITE,
+                                        )
+                                    });
+                                    let chip_w = galley.size().x + 2.0 * crate::tokens::SPACE_LG;
+                                    ui.add_sized(
+                                        egui::vec2(chip_w, 44.0),
+                                        egui::SelectableLabel::new(active, *chip),
+                                    )
+                                } else {
+                                    ui.selectable_label(active, *chip)
+                                };
+                                if chip_resp.clicked() {
+                                    if active {
+                                        self.search.clear();
+                                    } else {
+                                        self.search = chip.to_string();
+                                    }
+                                    self.selected_index = 0;
+                                }
+                            }
+                        });
+                    });
+            }
+
+            // ── Estado: conteo vivo + limpiar (una línea tenue, sin ruido) ──
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(palette_count(display.len(), total, locale))
+                        .size(TYPE_XS)
+                        .color(theme.text_tertiary),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if searching
+                        && Self::clear_button(ui, sheet, t("palette.clear", locale)).clicked()
+                    {
+                        self.search.clear();
+                        self.selected_index = 0;
+                    }
+                });
+            });
+            ui.add_space(SPACE_XS);
+
+            // ── Lista por secciones ──
+            if display.is_empty() {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(SPACE_LG);
+                    ui.label(egui::RichText::new(t("palette.empty", locale)).size(TYPE_BASE));
+                    ui.add_space(SPACE_XS);
+                    if Self::clear_button(ui, sheet, t("palette.clear", locale)).clicked() {
+                        self.search.clear();
+                        self.selected_index = 0;
+                    }
+                    ui.add_space(SPACE_LG);
+                });
+            } else {
+                egui::ScrollArea::vertical()
+                    .max_height(palette_list_max_height(screen_rect.height(), sheet))
+                    .show(ui, |ui| {
+                        // S2 táctil: filas ~44 en sheet (dedo), densidad
+                        // desktop intacta. Solo padding vertical extra.
+                        // Sheet: padding 12 → filas 20+24=44 px táctiles
+                        // (con 8 quedaban en ~36).
+                        if sheet {
+                            ui.spacing_mut().button_padding.y = crate::tokens::SPACE_MD;
+                        }
+                        let mut flat = 0;
+                        let mut first_section = true;
+                        // Recientes primero (solo sin búsqueda).
+                        if recent_count > 0 {
+                            if sheet {
+                                // S5: MRU horizontal táctil (repetir última
+                                // acción en 1 tap). Consume los mismos
+                                // índices que las filas (navegación intacta).
+                                egui::ScrollArea::horizontal()
+                                    .auto_shrink([true, false])
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            for cmd in display.iter().take(recent_count) {
+                                                // MRU táctil: ancho medido (el fijo 120 cortaba
+                                                // nombres largos a ciegas) + hover con el nombre.
+                                                let mru_g = ui.fonts(|f| {
+                                                    f.layout_no_wrap(
+                                                        cmd.name.to_owned(),
+                                                        egui::FontId::proportional(TYPE_BASE),
+                                                        egui::Color32::WHITE,
+                                                    )
+                                                });
+                                                let mru_w = (mru_g.size().x + 2.0 * SPACE_SM)
+                                                    .clamp(64.0, 200.0);
+                                                if ui
+                                                    .add_sized(
+                                                        egui::vec2(
+                                                            mru_w,
+                                                            crate::tokens::HIT_TARGET_AULA,
+                                                        ),
+                                                        egui::Button::new(cmd.name),
+                                                    )
+                                                    .on_hover_text(cmd.name)
+                                                    .clicked()
+                                                {
+                                                    selected_command =
+                                                        Some(cmd.selection_key.to_string());
+                                                }
+                                                flat += 1;
+                                            }
+                                        });
+                                    });
+                                first_section = false;
+                            } else {
+                                Self::section_header(ui, theme, t("palette.recent", locale));
+                                first_section = false;
+                                for cmd in display.iter().take(recent_count) {
+                                    if Self::palette_row(
+                                        ui,
+                                        theme,
+                                        cmd,
+                                        flat == self.selected_index,
+                                        navigated && flat == self.selected_index,
+                                    ) {
+                                        selected_command = Some(cmd.selection_key.to_string());
+                                    }
+                                    flat += 1;
+                                }
+                            }
+                        }
+                        for (category, cmds) in Self::group_by_category(&display[recent_count..]) {
+                            if !first_section {
+                                ui.add_space(SPACE_SM);
+                            }
+                            first_section = false;
+                            Self::section_header(ui, theme, category);
+                            for cmd in &cmds {
+                                if Self::palette_row(
+                                    ui,
+                                    theme,
+                                    cmd,
+                                    flat == self.selected_index,
+                                    navigated && flat == self.selected_index,
+                                ) {
+                                    selected_command = Some(cmd.selection_key.to_string());
+                                }
+                                flat += 1;
+                            }
+                        }
+                    });
+            }
+
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                dismissed = true;
+            }
+
+            // ── Herramientas personalizadas (.ggt): mismo lenguaje de
+            // fila, click directo (fuera de la navegación principal para
+            // índices estables), sin emoji.
+            let custom_shown = filter_custom_tool_entries(&self.custom_tools, &self.search);
+            if !custom_shown.is_empty() {
+                ui.add_space(SPACE_SM);
+                Self::section_header(ui, theme, t("palette.custom_tools", locale));
+                for entry in &custom_shown {
+                    // Elide como las filas: sin esto el nombre largo salía
+                    // por la derecha del sheet.
+                    let budget = ui.available_width().max(40.0);
+                    let shown = Self::elide_command_name(ui, entry.name.as_str(), budget);
+                    let response = ui
+                        .with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
+                            ui.selectable_label(false, shown)
+                        });
+                    let response = response.inner.on_hover_text(entry.detail.as_str());
+                    if response.clicked() {
+                        selected_command =
+                            Some(format!("{CUSTOM_TOOL_SELECTION_PREFIX}{}", entry.name));
+                    }
+                }
+            }
+
+            // En sheet el footer + separador roban ~100 px de cromo en
+            // viewports cortos (el conteo vivo de arriba ya informa).
+            // Desktop intacto.
+            if !sheet {
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(palette_footer(display.len(), total, locale))
+                        .small()
+                        .weak(),
+                );
+            }
+        });
+
+        if selected_command.is_some() || dismissed {
+            open = false;
+        }
+        if let Some(ref key) = selected_command {
+            self.mru.record(key);
+            self.search.clear();
+            self.prev_search.clear();
+            self.selected_index = 0;
+        }
+
+        self.open = open;
+        selected_command
+    }
+
+    /// Cabecera de sección serena: small caps tenues + aire, sin líneas.
+    fn section_header(ui: &mut egui::Ui, theme: &crate::theme::Theme, title: &str) {
+        ui.label(
+            egui::RichText::new(title)
+                .size(TYPE_SM)
+                .strong()
+                .color(theme.text_tertiary),
+        );
+        ui.add_space(SPACE_XS);
+    }
+
+    /// Botón Limpiar a 44 px en sheet (el small_button de ~19 px incumplía
+    /// el target táctil entre filas de 44). Desktop intacto.
+    fn clear_button(ui: &mut egui::Ui, sheet: bool, label: &str) -> egui::Response {
+        if !sheet {
+            return ui.small_button(label);
+        }
+        let galley = ui.fonts(|f| {
+            f.layout_no_wrap(
+                label.to_owned(),
+                egui::FontId::proportional(TYPE_SM),
+                egui::Color32::WHITE,
+            )
+        });
+        ui.add_sized(
+            egui::vec2(
+                galley.size().x + 2.0 * SPACE_LG,
+                crate::tokens::HIT_TARGET_AULA,
+            ),
+            egui::Button::new(label),
+        )
+    }
+
+    /// Elide con corte si el nombre excede el presupuesto (el
+    /// selectable_label sin elide hacía wrap con alturas irregulares y la
+    /// firma larga se clipaba en el scroll vertical).
+    fn elide_command_name(ui: &egui::Ui, name: &str, budget: f32) -> String {
+        let font = egui::FontId::proportional(TYPE_BASE);
+        let width_of = |s: &str| {
+            ui.fonts(|f| {
+                f.layout_no_wrap(s.to_owned(), font.clone(), egui::Color32::WHITE)
+                    .size()
+                    .x
+            })
+        };
+        if width_of(name) <= budget {
+            return name.to_owned();
+        }
+        let mut short: String = name.chars().take(24).collect();
+        while !short.is_empty() && width_of(&format!("{short}\u{2026}")) > budget {
+            short.pop();
+        }
+        format!("{short}\u{2026}")
+    }
+
+    /// Fila de comando a ancho completo: nombre base, tooltip rico en hover
+    /// (sin mover el layout) y detalle plegable solo en la seleccionada.
+    /// Devuelve `true` si hubo clic.
+    fn palette_row(
+        ui: &mut egui::Ui,
+        theme: &crate::theme::Theme,
+        cmd: &PaletteCommand,
+        is_selected: bool,
+        ensure_visible: bool,
+    ) -> bool {
+        // Nombre elidido al ancho vivo: sin esto las firmas largas se
+        // clipaban y el wrap daba alturas irregulares (auditoría paleta).
+        let budget = ui.available_width().max(40.0);
+        let shown = Self::elide_command_name(ui, cmd.name, budget);
+        let response = ui
+            .with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
+                ui.selectable_label(is_selected, egui::RichText::new(shown).size(TYPE_BASE))
+            })
+            .inner
+            .on_hover_text(rich_tooltip_for(cmd));
+        if ensure_visible {
+            response.scroll_to_me(Some(egui::Align::Center));
+        }
+        let clicked = response.clicked();
+        if is_selected {
+            ui.horizontal(|ui| {
+                ui.add_space(PALETTE_DETAIL_INDENT - ui.spacing().item_spacing.x);
+                ui.vertical(|ui| {
+                    // Truncate: la firma/ayuda larga se clipaba en el
+                    // scroll vertical (auditoría paleta); el hover de la
+                    // fila ya muestra el tooltip rico completo.
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(cmd.syntax_hint)
+                                .size(TYPE_SM)
+                                .monospace()
+                                .color(theme.text_secondary),
+                        )
+                        .truncate(),
+                    );
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(cmd.help)
+                                .size(TYPE_SM)
+                                .color(theme.text_tertiary),
+                        )
+                        .truncate(),
+                    );
+                });
+            });
+            ui.add_space(SPACE_XS);
+        }
+        clicked
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        all_commands, command_registry, fuzzy_match, rich_tooltip_for, CommandPaletteState,
+        MruPalette, UI_ACTIONS,
+    };
+
+    #[test]
+    fn paleta_expone_registro_mas_acciones_ui() {
+        let total = all_commands().len();
+        assert_eq!(
+            total,
+            command_registry::palette_commands().count() + UI_ACTIONS.len()
+        );
+        let state = CommandPaletteState::default();
+        assert_eq!(state.filtered_commands().len(), total);
+    }
+
+    #[test]
+    fn open_palette_abre_y_resetea_busqueda_y_cursor() {
+        // F18.1: un solo punto de apertura — abre aunque esté cerrada y
+        // resetea búsqueda + cursor aunque venga sucia.
+        let mut state = CommandPaletteState::default();
+        state.search.push_str("circulo sucio");
+        state.selected_index = 7;
+        state.open_palette();
+        assert!(state.open);
+        assert!(state.search.is_empty());
+        assert_eq!(state.selected_index, 0);
+        // Idempotente: abrir de nuevo no ensucia.
+        state.open_palette();
+        assert!(state.open);
+        assert!(state.search.is_empty());
+        assert_eq!(state.selected_index, 0);
+    }
+
+    #[test]
+    fn fuzzy_match_contiene_en_orden() {
+        assert!(fuzzy_match("", "cualquier cosa"));
+        assert!(fuzzy_match("punto", "Herramienta Punto"));
+        assert!(fuzzy_match("PUNTO", "herramienta punto"));
+        // Subsecuencia en orden, no sólo subcadena.
+        assert!(fuzzy_match("pncl", "Pencil"));
+        assert!(fuzzy_match("hrpt", "Herramienta Punto"));
+        // El orden importa.
+        assert!(!fuzzy_match("ecnp", "Pencil"));
+        // Insensible a tildes y a espacios.
+        assert!(fuzzy_match("lapiz", "Lápiz"));
+        assert!(fuzzy_match("cuadricula", "Alternar cuadrícula"));
+        assert!(fuzzy_match("darkmode", "dark mode"));
+        // Basura no coincide.
+        assert!(!fuzzy_match("zzzqqqx", "Guardar"));
+        assert!(!fuzzy_match("zzzqqqx", "Exporta el documento como SVG."));
+    }
+
+    #[test]
+    fn busqueda_bilingue_encuentra_acciones_en_ambos_idiomas() {
+        for (query, expected_key) in [
+            ("punto", "Point Tool"),
+            ("point", "Point Tool"),
+            ("guardar", "Save"),
+            ("save", "Save"),
+            ("cuadricula", "Toggle Grid"),
+            ("grid", "Toggle Grid"),
+            ("oscuro", "Toggle Dark Mode"),
+            ("dark", "Toggle Dark Mode"),
+            ("encuadrar", "Zoom to Fit"),
+            ("zoom", "Zoom to Fit"),
+            ("lapiz", "Pencil"),
+            ("pencil", "Pencil"),
+            ("indicar", "Indicate Selection"),
+            ("indicate", "Indicate Selection"),
+            ("resaltar", "Indicate Selection"),
+            ("highlight", "Indicate Selection"),
+            ("pasos", "Step by Step"),
+            ("step", "Step by Step"),
+            ("desarrollo", "Step by Step"),
+        ] {
+            let state = CommandPaletteState {
+                search: query.to_string(),
+                ..Default::default()
+            };
+            let keys: Vec<&str> = state
+                .filtered_commands()
+                .iter()
+                .map(|cmd| cmd.selection_key)
+                .collect();
+            assert!(
+                keys.contains(&expected_key),
+                "query {query:?} debería encontrar {expected_key:?}, encontró {keys:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn busqueda_tambien_revisa_syntax_hint() {
+        let state = CommandPaletteState {
+            search: "f(x)".to_string(),
+            ..Default::default()
+        };
+        let keys: Vec<&str> = state
+            .filtered_commands()
+            .iter()
+            .map(|cmd| cmd.selection_key)
+            .collect();
+        assert!(
+            keys.contains(&"Function Tool"),
+            "buscar 'f(x)' debería encontrar la herramienta función, encontró {keys:?}"
+        );
+
+        let state = CommandPaletteState {
+            search: "lienzo".to_string(),
+            ..Default::default()
+        };
+        let keys: Vec<&str> = state
+            .filtered_commands()
+            .iter()
+            .map(|cmd| cmd.selection_key)
+            .collect();
+        assert!(
+            keys.contains(&"Point Tool"),
+            "buscar 'lienzo' (sólo en syntax_hint) debería encontrar punto, encontró {keys:?}"
+        );
+    }
+
+    #[test]
+    fn nav_wrapped_da_la_vuelta_en_ambos_extremos() {
+        // N entradas en paleta (604 comandos + 20 acciones UI): el wrap evita
+        // callejones sin salida por teclado. 614 acá es largo de ejemplo.
+        assert_eq!(CommandPaletteState::nav_wrapped(0, 0, true), None);
+        assert_eq!(CommandPaletteState::nav_wrapped(0, 614, false), Some(613));
+        assert_eq!(CommandPaletteState::nav_wrapped(613, 614, true), Some(0));
+        assert_eq!(CommandPaletteState::nav_wrapped(5, 614, true), Some(6));
+        assert_eq!(CommandPaletteState::nav_wrapped(5, 614, false), Some(4));
+        assert_eq!(CommandPaletteState::nav_wrapped(0, 1, true), Some(0));
+    }
+
+    #[test]
+    fn nav_page_clampea_sin_wrap() {
+        // PageUp/PageDown: salto fijo con tope, nunca wrap (orientación kept).
+        assert_eq!(CommandPaletteState::nav_page(0, 0, 10), None);
+        assert_eq!(CommandPaletteState::nav_page(5, 614, 10), Some(15));
+        assert_eq!(CommandPaletteState::nav_page(5, 614, -10), Some(0));
+        assert_eq!(CommandPaletteState::nav_page(610, 614, 10), Some(613));
+        assert_eq!(CommandPaletteState::nav_page(0, 614, -10), Some(0));
+        assert_eq!(CommandPaletteState::nav_page(3, 614, 0), Some(3));
+        assert_eq!(
+            CommandPaletteState::nav_page(0, 1, 10),
+            Some(0),
+            "una sola fila no se mueve"
+        );
+    }
+
+    #[test]
+    fn group_by_category_preserva_orden_y_cubre_todo() {
+        let all = all_commands();
+        let groups = CommandPaletteState::group_by_category(&all);
+        // Sin duplicados ni pérdidas.
+        let counted: usize = groups.iter().map(|(_, cmds)| cmds.len()).sum();
+        assert_eq!(counted, all.len());
+        assert!(
+            groups.len() >= 20,
+            "25 categorías visibles: {}",
+            groups.len()
+        );
+        // Cada grupo homogéneo y en orden de aparición.
+        let mut seen: Vec<&str> = Vec::new();
+        for (cat, cmds) in &groups {
+            assert!(!cmds.is_empty());
+            assert!(
+                !seen.contains(cat),
+                "categoría repetida: {cat} (rompe secciones)"
+            );
+            seen.push(cat);
+            for cmd in cmds {
+                assert_eq!(&cmd.category, cat);
+            }
+        }
+        // UI_ACTIONS primero: la primera sección es Herramientas.
+        assert_eq!(groups[0].0, "Herramientas");
+    }
+
+    #[test]
+    fn mru_sube_recientes_sin_duplicar_y_show_los_registra() {
+        // Orden puro: recientes primero, resto intacto y sin duplicados.
+        let all = all_commands();
+        let mut mru = MruPalette::default();
+        mru.record("Save");
+        mru.record("Pencil");
+        let ordered = mru.apply_order(&all);
+        assert_eq!(ordered.len(), all.len());
+        assert_eq!(ordered[0].selection_key, "Pencil");
+        assert_eq!(ordered[1].selection_key, "Save");
+        // El estado nuevo arranca sin recientes (hygge: lista limpia).
+        let state = CommandPaletteState::default();
+        assert!(state.mru.recent().is_empty());
+        assert_eq!(state.filtered_commands_mru(&state.mru).len(), all.len());
+    }
+
+    #[test]
+    fn comandos_localizados_en_espanol_coinciden_con_la_ui_actual() {
+        use super::UI_ACTIONS;
+        use crate::i18n::{palette_action, Locale};
+        assert_eq!(UI_ACTIONS.len(), 16);
+        let current = all_commands();
+        let localized = super::all_commands_localized(Locale::Es);
+        assert_eq!(current.len(), localized.len());
+        for (a, b) in current.iter().zip(localized.iter()) {
+            // Migración neutra: mismo orden, mismo nombre, misma clave.
+            assert_eq!(a.name, b.name, "ES cambió para {:?}", a.selection_key);
+            assert_eq!(a.selection_key, b.selection_key);
+            assert_eq!(a.category, b.category);
+        }
+        // Cada acción UI localizada resuelve su slug en ambas lenguas
+        // (J1: sin entradas de Estudio, todas con slug).
+        for action in UI_ACTIONS {
+            let Some(slug) = action.locale_slug else {
+                panic!("sin slug para {:?}", action.selection_key);
+            };
+            assert_eq!(palette_action(slug, Locale::Es), action.name);
+            assert!(!palette_action(slug, Locale::En).is_empty());
+        }
+    }
+
+    #[test]
+    fn paleta_en_ingles_conmuta_nombres_y_conserva_despacho() {
+        use crate::i18n::Locale;
+        let localized = super::all_commands_localized(Locale::En);
+        let ui_actions: Vec<_> = localized
+            .iter()
+            .filter(|cmd| !cmd.is_registered())
+            .collect();
+        assert_eq!(ui_actions.len(), 16);
+        for expected in [
+            "Point Tool",
+            "Line Tool",
+            "Circle Tool",
+            "Polygon Tool",
+            "Function Tool",
+            "Pencil",
+            "Eraser",
+            "Save",
+            "Export SVG",
+            "Export PNG",
+            "Export TikZ",
+            "Zoom to Fit",
+            "Toggle Grid",
+            "Toggle Dark Mode",
+            "Indicate Selection",
+            "Step by Step",
+        ] {
+            assert!(
+                ui_actions.iter().any(|cmd| cmd.name == expected),
+                "falta el nombre EN {expected:?}"
+            );
+            // La clave de despacho sigue siendo la histórica en inglés.
+            assert!(
+                ui_actions.iter().any(|cmd| cmd.selection_key == expected),
+                "falta la clave estable {expected:?}"
+            );
+        }
+        // El filtro en EN encuentra por nombre inglés y por alias español.
+        for (query, expected_key) in [("pencil", "Pencil"), ("cuadricula", "Toggle Grid")] {
+            let state = CommandPaletteState {
+                search: query.to_string(),
+                ..Default::default()
+            };
+            let keys: Vec<&str> = state
+                .filtered_commands_localized(Locale::En)
+                .iter()
+                .map(|cmd| cmd.selection_key)
+                .collect();
+            assert!(
+                keys.contains(&expected_key),
+                "query {query:?} en EN debería encontrar {expected_key:?}, encontró {keys:?}"
+            );
+        }
+        // Pie localizado en ambas lenguas (formato idéntico al actual en ES).
+        assert_eq!(
+            crate::i18n::palette_footer(3, 207, Locale::Es),
+            "3 de 207 · ↑↓ navegar · Enter abrir · Esc cerrar"
+        );
+        assert_eq!(
+            crate::i18n::palette_footer(3, 207, Locale::En),
+            "3 of 207 · ↑↓ navigate · Enter open · Esc close"
+        );
+    }
+
+    #[test]
+    fn acciones_ui_muestran_espanol_y_despachan_clave_inglesa() {
+        let commands = all_commands();
+        let ui_actions: Vec<_> = commands.iter().filter(|cmd| !cmd.is_registered()).collect();
+        assert_eq!(ui_actions.len(), 16);
+        // Etiquetas visibles en español rioplatense.
+        for expected in [
+            "Herramienta Punto",
+            "Herramienta Recta",
+            "Herramienta Circunferencia",
+            "Herramienta Polígono",
+            "Herramienta Función",
+            "Lápiz",
+            "Borrador",
+            "Guardar",
+            "Exportar SVG",
+            "Exportar PNG",
+            "Exportar TikZ",
+            "Encuadrar todo",
+            "Alternar cuadrícula",
+            "Alternar modo oscuro",
+            "Indicar selección",
+            "Desarrollo por pasos",
+        ] {
+            assert!(
+                ui_actions.iter().any(|cmd| cmd.name == expected),
+                "falta la etiqueta {expected:?}"
+            );
+        }
+        // Claves estables en inglés para `apply_palette_command` (app.rs).
+        for expected_key in [
+            "Point Tool",
+            "Line Tool",
+            "Circle Tool",
+            "Polygon Tool",
+            "Function Tool",
+            "Pencil",
+            "Eraser",
+            "Save",
+            "Export SVG",
+            "Export PNG",
+            "Export TikZ",
+            "Zoom to Fit",
+            "Toggle Grid",
+            "Toggle Dark Mode",
+            "Indicate Selection",
+            "Step by Step",
+        ] {
+            assert!(
+                ui_actions
+                    .iter()
+                    .any(|cmd| cmd.selection_key == expected_key),
+                "falta la clave estable {expected_key:?}"
+            );
+        }
+        let indicar = ui_actions
+            .iter()
+            .find(|cmd| cmd.name == "Indicar selección");
+        match indicar {
+            Some(i) => {
+                assert_eq!(i.selection_key, "Indicate Selection");
+                assert!(i.input_template().is_none());
+            }
+            None => panic!("falta la acción Indicar selección"),
+        }
+        let guardar = ui_actions.iter().find(|cmd| cmd.name == "Guardar");
+        match guardar {
+            Some(g) => {
+                assert_eq!(g.selection_key, "Save");
+                assert!(g.input_template().is_none());
+            }
+            None => panic!("falta la acción Guardar"),
+        }
+    }
+
+    #[test]
+    fn estudio_fuera_de_paleta_j1() {
+        // J1: Estudio recortado del producto (pizarra + matemática/física
+        // + Mili). Ni entradas ni categoría "Estudio" en la paleta.
+        let commands = all_commands();
+        for key in ["New Quiz", "Mock Exam", "My Exam", "My Space", "View Guide"] {
+            assert!(
+                commands
+                    .iter()
+                    .find(|cmd| cmd.selection_key == key)
+                    .is_none(),
+                "Estudio sigue en paleta ({key})"
+            );
+        }
+        assert!(
+            commands.iter().all(|cmd| cmd.category != "Estudio"),
+            "categoría Estudio viva en paleta"
+        );
+    }
+    #[test]
+    fn mru_ordena_recientes_primero_sin_perder_comandos() {
+        // Onda 1: cap decorativo pinneado (8 recientes sin tapar búsqueda).
+        assert_eq!(MruPalette::CAP, 8);
+        let all = all_commands();
+        let mut mru = MruPalette::default();
+        assert_eq!(mru.apply_order(&all).len(), all.len());
+        mru.record("Save");
+        mru.record("Pencil");
+        mru.record("");
+        mru.record("Save");
+        assert_eq!(mru.recent(), vec!["Save".to_string(), "Pencil".to_string()]);
+        let ordered = mru.apply_order(&all);
+        assert_eq!(ordered.len(), all.len());
+        assert_eq!(ordered[0].selection_key, "Save");
+        assert_eq!(ordered[1].selection_key, "Pencil");
+        // Capacidad acotada.
+        for i in 0..20 {
+            mru.record(Box::leak(format!("Cmd{i}").into_boxed_str()) as &str);
+        }
+        assert_eq!(mru.recent().len(), MruPalette::CAP);
+        mru.clear();
+        assert!(mru.recent().is_empty());
+    }
+
+    #[test]
+    fn tooltip_rico_combina_nombre_sintaxis_y_ayuda() {
+        let cmd = UI_ACTIONS.iter().find(|cmd| cmd.selection_key == "Save");
+        match cmd {
+            Some(save) => {
+                let tip = rich_tooltip_for(save);
+                assert!(tip.contains(save.name));
+                assert!(tip.contains(save.syntax_hint));
+                assert!(tip.contains(save.help));
+            }
+            None => panic!("falta la acción Guardar"),
+        }
+    }
+
+    #[test]
+    fn filtrado_mru_respeta_busqueda_y_orden() {
+        let state = CommandPaletteState {
+            search: "punto".to_string(),
+            ..Default::default()
+        };
+        let mut mru = MruPalette::default();
+        mru.record("Save");
+        let ordered = state.filtered_commands_mru(&mru);
+        let plain = state.filtered_commands();
+        assert_eq!(ordered.len(), plain.len());
+        assert!(ordered.iter().all(|cmd| {
+            super::fuzzy_match("punto", cmd.name)
+                || super::fuzzy_match("punto", cmd.category)
+                || super::fuzzy_match("punto", cmd.syntax_hint)
+                || super::fuzzy_match("punto", cmd.help)
+                || super::fuzzy_match("punto", cmd.keywords)
+        }));
+    }
+
+    // ── Custom tools W2: visible solo si ejecuta ──
+
+    #[test]
+    fn custom_tool_entries_exponen_store_en_orden() {
+        use grafito_command::ggbscript::CustomToolStore;
+        let mut store = CustomToolStore::new();
+        assert!(super::custom_tool_entries(&store).is_empty());
+        store.define("Acerca", "ZoomIn[]").expect("define");
+        store.define("Macro", "Show[A]; Hide[A]").expect("define");
+        let entries = super::custom_tool_entries(&store);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "Acerca");
+        assert_eq!(entries[1].name, "Macro");
+        // Detalle con formato LoadTool + template multi-línea.
+        assert!(entries[1].detail.contains("'Macro' válida con 2 paso(s)"));
+        assert_eq!(entries[1].template, "Show[A]\nHide[A]");
+        assert!(entries[1].keywords.contains("Macro"));
+    }
+
+    #[test]
+    fn custom_tool_templates_execute_batch() {
+        // Cero fantasma: cada template expuesto ejecuta vía `process_input`
+        // (batch por `\n`) sobre un documento real, sin error.
+        use grafito_command::commands::{process_input, CommandOutcome};
+        use grafito_command::ggbscript::CustomToolStore;
+        let mut store = CustomToolStore::new();
+        store
+            .define("IdaVuelta", "Show[A]; Hide[A]")
+            .expect("define");
+        store.define("Acerca", "ZoomIn[]").expect("define");
+        let entries = super::custom_tool_entries(&store);
+        assert_eq!(entries.len(), 2);
+        for entry in &entries {
+            let mut doc = grafito_core::Document::new();
+            let mut setup = "A = (1, 2)".to_string();
+            assert!(
+                matches!(process_input(&mut doc, &mut setup), CommandOutcome::Ok),
+                "fixture punto A"
+            );
+            let mut input = entry.template.clone();
+            match process_input(&mut doc, &mut input) {
+                CommandOutcome::Ok | CommandOutcome::Message(_) => {}
+                CommandOutcome::Error(message) => {
+                    panic!("template '{}' no ejecutó: {message}", entry.name)
+                }
+            }
+        }
+        // Efecto real: IdaVuelta deja A oculto (Show luego Hide).
+        let mut doc = grafito_core::Document::new();
+        let mut setup = "A = (1, 2)".to_string();
+        let _ = process_input(&mut doc, &mut setup);
+        let mut input = entries[0].template.clone();
+        let _ = process_input(&mut doc, &mut input);
+        let id = grafito_command::commands::find_object_by_label(&doc, "A").expect("A");
+        assert!(!doc.get_object(id).expect("obj").is_visible());
+    }
+
+    #[test]
+    fn custom_tool_filter_respeta_query() {
+        use grafito_command::ggbscript::CustomToolStore;
+        let mut store = CustomToolStore::new();
+        store.define("Acerca", "ZoomIn[]").expect("define");
+        store.define("Macro", "Show[A]; Hide[A]").expect("define");
+        let entries = super::custom_tool_entries(&store);
+        assert_eq!(super::filter_custom_tool_entries(&entries, "").len(), 2);
+        let by_name = super::filter_custom_tool_entries(&entries, "acerca");
+        assert_eq!(by_name.len(), 1);
+        assert_eq!(by_name[0].name, "Acerca");
+        // Búsqueda por paso (los pasos viajan en keywords).
+        let by_step = super::filter_custom_tool_entries(&entries, "zoomin");
+        assert_eq!(by_step.len(), 1);
+        assert!(super::filter_custom_tool_entries(&entries, "zzzqqqx").is_empty());
+        // Store con maligno nunca expone nada: `load_json` lo rechaza.
+        let mut evil_store = CustomToolStore::new();
+        assert!(evil_store
+            .load_json("{\"grafito_tool\":1,\"name\":\"Evil\",\"steps\":[\"EraseAll[]\"]}")
+            .is_err());
+        assert!(super::custom_tool_entries(&evil_store).is_empty());
+    }
+}
+
+// ── F10 hostile fuzz P0 (solo tests, sin tocar prod) ──────────────────────
+// F10-FIX: spec con `signatures: &[]` ya no paniquea en
+// `PaletteCommand::registered` (antes `spec.signatures[0].syntax`, OOB);
+// ahora cae al fallback honesto (canónico).
+#[cfg(test)]
+mod hostile_crash_f10 {
+    use super::*;
+    use grafito_command::command_registry::{
+        ArgumentKind, CommandSignature, MutationClass, RiskLevel,
+    };
+
+    fn empty_sig_spec() -> CommandSpec {
+        CommandSpec {
+            id: "hostil.vacio",
+            canonical: "Hostil",
+            aliases: &[],
+            signatures: &[],
+            help: "comando hostil sin firmas",
+            category: "Crear",
+            insertion: "Hostil[",
+            dispatch_key: "Hostil",
+            mutation: MutationClass::CreatesObject,
+            risk: RiskLevel::Low,
+            palette_visible: true,
+            palette_label: "Hostil",
+        }
+    }
+
+    #[test]
+    fn hostile_registered_con_signatures_vacio() {
+        // F10-FIX: assert directo de fallback (antes `catch_unwind` que
+        // documentaba el panic en [0]). Ya no paniquea: `syntax_hint` cae
+        // al canónico honesto.
+        let spec: &'static CommandSpec = Box::leak(Box::new(empty_sig_spec()));
+        let cmd = PaletteCommand::registered(spec);
+        assert_eq!(cmd.syntax_hint, "Hostil");
+        assert_eq!(cmd.name, "Hostil");
+    }
+
+    #[test]
+    fn hostile_all_commands_no_paniquea_con_reales() {
+        // Con datos reales (todas tienen ≥1 firma por el macro) no debe paniquear.
+        let all = all_commands();
+        assert!(!all.is_empty());
+        let _ = all_commands_localized(crate::i18n::Locale::Es);
+    }
+
+    #[test]
+    fn hostile_filtro_con_search_gigante_y_unicode() {
+        for search in [
+            "",
+            "   ",
+            "***",
+            "(((",
+            "\u{1F600}".repeat(500).as_str(),
+            "**".repeat(5000).as_str(),
+            &"a".repeat(200_000),
+            "| a | b |",
+            "```".repeat(100).as_str(),
+        ] {
+            let state = CommandPaletteState {
+                search: search.to_string(),
+                ..Default::default()
+            };
+            let _ = state.filtered_commands();
+        }
+        // fuzzy_match hostil directo
+        let _ = fuzzy_match(&"a".repeat(10_000), &"b".repeat(10_000));
+        let _ = fuzzy_match("", "");
+        let _ = fuzzy_match("***", "\u{1F600}\u{1F600}");
+        // signatures con sintaxis vacía/rota no deben tumbar el tooltip
+        let cmd = PaletteCommand {
+            name: "",
+            category: "",
+            syntax_hint: "",
+            help: "",
+            selection_key: "",
+            keywords: "",
+            locale_slug: None,
+            insertion: None,
+            command_id: None,
+        };
+        let _ = rich_tooltip_for(&cmd);
+        let _ = CommandSignature {
+            syntax: "",
+            arguments: &[],
+        };
+        let _ = ArgumentKind::Unspecified;
+    }
+}
+#[cfg(test)]
+mod coverage_sweep_palette {
+    use super::*;
+    #[test]
+    fn barrido_fuzzy_y_ancho() {
+        assert!(fuzzy_match("", "cualquier cosa"));
+        assert!(fuzzy_match("punto", "Crear punto libre"));
+        assert!(fuzzy_match("pnto", "Crear punto libre"));
+        assert!(!fuzzy_match("zzz", "Crear punto libre"));
+        assert!(fuzzy_match("FUNCIÓN", "función cuadrática"));
+        assert!(!fuzzy_match("punto extra largo que no existe", "punto"));
+        assert_eq!(palette_window_width(800.0), 640.0);
+        assert_eq!(palette_window_width(100.0), 84.0);
+        assert_eq!(palette_window_width(0.0), 1.0);
+        // S1 móvil: bajo 740 la paleta es sheet abajo; en 740+ flota arriba.
+        assert_eq!(
+            palette_presentation(360.0),
+            PalettePresentation::BottomSheet
+        );
+        assert_eq!(
+            palette_presentation(739.0),
+            PalettePresentation::BottomSheet
+        );
+        assert_eq!(palette_presentation(740.0), PalettePresentation::Floating);
+        assert_eq!(palette_presentation(1360.0), PalettePresentation::Floating);
+        // La sheet cabe en media hoja; la flotante usa todo el alto.
+        assert!(palette_list_max_height(800.0, true) < palette_list_max_height(800.0, false));
+        // Reserva 152 (antes 168): cromo real medido con Limpiar a 44
+        // (search 44 + chips 44 + conteo 44 + gaps 8+8+4).
+        assert_eq!(palette_list_max_height(800.0, false), 800.0 - 152.0);
+        // Doble techo: en viewports cortos manda viewport − cromo.
+        assert_eq!(palette_list_max_height(500.0, true), 500.0 * 0.62 - 152.0);
+        assert_eq!(
+            palette_list_max_height(400.0, true),
+            PALETTE_LIST_MIN_HEIGHT
+        );
+        assert_eq!(
+            palette_list_max_height(200.0, true),
+            PALETTE_LIST_MIN_HEIGHT
+        );
+        // S5: cada chip de rama encuentra ≥1 comando (faceta viva).
+        assert!(!PALETTE_BRANCH_CHIPS.is_empty());
+        let all = all_commands();
+        for chip in PALETTE_BRANCH_CHIPS {
+            let hits = CommandPaletteState::filter_in(&all, chip);
+            assert!(!hits.is_empty(), "chip sin comandos: {chip}");
+        }
+        assert!(!all_commands().is_empty());
+        let rate = {
+            let st = CommandPaletteState {
+                search: "punto".to_string(),
+                ..Default::default()
+            };
+            st.filtered_commands().len()
+        };
+        assert!(rate > 0, "bilingüe encuentra punto");
+        let cmd = all_commands().into_iter().next().expect("hay comandos");
+        assert!(!rich_tooltip_for(&cmd).is_empty());
+    }
+}

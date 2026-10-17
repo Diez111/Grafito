@@ -1,0 +1,21 @@
+[plugin]
+id = "ejercicios.secundaria"
+name = "Ejercicios secundaria (funciones)"
+version = "1.0.0"
+category = "skills"
+description = "Banco de ejercicios de funciones y geometría para secundaria: pide, valida y da pistas (local, sin red)."
+activation = "manual"
+min_app_version = "1.3.0"
+
+[instructions]
+files = ["ejercicios.md"]
+budget_bytes = 2048
+
+[[tools]]
+id = "evaluate_expr"
+
+[[commands]]
+id = "Function"
+
+[[scenes]]
+template = "graph-trace"

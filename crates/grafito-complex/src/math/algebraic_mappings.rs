@@ -1,0 +1,1092 @@
+//! Mapeos algebraicos de primera clase para `ComplexMapping`.
+//!
+//! Representa los mapeos conformes más comunes como una enum cerrada,
+//! evitando parsear la expresión cada vez que se evalúa. Esto resuelve
+//! el bug de `ComplexMapping[1/z, ...]` donde el parser tokenizaba
+//! `1/z` como `1 * z` por una inserción de `*` implícito.
+//!
+//! Cada variante usa la fórmula algebraica cerrada, no el AST. Esto
+//! además es numéricamente más estable cerca de singularidades y permite
+//! un manejo explícito de "valor no finito" (devolviendo `None` en
+//! lugar de propagar `NaN`).
+//!
+//! # Uso
+//!
+//! ```ignore
+//! use grafito_complex::algebraic_mappings::ConformalMap;
+//! use num_complex::Complex64;
+//!
+//! let map = ConformalMap::from_expr_string("1/z").unwrap();
+//! let z = Complex64::new(2.0, 0.0);
+//! let w = map.apply(z).unwrap();  // 0.5
+//! ```
+
+use num_complex::Complex64;
+
+/// Mapeo conforme algebraico de primera clase.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ConformalMap {
+    /// Inversión simple `1/z`.
+    Inversion,
+    /// Potencia entera `z^n` con `n >= 1`.
+    Power(i32),
+    /// Exponencial `exp(z)`.
+    Exponential,
+    /// Logaritmo principal `log(z)` (rama con parte imaginaria en `(-π, π]`).
+    Logarithm,
+    /// Seno hiperbólico `sinh(z)`.
+    Sinh,
+    /// Coseno hiperbólico `cosh(z)`.
+    Cosh,
+    /// Seno `sin(z)`.
+    Sine,
+    /// Coseno `cos(z)`.
+    Cosine,
+    /// Tangente `tan(z)`.
+    Tangent,
+    /// Raíz cuadrada principal `sqrt(z)` (rama con parte real ≥ 0).
+    Sqrt,
+    /// Transformación de Joukowski `z + 1/z`.
+    Joukowski,
+    /// Transformación de Möbius general `(a*z + b) / (c*z + d)`.
+    Mobius {
+        a: Complex64,
+        b: Complex64,
+        c: Complex64,
+        d: Complex64,
+    },
+    /// Inversión desplazada `1/(z - a)`.
+    InversionShifted(Complex64),
+}
+
+/// Umbral para considerar una magnitud como singularidad.
+const SINGULARITY_THRESHOLD: f64 = 1e-15;
+
+/// Tope de entrada de `from_expr_string` (anti-DoS): el parseo es lineal
+/// pero las cadenas vienen de input de usuario sin cap previo.
+const MAX_MAP_EXPR_LEN: usize = 4096;
+
+/// Tope de anidado de paréntesis en `parse_mobius`.
+const MAX_MOBIUS_DEPTH: usize = 128;
+
+/// Comprueba singularidad relativa a una escala `scale`. Si `scale` no es
+/// finita o es <1, usa 1 como piso para no amplificar el umbral en
+/// magnitudes pequeñas.
+fn is_singular(value_norm: f64, scale: f64) -> bool {
+    let effective_scale = if scale.is_finite() && scale > 1.0 {
+        scale
+    } else {
+        1.0
+    };
+    value_norm < SINGULARITY_THRESHOLD * effective_scale
+}
+
+fn mobius_scale(a: Complex64, b: Complex64, c: Complex64, d: Complex64) -> f64 {
+    a.norm().max(b.norm()).max(c.norm()).max(d.norm()).max(1.0)
+}
+
+impl ConformalMap {
+    /// Aplica el mapeo al valor `z`. Devuelve `None` si la evaluación
+    /// cae en una singularidad (división por cero, raíz de cero, etc.).
+    pub fn apply(self, z: Complex64) -> Option<Complex64> {
+        if !z.re.is_finite() || !z.im.is_finite() {
+            return None;
+        }
+        finite_or_none(match self {
+            Self::Inversion => {
+                if z.norm() < SINGULARITY_THRESHOLD {
+                    None
+                } else {
+                    Some(z.inv())
+                }
+            }
+            Self::Power(n) => {
+                if n == 0 {
+                    if z.norm() < SINGULARITY_THRESHOLD {
+                        // 0^0 indeterminado: tratar como singular para no ocultar polo
+                        None
+                    } else {
+                        Some(Complex64::new(1.0, 0.0))
+                    }
+                } else if n < 0 && z.norm() < SINGULARITY_THRESHOLD {
+                    None
+                } else {
+                    Some(z.powi(n))
+                }
+            }
+            Self::Exponential => Some(z.exp()),
+            Self::Logarithm => {
+                if z.norm() < SINGULARITY_THRESHOLD {
+                    None
+                } else {
+                    Some(z.ln())
+                }
+            }
+            Self::Sinh => Some(z.sinh()),
+            Self::Cosh => Some(z.cosh()),
+            Self::Sine => Some(z.sin()),
+            Self::Cosine => Some(z.cos()),
+            Self::Tangent => {
+                let cos = z.cos();
+                if !cos.re.is_finite() || !cos.im.is_finite() || cos.norm() < SINGULARITY_THRESHOLD
+                {
+                    None
+                } else {
+                    Some(z.tan())
+                }
+            }
+            Self::Sqrt => {
+                // sqrt(0) = 0 está bien definido (no es singularidad). Sólo
+                // devolvemos 0 explícito para evitar cualquier NaN numérico.
+                if z.norm() < SINGULARITY_THRESHOLD {
+                    Some(Complex64::new(0.0, 0.0))
+                } else {
+                    Some(z.sqrt())
+                }
+            }
+            Self::Joukowski => {
+                if z.norm() < SINGULARITY_THRESHOLD {
+                    None
+                } else {
+                    Some(z + z.inv())
+                }
+            }
+            Self::Mobius { a, b, c, d } => {
+                let numer = a * z + b;
+                let denom = c * z + d;
+                let scale = mobius_scale(a, b, c, d);
+                if is_singular(denom.norm(), scale) {
+                    None
+                } else {
+                    Some(numer / denom)
+                }
+            }
+            Self::InversionShifted(a) => {
+                let diff = z - a;
+                if diff.norm() < SINGULARITY_THRESHOLD {
+                    None
+                } else {
+                    Some(diff.inv())
+                }
+            }
+        })
+    }
+
+    /// Aplica la **inversa** del mapeo: dado un valor `w` en el output,
+    /// devuelve un `z` tal que `self.apply(z) == w`. Devuelve `None` si
+    /// la inversa no está definida en `w` o si el mapeo no es
+    /// analíticamente invertible.
+    ///
+    /// Esto se usa para el **relleno de área** del `ComplexMapping`:
+    /// para cada celda `w` en el output, computamos `z = inverse(w)` y
+    /// evaluamos la curva original `f(z)`; según el signo determinamos
+    /// si la celda está dentro o fuera de la región transformada.
+    pub fn inverse_apply(self, w: Complex64) -> Option<Complex64> {
+        if !w.re.is_finite() || !w.im.is_finite() {
+            return None;
+        }
+        let result = match self {
+            // 1/z → z (es su propia inversa)
+            Self::Inversion => {
+                if w.norm() < SINGULARITY_THRESHOLD {
+                    None
+                } else {
+                    Some(w.inv())
+                }
+            }
+            // z^n → w^(1/n) (rama principal)
+            Self::Power(n) => {
+                if n == 0 {
+                    if w.norm() < SINGULARITY_THRESHOLD {
+                        None
+                    } else {
+                        Some(Complex64::new(1.0, 0.0))
+                    }
+                } else {
+                    let inv = w.powf(1.0 / n as f64);
+                    if !inv.re.is_finite() || !inv.im.is_finite() {
+                        None
+                    } else {
+                        Some(inv)
+                    }
+                }
+            }
+            // exp(z) = w → z = log(w) (rama principal)
+            Self::Exponential => {
+                if w.norm() < SINGULARITY_THRESHOLD {
+                    None
+                } else {
+                    Some(w.ln())
+                }
+            }
+            // log(z) = w → z = exp(w)
+            Self::Logarithm => {
+                let exp_w = w.exp();
+                if !exp_w.re.is_finite() || !exp_w.im.is_finite() {
+                    None
+                } else {
+                    Some(exp_w)
+                }
+            }
+            // sinh(z) = w → z = asinh(w) (rama principal)
+            Self::Sinh => Some(w.asinh()),
+            // cosh(z) = w → z = acosh(w) (rama principal)
+            Self::Cosh => Some(w.acosh()),
+            // sin(z) = w → z = asin(w) (rama principal)
+            Self::Sine => Some(w.asin()),
+            // cos(z) = w → z = acos(w) (rama principal)
+            Self::Cosine => Some(w.acos()),
+            // tan(z) = w → z = atan(w) (rama principal)
+            Self::Tangent => Some(w.atan()),
+            // sqrt(z) = w → z = w^2
+            Self::Sqrt => {
+                let sq = w * w;
+                if !sq.re.is_finite() || !sq.im.is_finite() {
+                    None
+                } else {
+                    Some(sq)
+                }
+            }
+            // Joukowski z + 1/z = w → ecuación cuadrática
+            // z^2 - w*z + 1 = 0 → z = (w ± sqrt(w^2 - 4)) / 2
+            Self::Joukowski => {
+                let disc = w * w - Complex64::new(4.0, 0.0);
+                if !disc.re.is_finite() || !disc.im.is_finite() {
+                    None
+                } else {
+                    let sqrt_disc = disc.sqrt();
+                    if !sqrt_disc.re.is_finite() || !sqrt_disc.im.is_finite() {
+                        None
+                    } else {
+                        // Tomamos la rama con |z| <= 1 (interior del disco unitario
+                        // mapea a Joukowski clásico, elipse con focos en ±2).
+                        let z1 = (w + sqrt_disc) * 0.5;
+                        let z2 = (w - sqrt_disc) * 0.5;
+                        let r = if z1.norm() <= 1.0 {
+                            Some(z1)
+                        } else if z2.norm() <= 1.0 {
+                            Some(z2)
+                        } else {
+                            Some(z1) // fallback
+                        };
+                        r.filter(|z| z.re.is_finite() && z.im.is_finite())
+                    }
+                }
+            }
+            // Möbius (az+b)/(cz+d) = w → z = (dw - b) / (-cw + a)
+            Self::Mobius { a, b, c, d } => {
+                let numer = d * w - b;
+                let denom = -c * w + a;
+                let scale = mobius_scale(a, b, c, d);
+                if is_singular(denom.norm(), scale) {
+                    None
+                } else {
+                    let z = numer / denom;
+                    if !z.re.is_finite() || !z.im.is_finite() {
+                        None
+                    } else {
+                        Some(z)
+                    }
+                }
+            }
+            // 1/(z - a) = w → z = a + 1/w
+            Self::InversionShifted(a) => {
+                if w.norm() < SINGULARITY_THRESHOLD {
+                    None
+                } else {
+                    let inv = w.inv();
+                    let z = a + inv;
+                    if !z.re.is_finite() || !z.im.is_finite() {
+                        None
+                    } else {
+                        Some(z)
+                    }
+                }
+            }
+        };
+        result.filter(|z| z.re.is_finite() && z.im.is_finite())
+    }
+
+    /// Intenta reconocer una cadena como uno de los mapeos algebraicos
+    /// soportados. La cadena se normaliza quitando espacios. Devuelve
+    /// `None` si no se reconoce.
+    ///
+    /// # Sintaxis reconocida
+    ///
+    /// - `1/z`, `1 / z`
+    /// - `z^2`, `z^3`, ..., `z^10` (potencias enteras)
+    /// - `exp(z)`, `exp z`
+    /// - `log(z)`, `ln(z)`, `log z`, `ln z`
+    /// - `sin(z)`, `cos(z)`, `tan(z)`
+    /// - `sinh(z)`, `cosh(z)`
+    /// - `sqrt(z)`
+    /// - `z+1/z`, `z + 1/z`
+    /// - `1/(z-a)` con `a` numérico (inversión desplazada)
+    /// - `(a*z+b)/(c*z+d)` con coeficientes numéricos (Möbius)
+    pub fn from_expr_string(s: &str) -> Option<Self> {
+        let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+        if s.is_empty() || s.len() > MAX_MAP_EXPR_LEN {
+            return None;
+        }
+        // Casos directos primero
+        match s.as_str() {
+            "1/z" => return Some(Self::Inversion),
+            "z+1/z" => return Some(Self::Joukowski),
+            _ => {}
+        }
+        // log / ln
+        if s == "log(z)" || s == "ln(z)" {
+            return Some(Self::Logarithm);
+        }
+        // exp, sin, cos, tan, sinh, cosh, sqrt
+        if let Some(inner) = s.strip_prefix("exp(").and_then(|x| x.strip_suffix(')')) {
+            if inner == "z" {
+                return Some(Self::Exponential);
+            }
+        }
+        for (prefix, variant) in [
+            ("sin(", Self::Sine),
+            ("cos(", Self::Cosine),
+            ("tan(", Self::Tangent),
+            ("sinh(", Self::Sinh),
+            ("cosh(", Self::Cosh),
+            ("sqrt(", Self::Sqrt),
+        ] {
+            if let Some(inner) = s.strip_prefix(prefix).and_then(|x| x.strip_suffix(')')) {
+                if inner == "z" {
+                    return Some(variant);
+                }
+            }
+        }
+        // z^n con n natural
+        if let Some(rest) = s.strip_prefix("z^") {
+            if let Ok(n) = rest.parse::<i32>() {
+                if (1..=32).contains(&n) {
+                    return Some(Self::Power(n));
+                }
+            }
+        }
+        // 1/(z-a) con a numérico
+        if let Some(inner) = s.strip_prefix("1/(z-").and_then(|x| x.strip_suffix(')')) {
+            if let Some(a) = parse_complex_literal(inner) {
+                return Some(Self::InversionShifted(a));
+            }
+        }
+        // (a*z+b)/(c*z+d) Möbius
+        if let Some(mobius) = parse_mobius(&s) {
+            return Some(mobius);
+        }
+        None
+    }
+}
+
+fn finite_or_none(value: Option<Complex64>) -> Option<Complex64> {
+    value.filter(|z| z.re.is_finite() && z.im.is_finite())
+}
+
+/// Parsea un literal numérico (entero o decimal) como `Complex64`.
+fn parse_complex_literal(s: &str) -> Option<Complex64> {
+    s.parse::<f64>().ok().map(|r| Complex64::new(r, 0.0))
+}
+
+/// Intenta parsear una expresión Möbius `(a*z+b)/(c*z+d)`.
+/// Solo reconoce coeficientes numéricos constantes.
+fn parse_mobius(s: &str) -> Option<ConformalMap> {
+    // Formato esperado: "(<num>*z+<num>)/(<num>*z+<num>)" o variantes con espacios
+    // removidos. Sin negaciones compuestas (el caller ya normalizó espacios).
+    //
+    // No podemos strip_prefix('(')/strip_suffix(')') sobre el string entero:
+    // una Möbius canónica tiene paréntesis anidados. En su lugar, dividimos
+    // por el primer '/' que esté a profundidad 0 de paréntesis.
+    let bytes = s.as_bytes();
+    let mut depth = 0usize;
+    let mut split_at = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'(' => {
+                depth += 1;
+                if depth > MAX_MOBIUS_DEPTH {
+                    return None;
+                }
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+            }
+            b'/' if depth == 0 => {
+                split_at = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let split_at = split_at?;
+    let num_str = s[..split_at].trim();
+    let den_str = s[split_at + 1..].trim();
+    // Strip outer parens from num/den si los hay (case "(...)/(...)").
+    let num_str = num_str
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+        .map(|s| s.trim())
+        .unwrap_or(num_str);
+    let den_str = den_str
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+        .map(|s| s.trim())
+        .unwrap_or(den_str);
+
+    let (a, b) = parse_linear_in_z(num_str)?;
+    let (c, d) = parse_linear_in_z(den_str)?;
+    // Detectar caso degenerado: a == 0, c == 0
+    if (a * d - b * c).norm() < SINGULARITY_THRESHOLD {
+        return None;
+    }
+    Some(ConformalMap::Mobius { a, b, c, d })
+}
+
+/// Parsea `<coef>*z+<const>` o `z+<const>` o `<coef>*z` o `<const>`.
+/// Soporta signo líder (`-z`, `-2*z`) y variantes sin `*` (`2z`, `-z`).
+fn parse_linear_in_z(s: &str) -> Option<(Complex64, Complex64)> {
+    // Caso: solo una constante
+    if !s.contains('z') {
+        let c = s.parse::<f64>().ok()?;
+        if !c.is_finite() {
+            return None;
+        }
+        return Some((Complex64::new(0.0, 0.0), Complex64::new(c, 0.0)));
+    }
+    // Casos directos con signo
+    if s == "z" {
+        return Some((Complex64::new(1.0, 0.0), Complex64::new(0.0, 0.0)));
+    }
+    if s == "-z" {
+        return Some((Complex64::new(-1.0, 0.0), Complex64::new(0.0, 0.0)));
+    }
+    if s == "+z" {
+        return Some((Complex64::new(1.0, 0.0), Complex64::new(0.0, 0.0)));
+    }
+    // Buscar el signo + o - (que no sea el inicial) que separa coef*z de const.
+    // Necesitamos escanear por bytes pero respetando que el split debe estar
+    // después del `z` del término lineal, no dentro del coeficiente numérico.
+    // Estrategia: encontrar la `z` y luego buscar el siguiente +/-.
+    let z_pos = s.find('z')?;
+    let mut split_idx = None;
+    for (i, c) in s.char_indices().skip(z_pos + 1) {
+        if c == '+' || c == '-' {
+            split_idx = Some(i);
+            break;
+        }
+    }
+    let (coef_str, const_str) = match split_idx {
+        Some(i) => (&s[..i], &s[i..]),
+        None => (s, ""),
+    };
+    // coef_str puede ser "z", "-z", "<num>*z", "<num>z" (sin *)
+    let a = if coef_str == "z" || coef_str == "+z" {
+        Complex64::new(1.0, 0.0)
+    } else if coef_str == "-z" {
+        Complex64::new(-1.0, 0.0)
+    } else if let Some(rest) = coef_str.strip_suffix("*z") {
+        let v = rest.parse::<f64>().ok()?;
+        if !v.is_finite() {
+            return None;
+        }
+        Complex64::new(v, 0.0)
+    } else {
+        let rest = coef_str.strip_suffix('z')?;
+        // Forma sin '*': "2z", "-2z", "0.5z"
+        let v = if rest.is_empty() || rest == "+" {
+            1.0
+        } else if rest == "-" {
+            -1.0
+        } else {
+            rest.parse::<f64>().ok()?
+        };
+        if !v.is_finite() {
+            return None;
+        }
+        Complex64::new(v, 0.0)
+    };
+    let b = if const_str.is_empty() {
+        Complex64::new(0.0, 0.0)
+    } else {
+        let v = const_str.parse::<f64>().ok()?;
+        if !v.is_finite() {
+            return None;
+        }
+        Complex64::new(v, 0.0)
+    };
+    Some((a, b))
+}
+
+/// Clasificación dinámica de una transformación de Möbius por su
+/// traza normalizada `tr² = (a+d)²/(ad−bc)`. Público (O4.3b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MobiusClass {
+    /// `tr² = 4`: un punto fijo (conjugada a una traslación).
+    Parabolic,
+    /// `tr² ∈ [0,4)` real: conjugada a una rotación.
+    Elliptic,
+    /// `tr² ≥ 4` real: conjugada a una homotecia.
+    Hyperbolic,
+    /// `tr²` no real: espiral (rotación + homotecia).
+    Loxodromic,
+}
+
+impl std::fmt::Display for MobiusClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::Parabolic => "parabólica",
+            Self::Elliptic => "elíptica",
+            Self::Hyperbolic => "hiperbólica",
+            Self::Loxodromic => "loxodrómica",
+        };
+        write!(f, "{name}")
+    }
+}
+
+/// Puntos fijos finitos de `(a·z+b)/(c·z+d)`: raíces de
+/// `c·z²+(d−a)·z−b = 0` (0, 1 o 2). `Err` si `ad−bc ≈ 0` (no es
+/// transformación) o si es la identidad (todo punto es fijo).
+/// Público (O4.3b): base de `MobiusFixedPoints`.
+pub fn mobius_fixed_points(
+    a: Complex64,
+    b: Complex64,
+    c: Complex64,
+    d: Complex64,
+) -> Result<Vec<Complex64>, String> {
+    for z in [a, b, c, d] {
+        if !z.re.is_finite() || !z.im.is_finite() {
+            return Err("coeficientes no finitos".to_string());
+        }
+    }
+    let det = a * d - b * c;
+    let scale = mobius_scale(a, b, c, d);
+    if is_singular(det.norm(), scale * scale) {
+        return Err("ad−bc ≈ 0: no es una transformación de Möbius".to_string());
+    }
+    // c ≈ 0: afín z ↦ (a/d)·z + b/d.
+    if is_singular(c.norm(), scale) {
+        let shift = d - a;
+        if is_singular(shift.norm(), scale) {
+            if is_singular(b.norm(), scale) {
+                return Err("identidad: todo punto es fijo".to_string());
+            }
+            // Traslación no trivial: el único fijo es ∞.
+            return Ok(Vec::new());
+        }
+        return Ok(vec![b / shift]);
+    }
+    // Cuadrática: c·z² + (d−a)·z − b = 0.
+    let linear = d - a;
+    let disc = linear * linear + Complex64::new(4.0, 0.0) * c * b;
+    if !disc.re.is_finite() || !disc.im.is_finite() {
+        return Err("discriminante no finito".to_string());
+    }
+    let sqrt_disc = disc.sqrt();
+    let two_c = Complex64::new(2.0, 0.0) * c;
+    let z1 = (-linear + sqrt_disc) / two_c;
+    let z2 = (-linear - sqrt_disc) / two_c;
+    for z in [z1, z2] {
+        if !z.re.is_finite() || !z.im.is_finite() {
+            return Err("punto fijo no finito".to_string());
+        }
+    }
+    if (z1 - z2).norm() <= 1e-12 * z1.norm().max(1.0) {
+        Ok(vec![z1])
+    } else {
+        Ok(vec![z1, z2])
+    }
+}
+
+/// Clasifica la transformación por `tr² = (a+d)²/(ad−bc)` con tolerancia
+/// 1e−9 relativa. `Err` si `ad−bc ≈ 0`. Público (O4.3b).
+pub fn mobius_classify(
+    a: Complex64,
+    b: Complex64,
+    c: Complex64,
+    d: Complex64,
+) -> Result<MobiusClass, String> {
+    for z in [a, b, c, d] {
+        if !z.re.is_finite() || !z.im.is_finite() {
+            return Err("coeficientes no finitos".to_string());
+        }
+    }
+    let det = a * d - b * c;
+    let scale = mobius_scale(a, b, c, d);
+    if is_singular(det.norm(), scale * scale) {
+        return Err("ad−bc ≈ 0: no es una transformación de Möbius".to_string());
+    }
+    let trace2 = (a + d) * (a + d) / det;
+    if (trace2 - Complex64::new(4.0, 0.0)).norm() <= 1e-9 * trace2.norm().max(1.0) {
+        return Ok(MobiusClass::Parabolic);
+    }
+    if trace2.im.abs() <= 1e-9 * trace2.norm().max(1.0) {
+        if trace2.re >= 4.0 {
+            return Ok(MobiusClass::Hyperbolic);
+        }
+        return Ok(MobiusClass::Elliptic);
+    }
+    Ok(MobiusClass::Loxodromic)
+}
+
+/// Proyección estereográfica plano → esfera unidad (O7):
+/// `(2x, 2y, |z|²−1)/(|z|²+1)`. `None` si `z` no es finito (∞ ↦ polo norte
+/// se representa con `Some([0, 0, 1])` solo vía complemento: esta función
+/// devuelve `None` y el llamador decide; ver `stereographic_north_pole`).
+/// Pública (O7).
+pub fn stereographic_project(z: Complex64) -> Option<[f64; 3]> {
+    if !z.re.is_finite() || !z.im.is_finite() {
+        return None;
+    }
+    let norm2 = z.norm_sqr();
+    if !norm2.is_finite() {
+        return None;
+    }
+    let denom = norm2 + 1.0;
+    Some([
+        2.0 * z.re / denom,
+        2.0 * z.im / denom,
+        (norm2 - 1.0) / denom,
+    ])
+}
+
+/// Polo norte = imagen de ∞ (O7).
+pub const STEREOGRAPHIC_NORTH_POLE: [f64; 3] = [0.0, 0.0, 1.0];
+
+/// Inversa esfera → plano (O7): `(x, y)/(1−z)`. `None` si el punto no es
+/// finito, no está en la esfera (|p| ≈ 1) o es el polo norte (∞).
+/// Pública (O7).
+pub fn stereographic_unproject(point: [f64; 3]) -> Option<Complex64> {
+    let [x, y, z] = point;
+    if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+        return None;
+    }
+    let norm = (x * x + y * y + z * z).sqrt();
+    if (norm - 1.0).abs() > 1e-9 {
+        return None;
+    }
+    let denom = 1.0 - z;
+    if denom.abs() < 1e-15 {
+        return None;
+    }
+    Some(Complex64::new(x / denom, y / denom))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_close(a: Complex64, b: Complex64, tol: f64, msg: &str) {
+        let d = (a - b).norm();
+        assert!(d < tol, "{}: a={}, b={}, |a-b|={} > {}", msg, a, b, d, tol);
+    }
+
+    // ----- Inversion -----
+
+    #[test]
+    fn inversion_of_two_is_half() {
+        let m = ConformalMap::from_expr_string("1/z").unwrap();
+        let w = m.apply(Complex64::new(2.0, 0.0)).unwrap();
+        assert_close(w, Complex64::new(0.5, 0.0), 1e-12, "1/2");
+    }
+
+    #[test]
+    fn inversion_of_unit_circle_returns_unit_circle() {
+        let m = ConformalMap::Inversion;
+        for i in 0..32 {
+            let theta = i as f64 / 32.0 * std::f64::consts::TAU;
+            let z = Complex64::new(theta.cos(), theta.sin());
+            let w = m.apply(z).unwrap();
+            assert!(
+                (w.norm() - 1.0).abs() < 1e-9,
+                "|1/z| should be 1 on unit circle"
+            );
+        }
+    }
+
+    #[test]
+    fn inversion_of_zero_is_singular() {
+        let m = ConformalMap::Inversion;
+        assert!(m.apply(Complex64::new(0.0, 0.0)).is_none());
+    }
+
+    #[test]
+    fn inversion_with_spaces() {
+        let m = ConformalMap::from_expr_string("1 / z").unwrap();
+        assert_eq!(m, ConformalMap::Inversion);
+    }
+
+    // ----- Power -----
+
+    #[test]
+    fn z_squared_of_two_is_four() {
+        let m = ConformalMap::from_expr_string("z^2").unwrap();
+        let w = m.apply(Complex64::new(2.0, 0.0)).unwrap();
+        assert_close(w, Complex64::new(4.0, 0.0), 1e-12, "2^2");
+    }
+
+    #[test]
+    fn z_squared_on_unit_circle_returns_unit_circle() {
+        let m = ConformalMap::Power(2);
+        for i in 0..32 {
+            let theta = i as f64 / 32.0 * std::f64::consts::TAU;
+            let z = Complex64::new(theta.cos(), theta.sin());
+            let w = m.apply(z).unwrap();
+            assert!(
+                (w.norm() - 1.0).abs() < 1e-9,
+                "|z^2| should be 1 on unit circle"
+            );
+        }
+    }
+
+    #[test]
+    fn z_to_zero_is_one() {
+        let m = ConformalMap::Power(0);
+        let w = m.apply(Complex64::new(5.0, 0.0)).unwrap();
+        assert_close(w, Complex64::new(1.0, 0.0), 1e-12, "z^0");
+    }
+
+    // ----- Exponential -----
+
+    #[test]
+    fn exp_of_zero_is_one() {
+        let m = ConformalMap::Exponential;
+        let w = m.apply(Complex64::new(0.0, 0.0)).unwrap();
+        assert_close(w, Complex64::new(1.0, 0.0), 1e-12, "exp(0)");
+    }
+
+    #[test]
+    fn exp_of_i_pi_is_minus_one() {
+        // e^(iπ) = -1 + 0i
+        let m = ConformalMap::Exponential;
+        let w = m.apply(Complex64::new(0.0, std::f64::consts::PI)).unwrap();
+        assert_close(w, Complex64::new(-1.0, 0.0), 1e-9, "exp(i*pi)");
+    }
+
+    // ----- Logarithm -----
+
+    #[test]
+    fn log_of_one_is_zero() {
+        let m = ConformalMap::Logarithm;
+        let w = m.apply(Complex64::new(1.0, 0.0)).unwrap();
+        assert_close(w, Complex64::new(0.0, 0.0), 1e-12, "log(1)");
+    }
+
+    #[test]
+    fn log_of_e_is_one() {
+        let m = ConformalMap::Logarithm;
+        let w = m.apply(Complex64::new(std::f64::consts::E, 0.0)).unwrap();
+        assert_close(w, Complex64::new(1.0, 0.0), 1e-9, "log(e)");
+    }
+
+    #[test]
+    fn log_of_unit_circle_is_imaginary_axis_segment() {
+        // log(e^(iθ)) = iθ usando la rama principal con im ∈ (-π, π].
+        // Para θ en (π, 2π), el resultado es i(θ - 2π) por el branch cut.
+        let m = ConformalMap::Logarithm;
+        for i in 0..32 {
+            let theta = i as f64 / 32.0 * std::f64::consts::TAU;
+            let z = Complex64::new(theta.cos(), theta.sin());
+            let w = m.apply(z).unwrap();
+            assert!(
+                w.re.abs() < 1e-9,
+                "log(e^(iθ)).re should be 0, got {}",
+                w.re
+            );
+            let expected_im = if theta > std::f64::consts::PI {
+                theta - std::f64::consts::TAU
+            } else {
+                theta
+            };
+            assert!(
+                (w.im - expected_im).abs() < 1e-9,
+                "log(e^(iθ)).im should be {}, got {}",
+                expected_im,
+                w.im
+            );
+        }
+    }
+
+    #[test]
+    fn log_of_zero_is_singular() {
+        let m = ConformalMap::Logarithm;
+        assert!(m.apply(Complex64::new(0.0, 0.0)).is_none());
+    }
+
+    // ----- Sine / Cosine / Tangent -----
+
+    #[test]
+    fn sin_of_zero_is_zero() {
+        let m = ConformalMap::Sine;
+        let w = m.apply(Complex64::new(0.0, 0.0)).unwrap();
+        assert_close(w, Complex64::new(0.0, 0.0), 1e-12, "sin(0)");
+    }
+
+    #[test]
+    fn cos_of_zero_is_one() {
+        let m = ConformalMap::Cosine;
+        let w = m.apply(Complex64::new(0.0, 0.0)).unwrap();
+        assert_close(w, Complex64::new(1.0, 0.0), 1e-12, "cos(0)");
+    }
+
+    #[test]
+    fn sinh_of_zero_is_zero() {
+        let m = ConformalMap::Sinh;
+        let w = m.apply(Complex64::new(0.0, 0.0)).unwrap();
+        assert_close(w, Complex64::new(0.0, 0.0), 1e-12, "sinh(0)");
+    }
+
+    #[test]
+    fn cosh_of_zero_is_one() {
+        let m = ConformalMap::Cosh;
+        let w = m.apply(Complex64::new(0.0, 0.0)).unwrap();
+        assert_close(w, Complex64::new(1.0, 0.0), 1e-12, "cosh(0)");
+    }
+
+    #[test]
+    fn tan_of_zero_is_zero() {
+        let m = ConformalMap::Tangent;
+        let w = m.apply(Complex64::new(0.0, 0.0)).unwrap();
+        assert_close(w, Complex64::new(0.0, 0.0), 1e-12, "tan(0)");
+    }
+
+    #[test]
+    fn tan_of_pi_over_2_is_singular() {
+        let m = ConformalMap::Tangent;
+        let w = m.apply(Complex64::new(std::f64::consts::FRAC_PI_2, 0.0));
+        assert!(w.is_none(), "tan(pi/2) should be singular");
+    }
+
+    // ----- Sqrt -----
+
+    #[test]
+    fn sqrt_of_four_is_two() {
+        let m = ConformalMap::Sqrt;
+        let w = m.apply(Complex64::new(4.0, 0.0)).unwrap();
+        assert_close(w, Complex64::new(2.0, 0.0), 1e-12, "sqrt(4)");
+    }
+
+    #[test]
+    fn sqrt_of_minus_one_is_i() {
+        let m = ConformalMap::Sqrt;
+        let w = m.apply(Complex64::new(-1.0, 0.0)).unwrap();
+        assert_close(w, Complex64::new(0.0, 1.0), 1e-12, "sqrt(-1)");
+    }
+
+    // ----- Joukowski -----
+
+    #[test]
+    fn joukowski_of_two_is_2_5() {
+        // 2 + 1/2 = 2.5
+        let m = ConformalMap::Joukowski;
+        let w = m.apply(Complex64::new(2.0, 0.0)).unwrap();
+        assert_close(w, Complex64::new(2.5, 0.0), 1e-12, "2 + 1/2");
+    }
+
+    #[test]
+    fn joukowski_of_unit_circle_maps_to_ellipse() {
+        // Para |z|=1, z + 1/z = 2*cos(θ), así que x ∈ [-2, 2], y = 0
+        let m = ConformalMap::Joukowski;
+        for i in 0..32 {
+            let theta = i as f64 / 32.0 * std::f64::consts::TAU;
+            let z = Complex64::new(theta.cos(), theta.sin());
+            let w = m.apply(z).unwrap();
+            assert!((w.re - 2.0 * theta.cos()).abs() < 1e-9);
+            assert!(
+                w.im.abs() < 1e-9,
+                "Joukowski on unit circle should have im=0"
+            );
+        }
+    }
+
+    // ----- InversionShifted -----
+
+    #[test]
+    fn inversion_shifted_works() {
+        let m = ConformalMap::InversionShifted(Complex64::new(1.0, 0.0));
+        let w = m.apply(Complex64::new(2.0, 0.0)).unwrap();
+        assert_close(w, Complex64::new(1.0, 0.0), 1e-12, "1/(2-1)");
+    }
+
+    #[test]
+    fn inversion_shifted_at_pole_is_none() {
+        let m = ConformalMap::InversionShifted(Complex64::new(1.0, 0.0));
+        assert!(m.apply(Complex64::new(1.0, 0.0)).is_none());
+    }
+
+    #[test]
+    fn from_string_1_over_z_minus_1() {
+        let m = ConformalMap::from_expr_string("1/(z-1)").unwrap();
+        let w = m.apply(Complex64::new(2.0, 0.0)).unwrap();
+        assert_close(w, Complex64::new(1.0, 0.0), 1e-12, "1/(2-1)");
+    }
+
+    // ----- Mobius -----
+
+    #[test]
+    fn mobius_identity() {
+        // z → (1*z + 0) / (0*z + 1) = z
+        let m = ConformalMap::Mobius {
+            a: Complex64::new(1.0, 0.0),
+            b: Complex64::new(0.0, 0.0),
+            c: Complex64::new(0.0, 0.0),
+            d: Complex64::new(1.0, 0.0),
+        };
+        let w = m.apply(Complex64::new(3.0, 4.0)).unwrap();
+        assert_close(w, Complex64::new(3.0, 4.0), 1e-12, "identity");
+    }
+
+    #[test]
+    fn mobius_inversion_via_formula() {
+        // (0*z + 1) / (1*z + 0) = 1/z
+        let m = ConformalMap::Mobius {
+            a: Complex64::new(0.0, 0.0),
+            b: Complex64::new(1.0, 0.0),
+            c: Complex64::new(1.0, 0.0),
+            d: Complex64::new(0.0, 0.0),
+        };
+        let w = m.apply(Complex64::new(2.0, 0.0)).unwrap();
+        assert_close(w, Complex64::new(0.5, 0.0), 1e-12, "1/z via Möbius");
+    }
+
+    // ----- Recognition -----
+
+    #[test]
+    fn from_string_recognizes_all() {
+        assert_eq!(
+            ConformalMap::from_expr_string("1/z"),
+            Some(ConformalMap::Inversion)
+        );
+        assert_eq!(
+            ConformalMap::from_expr_string("z^2"),
+            Some(ConformalMap::Power(2))
+        );
+        assert_eq!(
+            ConformalMap::from_expr_string("z^3"),
+            Some(ConformalMap::Power(3))
+        );
+        assert_eq!(
+            ConformalMap::from_expr_string("exp(z)"),
+            Some(ConformalMap::Exponential)
+        );
+        assert_eq!(
+            ConformalMap::from_expr_string("log(z)"),
+            Some(ConformalMap::Logarithm)
+        );
+        assert_eq!(
+            ConformalMap::from_expr_string("ln(z)"),
+            Some(ConformalMap::Logarithm)
+        );
+        assert_eq!(
+            ConformalMap::from_expr_string("sin(z)"),
+            Some(ConformalMap::Sine)
+        );
+        assert_eq!(
+            ConformalMap::from_expr_string("cos(z)"),
+            Some(ConformalMap::Cosine)
+        );
+        assert_eq!(
+            ConformalMap::from_expr_string("tan(z)"),
+            Some(ConformalMap::Tangent)
+        );
+        assert_eq!(
+            ConformalMap::from_expr_string("sinh(z)"),
+            Some(ConformalMap::Sinh)
+        );
+        assert_eq!(
+            ConformalMap::from_expr_string("cosh(z)"),
+            Some(ConformalMap::Cosh)
+        );
+        assert_eq!(
+            ConformalMap::from_expr_string("sqrt(z)"),
+            Some(ConformalMap::Sqrt)
+        );
+        assert_eq!(
+            ConformalMap::from_expr_string("z+1/z"),
+            Some(ConformalMap::Joukowski)
+        );
+    }
+
+    #[test]
+    fn from_string_rejects_unknown() {
+        assert_eq!(ConformalMap::from_expr_string("z^2 + 1"), None);
+        assert_eq!(ConformalMap::from_expr_string(""), None);
+        assert_eq!(ConformalMap::from_expr_string("garbage"), None);
+    }
+
+    #[test]
+    fn apply_rejects_non_finite_results() {
+        assert_eq!(
+            ConformalMap::Exponential.apply(Complex64::new(1000.0, 0.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn from_string_rejects_degenerate_mobius() {
+        assert_eq!(ConformalMap::from_expr_string("(z+1)/(z+1)"), None);
+    }
+
+    #[test]
+    fn o43b_mobius_fijos_y_clase() {
+        let z = Complex64::new;
+        // 1/z: fijos {1, −1}, tr² = 0 ⇒ elíptica.
+        let fixed = mobius_fixed_points(z(0.0, 0.0), z(1.0, 0.0), z(1.0, 0.0), z(0.0, 0.0))
+            .expect("fijos de 1/z");
+        assert_eq!(fixed.len(), 2);
+        assert!(fixed.contains(&z(1.0, 0.0)) && fixed.contains(&z(-1.0, 0.0)));
+        assert_eq!(
+            mobius_classify(z(0.0, 0.0), z(1.0, 0.0), z(1.0, 0.0), z(0.0, 0.0)),
+            Ok(MobiusClass::Elliptic)
+        );
+        // 2z: fijo finito {0} (el otro es ∞), tr² = 9/2 ⇒ hiperbólica.
+        let fixed = mobius_fixed_points(z(2.0, 0.0), z(0.0, 0.0), z(0.0, 0.0), z(1.0, 0.0))
+            .expect("fijos de 2z");
+        assert_eq!(fixed, vec![z(0.0, 0.0)]);
+        assert_eq!(
+            mobius_classify(z(2.0, 0.0), z(0.0, 0.0), z(0.0, 0.0), z(1.0, 0.0)),
+            Ok(MobiusClass::Hyperbolic)
+        );
+        // z+1: sin fijos finitos, tr² = 4 ⇒ parabólica.
+        let fixed = mobius_fixed_points(z(1.0, 0.0), z(1.0, 0.0), z(0.0, 0.0), z(1.0, 0.0))
+            .expect("fijos de z+1");
+        assert!(fixed.is_empty());
+        assert_eq!(
+            mobius_classify(z(1.0, 0.0), z(1.0, 0.0), z(0.0, 0.0), z(1.0, 0.0)),
+            Ok(MobiusClass::Parabolic)
+        );
+        // (1+i)z: tr² = (1+i)² = 2i ⇒ loxodrómica.
+        assert_eq!(
+            mobius_classify(z(1.0, 1.0), z(0.0, 0.0), z(0.0, 0.0), z(1.0, 0.0)),
+            Ok(MobiusClass::Loxodromic)
+        );
+        // Degenerados honestos: det = 0 e identidad.
+        assert!(mobius_fixed_points(z(1.0, 0.0), z(1.0, 0.0), z(1.0, 0.0), z(1.0, 0.0)).is_err());
+        assert!(mobius_fixed_points(z(1.0, 0.0), z(0.0, 0.0), z(0.0, 0.0), z(1.0, 0.0)).is_err());
+        assert!(mobius_classify(z(1.0, 0.0), z(1.0, 0.0), z(1.0, 0.0), z(1.0, 0.0)).is_err());
+    }
+
+    #[test]
+    fn o7_estereografica_redonda_y_polos() {
+        let z = Complex64::new;
+        // 0 ↦ polo sur, 1 ↦ ecuador (1,0,0), ida y vuelta exacta.
+        assert_eq!(stereographic_project(z(0.0, 0.0)), Some([0.0, 0.0, -1.0]));
+        assert_eq!(stereographic_project(z(1.0, 0.0)), Some([1.0, 0.0, 0.0]));
+        assert_eq!(stereographic_project(z(0.0, 1.0)), Some([0.0, 1.0, 0.0]));
+        for (re, im) in [(0.5, -1.5), (2.0, 3.0), (-1.0, 0.25)] {
+            let projected = stereographic_project(z(re, im)).expect("finito proyecta");
+            let norm = (projected[0] * projected[0]
+                + projected[1] * projected[1]
+                + projected[2] * projected[2])
+                .sqrt();
+            assert!((norm - 1.0).abs() < 1e-15, "en la esfera");
+            let back = stereographic_unproject(projected).expect("vuelve al plano");
+            assert!((back - z(re, im)).norm() < 1e-12, "redonda");
+        }
+        // Polos honestos: ∞ no finito → None; polo norte → None; fuera de esfera → None.
+        assert_eq!(stereographic_project(z(f64::INFINITY, 0.0)), None);
+        assert_eq!(stereographic_unproject([0.0, 0.0, 1.0]), None);
+        assert_eq!(stereographic_unproject([0.0, 0.0, 0.0]), None);
+        assert_eq!(STEREOGRAPHIC_NORTH_POLE, [0.0, 0.0, 1.0]);
+    }
+}

@@ -1,0 +1,35 @@
+[package]
+name = "grafito-ui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+grafito-anim.workspace = true
+grafito-core.workspace = true
+grafito-geometry.workspace = true
+grafito-command.workspace = true
+grafito-assistant-types.workspace = true
+grafito-pedagogy.workspace = true
+grafito-profile.workspace = true
+# R3: LaTeX real offline para `draw_math` (con fallback al subset casero).
+grafito-tex.workspace = true
+
+egui.workspace = true
+log.workspace = true
+once_cell.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+# Sin `html_reports` (ver grafito-anim: plotters fuera de `cargo test`).
+criterion = "0.5"
+
+[[bench]]
+name = "assistant_blocks"
+harness = false
+

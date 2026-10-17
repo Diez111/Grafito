@@ -1,0 +1,972 @@
+//! Bayesian Knowledge Tracing (BKT) para el perfil pedagógico.
+//! Modelo bayesiano que estima P(sabe) por rama y se actualiza con cada
+//! respuesta. Sin dependencias externas, determinista y testeable.
+
+use serde::{Deserialize, Serialize};
+
+/// Parámetros BKT por habilidad/rama.
+///
+/// - `p_init`: probabilidad inicial de saber la habilidad.
+/// - `p_learn`: probabilidad de aprender tras un intento.
+/// - `p_guess`: probabilidad de acertar sin saber.
+/// - `p_slip`: probabilidad de fallar aun sabiendo.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BktParams {
+    pub p_init: f64,
+    pub p_learn: f64,
+    pub p_guess: f64,
+    pub p_slip: f64,
+}
+
+impl Default for BktParams {
+    fn default() -> Self {
+        Self {
+            p_init: 0.3,
+            p_learn: 0.3,
+            p_guess: 0.2,
+            p_slip: 0.1,
+        }
+    }
+}
+
+impl BktParams {
+    /// Crea parámetros validando rangos (0,1) para cada probabilidad.
+    pub fn new(p_init: f64, p_learn: f64, p_guess: f64, p_slip: f64) -> Result<Self, String> {
+        let candidate = Self {
+            p_init,
+            p_learn,
+            p_guess,
+            p_slip,
+        };
+        candidate.validate()?;
+        Ok(candidate)
+    }
+
+    /// Valida que cada parámetro esté en \[0,1\] y que guess/slip no sean degenerados.
+    pub fn validate(&self) -> Result<(), String> {
+        for (name, value) in [
+            ("p_init", self.p_init),
+            ("p_learn", self.p_learn),
+            ("p_guess", self.p_guess),
+            ("p_slip", self.p_slip),
+        ] {
+            if !value.is_finite() {
+                return Err(format!("{name} no es finito"));
+            }
+            if !(0.0..=1.0).contains(&value) {
+                return Err(format!("{name}={value} fuera de rango 0..=1"));
+            }
+        }
+        if self.p_guess >= 1.0 || self.p_slip >= 1.0 {
+            return Err("p_guess/p_slip deben ser < 1.0".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// Estado BKT por rama: probabilidad actual de dominio latente.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BktState {
+    /// P(sabe) actual.
+    pub p_known: f64,
+}
+
+impl Default for BktState {
+    fn default() -> Self {
+        Self { p_known: 0.3 }
+    }
+}
+
+impl BktState {
+    /// Crea estado con probabilidad inicial dada (clamp 0..=1).
+    pub fn new(p_known: f64) -> Self {
+        Self {
+            p_known: p_known.clamp(0.0, 1.0),
+        }
+    }
+
+    /// Crea desde parámetros (usa p_init).
+    pub fn from_params(params: &BktParams) -> Self {
+        Self {
+            p_known: params.p_init.clamp(0.0, 1.0),
+        }
+    }
+
+    /// Actualiza bayesianamente con la evidencia `correct`.
+    ///
+    /// Fórmula estándar BKT:
+    /// - si acierta: posterior = p*(1-slip) / (p*(1-slip)+(1-p)*guess)
+    /// - si falla: posterior = p*slip / (p*slip+(1-p)*(1-guess))
+    ///
+    /// Luego: p' = posterior + (1-posterior)*p_learn. Retorna el nuevo
+    /// `p_known` y muta el estado.
+    pub fn update(&mut self, correct: bool, params: &BktParams) -> f64 {
+        let next = bkt_update(self.p_known, correct, params);
+        self.p_known = next;
+        next
+    }
+
+    /// Indica si el dominio latente supera el umbral (default 0.8).
+    pub fn is_mastered(&self, threshold: f64) -> bool {
+        self.p_known >= threshold.clamp(0.0, 1.0)
+    }
+}
+
+/// Posterior bayesiano puro sin el paso de aprendizaje (`p_learn`).
+///
+/// Es la `P(sabe|evidencia)` antes de aplicar `p_learn`: útil como
+/// `mastery` honesto derivado de BKT (el dashboard/aula lo usa como
+/// `posterior_mastery`). `bkt_update` = `posterior + (1-posterior)*p_learn`.
+/// Puro, NaN-safe, sin pánicos.
+pub fn bkt_posterior(p_known: f64, correct: bool, params: &BktParams) -> f64 {
+    let p = if p_known.is_finite() {
+        p_known.clamp(0.0, 1.0)
+    } else {
+        0.3
+    };
+    let guess = if params.p_guess.is_finite() {
+        params.p_guess.clamp(0.0, 1.0)
+    } else {
+        0.2
+    };
+    let slip = if params.p_slip.is_finite() {
+        params.p_slip.clamp(0.0, 1.0)
+    } else {
+        0.1
+    };
+    let posterior = if correct {
+        let num = p * (1.0 - slip);
+        let denom = num + (1.0 - p) * guess;
+        if denom <= f64::EPSILON {
+            p
+        } else {
+            num / denom
+        }
+    } else {
+        let num = p * slip;
+        let denom = num + (1.0 - p) * (1.0 - guess);
+        if denom <= f64::EPSILON {
+            p
+        } else {
+            num / denom
+        }
+    };
+    posterior.clamp(0.0, 1.0)
+}
+
+/// Mastery honesto derivado del posterior BKT (`0..=1` como `f32`).
+///
+/// Convierte `bkt_p_known` (ya posterior tras `bkt_update`) a la escala del
+/// campo legacy `BranchState::mastery` (EMA) para comparar/migrar sin romper
+/// compat. NaN-safe: no finitos → `0.0`.
+#[must_use]
+pub fn mastery_from_bkt(bkt_p_known: f64) -> f32 {
+    if !bkt_p_known.is_finite() {
+        return 0.0;
+    }
+    bkt_p_known.clamp(0.0, 1.0) as f32
+}
+
+/// Función pura: calcula el siguiente `p_known` sin mutar estado externo.
+/// Útil para `BranchState` que guarda solo `f64`.
+pub fn bkt_update(p_known: f64, correct: bool, params: &BktParams) -> f64 {
+    let posterior = bkt_posterior(p_known, correct, params);
+    let learn = if params.p_learn.is_finite() {
+        params.p_learn.clamp(0.0, 1.0)
+    } else {
+        0.3
+    };
+    let next = posterior + (1.0 - posterior) * learn;
+    next.clamp(0.0, 1.0)
+}
+
+/// Parámetros por defecto genéricos (usados si no hay mapeo de rama).
+pub const BKT_DEFAULT_PARAMS: BktParams = BktParams {
+    p_init: 0.3,
+    p_learn: 0.3,
+    p_guess: 0.2,
+    p_slip: 0.1,
+};
+
+/// Parámetros BKT diferenciados por rama (heurística pedagógica).
+/// Ramas más abstractas tienen guess más alto y learn levemente menor.
+pub fn bkt_params_for_branch(branch_id: &str) -> BktParams {
+    match branch_id {
+        "functions" => BktParams {
+            p_init: 0.35,
+            p_learn: 0.32,
+            p_guess: 0.22,
+            p_slip: 0.09,
+        },
+        "algebra" => BktParams {
+            p_init: 0.30,
+            p_learn: 0.30,
+            p_guess: 0.20,
+            p_slip: 0.10,
+        },
+        "geometry" | "geometry3d" => BktParams {
+            p_init: 0.28,
+            p_learn: 0.28,
+            p_guess: 0.18,
+            p_slip: 0.12,
+        },
+        "trigonometry" => BktParams {
+            p_init: 0.25,
+            p_learn: 0.27,
+            p_guess: 0.20,
+            p_slip: 0.13,
+        },
+        "calculus" => BktParams {
+            p_init: 0.20,
+            p_learn: 0.25,
+            p_guess: 0.22,
+            p_slip: 0.14,
+        },
+        "stats" => BktParams {
+            p_init: 0.30,
+            p_learn: 0.31,
+            p_guess: 0.24,
+            p_slip: 0.10,
+        },
+        "complex" => BktParams {
+            p_init: 0.18,
+            p_learn: 0.24,
+            p_guess: 0.18,
+            p_slip: 0.15,
+        },
+        _ => BktParams::default(),
+    }
+}
+
+/// IDs de los 50 LOs del currículum cubiertos por [`bkt_params_for_lo_opt`].
+///
+/// Espejo manual de `Curriculum::all()` en
+/// `grafito-pedagogy/src/curriculum.rs`: 5 primaria, 12 secundaria, 8 AM1,
+/// 9 AM2 (incluye `am2-edp` y `am2-fourier`), 7 Álgebra, 6 Probabilidad y 3
+/// avanzados (`am3-residuos`, `comp-groebner`, `comp-laplace`) = 50 en total
+/// (ver test `all_counts` allí).
+/// `grafito-profile` no depende de `grafito-pedagogy` (hoja sin ciclos), así
+/// que la cobertura se verifica contra esta lista: si el currículum añade,
+/// renombra o quita un LO hay que actualizar esta constante Y el `match` de
+/// [`bkt_params_for_lo_opt`].
+///
+/// **Honesto sobre lo que los tests de este crate verifican**:
+/// `all_lo_ids_mirror_has_50_entries` y `all_los_covered_against_mirror`
+/// iteran `ALL_LO_IDS` contra sí mismos — chequean consistencia *interna* del
+/// espejo (longitud, sin duplicados, `is_some` por ID, params válidos), NO
+/// contra `Curriculum::all()`. Si el currículum cambia un LO, estos tests
+/// **no** fallan. El cruce real vive en [`los_without_calibration`]: función
+/// pura que recibe los IDs del currículum (el caller que vea ambos) y
+/// devuelve los que quedaron sin calibración. **Dónde llamarlo**: un test en
+/// un crate que converja `grafito-pedagogy` + `grafito-profile` (p. ej.
+/// `grafito-app` o `grafito-command`, que ya dependen de ambos):
+/// ```ignore
+/// let ids: Vec<&str> = Curriculum::all().iter().map(|lo| lo.id.as_str()).collect();
+/// assert!(grafito_profile::los_without_calibration(&ids).is_empty());
+/// ```
+pub const ALL_LO_IDS: [&str; 50] = [
+    "pri-conteo",
+    "pri-fracc-vis",
+    "pri-perim-area",
+    "pri-proporciones",
+    "pri-datos",
+    "sec-fracc",
+    "sec-prop",
+    "sec-ec",
+    "sec-lineal",
+    "sec-cuad",
+    "sec-pend",
+    "sec-area",
+    "sec-trig",
+    "sec-vect",
+    "sec-prob",
+    "sec-pitagoras",
+    "sec-fractales",
+    "am1-func",
+    "am1-lim",
+    "am1-cont",
+    "am1-der",
+    "am1-der-aplic",
+    "am1-int",
+    "am1-int-aplic",
+    "am1-sucesiones",
+    "am2-edo",
+    "am2-series",
+    "am2-taylor",
+    "am2-multivariable",
+    "am2-int-multi",
+    "am2-campos",
+    "am2-teoremas",
+    "am2-edp",
+    "am2-fourier",
+    "alg-vectores",
+    "alg-rectas-planos",
+    "alg-matrices",
+    "alg-determinantes",
+    "alg-conicas",
+    "alg-subespacios",
+    "alg-transformaciones",
+    "prob-basica",
+    "prob-var",
+    "prob-distribuciones",
+    "prob-inferencia",
+    "prob-regresion",
+    "prob-muestreo",
+    "am3-residuos",
+    "comp-groebner",
+    "comp-laplace",
+];
+
+/// Mapeo fino por LO individual (50 LOs) con distinción conocido/desconocido.
+///
+/// Fuente única de verdad para [`bkt_params_for_lo`] e [`is_known_lo`]: los
+/// 50 brazos retornan `BktParams` y el `match` completo se envuelve en
+/// `Some(...)`; cualquier otro ID usa `return None` temprano. Si se añade un
+/// LO en `grafito-pedagogy/src/curriculum.rs`, añadir su brazo aquí Y su ID
+/// en [`ALL_LO_IDS`].
+///
+/// `p_init` escala con `level_min`: primaria (1-2) → 0.40-0.35, secundaria
+/// (4-8) → 0.33-0.28, universidad (10-15) → 0.26-0.16. `p_learn`/`p_guess`
+/// por bloque temático; `p_slip` crece con dificultad.
+pub fn bkt_params_for_lo_opt(lo_id: &str) -> Option<BktParams> {
+    Some(match lo_id {
+        // Primaria (5) — p_init alto, slip bajo
+        "pri-conteo" => BktParams {
+            p_init: 0.40,
+            p_learn: 0.35,
+            p_guess: 0.25,
+            p_slip: 0.08,
+        },
+        "pri-fracc-vis" => BktParams {
+            p_init: 0.38,
+            p_learn: 0.33,
+            p_guess: 0.24,
+            p_slip: 0.09,
+        },
+        "pri-perim-area" => BktParams {
+            p_init: 0.36,
+            p_learn: 0.32,
+            p_guess: 0.22,
+            p_slip: 0.09,
+        },
+        "pri-proporciones" => BktParams {
+            p_init: 0.36,
+            p_learn: 0.32,
+            p_guess: 0.23,
+            p_slip: 0.09,
+        },
+        "pri-datos" => BktParams {
+            p_init: 0.38,
+            p_learn: 0.33,
+            p_guess: 0.24,
+            p_slip: 0.08,
+        },
+
+        // Secundaria (12) — incluye sec-pitagoras y sec-fractales
+        "sec-fracc" => BktParams {
+            p_init: 0.33,
+            p_learn: 0.30,
+            p_guess: 0.21,
+            p_slip: 0.10,
+        },
+        "sec-prop" => BktParams {
+            p_init: 0.32,
+            p_learn: 0.30,
+            p_guess: 0.20,
+            p_slip: 0.10,
+        },
+        "sec-ec" => BktParams {
+            p_init: 0.30,
+            p_learn: 0.29,
+            p_guess: 0.20,
+            p_slip: 0.11,
+        },
+        "sec-lineal" => BktParams {
+            p_init: 0.30,
+            p_learn: 0.29,
+            p_guess: 0.19,
+            p_slip: 0.11,
+        },
+        "sec-cuad" => BktParams {
+            p_init: 0.28,
+            p_learn: 0.28,
+            p_guess: 0.19,
+            p_slip: 0.12,
+        },
+        "sec-pend" => BktParams {
+            p_init: 0.30,
+            p_learn: 0.29,
+            p_guess: 0.19,
+            p_slip: 0.11,
+        },
+        "sec-area" => BktParams {
+            p_init: 0.30,
+            p_learn: 0.29,
+            p_guess: 0.20,
+            p_slip: 0.11,
+        },
+        "sec-trig" => BktParams {
+            p_init: 0.26,
+            p_learn: 0.27,
+            p_guess: 0.20,
+            p_slip: 0.13,
+        },
+        "sec-vect" => BktParams {
+            p_init: 0.28,
+            p_learn: 0.28,
+            p_guess: 0.19,
+            p_slip: 0.12,
+        },
+        "sec-prob" => BktParams {
+            p_init: 0.31,
+            p_learn: 0.30,
+            p_guess: 0.23,
+            p_slip: 0.10,
+        },
+        "sec-pitagoras" => BktParams {
+            p_init: 0.29,
+            p_learn: 0.28,
+            p_guess: 0.19,
+            p_slip: 0.12,
+        },
+        "sec-fractales" => BktParams {
+            p_init: 0.30,
+            p_learn: 0.29,
+            p_guess: 0.20,
+            p_slip: 0.11,
+        },
+
+        // AM1 (8)
+        "am1-func" => BktParams {
+            p_init: 0.26,
+            p_learn: 0.28,
+            p_guess: 0.22,
+            p_slip: 0.12,
+        },
+        "am1-lim" => BktParams {
+            p_init: 0.24,
+            p_learn: 0.27,
+            p_guess: 0.21,
+            p_slip: 0.13,
+        },
+        "am1-cont" => BktParams {
+            p_init: 0.24,
+            p_learn: 0.27,
+            p_guess: 0.21,
+            p_slip: 0.13,
+        },
+        "am1-der" => BktParams {
+            p_init: 0.22,
+            p_learn: 0.26,
+            p_guess: 0.22,
+            p_slip: 0.14,
+        },
+        "am1-der-aplic" => BktParams {
+            p_init: 0.21,
+            p_learn: 0.25,
+            p_guess: 0.22,
+            p_slip: 0.14,
+        },
+        "am1-int" => BktParams {
+            p_init: 0.22,
+            p_learn: 0.26,
+            p_guess: 0.22,
+            p_slip: 0.14,
+        },
+        "am1-int-aplic" => BktParams {
+            p_init: 0.21,
+            p_learn: 0.25,
+            p_guess: 0.22,
+            p_slip: 0.14,
+        },
+        "am1-sucesiones" => BktParams {
+            p_init: 0.24,
+            p_learn: 0.27,
+            p_guess: 0.20,
+            p_slip: 0.13,
+        },
+
+        // AM2 (7)
+        "am2-edo" => BktParams {
+            p_init: 0.20,
+            p_learn: 0.25,
+            p_guess: 0.21,
+            p_slip: 0.14,
+        },
+        "am2-series" => BktParams {
+            p_init: 0.20,
+            p_learn: 0.25,
+            p_guess: 0.20,
+            p_slip: 0.14,
+        },
+        "am2-taylor" => BktParams {
+            p_init: 0.18,
+            p_learn: 0.24,
+            p_guess: 0.19,
+            p_slip: 0.15,
+        },
+        "am2-multivariable" => BktParams {
+            p_init: 0.19,
+            p_learn: 0.25,
+            p_guess: 0.20,
+            p_slip: 0.14,
+        },
+        "am2-int-multi" => BktParams {
+            p_init: 0.18,
+            p_learn: 0.24,
+            p_guess: 0.19,
+            p_slip: 0.15,
+        },
+        "am2-campos" => BktParams {
+            p_init: 0.18,
+            p_learn: 0.24,
+            p_guess: 0.19,
+            p_slip: 0.15,
+        },
+        "am2-teoremas" => BktParams {
+            p_init: 0.17,
+            p_learn: 0.23,
+            p_guess: 0.18,
+            p_slip: 0.15,
+        },
+        "am2-edp" => BktParams {
+            p_init: 0.17,
+            p_learn: 0.23,
+            p_guess: 0.18,
+            p_slip: 0.15,
+        },
+        "am2-fourier" => BktParams {
+            p_init: 0.17,
+            p_learn: 0.23,
+            p_guess: 0.18,
+            p_slip: 0.15,
+        },
+
+        // Álgebra (7)
+        "alg-vectores" => BktParams {
+            p_init: 0.25,
+            p_learn: 0.28,
+            p_guess: 0.19,
+            p_slip: 0.12,
+        },
+        "alg-rectas-planos" => BktParams {
+            p_init: 0.23,
+            p_learn: 0.27,
+            p_guess: 0.19,
+            p_slip: 0.13,
+        },
+        "alg-matrices" => BktParams {
+            p_init: 0.25,
+            p_learn: 0.28,
+            p_guess: 0.20,
+            p_slip: 0.12,
+        },
+        "alg-determinantes" => BktParams {
+            p_init: 0.23,
+            p_learn: 0.27,
+            p_guess: 0.19,
+            p_slip: 0.13,
+        },
+        "alg-conicas" => BktParams {
+            p_init: 0.22,
+            p_learn: 0.26,
+            p_guess: 0.19,
+            p_slip: 0.13,
+        },
+        "alg-subespacios" => BktParams {
+            p_init: 0.23,
+            p_learn: 0.27,
+            p_guess: 0.19,
+            p_slip: 0.13,
+        },
+        "alg-transformaciones" => BktParams {
+            p_init: 0.20,
+            p_learn: 0.25,
+            p_guess: 0.18,
+            p_slip: 0.14,
+        },
+
+        // Probabilidad (6)
+        "prob-basica" => BktParams {
+            p_init: 0.26,
+            p_learn: 0.29,
+            p_guess: 0.23,
+            p_slip: 0.11,
+        },
+        "prob-var" => BktParams {
+            p_init: 0.24,
+            p_learn: 0.28,
+            p_guess: 0.23,
+            p_slip: 0.12,
+        },
+        "prob-distribuciones" => BktParams {
+            p_init: 0.23,
+            p_learn: 0.27,
+            p_guess: 0.22,
+            p_slip: 0.12,
+        },
+        "prob-inferencia" => BktParams {
+            p_init: 0.21,
+            p_learn: 0.26,
+            p_guess: 0.22,
+            p_slip: 0.13,
+        },
+        "prob-regresion" => BktParams {
+            p_init: 0.22,
+            p_learn: 0.26,
+            p_guess: 0.22,
+            p_slip: 0.13,
+        },
+        "prob-muestreo" => BktParams {
+            p_init: 0.21,
+            p_learn: 0.26,
+            p_guess: 0.22,
+            p_slip: 0.13,
+        },
+
+        // Avanzados (3) — análisis complejo / computación simbólica
+        "am3-residuos" => BktParams {
+            p_init: 0.16,
+            p_learn: 0.22,
+            p_guess: 0.17,
+            p_slip: 0.16,
+        },
+        "comp-groebner" => BktParams {
+            p_init: 0.16,
+            p_learn: 0.22,
+            p_guess: 0.17,
+            p_slip: 0.16,
+        },
+        "comp-laplace" => BktParams {
+            p_init: 0.16,
+            p_learn: 0.22,
+            p_guess: 0.17,
+            p_slip: 0.16,
+        },
+
+        // Cualquier otro ID es desconocido para el currículum. Incluye las
+        // claves legacy de perfil (`functions`/`algebra`/`geometry`/
+        // `geometry3d`/`trigonometry`/`calculus`/`stats`/`complex`), que NO
+        // son LOs: `bkt_params_for_lo` las resuelve vía `bkt_params_for_branch`
+        // para compatibilidad con perfiles antiguos. Se usa `return` temprano
+        // para no contaminar el `Some(match ...)` que envuelve los 50 LOs.
+        _ => return None,
+    })
+}
+
+/// ¿El ID corresponde a uno de los 50 LOs del currículum?
+///
+/// Equivale a `bkt_params_for_lo_opt(lo_id).is_some()`. Retorna `false` para
+/// claves legacy de rama (`algebra`, `calculus`, …) aunque
+/// [`bkt_params_for_lo`] les dé parámetros: esas no son LOs.
+pub fn is_known_lo(lo_id: &str) -> bool {
+    bkt_params_for_lo_opt(lo_id).is_some()
+}
+
+/// LOs **sin** calibración BKT por LO dentro de `ids` (en el mismo orden).
+///
+/// Es el cruce currículum ↔ perfil que este crate no puede hacer solo
+/// (`grafito-profile` es hoja a propósito y no ve `Curriculum`): la función
+/// viva acá, **pura y testeable**, y el caller que converja ambos crates le
+/// pasa `Curriculum::all()` y debe recibir `vec![]` (ver doc de
+/// [`ALL_LO_IDS`] para el snippet del test en `grafito-app`/`grafito-command`).
+///
+/// Un ID está "calibrado" si [`bkt_params_for_lo_opt`] devuelve `Some`. Las
+/// claves legacy de rama (`algebra`, `calculus`, …) NO son LOs y se reportan
+/// como sin calibración (honesto: no tienen parámetros por LO).
+pub fn los_without_calibration(ids: &[&str]) -> Vec<String> {
+    ids.iter()
+        .filter(|id| bkt_params_for_lo_opt(id).is_none())
+        .map(|id| (*id).to_string())
+        .collect()
+}
+
+/// Parámetros BKT por LO con fallback compatible.
+///
+/// - LO conocido (ver [`ALL_LO_IDS`]) → parámetros diferenciados.
+/// - Clave legacy de rama (`functions`, `algebra`, `geometry`, `geometry3d`,
+///   `trigonometry`, `calculus`, `stats`, `complex`) → delega en
+///   [`bkt_params_for_branch`] (perfiles antiguos).
+/// - Cualquier otro ID → [`BktParams::default`].
+///
+/// Sin pánicos: todo `match`, ningún `unwrap`/`expect`.
+pub fn bkt_params_for_lo(lo_id: &str) -> BktParams {
+    match bkt_params_for_lo_opt(lo_id) {
+        Some(params) => params,
+        None => match lo_id {
+            "functions" | "algebra" | "geometry" | "geometry3d" | "trigonometry" | "calculus"
+            | "stats" | "complex" => bkt_params_for_branch(lo_id),
+            _ => BktParams::default(),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn params_validate_rejects_out_of_range() {
+        assert!(BktParams::new(0.3, 0.3, 0.2, 0.1).is_ok());
+        assert!(BktParams::new(1.5, 0.3, 0.2, 0.1).is_err());
+        assert!(BktParams::new(0.3, -0.1, 0.2, 0.1).is_err());
+        assert!(BktParams::new(f64::NAN, 0.3, 0.2, 0.1).is_err());
+    }
+
+    #[test]
+    fn update_correct_increases_and_incorrect_decreases() {
+        let params = BktParams::default();
+        let mut state = BktState::new(0.3);
+        let after_correct = state.update(true, &params);
+        assert!(
+            after_correct > 0.3,
+            "acierto debe subir p_known: {after_correct}"
+        );
+        let mut state2 = BktState::new(0.5);
+        let after_incorrect = state2.update(false, &params);
+        assert!(
+            after_incorrect < 0.5,
+            "fallo debe bajar p_known: {after_incorrect}"
+        );
+    }
+
+    #[test]
+    fn bkt_update_pure_matches_state_update() {
+        let params = BktParams::default();
+        let p = 0.4;
+        let via_fn = bkt_update(p, true, &params);
+        let mut s = BktState::new(p);
+        let via_state = s.update(true, &params);
+        assert!((via_fn - via_state).abs() < 1e-12);
+    }
+
+    #[test]
+    fn sequence_correct_monotonic_toward_one() {
+        let params = BktParams::default();
+        let mut s = BktState::new(0.3);
+        let mut prev = s.p_known;
+        for _ in 0..6 {
+            let next = s.update(true, &params);
+            assert!(next >= prev, "con aciertos no debe bajar: {prev} -> {next}");
+            assert!(next <= 1.0);
+            prev = next;
+        }
+        assert!(prev > 0.85, "tras 6 aciertos debe estar cerca de 1: {prev}");
+    }
+
+    #[test]
+    fn incorrect_from_high_drops_significantly() {
+        let params = BktParams::default();
+        let p = bkt_update(0.9, false, &params);
+        assert!(p < 0.9);
+        // Con slip bajo, un fallo desde 0.9 no colapsa a 0 pero baja notablemente.
+        assert!(p < 0.75, "desde 0.9 un fallo debe bajar bajo 0.75: {p}");
+    }
+
+    #[test]
+    fn handles_edge_probabilities_without_panic() {
+        let params = BktParams::default();
+        assert!(bkt_update(0.0, true, &params).is_finite());
+        assert!(bkt_update(1.0, false, &params).is_finite());
+        assert!(bkt_update(0.0, false, &params).is_finite());
+        assert!(bkt_update(1.0, true, &params).is_finite());
+    }
+
+    #[test]
+    fn params_for_branch_returns_sensible_defaults() {
+        let a = bkt_params_for_branch("calculus");
+        assert!(a.validate().is_ok());
+        let b = bkt_params_for_branch("desconocida");
+        assert_eq!(b, BktParams::default());
+        // Cada rama conocida debe validar
+        for id in [
+            "functions",
+            "algebra",
+            "geometry",
+            "trigonometry",
+            "calculus",
+            "stats",
+            "complex",
+        ] {
+            assert!(bkt_params_for_branch(id).validate().is_ok(), "{id}");
+        }
+    }
+
+    #[test]
+    fn is_mastered_threshold() {
+        let s = BktState::new(0.85);
+        assert!(s.is_mastered(0.8));
+        assert!(!s.is_mastered(0.9));
+    }
+
+    #[test]
+    fn all_lo_ids_mirror_has_50_entries() {
+        // Espejo de `Curriculum::all().len()` (ver
+        // `grafito-pedagogy/src/curriculum.rs::all_counts`): si el currículum
+        // cambia de tamaño, actualizar `ALL_LO_IDS` + `bkt_params_for_lo_opt`.
+        assert_eq!(ALL_LO_IDS.len(), 50, "deben ser 50 LOs");
+        // Sin duplicados.
+        let mut sorted = ALL_LO_IDS;
+        sorted.sort_unstable();
+        for pair in sorted.windows(2) {
+            assert_ne!(pair[0], pair[1], "ID duplicado en ALL_LO_IDS: {}", pair[0]);
+        }
+    }
+
+    #[test]
+    fn all_los_covered_against_mirror() {
+        // Verifica por ID que cada LO del espejo tiene parámetros conocidos y
+        // válidos. Falla si falta un brazo en `bkt_params_for_lo_opt` (opt
+        // retornaría `None`) o si algún parámetro es inválido.
+        assert_eq!(ALL_LO_IDS.len(), 50, "deben ser 50 LOs");
+        for id in ALL_LO_IDS {
+            assert!(
+                is_known_lo(id),
+                "{id} debe ser un LO conocido (falta brazo en bkt_params_for_lo_opt)"
+            );
+            let opt = bkt_params_for_lo_opt(id);
+            assert!(opt.is_some(), "{id} debe tener parámetros Some");
+            let p = bkt_params_for_lo(id);
+            assert!(p.validate().is_ok(), "{id} debe validar: {p:?}");
+            // p_init decrece con nivel: primaria ~0.36-0.40, secundaria ~0.26-0.33, uni ~0.17-0.26
+            assert!(
+                (0.15..=0.45).contains(&p.p_init),
+                "{id} p_init fuera rango: {}",
+                p.p_init
+            );
+        }
+        // Desconocido retorna None + fallback default.
+        assert!(!is_known_lo("no-existe"));
+        assert!(bkt_params_for_lo_opt("no-existe").is_none());
+        assert_eq!(bkt_params_for_lo("no-existe"), BktParams::default());
+        // Claves legacy de rama NO son LOs (opt None) pero mantienen delegación.
+        for legacy in ["algebra", "calculus", "geometry3d", "stats", "complex"] {
+            assert!(!is_known_lo(legacy), "{legacy} no es un LO");
+            assert!(bkt_params_for_lo_opt(legacy).is_none());
+            assert_eq!(
+                bkt_params_for_lo(legacy),
+                bkt_params_for_branch(legacy),
+                "{legacy} debe delegar en branch"
+            );
+        }
+    }
+
+    #[test]
+    fn bkt_params_for_lo_p_init_monotonic_primary_gt_university() {
+        let pri = bkt_params_for_lo("pri-conteo").p_init;
+        let sec = bkt_params_for_lo("sec-fracc").p_init;
+        let uni = bkt_params_for_lo("am2-teoremas").p_init;
+        assert!(
+            pri > sec,
+            "primaria debe tener p_init mayor que secundaria: {pri} vs {sec}"
+        );
+        assert!(
+            sec > uni,
+            "secundaria debe tener p_init mayor que uni avanzada: {sec} vs {uni}"
+        );
+    }
+
+    #[test]
+    fn bkt_posterior_is_below_update_and_moves_correctly() {
+        let params = BktParams::default();
+        // Con acierto: posterior < update (update suma p_learn) y > prior.
+        let posterior = bkt_posterior(0.3, true, &params);
+        let updated = bkt_update(0.3, true, &params);
+        assert!(posterior > 0.3, "posterior con acierto sube: {posterior}");
+        assert!(
+            updated > posterior,
+            "update agrega aprendizaje: {updated} > {posterior}"
+        );
+        // Con fallo: posterior < prior y update > posterior (pero < prior).
+        let post_fail = bkt_posterior(0.5, false, &params);
+        let upd_fail = bkt_update(0.5, false, &params);
+        assert!(post_fail < 0.5, "posterior con fallo baja: {post_fail}");
+        assert!(upd_fail >= post_fail);
+        assert!(upd_fail < 0.5);
+    }
+
+    #[test]
+    fn bkt_posterior_nan_safe_and_bounded() {
+        let params = BktParams::default();
+        assert!(bkt_posterior(f64::NAN, true, &params).is_finite());
+        assert!((0.0..=1.0).contains(&bkt_posterior(f64::NAN, true, &params)));
+        assert!((0.0..=1.0).contains(&bkt_posterior(2.0, false, &params)));
+        assert!((0.0..=1.0).contains(&bkt_posterior(-1.0, true, &params)));
+    }
+
+    #[test]
+    fn bkt_update_contracto_nan_y_extremos_paridad() {
+        // Contrato NaN compartido con el gemelo `grafito-pedagogy::bkt`
+        // (duplicado a propósito para no crear ciclo; ver doc del módulo).
+        // Mismos casos de entrada que
+        // `grafito-pedagogy::bkt::tests::bkt_update_contracto_nan_y_extremos`:
+        // entradas no finitas caen a defaults (p=0.3, guess=0.2, slip=0.1,
+        // learn=0.3) y la salida SIEMPRE es finita y ∈ [0,1].
+        let nan = f64::NAN;
+        let params_nan = BktParams {
+            p_init: nan,
+            p_learn: nan,
+            p_guess: nan,
+            p_slip: nan,
+        };
+        let casos: [(f64, bool, &BktParams, f64); 5] = [
+            (nan, true, &BKT_DEFAULT_PARAMS, 0.7609756097560976),
+            (nan, false, &BKT_DEFAULT_PARAMS, 0.3355932203389831),
+            (0.5, true, &params_nan, 0.8727272727272727),
+            (2.0, true, &BKT_DEFAULT_PARAMS, 1.0),
+            (-1.0, false, &BKT_DEFAULT_PARAMS, 0.3),
+        ];
+        for (p_known, correct, params, esperado) in casos {
+            let got = bkt_update(p_known, correct, params);
+            assert!(got.is_finite(), "salida no finita: {got}");
+            assert!((0.0..=1.0).contains(&got), "salida fuera de [0,1]: {got}");
+            assert!(
+                (got - esperado).abs() < 1e-9,
+                "paridad rota: p_known={p_known} correct={correct} → {got}, esperado {esperado}"
+            );
+        }
+        // Propiedad: ninguna combinación de basura produce NaN/inf o fuga de rango.
+        for p_known in [nan, f64::INFINITY, f64::NEG_INFINITY, -5.0, 5.0] {
+            for correct in [true, false] {
+                let got = bkt_update(p_known, correct, &params_nan);
+                assert!(got.is_finite() && (0.0..=1.0).contains(&got), "{got}");
+            }
+        }
+    }
+
+    #[test]
+    fn mastery_from_bkt_clamps_and_handles_nan() {
+        assert!((mastery_from_bkt(0.7) - 0.7_f32).abs() < 1e-6);
+        assert_eq!(mastery_from_bkt(f64::NAN), 0.0);
+        assert_eq!(mastery_from_bkt(2.0), 1.0);
+        assert_eq!(mastery_from_bkt(-1.0), 0.0);
+    }
+
+    #[test]
+    fn los_without_calibration_cruza_ids_contra_el_espejo() {
+        // El cruce currículum ↔ perfil: el caller que vea ambos pasa los IDs
+        // del currículum y debe recibir los que quedaron sin calibración.
+        // Acá se verifica la función con el espejo local (consistencia
+        // interna); el llamado real con `Curriculum::all()` vive en un test de
+        // `grafito-app`/`grafito-command` (ver doc de `ALL_LO_IDS`).
+        // Todos los LOs del espejo están calibrados → vacío.
+        assert!(los_without_calibration(&ALL_LO_IDS).is_empty());
+        // Vacío en, vacío out.
+        assert!(los_without_calibration(&[]).is_empty());
+        // Un LO conocido + uno inventado + clave legacy → solo los dos últimos.
+        let ids = ["am1-der", "no-existe", "calculus"];
+        assert_eq!(
+            los_without_calibration(&ids),
+            vec!["no-existe".to_string(), "calculus".to_string()]
+        );
+        // Los LOs nuevos (Tarea 3) también están calibrados.
+        let nuevos = [
+            "am2-edp",
+            "am2-fourier",
+            "am3-residuos",
+            "comp-groebner",
+            "comp-laplace",
+        ];
+        assert!(los_without_calibration(&nuevos).is_empty());
+    }
+}

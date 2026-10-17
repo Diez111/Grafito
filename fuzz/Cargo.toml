@@ -1,0 +1,81 @@
+[package]
+name = "grafito-fuzz"
+version.workspace = true
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Keep the fuzz package independent of Grafito's workspace manifests.
+[workspace]
+members = ["."]
+
+[workspace.package]
+version = "1.0.0"
+
+[dependencies]
+grafito-command = { path = "../crates/grafito-command" }
+grafito-complex = { path = "../crates/grafito-complex" }
+grafito-core = { path = "../crates/grafito-core" }
+grafito-geometry = { path = "../crates/grafito-geometry" }
+grafito-ggb = { path = "../crates/grafito-ggb" }
+grafito-anim = { path = "../crates/grafito-anim" }
+libfuzzer-sys = "0.4"
+serde_json = "1.0"
+
+[[bin]]
+name = "ast_parser"
+path = "fuzz_targets/ast_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "complex_parser"
+path = "fuzz_targets/complex_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "document_deserialization"
+path = "fuzz_targets/document_deserialization.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "command_atomicity"
+path = "fuzz_targets/command_atomicity.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "validation_limits"
+path = "fuzz_targets/validation_limits.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "spreadsheet_recompute"
+path = "fuzz_targets/spreadsheet_recompute.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "anim_wire"
+path = "fuzz_targets/anim_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ggb_import"
+path = "fuzz_targets/ggb_import.rs"
+test = false
+doc = false
+bench = false

@@ -1,0 +1,11266 @@
+//! Main application state and eframe orchestration.
+//!
+//! Holds `GrafitoApp`, its constructor, file/undo helpers, and the top-level
+//! `eframe::App::update` loop that dispatches rendering to focused UI modules.
+//!
+//! # Presupuestos de rendimiento (Piel)
+//! - Tessellation egui: 1-2 ms/frame con 10K vértices (feature `egui/rayon`,
+//!   epaint/rayon, ver `Cargo.toml` workspace). Medir con `--features profile`
+//!   + `puffin_viewer 127.0.0.1:8585` antes de optimizar.
+//! - GPU compute: `domain_coloring_compute` 500×500 = 250k cells en un único
+//!   dispatch wgpu (grafito-render). CPU submit << GPU time ⇒ GPU-bound.
+
+use crate::controllers::{AssistantController, DocumentController, ViewController};
+use crate::utils::{load_config, save_config, AppConfig, AppLocale, AutosaveDebouncer};
+use crate::view_flags::view_bg_color;
+use crate::{Perspective, ViewMode};
+use egui::Pos2;
+use grafito_core::{
+    ChangeSet, CircleObj, Cube3DObj, Document, EllipseObj, FunctionObj, GeoObject, HyperbolaObj,
+    LineObj, ObjectId, ParabolaObj, PointObj, RenderQuality, Sphere3DObj,
+};
+use grafito_geometry::{Camera3D, Color, Point2, Point3D, ViewTransform};
+use grafito_ui::theme::{DARK, LIGHT};
+use grafito_ui::Tool;
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
+
+use grafito_command::commands::{register_gpu_function_evaluator, GpuFunctionEvaluator};
+
+// F4: atajos extraídos a hijo `shortcuts` (conserva acceso a privados de `app`).
+#[path = "shortcuts.rs"]
+mod shortcuts;
+
+/// Máximo de entradas de undo y presupuesto global de memoria (50 / 50 MiB).
+/// Fuente única: `crate::controllers::{MAX_UNDO, MAX_UNDO_BYTES}` (ver
+/// `Document::estimated_bytes()` para la estimación
+/// `max(object_count*200KiB, json_len, 8KiB)`). Este re-export evita deriva
+/// entre el shim `push_history_snapshot` (GrafitoApp) y `DocumentController`.
+pub(crate) use crate::controllers::{MAX_UNDO, MAX_UNDO_BYTES};
+
+/// Cota del protocolo de construcción: 500 entradas cronológicas máximo.
+/// Tras cada `push` se trunca manteniendo las más recientes (`drain 0..excess`)
+/// para presupuesto O(n) acotado (500) y orden cronológico.
+pub(crate) const MAX_CONSTRUCTION_LOG: usize = 500;
+
+/// Tope de pasos del historial usados al definir una custom tool (W-A).
+/// El diálogo muestra "usando N de M" en vez de truncar en silencio.
+pub(crate) const CUSTOM_TOOL_HISTORY_LIMIT: usize = 64;
+
+/// Texto del toast de lockdown de examen en el idioma pedido (B-A180). Es
+/// delega al canónico `format!("{que} bloqueado en modo examen, che.")`
+/// (paridad byte-idéntica, patrón B-A98/B-A170); resto interpola el template
+/// `exam.blocked_toast` con `{que}`. El `que` va crudo ("Export"/
+/// "Herramientas", identificadores de acción, precedente B-A98).
+pub(crate) fn exam_blocks_text_for(que: &str, locale: grafito_ui::i18n::Locale) -> String {
+    use grafito_ui::i18n::{t, Locale};
+    if locale == Locale::Es {
+        format!("{que} bloqueado en modo examen, che.")
+    } else {
+        t("exam.blocked_toast", locale).replace("{que}", que)
+    }
+}
+
+/// Toast cuando el worker de guardado muere sin resultado: no es un error
+/// (el documento en memoria está intacto, nada se perdió), es una
+/// cancelación sin cambios. Severidad honesta: Info, nunca Error.
+/// Puro, para que los tests pinnen texto + severidad en el call-site.
+pub(crate) fn save_cancelled_message() -> &'static str {
+    "Guardado cancelado, sin cambios."
+}
+
+/// Toast cuando no se pudo lanzar el explorador para mostrar la carpeta de
+/// la última exportación: causa honesta + qué hacer (abrirla a mano).
+/// Puro, para que los tests pinnen el texto en el call-site.
+pub(crate) fn reveal_export_spawn_error_message() -> &'static str {
+    "No se pudo abrir la carpeta de exportación: no se pudo iniciar el explorador de archivos. Buscá la carpeta de tu última exportación y abrila manualmente."
+}
+
+/// Job de guardado en background — evita bloquear UI thread (60fps) en `save_document`.
+/// Pattern `spawn_profile_save` (assistant.rs:41-51) con `sync_channel(1)` + `request_repaint`.
+pub(crate) struct PendingSaveJob {
+    pub receiver: Receiver<Result<PathBuf, String>>,
+}
+/// Job de portapapeles PNG en background — arboard bloquea (Wayland) y
+/// jamás corre en Ui::. `None` = idle.
+pub(crate) struct PendingClipboardJob {
+    pub receiver: Receiver<Result<String, String>>,
+}
+/// Job de apertura en background — evita bloquear UI thread en `choose_and_open_document`.
+pub(crate) struct PendingOpenJob {
+    pub receiver: Receiver<Result<(PathBuf, Document), String>>,
+}
+/// Job de export en background — evita bloquear UI thread en `export_with_dialog`.
+pub(crate) struct PendingExportJob {
+    pub receiver: Receiver<Result<(PathBuf, String), String>>,
+}
+/// Job de importación CSV/TSV en background (lectura ≤2MB en worker).
+pub(crate) struct PendingImportJob {
+    pub receiver: Receiver<Result<crate::sheet_layout::LocalXYTable, String>>,
+}
+/// Job genérico de escritura de texto en background (p. ej. export LaTeX del protocolo).
+pub(crate) struct PendingTextWriteJob {
+    pub receiver: Receiver<Result<PathBuf, String>>,
+}
+/// Presupuestos espejo de `grafito-ggb` (sin añadir dependencia para no tocar
+/// `Cargo.toml`): `MAX_GGB_BYTES` 64MiB, `MAX_GGB_XML_BYTES` 10MiB,
+/// `MAX_ELEMS` 5000, `MAX_ZIP_ENTRIES` 4096. Ver
+/// `crates/grafito-ggb/src/lib.rs:12-16`.
+pub(crate) const GGB_MAX_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const GGB_MAX_XML_BYTES: u64 = 10 * 1024 * 1024;
+pub(crate) const GGB_MAX_ELEMS: usize = 5000;
+pub(crate) const GGB_MAX_ZIP_ENTRIES: usize = 4096;
+pub(crate) const GGB_XML_NAME: &str = "geogebra.xml";
+/// Cota de expresión espejo de `grafito-ggb::MAX_EXPR_CHARS` (2000) y de
+/// `grafito-core::validation::MAX_EXPR_LENGTH` (2000).
+pub(crate) const GGB_MAX_EXPR_CHARS: usize = 2000;
+
+/// Comando Grafito mapeado desde `.ggb` — espejo de `grafito-ggb::MappedObject`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GgbMappedCommand {
+    pub kind: String,
+    pub command: String,
+}
+
+/// Elemento omitido con razón honesta — espejo de `grafito-ggb::OmittedObject`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GgbOmitted {
+    pub kind: String,
+    pub label: String,
+    pub reason: String,
+}
+
+/// Reporte de importación — espejo de `grafito-ggb::ImportReport` con
+/// `.commands()` y `.summary()`. Nunca fallo silencioso: `omitted` siempre
+/// explica cada salto.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GgbImportReport {
+    pub mapped: Vec<GgbMappedCommand>,
+    pub omitted: Vec<GgbOmitted>,
+}
+
+impl GgbImportReport {
+    pub(crate) fn commands(&self) -> Vec<String> {
+        self.mapped.iter().map(|m| m.command.clone()).collect()
+    }
+
+    pub(crate) fn summary(&self) -> String {
+        let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+        for m in &self.mapped {
+            *counts.entry(m.kind.as_str()).or_insert(0) += 1;
+        }
+        let tipos = counts
+            .iter()
+            .map(|(tipo, n)| format!("{tipo} x{n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let detalle = if tipos.is_empty() {
+            "sin objetos"
+        } else {
+            &tipos
+        };
+        format!(
+            "ggb importado: {} objetos ({}) + {} omitidos",
+            self.mapped.len(),
+            detalle,
+            self.omitted.len()
+        )
+    }
+
+    /// Detalle honesto de omitidos para el toast (máx. 3 + contador resto).
+    pub(crate) fn omitted_detail(&self) -> String {
+        if self.omitted.is_empty() {
+            return "sin omitidos".to_string();
+        }
+        let primeros = self
+            .omitted
+            .iter()
+            .take(3)
+            .map(|o| {
+                if o.label.is_empty() {
+                    format!("{}: {}", o.kind, o.reason)
+                } else {
+                    format!("{} '{}': {}", o.kind, o.label, o.reason)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        if self.omitted.len() > 3 {
+            format!(
+                "{} omitidos: {}… y {} más",
+                self.omitted.len(),
+                primeros,
+                self.omitted.len() - 3
+            )
+        } else {
+            format!("{} omitidos: {primeros}", self.omitted.len())
+        }
+    }
+}
+
+/// Job de importación `.ggb` en background — lectura + parse fuera del UI thread.
+/// Pattern `spawn_profile_save` con `sync_channel(1)` + `request_repaint`.
+pub(crate) struct PendingGgbImportJob {
+    pub receiver: Receiver<Result<GgbImportReport, String>>,
+    pub path: PathBuf,
+}
+
+/// Job de exportación `.ggb` en background — serialización + ZIP + escritura
+/// atómica fuera del UI thread. El `String` es el resumen para el toast.
+pub(crate) struct PendingGgbExportJob {
+    pub receiver: Receiver<Result<String, String>>,
+    pub path: PathBuf,
+}
+
+/// ── A8 Recovery de autosave al arranque ──────────────────────────────────
+/// Gap crítico: el sidecar `.autosave` se escribía (`tick_autosave` en
+/// background) pero nunca se ofrecía recuperar (`load_autosave_candidate` /
+/// `should_offer_autosave` existían en core sin llamadas en app; el modal
+/// solo existía en comentarios de `persistence.rs:661-667`).
+/// Piel pura: todo I/O en background thread (spawn + `request_repaint`);
+/// `Ui::` solo lee `recovery_offer` / `recovery_corrupt` ya cargados.
+pub(crate) struct PendingAutosaveRecoveryJob {
+    pub receiver: Receiver<Result<Option<grafito_core::persistence::AutosaveCandidate>, String>>,
+    pub main_path: PathBuf,
+}
+
+/// Oferta de recuperación ya validada (sidecar estrictamente más nuevo).
+/// Vive en memoria tras el job en background; el modal solo la renderiza.
+pub(crate) struct AutosaveRecoveryOffer {
+    pub main_path: PathBuf,
+    pub sidecar_path: PathBuf,
+    pub document: Document,
+    pub main_modified_epoch: Option<u64>,
+    pub sidecar_modified_epoch: u64,
+    pub show_diff: bool,
+}
+
+/// Sidecar candidato pero corrupto: no se puede recuperar, la UI ofrece
+/// descartarlo. `main_path`/`sidecar_path` para el borrado best-effort.
+pub(crate) struct AutosaveRecoveryCorrupt {
+    pub main_path: PathBuf,
+    pub sidecar_path: PathBuf,
+    pub error: String,
+}
+
+// ── A8 tests recovery (solo región arranque/recovery) ────────────────
+// sidecar-nuevo→ofrece, sidecar-viejo→no ofrece, recuperar restaura.
+// Usan `load_autosave_candidate` (core, ya en background en prod) +
+// `accept_recovery_offer` / `recovery_diff_summary` (app, puros).
+#[cfg(test)]
+mod autosave_recovery_tests {
+    use super::*;
+
+    static NEXT_RECOVERY_TEST_ID: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    fn recovery_temp_path(name: &str) -> PathBuf {
+        let id = NEXT_RECOVERY_TEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "grafito_recovery_{name}_{}_{}",
+            std::process::id(),
+            id
+        ))
+    }
+
+    fn recovery_doc_with_points(count: usize) -> Document {
+        let mut doc = Document::new();
+        for index in 0..count {
+            doc.add_point(Point2::new(index as f64, 0.0));
+        }
+        doc
+    }
+
+    /// Fija el mtime sin sleeps: determinista aunque el FS tenga granularidad
+    /// gruesa (el orden "sidecar más nuevo" ya no depende del reloj real).
+    fn set_recovery_mtime(path: &Path, epoch_secs: u64) {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("abrir para fijar mtime");
+        file.set_modified(
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(epoch_secs),
+        )
+        .expect("fijar mtime");
+    }
+
+    fn cleanup_recovery_path(main: &Path) {
+        if let Some(sidecar) = grafito_core::persistence::autosave_sidecar_path(main) {
+            let _ = std::fs::remove_file(sidecar);
+        }
+        let _ = std::fs::remove_file(main);
+    }
+
+    #[test]
+    fn startup_file_arg_ignores_flags_y_vacios() {
+        assert_eq!(GrafitoApp::startup_file_arg_from(&[]), None);
+        assert_eq!(
+            GrafitoApp::startup_file_arg_from(&[
+                "--help".to_string(),
+                "--profile".to_string(),
+                String::new(),
+                "-h".to_string(),
+            ]),
+            None
+        );
+        assert_eq!(
+            GrafitoApp::startup_file_arg_from(&["--profile".to_string(), "nota.json".to_string(),]),
+            Some(PathBuf::from("nota.json"))
+        );
+        // NUL nunca es ruta válida.
+        assert_eq!(
+            GrafitoApp::startup_file_arg_from(&["a\0b.json".to_string()]),
+            None
+        );
+    }
+
+    #[test]
+    fn sidecar_nuevo_ofrece_recuperacion() {
+        let main = recovery_temp_path("nuevo");
+        cleanup_recovery_path(&main);
+        let main_doc = recovery_doc_with_points(2);
+        grafito_core::persistence::write_document_atomic(&main_doc, &main).expect("write main");
+        set_recovery_mtime(&main, 1_000);
+        let sidecar_doc = recovery_doc_with_points(3);
+        let sidecar = grafito_core::persistence::write_autosave_sidecar(&sidecar_doc, &main)
+            .expect("write sidecar");
+        set_recovery_mtime(&sidecar, 2_000);
+        assert!(sidecar.exists());
+
+        let candidate =
+            grafito_core::persistence::load_autosave_candidate(&main).expect("load candidate");
+        let candidate = candidate.expect("sidecar más nuevo debe ofrecerse");
+        assert_eq!(candidate.document.object_count(), 3);
+        assert_eq!(candidate.sidecar_path, sidecar);
+
+        // Nivel app: la oferta alimenta el diff (conteo + fecha).
+        let mut app = super::dummy_grafito_app();
+        app.document = main_doc;
+        app.recovery_offer = Some(AutosaveRecoveryOffer {
+            main_path: candidate.main_path.clone(),
+            sidecar_path: candidate.sidecar_path.clone(),
+            document: candidate.document,
+            main_modified_epoch: candidate.main_modified_epoch,
+            sidecar_modified_epoch: candidate.sidecar_modified_epoch,
+            show_diff: false,
+        });
+        let diff = app.recovery_diff_summary().expect("con oferta hay diff");
+        assert!(diff.contains('3'), "diff muestra autosave: {diff}");
+        assert!(diff.contains('2'), "diff muestra guardado: {diff}");
+
+        cleanup_recovery_path(&main);
+    }
+
+    #[test]
+    fn sidecar_viejo_no_ofrece_recuperacion() {
+        let main = recovery_temp_path("viejo");
+        cleanup_recovery_path(&main);
+        let doc = recovery_doc_with_points(2);
+        grafito_core::persistence::write_document_atomic(&doc, &main).expect("write main");
+        set_recovery_mtime(&main, 1_000);
+        let sidecar =
+            grafito_core::persistence::write_autosave_sidecar(&doc, &main).expect("write sidecar");
+        set_recovery_mtime(&sidecar, 2_000);
+        // Reescribir el main lo deja más nuevo que el sidecar: `>` ya no ofrece.
+        grafito_core::persistence::write_document_atomic(&doc, &main).expect("rewrite main");
+        set_recovery_mtime(&main, 3_000);
+
+        let stale = grafito_core::persistence::load_autosave_candidate(&main).expect("stale loads");
+        assert!(
+            stale.is_none(),
+            "sidecar igual o más viejo no debe ofrecerse"
+        );
+
+        cleanup_recovery_path(&main);
+    }
+
+    #[test]
+    fn recuperar_restaura_el_documento_del_sidecar() {
+        let main = recovery_temp_path("restaura");
+        cleanup_recovery_path(&main);
+        let main_doc = recovery_doc_with_points(2);
+        grafito_core::persistence::write_document_atomic(&main_doc, &main).expect("write main");
+        set_recovery_mtime(&main, 1_000);
+        let sidecar_doc = recovery_doc_with_points(5);
+        let sidecar = grafito_core::persistence::write_autosave_sidecar(&sidecar_doc, &main)
+            .expect("write sidecar");
+        set_recovery_mtime(&sidecar, 2_000);
+
+        let candidate = grafito_core::persistence::load_autosave_candidate(&main)
+            .expect("load")
+            .expect("debe haber candidato");
+        assert_eq!(candidate.document.object_count(), 5);
+
+        let mut app = super::dummy_grafito_app();
+        app.document = main_doc;
+        assert_eq!(app.document.object_count(), 2);
+        app.recovery_offer = Some(AutosaveRecoveryOffer {
+            main_path: candidate.main_path.clone(),
+            sidecar_path: candidate.sidecar_path.clone(),
+            document: candidate.document,
+            main_modified_epoch: candidate.main_modified_epoch,
+            sidecar_modified_epoch: candidate.sidecar_modified_epoch,
+            show_diff: false,
+        });
+
+        assert!(app.accept_recovery_offer(), "aceptar debe restaurar");
+        assert_eq!(
+            app.document.object_count(),
+            5,
+            "el documento debe ser el del sidecar"
+        );
+        assert!(app.recovery_offer.is_none(), "la oferta se consume");
+        assert!(
+            !sidecar.exists(),
+            "tras recuperar se borra el sidecar best-effort"
+        );
+
+        cleanup_recovery_path(&main);
+    }
+}
+
+/// Persiste la config con los campos que se editan en otra ruta (plugins y
+/// onboarding) leídos del archivo: lo usa el worker de `save_app_config`.
+/// I/O pura, sin estado de UI.
+fn save_config_merging(mut requested: AppConfig) {
+    let existing = load_config();
+    requested.onboarding_completed = existing.onboarding_completed;
+    requested.enabled_plugins = existing.enabled_plugins;
+    requested.disabled_plugins = existing.disabled_plugins;
+    save_config(&requested);
+}
+
+/// Spawns document save in background — evita bloquear UI thread (60fps).
+/// Pattern `spawn_profile_save` (assistant.rs:41-51) con `sync_channel(1)` + `request_repaint`.
+/// Devuelve `None` si el OS rechaza el thread (el caller degrada a `SaveAttempt::Failed`).
+pub(crate) fn spawn_document_save(
+    document: Document,
+    path: PathBuf,
+    ctx: &egui::Context,
+) -> Option<Receiver<Result<PathBuf, String>>> {
+    let ctx = egui::Context::clone(ctx);
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("document-save".into())
+        .spawn(move || {
+            let res = write_document_to_path(&document, &path).map(|_| path.clone());
+            let _ = tx.send(res);
+            ctx.request_repaint();
+        })
+        .ok()?;
+    Some(rx)
+}
+
+/// Spawns document open in background — evita bloquear UI thread.
+pub(crate) fn spawn_document_open(
+    path: PathBuf,
+    ctx: &egui::Context,
+) -> Receiver<Result<(PathBuf, Document), String>> {
+    let ctx = egui::Context::clone(ctx);
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let _ = std::thread::Builder::new()
+        .name("document-open".into())
+        .spawn(move || {
+            let res = load_document_candidate(&path).map(|doc| (path.clone(), doc));
+            let _ = tx.send(res);
+            ctx.request_repaint();
+        });
+    rx
+}
+
+/// Spawns export en background — evita bloquear UI thread en `export_with_dialog`.
+/// Envía `(path, summary)` para preservar el UX del path sincrónico en el poll.
+pub(crate) fn spawn_export(
+    document: Document,
+    path: PathBuf,
+    format: crate::export::ExportFormat,
+    ctx: &egui::Context,
+) -> Receiver<Result<(PathBuf, String), String>> {
+    let ctx = egui::Context::clone(ctx);
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let _ = std::thread::Builder::new()
+        .name("export".into())
+        .spawn(move || {
+            let res: Result<crate::export::ExportReport, String> = match format {
+                crate::export::ExportFormat::Svg => {
+                    crate::export::export_svg(&document, &path).map_err(|e| e.to_string())
+                }
+                crate::export::ExportFormat::Png => {
+                    crate::export::export_png(&document, &path).map_err(|e| e.to_string())
+                }
+                crate::export::ExportFormat::Tikz => {
+                    crate::export::export_tikz(&document, &path).map_err(|e| e.to_string())
+                }
+            };
+            let _ = tx.send(res.map(|report| (path.clone(), report.summary())));
+            ctx.request_repaint();
+        });
+    rx
+}
+
+/// Spawns importación CSV/TSV en background — lectura ≤2MB fuera del UI thread.
+/// El commit al documento ocurre en `poll_background_jobs` (mismo hilo que el sync).
+pub(crate) fn spawn_csv_import(
+    path: PathBuf,
+    ctx: &egui::Context,
+) -> Receiver<Result<crate::sheet_layout::LocalXYTable, String>> {
+    let ctx = egui::Context::clone(ctx);
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let _ = std::thread::Builder::new()
+        .name("csv-import".into())
+        .spawn(move || {
+            let res = crate::panels::load_local_xy_table(&path);
+            let _ = tx.send(res);
+            ctx.request_repaint();
+        });
+    rx
+}
+
+/// Spawns escritura de texto en background (export LaTeX del protocolo).
+pub(crate) fn spawn_text_write(
+    path: PathBuf,
+    text: String,
+    ctx: &egui::Context,
+) -> Receiver<Result<PathBuf, String>> {
+    let ctx = egui::Context::clone(ctx);
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let _ = std::thread::Builder::new()
+        .name("text-write".into())
+        .spawn(move || {
+            let res = crate::export::write_text_atomic(&path, &text)
+                .map(|_| path.clone())
+                .map_err(|e| e.to_string());
+            let _ = tx.send(res);
+            ctx.request_repaint();
+        });
+    rx
+}
+
+/// Fecha civil UTC (Hinnant `civil_from_days`) desde epoch; sin chrono.
+///
+/// (año, mes, día, hora, minuto) — para nombres de export al vault.
+pub(crate) fn fecha_civil_utc() -> (i64, u32, u32, u32, u32) {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = (secs / 86_400) as i64;
+    let secs_of_day = (secs % 86_400) as u32;
+    let hh = secs_of_day / 3600;
+    let mm = (secs_of_day % 3600) / 60;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y_base = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = y_base + i64::from(m <= 2);
+    (y, m, d, hh, mm)
+}
+
+/// Worker de escritura de la lección al vault: crea la carpeta destino
+/// (`create_dir_all` del root, dentro del worker, jamás en Ui::) y luego
+/// escribe atómico (`write_text_atomic`, paridad `spawn_text_write`).
+pub(crate) fn spawn_lesson_write(
+    path: PathBuf,
+    text: String,
+    ctx: &egui::Context,
+) -> Receiver<Result<PathBuf, String>> {
+    let ctx = egui::Context::clone(ctx);
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let _ = std::thread::Builder::new()
+        .name("lesson-vault-write".into())
+        .spawn(move || {
+            let res = std::fs::create_dir_all(path.parent().unwrap_or(Path::new(".")))
+                .and_then(|_| crate::export::write_text_atomic(&path, &text))
+                .map(|_| path.clone())
+                .map_err(|e| e.to_string());
+            let _ = tx.send(res);
+            ctx.request_repaint();
+        });
+    rx
+}
+/// Spawns guardado de la pizarra como `.svg` en background (S5) — mismo
+/// contrato que `spawn_export` (canal `Result<(PathBuf, String), String>`
+/// apto para `PendingExportJob`; el poll muestra el summary tal cual).
+/// Cero I/O en Ui:: — el diálogo rfd queda en el UI thread y el write va
+/// al worker, igual que `export_with_dialog`.
+pub(crate) fn spawn_whiteboard_svg_write(
+    svg: String,
+    path: PathBuf,
+    ctx: &egui::Context,
+) -> Receiver<Result<(PathBuf, String), String>> {
+    let ctx = egui::Context::clone(ctx);
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let _ = std::thread::Builder::new()
+        .name("whiteboard-svg".into())
+        .spawn(move || {
+            let res = crate::export::write_text_atomic(&path, &svg)
+                .map(|_| {
+                    let summary = format!("Pizarra guardada como SVG -> {}", path.display());
+                    (path.clone(), summary)
+                })
+                .map_err(|e| e.to_string());
+            let _ = tx.send(res);
+            ctx.request_repaint();
+        });
+    rx
+}
+const TRIG_GRAPH_LABEL: &str = "TrigGraph";
+const TRIG_VALUE_LABEL: &str = "TrigValue";
+const VIEW_SETTLE_DURATION: Duration = Duration::from_millis(150);
+/// Arranque sin overlay (estilo VSCode/Zed): primera frame instantánea, los
+/// gates calientan en background sin bloquear (`new` spawnea el `Renderer`
+/// wgpu; `update` abre el doc CLI y carga plugins en workers).
+///
+/// Costos medidos en este box 2026-09-26 (release tests, `cargo test -p
+/// grafito-app --test __gate_measure_tmp`, tmpfs; ver detalle abajo):
+/// - `Document::new` + view 1280×720: ~21 µs (despreciable).
+/// - Doc CLI (`write_document_atomic` + `read_document_file`, JSON):
+///   vacío (1 KiB) ~164 µs write / ~125 µs read; 100 objs (61 KiB) ~1 ms;
+///   1000 objs (606 KiB) ~15 ms write / ~11 ms read. Cota `MAX_OBJECT_COUNT`
+///   5000 vía Python: ~5 ms write / ~6 ms read (298 KiB). Siempre en worker
+///   (`spawn_document_open` + `poll_background_jobs`), jamás bloquea el paint.
+/// - Plugins (`PluginRegistry::load_many`, 1 dir vacío, 0 plugins): ~23 µs;
+///   `scandir` de los 3 dirs reales vacíos ~0.02 ms c/u. Con manifiestos suma
+///   ~0.1-0.5 ms por manifiesto (lectura acotada + parse); sigue en worker
+///   (`spawn_plugin_load`, `assistant.rs`).
+/// - Escena 2D: fallback CPU inmediato (`draw_grid`/`draw_axes`); el prepare
+///   GPU llega un frame después del renderer. Tessellation egui 1-2 ms/frame
+///   con 10K vértices (presupuesto en el header de este archivo).
+/// - GPU init (`Renderer::new`, compilación de shaders wgpu): único gate
+///   potencialmente lento (~50-300 ms típico en desktop); corre en background
+///   thread (`new`, `weak_renderer` + `request_repaint`) y su fin se loguea
+///   como "Background shader compilation finished". Nunca bloquea el primer
+///   frame.
+/// - Branding: el logo 256×256 (18 KiB, read ~0.05 ms, decode `image` ~2-5 ms)
+///   y la fuente Inter (880 KiB, read ~0.5 ms) NO bloquean: el logo vive solo
+///   en About/Onboarding bajo demanda, la fuente se instala una vez en `new`.
+///
+/// Política: si algún gate sigue pendiente pasados `STARTUP_SLOW_HINT_MS`, se
+/// muestra una pill sutil no bloqueante (spinner + fase, esquina inferior
+/// derecha, `interactable(false)`); sin conteos, sin % falso, sin "Listo".
+/// Cuando todo resuelve, la pill desaparece sola (se deja de dibujar).
+const MULTIDIMENSIONAL_MOTION_REPAINT_INTERVAL: Duration = Duration::from_millis(33);
+pub(crate) const DEFAULT_3D_ORBIT_RADIANS_PER_SECOND: f32 = 0.3;
+pub(crate) const DEFAULT_4D_ROTATION_RADIANS_PER_SECOND: f64 = 0.55;
+pub(crate) const MIN_MULTIDIMENSIONAL_MOTION_SPEED: f32 = 0.25;
+pub(crate) const DEFAULT_MULTIDIMENSIONAL_MOTION_SPEED: f32 = 1.0;
+pub(crate) const MAX_MULTIDIMENSIONAL_MOTION_SPEED: f32 = 2.0;
+/// Ola 2.7: tope de guiones `OnUpdate` ejecutados por commit mutante.
+pub(crate) const MAX_ON_UPDATE_SCRIPTS_PER_COMMIT: usize = 16;
+
+/// Ola 2.7: comandos que solo guardan guiones; no disparan `OnUpdate` al
+/// almacenarse (GeoGebra tampoco los ejecuta al definir).
+pub(crate) fn is_script_store_command(cmd: &str) -> bool {
+    let head = cmd
+        .trim()
+        .split(['[', '('])
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    matches!(head.as_str(), "onload" | "onupdate" | "onclick" | "script")
+}
+
+// ── F17 Repaint coalesce + Ola 2 presupuesto único ──────────────────────────
+// El scheduler unificado de `GrafitoApp::update` (ver `update`) es la única
+// fuente de `ctx.request_repaint_after` para el estado global (animating /
+// warmup / busy). Los widgets periféricos NO deben llamar
+// `ctx.request_repaint_after` directamente: deben pedir vía
+// `GrafitoApp::request_repaint_budget` para que `RepaintBudget` acumule la
+// necesidad mínima del frame y el scheduler la aplique una sola vez al final.
+//
+// Presupuesto único de relojes (Ola 2) — todos coalescen al mínimo por frame:
+//   scheduler base              16 ms (`needs_repaint_delay`, 60 Hz interacción)
+//   motion multidimensional     33 ms (`MULTIDIMENSIONAL_MOTION_REPAINT_INTERVAL`)
+//   settle post-interacción    150 ms (`VIEW_SETTLE_DURATION`, histéresis)
+//   pulso "Generando anim…"     48 ms (fallback local `grafito-ui`, subsumido
+//                               por el scheduler cuando `assistant.is_pending`)
+//   playback media card         40 ms (fallback local `grafito-ui`, idem)
+// Los one-shot de respuesta a input (`clicked`, scroll, consumo de tecla)
+// usan `request_repaint_budget(Duration::ZERO)` = inmediato por la misma ruta
+// (ver `RepaintBudget::apply`); quedan 3 inmediatos directos sin handle al
+// presupuesto (`teaching_ui` fn libre ×2, `WhiteboardSession` ×1), todos
+// transitorios de un frame y documentados in situ.
+//
+// Inventario F17 — fuentes de wake extra (todas coalescidas por el presupuesto):
+//   1. whiteboard_ui.rs:482   — 16ms  pointer/touch down (canvas pizarra)
+//   2. whiteboard_ui.rs:1188  — 16ms busy / 100ms idle (scheduler pizarra)
+//   3. teaching_ui.rs:1021    — 80ms  playback animación nativa (12fps)
+//   4. teaching_ui.rs:1057    — 48ms  pulso "Generando animación"
+//   5. grafito-ui/animation.rs:232  — 50ms orb de pensamiento (fallback standalone)
+//   6. grafito-ui/assistant.rs:3748 — 48ms pulso "Generando animación…"
+//   7. grafito-ui/assistant.rs:3800 — 40ms playback media card (GIF-like)
+//   8. app.rs:4176            — 33ms motion multidimensional (redundante con scheduler)
+// Las fuentes 5-7 viven en `grafito-ui` (capa Piel, DAG `ui → app`) y no pueden
+// alcanzar `GrafitoApp`; se mantienen como fallback local con constantes
+// nombradas y quedan subsumidas por el scheduler cuando `assistant.is_pending`
+// (el scheduler ya repinta a 16ms en ese caso).
+// TODO(F17): si `whiteboard` idle 100ms solo alimenta `ctx.animate_bool` de la
+// paleta, egui ya repinta automáticamente durante animaciones → se puede quitar.
+
+/// Presupuesto de repintado coalescido por frame (F17).
+///
+/// Acumula la necesidad mínima de repintado de los widgets del frame y la
+/// aplica una sola vez al final (`apply`). El intervalo más corto gana; el
+/// resto se descarta. egui ya coalesce múltiples `request_repaint_after` al
+/// mínimo, pero centralizar la política evita intervalos arbitrarios
+/// dispersos (16/40/48/50/80/100ms) y deja una única ruta documentada:
+/// `GrafitoApp::request_repaint_budget`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RepaintBudget {
+    needed: Option<Duration>,
+}
+
+impl RepaintBudget {
+    /// Pide repintado periódico con `delay`; conserva el mínimo acumulado.
+    pub(crate) fn request(&mut self, delay: Duration) {
+        self.needed = Some(match self.needed {
+            Some(current) => current.min(delay),
+            None => delay,
+        });
+    }
+
+    /// Aplica el presupuesto acumulado a `ctx` (una sola llamada por frame).
+    pub(crate) fn apply(self, ctx: &egui::Context) {
+        if let Some(delay) = self.needed {
+            if delay.is_zero() {
+                ctx.request_repaint();
+            } else {
+                ctx.request_repaint_after(delay);
+            }
+        }
+    }
+}
+
+// ── Tessellation egui (rayon) ─────────────────────────────────────────────
+// `egui` trae feature `rayon` en el workspace (`Cargo.toml` raíz): epaint
+// paraleliza el teselado cuando `parallel_tessellation` es `true` (default
+// `true` en 0.29, se fija explícito para pinnear el presupuesto 1-2 ms/frame
+// con 10K vértices). `coarse_tessellation_culling` queda en default (`true`)
+// y `round_text_to_pixels` en `true` (texto nítido, sin cambio visual).
+// `feathering` se mantiene `true` global: desactivarlo cambia el AA de todos
+// los strokes (cambio visual); las series densas ya van diezmadas a ~1px
+// (`decimate_run_to_pixels` en `render_2d.rs`) y en batch (`Shape::Vec`), así
+// que el costo del feathering ahí es menor que el riesgo visual de apagarlo.
+
+/// Fija las opciones de teselado del contexto egui (llamar una vez en `new`).
+pub(crate) fn configure_egui_tessellation(ctx: &egui::Context) {
+    ctx.tessellation_options_mut(|opts| {
+        opts.parallel_tessellation = true;
+        opts.coarse_tessellation_culling = true;
+        opts.round_text_to_pixels = true;
+    });
+}
+
+#[cfg(test)]
+mod tessellation_config_tests {
+    use super::configure_egui_tessellation;
+
+    #[test]
+    fn fija_paralelo_cull_y_texto_nitido_sin_tocar_feathering() {
+        let ctx = egui::Context::default();
+        configure_egui_tessellation(&ctx);
+        let (parallel, coarse, round_text, feathering) = ctx.tessellation_options(|opts| {
+            (
+                opts.parallel_tessellation,
+                opts.coarse_tessellation_culling,
+                opts.round_text_to_pixels,
+                opts.feathering,
+            )
+        });
+        assert!(parallel, "rayon paraleliza el teselado");
+        assert!(coarse, "cull grueso en default");
+        assert!(round_text, "texto alineado a píxel");
+        assert!(
+            feathering,
+            "feathering global intacto (sin cambio visual; densas ya diezmadas)"
+        );
+    }
+}
+
+// ── F5 Scandinavian progressive disclosure — toolbar filtrado por nivel ──
+// Sin laberinto: Primary (level_value `0..=PRIMARY_MAX`=`4`) → 5 grupos compactos
+// [Move, Point, Line, Circle, Polygon]; Secondary (`5..=10`) → 8 (añade Pencil, Measure, Analysis);
+// University (`11+`) → todos (Constraint, Boolean, Advanced, Dynamics, ThreeD…).
+// Helper ligero vía `grafito_ui::toolbar::toolbar_groups_for_level_value(level_value)` o
+// tipado `toolbar_groups_for_level(PedagogicalLevel)` sin romper API existente.
+// Usa constantes `TOOLBAR_LEVEL_PRIMARY_MAX`/`SECONDARY_MAX` para evitar magia 4/10.
+// Uso: `toolbar_groups_for_level_filtered(perspective.layout().visible_tool_groups, self.profile.level)`
+// Si `level_value <= PRIMARY_MAX` fuerza compact set aunque la perspectiva pida más.
+
+/// Filtra los grupos visibles de la perspectiva por nivel pedagógico (progressive disclosure).
+/// Usa `TOOLBAR_LEVEL_PRIMARY_MAX` (4) y `SECONDARY_MAX` (10) vía `filter_groups_by_level`.
+/// Intersecta con `perspective_groups` para respetar la perspectiva y no añadir grupos extra.
+pub(crate) fn toolbar_groups_for_level_filtered(
+    perspective_groups: &[grafito_ui::toolbar::ToolGroupId],
+    level_value: u32,
+) -> Vec<grafito_ui::toolbar::ToolGroupId> {
+    grafito_ui::toolbar::filter_groups_by_level(perspective_groups, level_value)
+}
+
+/// Variante tipada que acepta `PedagogicalLevel` directamente (convierte vía `level_value()`).
+pub(crate) fn toolbar_groups_for_pedagogical_level(
+    perspective_groups: &[grafito_ui::toolbar::ToolGroupId],
+    level: grafito_pedagogy::PedagogicalLevel,
+) -> Vec<grafito_ui::toolbar::ToolGroupId> {
+    grafito_ui::toolbar::filter_groups_by_pedagogical_level(perspective_groups, level)
+}
+
+/// The trigonometric explorer draws a 2D canvas overlay, so it is unavailable in 3D.
+pub(crate) fn trig_animation_supported(view: ViewMode) -> bool {
+    view != ViewMode::D3
+}
+
+fn canvas_resize_preview_active(resized_at: Option<Instant>, now: Instant) -> bool {
+    resized_at
+        .is_some_and(|resized_at| now.saturating_duration_since(resized_at) <= VIEW_SETTLE_DURATION)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CtrlYShortcut {
+    Redo,
+    YIntercept,
+}
+
+pub(crate) const fn ctrl_y_shortcut(shift: bool) -> CtrlYShortcut {
+    if shift {
+        CtrlYShortcut::YIntercept
+    } else {
+        CtrlYShortcut::Redo
+    }
+}
+
+// Re-export lifecycle canonical types to avoid duplication. `app.rs` retains
+// `pub(crate)` visibility for `crate::app::DocumentLifecycle` etc. so tests
+// and input modules keep working, but the single source of truth lives in
+// `crate::lifecycle`. Dirty-check semantics ignore `view.screen_size`.
+pub(crate) use crate::lifecycle::{
+    command_mutated_document, documents_semantically_differ, load_document_candidate,
+    try_stage_numeric_constraint, write_document_to_path, DeferredFileActions, DeferredFileIntent,
+    DocumentAction, DocumentActionRequest, DocumentLifecycle, FileCommand, SaveMode,
+    UnsavedDecision, UnsavedResolution,
+};
+// `SaveAttempt` is an internal helper owned by `lifecycle`.
+use crate::lifecycle::SaveAttempt;
+
+pub(crate) fn apply_command_outcome(
+    outcome: &grafito_command::commands::CommandOutcome,
+    cas_result: &mut String,
+    cas_history: &mut VecDeque<String>,
+    toasts: &mut grafito_ui::toast::ToastManager,
+    time: f64,
+    input_was: &str,
+) {
+    match outcome {
+        grafito_command::commands::CommandOutcome::Ok => {}
+        grafito_command::commands::CommandOutcome::Message(message) => {
+            let feedback = if message.is_empty() {
+                "Comando completado"
+            } else {
+                message
+            };
+            *cas_result = feedback.to_string();
+            if cas_history.len() > 20 {
+                cas_history.pop_front();
+            }
+            cas_history.push_back(format!("> {}\n  {}", input_was, feedback));
+            toasts.push(
+                wrap_toast_message(feedback, 52),
+                grafito_ui::toast::ToastKind::Info,
+                time,
+            );
+        }
+        grafito_command::commands::CommandOutcome::Error(message) => {
+            *cas_result = message.clone();
+            if cas_history.len() > 20 {
+                cas_history.pop_front();
+            }
+            cas_history.push_back(format!("> {}\n  Error: {}", input_was, message));
+            toasts.push(
+                wrap_toast_message(&format!("Error: {}", message), 52),
+                grafito_ui::toast::ToastKind::Error,
+                time,
+            );
+        }
+    }
+}
+
+pub(crate) fn apply_export_outcome(
+    outcome: Result<crate::export::ExportReport, crate::export::ExportError>,
+    cas_result: &mut String,
+    toasts: &mut grafito_ui::toast::ToastManager,
+    time: f64,
+) {
+    let (message, kind) = match outcome {
+        Ok(report) => (report.summary(), grafito_ui::toast::ToastKind::Success),
+        Err(error) => (error.to_string(), grafito_ui::toast::ToastKind::Error),
+    };
+    *cas_result = message.clone();
+    toasts.push(wrap_toast_message(&message, 52), kind, time);
+}
+
+pub(crate) fn clear_submitted_input_on_success(
+    input_text: &mut String,
+    outcome: &grafito_command::commands::CommandOutcome,
+) -> bool {
+    if matches!(outcome, grafito_command::commands::CommandOutcome::Error(_)) {
+        return false;
+    }
+    input_text.clear();
+    true
+}
+
+pub(crate) fn sidebar_uses_cas_worksheet(sidebar_tab: usize) -> bool {
+    sidebar_tab == crate::LeftPanelContent::Cas.default_sidebar_tab()
+}
+
+pub(crate) fn renderer_is_ready<T>(renderer: Option<&Arc<RwLock<Option<T>>>>) -> bool {
+    renderer
+        .and_then(|renderer| renderer.try_write().ok().map(|lock| lock.is_some()))
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+pub(crate) fn should_use_gpu_2d(
+    use_gpu: bool,
+    renderer_ready: bool,
+    canvas_size: egui::Vec2,
+) -> bool {
+    use_gpu && renderer_ready && canvas_size.x > 0.0 && canvas_size.y > 0.0
+}
+
+pub(crate) const fn should_use_gpu_3d(
+    use_gpu: bool,
+    renderer_ready: bool,
+    view_is_changing: bool,
+) -> bool {
+    use_gpu && renderer_ready && !view_is_changing
+}
+
+pub(crate) const fn should_prepare_gpu_3d(
+    use_gpu: bool,
+    renderer_ready: bool,
+    view_is_changing: bool,
+    automatic_motion_active: bool,
+    retained_typed_four_d_phase: bool,
+    readiness: crate::canvas::Scene3DReadiness,
+) -> bool {
+    if !should_use_gpu_3d(use_gpu, renderer_ready, view_is_changing)
+        || automatic_motion_active
+        || retained_typed_four_d_phase
+    {
+        return false;
+    }
+    match readiness {
+        crate::canvas::Scene3DReadiness::CpuOnly => false,
+        crate::canvas::Scene3DReadiness::Pending | crate::canvas::Scene3DReadiness::GpuReady => {
+            true
+        }
+    }
+}
+
+pub(crate) const fn should_repaint_3d_warmup(readiness: crate::canvas::Scene3DReadiness) -> bool {
+    matches!(readiness, crate::canvas::Scene3DReadiness::Pending)
+}
+
+pub(crate) fn should_animate_multidimensional_scene(
+    view: ViewMode,
+    motion_enabled: bool,
+    has_visible_3d_object: bool,
+) -> bool {
+    view == ViewMode::D3 && motion_enabled && has_visible_3d_object
+}
+
+pub(crate) fn is_typed_four_d_projection(object: &GeoObject) -> bool {
+    match object {
+        GeoObject::RegularPolychoron4D(_) => true,
+        GeoObject::RegularPolytopeND(polytope) => polytope.dimension == 4,
+        _ => false,
+    }
+}
+
+pub(crate) fn typed_four_d_motion_phase(four_d_phase: f64) -> Option<f64> {
+    four_d_phase.is_finite().then_some(four_d_phase)
+}
+
+pub(crate) fn pause_default_multidimensional_motion(motion_enabled: &mut bool) -> bool {
+    let changed = *motion_enabled;
+    *motion_enabled = false;
+    changed
+}
+
+pub(crate) fn reset_3d_view_and_pause_motion(
+    camera: &mut Camera3D,
+    canvas_width: f32,
+    canvas_height: f32,
+    motion_enabled: &mut bool,
+) {
+    pause_default_multidimensional_motion(motion_enabled);
+    *camera = Camera3D::new(canvas_width / canvas_height.max(1.0));
+}
+
+pub(crate) fn toggle_default_multidimensional_motion(motion_enabled: &mut bool) -> bool {
+    *motion_enabled = !*motion_enabled;
+    *motion_enabled
+}
+
+pub(crate) fn normalize_multidimensional_motion_speed(speed: f32) -> f32 {
+    if speed.is_finite() {
+        speed.clamp(
+            MIN_MULTIDIMENSIONAL_MOTION_SPEED,
+            MAX_MULTIDIMENSIONAL_MOTION_SPEED,
+        )
+    } else {
+        DEFAULT_MULTIDIMENSIONAL_MOTION_SPEED
+    }
+}
+
+/// Órbita de cámara en perspectiva para tests: el advance loop productivo usa
+/// `canvas::tick_view3d_ambient` (misma matemática, con vista); este wrapper
+/// solo existe para pinear el comportamiento histórico en tests.
+#[cfg(test)]
+pub(crate) fn advance_default_camera_orbit_at_speed(
+    camera: &mut Camera3D,
+    dt: f64,
+    speed: f32,
+) -> bool {
+    if !dt.is_finite() || dt <= 0.0 {
+        return false;
+    }
+    let speed = normalize_multidimensional_motion_speed(speed);
+    crate::canvas::tick_view3d_ambient(
+        crate::canvas::View3D::Perspective,
+        camera,
+        dt.min(0.1) as f32,
+        DEFAULT_3D_ORBIT_RADIANS_PER_SECOND * speed,
+    )
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct TransientRenderState {
+    homotopy_time: f64,
+    four_d_phase: f64,
+    revision: u64,
+}
+
+impl TransientRenderState {
+    pub(crate) fn advance_homotopy(&mut self, dt: f64) -> bool {
+        if !dt.is_finite() || dt <= 0.0 {
+            return false;
+        }
+        let next = self.homotopy_time + dt;
+        if !next.is_finite() {
+            return false;
+        }
+        self.homotopy_time = next;
+        self.revision = self.revision.wrapping_add(1);
+        true
+    }
+
+    pub(crate) fn homotopy_time(self) -> f64 {
+        self.homotopy_time
+    }
+
+    pub(crate) fn advance_four_d_phase(&mut self, delta: f64) -> bool {
+        if !delta.is_finite() || delta <= 0.0 {
+            return false;
+        }
+        self.four_d_phase = (self.four_d_phase + delta).rem_euclid(std::f64::consts::TAU);
+        true
+    }
+
+    pub(crate) fn four_d_phase(self) -> f64 {
+        self.four_d_phase
+    }
+
+    pub(crate) fn revision(self) -> u64 {
+        self.revision
+    }
+}
+
+/// Refreshes render state after direct panel edits that bypass Document setters.
+pub(crate) fn refresh_unversioned_document_change(
+    before: &Document,
+    document: &mut Document,
+) -> bool {
+    refresh_direct_document_change(document, before.version)
+}
+
+/// Actualiza el estado de render después de una mutación directa que pudo no
+/// haber actualizado la versión del documento.
+pub(crate) fn refresh_direct_document_change(document: &mut Document, version_before: u64) -> bool {
+    if document.version == version_before {
+        document.bump_version();
+    }
+
+    document.invalidate_all_caches();
+    true
+}
+
+pub(crate) fn is_free_point(document: &Document, id: ObjectId) -> bool {
+    document.is_free_object(&id) && matches!(document.get_object(id), Some(GeoObject::Point(_)))
+}
+
+/// Captures the object under the pointer at Select-drag start. The input loop
+/// keeps this result for the whole gesture instead of consulting selection
+/// again after the pointer has moved.
+pub(crate) fn captured_select_drag_object(
+    document: &mut Document,
+    world: Point2,
+    tolerance: f64,
+) -> Option<ObjectId> {
+    document.pick_object(world, tolerance)
+}
+
+pub(crate) fn free_point_position_differs(
+    document: &Document,
+    id: ObjectId,
+    new_pos: Point2,
+) -> bool {
+    is_free_point(document, id)
+        && matches!(
+            document.get_object(id),
+            Some(GeoObject::Point(point))
+                if point.position.x != new_pos.x || point.position.y != new_pos.y
+        )
+}
+
+/// W-B: snapshot único por gesto de arrastre. Clona `before` sólo en el
+/// primer frame que realmente mueve el punto; los frames siguientes del mismo
+/// gesto devuelven `None`, así que un gesto completo cuesta exactamente un
+/// undo (el llamador guarda el `Some` con `save_snapshot`; al soltar sólo se
+/// limpian los flags). I/O cero: un `Document::clone` en memoria por gesto,
+/// nunca por frame.
+pub(crate) fn capture_point_drag_snapshot(
+    document: &Document,
+    id: ObjectId,
+    new_pos: Point2,
+    already_mutated: bool,
+) -> Option<Document> {
+    (!already_mutated && free_point_position_differs(document, id, new_pos))
+        .then(|| document.clone())
+}
+
+/// Delegado fino a `Document::estimated_bytes()` (`max(object_count*200KiB, json_len, 8KiB)`).
+/// Mantiene compatibilidad con call-sites heredados; el presupuesto real vive en `Document`.
+/// `DocumentController` (controllers.rs) mantiene `undo_total_bytes` como running
+/// counter O(1) — este shim sólo se usa en `push_history_snapshot` (GrafitoApp).
+fn document_bytes_approx(doc: &Document) -> usize {
+    doc.estimated_bytes()
+}
+
+/// Peso estimado de un `ChangeSet` de redo (`before+after`, `saturating_add`).
+///
+/// R1: seam testeado (`tests.rs::redo_acotado_en_cantidad_y_bytes`); el dueño
+/// prod es `DocumentController::redo_total_bytes` (controllers.rs) y
+/// `GrafitoApp::undo` delega ahí. Se conserva la fn libre para no cambiar
+/// aserciones pineadas.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn redo_changeset_bytes(changes: &ChangeSet) -> usize {
+    changes
+        .before
+        .estimated_bytes()
+        .saturating_add(changes.after.estimated_bytes())
+}
+
+/// Evicción de redo por `MAX_UNDO` (50) y `MAX_UNDO_BYTES` (50 MiB) con
+/// `pop_front` O(1) — espejo de `DocumentController::enforce_redo_budgets`
+/// (controllers.rs). Scan O(n≤50) solo en `undo()` (acción de usuario, no por
+/// frame). Guarda ≥1 entrada, igual que undo.
+///
+/// R1: ver `redo_changeset_bytes` (seam testeado, dueño prod el controller).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn enforce_redo_budgets(redo_stack: &mut VecDeque<ChangeSet>) {
+    while redo_stack.len() > MAX_UNDO {
+        if redo_stack.pop_front().is_none() {
+            break;
+        }
+    }
+    while redo_stack.len() > 1 {
+        let total: usize = redo_stack
+            .iter()
+            .map(redo_changeset_bytes)
+            .fold(0usize, |a, b| a.saturating_add(b));
+        if total <= MAX_UNDO_BYTES {
+            break;
+        }
+        if redo_stack.pop_front().is_none() {
+            break;
+        }
+    }
+}
+
+/// Enforce budgets O(1) con running counter — espejo de `DocumentController::enforce_budgets` (controllers.rs:173-201).
+/// Evicción por `MAX_UNDO` (50) y `MAX_UNDO_BYTES` (50 MiB) con `pop_front` O(1) y `saturating_sub`.
+fn enforce_undo_budgets(undo_stack: &mut VecDeque<Document>, total_bytes: &mut usize) {
+    while undo_stack.len() > MAX_UNDO {
+        if let Some(front) = undo_stack.pop_front() {
+            *total_bytes = total_bytes.saturating_sub(front.estimated_bytes());
+        } else {
+            break;
+        }
+    }
+    while *total_bytes > MAX_UNDO_BYTES && undo_stack.len() > 1 {
+        if let Some(front) = undo_stack.pop_front() {
+            *total_bytes = total_bytes.saturating_sub(front.estimated_bytes());
+        } else {
+            break;
+        }
+    }
+    debug_assert!(
+        *total_bytes
+            <= undo_stack
+                .iter()
+                .map(|d| d.estimated_bytes())
+                .fold(0usize, |a, b| a.saturating_add(b)),
+        "running counter must not exceed recomputed sum"
+    );
+}
+
+/// Inserta snapshot con contador running O(1) si se provee, o scan O(n≤50) fallback para call-sites sin contador.
+/// `GrafitoApp` usa `Some(&mut self.undo_total_bytes)` para O(1); tests y free functions legacy usan `None` y escanean.
+fn push_history_snapshot_with_counter(
+    undo_stack: &mut VecDeque<Document>,
+    redo_stack: &mut VecDeque<ChangeSet>,
+    snapshot: Document,
+    undo_total_bytes: Option<&mut usize>,
+) {
+    if let Some(total) = undo_total_bytes {
+        let bytes = snapshot.estimated_bytes();
+        undo_stack.push_back(snapshot);
+        redo_stack.clear();
+        *total = total.saturating_add(bytes);
+        enforce_undo_budgets(undo_stack, total);
+    } else {
+        // Fallback O(n≤50) para call-sites sin contador (tests, legacy)
+        undo_stack.push_back(snapshot);
+        redo_stack.clear();
+        while undo_stack.len() > MAX_UNDO {
+            undo_stack.pop_front();
+        }
+        let mut total_bytes: usize = undo_stack
+            .iter()
+            .map(document_bytes_approx)
+            .fold(0usize, |acc, bytes| acc.saturating_add(bytes));
+        while total_bytes > MAX_UNDO_BYTES && undo_stack.len() > 1 {
+            if let Some(front) = undo_stack.pop_front() {
+                total_bytes = total_bytes.saturating_sub(document_bytes_approx(&front));
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+/// Wrapper legacy — mantiene compatibilidad con call-sites externos sin contador (input.rs, panels.rs, tests).
+/// Internamente delega a `push_history_snapshot_with_counter` con `None` (scan O(n≤50)).
+fn push_history_snapshot(
+    undo_stack: &mut VecDeque<Document>,
+    redo_stack: &mut VecDeque<ChangeSet>,
+    snapshot: Document,
+) {
+    push_history_snapshot_with_counter(undo_stack, redo_stack, snapshot, None);
+}
+
+/// Captura el estado previo de un panel sólo cuando una interacción puede
+/// modificar el documento, evitando clonar y serializar durante repaints idle.
+pub(crate) struct DeferredPanelSnapshot {
+    before: Option<Document>,
+    undo_depth: usize,
+    requires_semantic_comparison: bool,
+}
+
+impl DeferredPanelSnapshot {
+    pub(crate) const fn new(undo_depth: usize) -> Self {
+        Self {
+            before: None,
+            undo_depth,
+            requires_semantic_comparison: false,
+        }
+    }
+
+    pub(crate) fn capture(&mut self, document: &Document) {
+        if self.before.is_none() {
+            self.before = Some(document.clone());
+        }
+        self.requires_semantic_comparison = true;
+    }
+
+    /// Conserva el estado anterior que un reemplazo ya validó y comprometió.
+    /// No requiere la comparación JSON usada por mutaciones directas heredadas.
+    pub(crate) fn capture_successful_replacement(&mut self, before: Document) {
+        if self.before.is_none() {
+            self.before = Some(before);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn is_captured(&self) -> bool {
+        self.before.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn requires_semantic_comparison(&self) -> bool {
+        self.requires_semantic_comparison
+    }
+
+    pub(crate) fn save_if_semantically_changed(
+        &mut self,
+        document: &mut Document,
+        undo_stack: &mut VecDeque<Document>,
+        redo_stack: &mut VecDeque<ChangeSet>,
+    ) -> bool {
+        let requires_semantic_comparison = std::mem::take(&mut self.requires_semantic_comparison);
+        let Some(before) = self.before.take() else {
+            return false;
+        };
+        if undo_stack.len() != self.undo_depth {
+            return false;
+        }
+        if requires_semantic_comparison {
+            if !documents_semantically_differ(&before, document) {
+                return false;
+            }
+            refresh_unversioned_document_change(&before, document);
+        }
+        push_history_snapshot(undo_stack, redo_stack, before);
+        true
+    }
+}
+
+/// Clave base para el `before` por gesto en memoria temporal egui (el
+/// segundo componente identifica el slider: `"live-p"`, `("style", oid)`…).
+pub(crate) const PANEL_GESTURE_UNDO_KEY: &str = "panel_gesture_undo";
+
+thread_local! {
+    /// Gestos de slider de panel en curso: `clave → (before, frame)`.
+    ///
+    /// El `before` vive acá (y no en temp-data de egui) para poder
+    /// **barrer huérfanos**: si el widget desaparece a mitad del arrastre
+    /// (undo que borra la variable, cambio de modo), `drag_stopped` nunca
+    /// llega y el `before` quedaría colgado para siempre; `panel_gesture_sweep`
+    /// lo commitea (si hubo cambio) a los 3 frames sin toque.
+    static PANEL_GESTURES: std::cell::RefCell<
+        std::collections::HashMap<egui::Id, (Document, u64)>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Guarda el `before` una sola vez al iniciar un arrastre de slider de
+/// panel (idempotente por clave; refresca el frame en cada toque). Sin
+/// esto, cada frame con cambio pushea un `Document` entero e inunda el
+/// undo a mitad del gesto (los sliders del canvas ya usan este patrón con
+/// `CANVAS_SLIDER_UNDO_KEY`; punto-arrastre usa `point_drag_has_mutated`).
+pub(crate) fn panel_gesture_begin(ctx: &egui::Context, key: egui::Id, document: &Document) {
+    let now = ctx.cumulative_pass_nr();
+    PANEL_GESTURES.with(|gestos| {
+        let mut gestos = gestos.borrow_mut();
+        match gestos.get_mut(&key) {
+            Some(entry) => entry.1 = now,
+            None => {
+                // Cota 8: cada entrada retiene un `Document` entero; sin
+                // cota K sliders = K documentos. Expulsa el más viejo por
+                // frame (solo pierde granularidad de undo de ese gesto,
+                // nunca datos del documento).
+                if gestos.len() >= PANEL_GESTURES_MAX_ENTRIES {
+                    if let Some(vieja) = gestos
+                        .iter()
+                        .min_by_key(|(_, (_, frame))| *frame)
+                        .map(|(clave, _)| *clave)
+                    {
+                        gestos.remove(&vieja);
+                    }
+                }
+                gestos.insert(key, (document.clone(), now));
+            }
+        }
+    });
+}
+
+/// Commitea el gesto al soltar: una sola entrada si la versión cambió
+/// (O(1), sin serializar; la versión solo bumpea en mutaciones
+/// comprometidas, el contrato que ya usan los memos). Devuelve `true` si
+/// pusheó. Un gesto sin cambio neto no deja entrada.
+pub(crate) fn panel_gesture_commit(
+    ctx: &egui::Context,
+    key: egui::Id,
+    current_version: u64,
+    undo_stack: &mut VecDeque<Document>,
+    redo_stack: &mut VecDeque<ChangeSet>,
+) -> bool {
+    let _ = ctx;
+    let before = PANEL_GESTURES.with(|gestos| gestos.borrow_mut().remove(&key));
+    match before {
+        Some((before, _)) if before.version != current_version => {
+            push_history_snapshot(undo_stack, redo_stack, before);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Commitea gestos huérfanos (widget desaparecido a mitad de arrastre) tras
+/// `PANEL_GESTURE_STALE_FRAMES` frames sin toque. Se llama una vez por frame
+/// desde `draw_objects`. Devuelve cuántos gestos cerró (tests).
+pub(crate) fn panel_gesture_sweep_at(
+    now: u64,
+    current_version: u64,
+    undo_stack: &mut VecDeque<Document>,
+    redo_stack: &mut VecDeque<ChangeSet>,
+) -> usize {
+    let huerfanos: Vec<(egui::Id, Document)> = PANEL_GESTURES.with(|gestos| {
+        let mut gestos = gestos.borrow_mut();
+        let claves: Vec<egui::Id> = gestos
+            .iter()
+            .filter(|(_, (_, frame))| now.saturating_sub(*frame) > PANEL_GESTURE_STALE_FRAMES)
+            .map(|(clave, _)| *clave)
+            .collect();
+        claves
+            .into_iter()
+            .filter_map(|clave| gestos.remove(&clave).map(|(before, _)| (clave, before)))
+            .collect()
+    });
+    let cerrados = huerfanos.len();
+    for (_clave, before) in huerfanos {
+        if before.version != current_version {
+            push_history_snapshot(undo_stack, redo_stack, before);
+        }
+    }
+    cerrados
+}
+
+/// Frames sin toque tras los cuales un gesto se considera huérfano.
+pub(crate) const PANEL_GESTURE_STALE_FRAMES: u64 = 2;
+/// Cota de gestos simultáneos: cada entrada retiene un `Document` entero.
+/// Ver `panel_gesture_begin` (expulsa el más viejo por frame).
+pub(crate) const PANEL_GESTURES_MAX_ENTRIES: usize = 8;
+
+/// Inserts a complete object batch on detached state and records one undo
+/// snapshot only after every object has passed validation.
+pub(crate) fn commit_object_insertions(
+    document: &mut Document,
+    undo_stack: &mut VecDeque<Document>,
+    redo_stack: &mut VecDeque<ChangeSet>,
+    objects: Vec<GeoObject>,
+) -> Result<Vec<ObjectId>, String> {
+    if objects.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let before = document.clone();
+    let mut staged = document.detached_clone_for_staging();
+    let ids = objects
+        .into_iter()
+        .map(|object| staged.try_add_object(object))
+        .collect::<Result<Vec<_>, _>>()?;
+    staged.version = before.version.wrapping_add(1);
+    *document = staged;
+    push_history_snapshot(undo_stack, redo_stack, before);
+    Ok(ids)
+}
+
+/// Removes an object as part of one eraser gesture, snapshotting only the
+/// first actual deletion so no-op strokes leave redo history intact.
+pub(crate) fn erase_object_for_stroke(
+    document: &mut Document,
+    id: ObjectId,
+    stroke_has_mutated: &mut bool,
+    undo_stack: &mut VecDeque<Document>,
+    redo_stack: &mut VecDeque<ChangeSet>,
+) -> bool {
+    if document.get_object(id).is_none() {
+        return false;
+    }
+    if !*stroke_has_mutated {
+        push_history_snapshot(undo_stack, redo_stack, document.clone());
+        *stroke_has_mutated = true;
+    }
+    document.remove_object(id).is_some()
+}
+
+/// Stages a conic construction and its propagation before replacing the live
+/// document, so an invalid point set cannot leave a placeholder output behind.
+pub(crate) fn try_stage_conic_by_five_points(
+    document: &mut Document,
+    points: &[ObjectId],
+) -> Result<(), String> {
+    let mut staged = document.detached_clone_for_staging();
+    staged.try_add_conic_by_five_points_constraint(points)?;
+    let order = staged.propagation_order(points);
+    staged.try_re_evaluate_constraints(&order)?;
+    *document = staged;
+    Ok(())
+}
+
+/// Commits a complete conic operation as one undoable action only after its
+/// staged fit and propagation have succeeded.
+pub(crate) fn commit_conic_by_five_points(
+    document: &mut Document,
+    undo_stack: &mut VecDeque<Document>,
+    redo_stack: &mut VecDeque<ChangeSet>,
+    points: &[ObjectId],
+) -> Result<(), String> {
+    let before = document.clone();
+    try_stage_conic_by_five_points(document, points)?;
+    push_history_snapshot(undo_stack, redo_stack, before);
+    Ok(())
+}
+
+/// Adds a constructive conic and evaluates its complete dependency path on
+/// detached state. The undo entry is created only after that state is valid.
+fn commit_constructive_conic<F>(
+    document: &mut Document,
+    undo_stack: &mut VecDeque<Document>,
+    redo_stack: &mut VecDeque<ChangeSet>,
+    inputs: &[ObjectId],
+    add_constraint: F,
+) -> Result<(), String>
+where
+    F: FnOnce(&mut Document) -> Result<(), String>,
+{
+    let before = document.clone();
+    let mut staged = document.detached_clone_for_staging();
+    add_constraint(&mut staged)?;
+    let order = staged.propagation_order(inputs);
+    staged.try_re_evaluate_constraints(&order)?;
+    *document = staged;
+    push_history_snapshot(undo_stack, redo_stack, before);
+    Ok(())
+}
+
+pub(crate) fn commit_ellipse_by_foci(
+    document: &mut Document,
+    undo_stack: &mut VecDeque<Document>,
+    redo_stack: &mut VecDeque<ChangeSet>,
+    first_focus: ObjectId,
+    second_focus: ObjectId,
+    point_on_ellipse: ObjectId,
+) -> Result<(), String> {
+    let inputs = [first_focus, second_focus, point_on_ellipse];
+    commit_constructive_conic(document, undo_stack, redo_stack, &inputs, |staged| {
+        staged
+            .try_add_constructed_object(
+                GeoObject::Ellipse(EllipseObj::new(Point2::new(0.0, 0.0), 1.0, 1.0)),
+                "EllipseByFoci",
+                &inputs,
+            )
+            .map(|_| ())
+    })
+}
+
+pub(crate) fn commit_parabola_by_focus_directrix(
+    document: &mut Document,
+    undo_stack: &mut VecDeque<Document>,
+    redo_stack: &mut VecDeque<ChangeSet>,
+    focus: ObjectId,
+    directrix: ObjectId,
+) -> Result<(), String> {
+    let inputs = [focus, directrix];
+    commit_constructive_conic(document, undo_stack, redo_stack, &inputs, |staged| {
+        staged
+            .try_add_constructed_object(
+                GeoObject::Parabola(ParabolaObj::new(Point2::new(0.0, 0.0), 1.0)),
+                "ParabolaByFocusDirectrix",
+                &inputs,
+            )
+            .map(|_| ())
+    })
+}
+
+pub(crate) fn commit_hyperbola_by_foci(
+    document: &mut Document,
+    undo_stack: &mut VecDeque<Document>,
+    redo_stack: &mut VecDeque<ChangeSet>,
+    first_focus: ObjectId,
+    second_focus: ObjectId,
+    point_on_hyperbola: ObjectId,
+) -> Result<(), String> {
+    let inputs = [first_focus, second_focus, point_on_hyperbola];
+    commit_constructive_conic(document, undo_stack, redo_stack, &inputs, |staged| {
+        staged
+            .try_add_constructed_object(
+                GeoObject::Hyperbola(HyperbolaObj::new(Point2::new(0.0, 0.0), 1.0, 1.0)),
+                "HyperbolaByFoci",
+                &inputs,
+            )
+            .map(|_| ())
+    })
+}
+
+pub(crate) fn wrap_toast_message(message: &str, max_columns: usize) -> String {
+    if max_columns == 0 || message.chars().count() <= max_columns {
+        return message.to_string();
+    }
+
+    let mut wrapped = String::new();
+    let mut line_len = 0usize;
+    for word in message.split_whitespace() {
+        let word_len = word.chars().count();
+        if line_len > 0 {
+            if line_len + 1 + word_len > max_columns {
+                wrapped.push('\n');
+                line_len = 0;
+            } else {
+                wrapped.push(' ');
+                line_len += 1;
+            }
+        }
+        for character in word.chars() {
+            if line_len == max_columns {
+                wrapped.push('\n');
+                line_len = 0;
+            }
+            wrapped.push(character);
+            line_len += 1;
+        }
+    }
+    wrapped
+}
+
+pub(crate) fn save_command_snapshot_if_mutated(
+    outcome: &grafito_command::commands::CommandOutcome,
+    before: Document,
+    after: &Document,
+    undo_stack: &mut VecDeque<Document>,
+    redo_stack: &mut VecDeque<ChangeSet>,
+) {
+    if command_mutated_document(outcome, &before, after) {
+        push_history_snapshot(undo_stack, redo_stack, before);
+    }
+}
+
+/// Las celdas CAS de error mutan el documento de forma intencional aunque el
+/// comando subyacente haya fallado, por lo que no pueden usar la regla genérica
+/// que descarta snapshots para `CommandOutcome::Error`.
+pub(crate) fn save_cas_worksheet_snapshot_if_mutated(
+    before: Document,
+    after: &Document,
+    undo_stack: &mut VecDeque<Document>,
+    redo_stack: &mut VecDeque<ChangeSet>,
+) {
+    if documents_semantically_differ(&before, after) {
+        push_history_snapshot(undo_stack, redo_stack, before);
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TrigFunctionSpec {
+    pub name: &'static str,
+    pub color: Color,
+}
+
+/// Cota de singularidad trigonométrica: denominador (`sin`/`cos`) con
+/// `|v| < EPS` cuenta como cero exacto (función no definida, `None` honesto
+/// en vez de `inf`/`1.6e16` pintado en el overlay).
+pub(crate) const TRIG_SINGULAR_EPS: f64 = 1.0e-12;
+
+pub(crate) const TRIG_FUNCTIONS: [TrigFunctionSpec; 6] = [
+    TrigFunctionSpec {
+        name: "sin",
+        color: Color::new(0.15, 0.38, 0.95, 1.0),
+    },
+    TrigFunctionSpec {
+        name: "cos",
+        color: Color::new(0.90, 0.35, 0.10, 1.0),
+    },
+    TrigFunctionSpec {
+        name: "tan",
+        color: Color::new(0.55, 0.20, 0.90, 1.0),
+    },
+    TrigFunctionSpec {
+        name: "cot",
+        color: Color::new(0.05, 0.55, 0.45, 1.0),
+    },
+    TrigFunctionSpec {
+        name: "sec",
+        color: Color::new(0.90, 0.65, 0.05, 1.0),
+    },
+    TrigFunctionSpec {
+        name: "csc",
+        color: Color::new(0.85, 0.10, 0.35, 1.0),
+    },
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TrigViewMode {
+    Didactic,
+    Grid,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TrigGraphCache {
+    pub function: u8,
+    pub x_min_bits: u64,
+    pub x_max_bits: u64,
+    pub y_min_bits: u64,
+    pub y_max_bits: u64,
+    pub width_px: u32,
+    pub quality: RenderQuality,
+    /// `Arc`: el hit clona el refcount, no los segmentos (~10k) por frame.
+    pub segments: std::sync::Arc<Vec<(Point2, Point2)>>,
+    pub asymptotes: std::sync::Arc<Vec<f64>>,
+}
+
+// Evaluador GPU para la ruta híbrida de integrales definidas.
+struct AppGpuFunctionEvaluator {
+    renderer: Arc<RwLock<Option<grafito_render::Renderer>>>,
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
+}
+
+impl GpuFunctionEvaluator for AppGpuFunctionEvaluator {
+    fn evaluate_function_batch(
+        &self,
+        expr: &str,
+        a: f64,
+        b: f64,
+        samples: usize,
+        variables: &std::collections::BTreeMap<String, f64>,
+    ) -> Option<Vec<f64>> {
+        let renderer_lock = self.renderer.write().ok()?;
+        let renderer = renderer_lock.as_ref()?;
+        let pipeline = renderer.function_compute.as_ref()?;
+        let grid_size = samples.saturating_sub(1).max(1);
+        pipeline.evaluate_expr(
+            &self.device,
+            &self.queue,
+            expr,
+            (a, b),
+            grid_size,
+            variables,
+        )
+    }
+}
+
+/// Pending interactive action that requires selecting objects on the canvas.
+#[derive(Debug, Clone, Default)]
+pub enum PendingAction {
+    #[default]
+    None,
+    Distance {
+        first: Option<ObjectId>,
+    },
+    Angle {
+        first: Option<ObjectId>,
+    },
+    Tangent {
+        first: Option<ObjectId>,
+    },
+    Coincident {
+        first: Option<ObjectId>,
+    },
+    Horizontal {
+        line: Option<ObjectId>,
+    },
+    Vertical {
+        line: Option<ObjectId>,
+    },
+    EqualLength {
+        first: Option<ObjectId>,
+    },
+    Symmetry {
+        point: Option<ObjectId>,
+        mirror_point: Option<ObjectId>,
+        line: Option<ObjectId>,
+    },
+    EllipseByFoci {
+        f1: Option<ObjectId>,
+        f2: Option<ObjectId>,
+    },
+    ParabolaByFocusDirectrix {
+        focus: Option<ObjectId>,
+        directrix: Option<ObjectId>,
+    },
+    HyperbolaByFoci {
+        f1: Option<ObjectId>,
+        f2: Option<ObjectId>,
+    },
+    ConicByFivePoints {
+        points: Vec<ObjectId>,
+    },
+    BooleanUnion {
+        first: Option<ObjectId>,
+    },
+    BooleanIntersection {
+        first: Option<ObjectId>,
+    },
+    BooleanDifference {
+        first: Option<ObjectId>,
+    },
+    BooleanXor {
+        first: Option<ObjectId>,
+    },
+}
+
+impl PendingAction {
+    fn boolean_cmd_name(&self) -> Option<&'static str> {
+        match self {
+            PendingAction::BooleanUnion { .. } => Some("PolygonUnion"),
+            PendingAction::BooleanIntersection { .. } => Some("PolygonIntersection"),
+            PendingAction::BooleanDifference { .. } => Some("PolygonDifference"),
+            PendingAction::BooleanXor { .. } => Some("PolygonXor"),
+            _ => None,
+        }
+    }
+
+    fn with_boolean_first(self, id: ObjectId) -> Self {
+        match self {
+            PendingAction::BooleanUnion { .. } => PendingAction::BooleanUnion { first: Some(id) },
+            PendingAction::BooleanIntersection { .. } => {
+                PendingAction::BooleanIntersection { first: Some(id) }
+            }
+            PendingAction::BooleanDifference { .. } => {
+                PendingAction::BooleanDifference { first: Some(id) }
+            }
+            PendingAction::BooleanXor { .. } => PendingAction::BooleanXor { first: Some(id) },
+            other => other,
+        }
+    }
+}
+
+pub(crate) fn pending_action_needs_reinitialization(
+    current_tool: Tool,
+    previous_tool: Tool,
+    pending_action: &PendingAction,
+) -> bool {
+    current_tool != previous_tool
+        || (GrafitoApp::is_constraint_tool(current_tool)
+            && matches!(pending_action, PendingAction::None))
+}
+
+/// Campo persistido que modifica el selector de color compartido.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ColorPickerTarget {
+    /// El color expuesto por [`GeoObject::color`].
+    ObjectColor,
+    /// El relleno opcional de un [`grafito_core::RegularPolychoron4DObj`].
+    RegularPolychoronFill,
+}
+
+/// Estado transitorio del único diálogo de color de Grafito.
+#[derive(Debug, Clone)]
+pub(crate) struct ActiveColorPicker {
+    pub(crate) object_id: ObjectId,
+    pub(crate) target: ColorPickerTarget,
+    pub(crate) picker: grafito_ui::color_picker::HsvColorPicker,
+}
+
+/// `GrafitoApp` es el compositor (God Object en migración): orquesta Piel ↔ Cerebro.
+///
+/// Descomposición incremental hacia `crate::controllers`:
+///
+/// - `DocumentController` — document + undo/redo + lifecycle (ya con `Document::estimated_bytes()` y running counter)
+/// - `ViewController` — camera/perspective/view (cache derivado)
+/// - `AssistantController` — assistant state + runtime
+///
+/// `GrafitoApp` conserva campos directos para compatibilidad pero delega lógica
+/// nueva a `controllers` cuando existe.
+///
+/// Caché del último pick del cursor: `((x_bits, y_bits), versión, tol_bits, hit)`.
+type HoverPickCache = Option<(((u64, u64), u64, u64), Option<grafito_core::ObjectId>)>;
+
+pub struct GrafitoApp {
+    pub document: Document,
+    pub current_tool: Tool,
+    pub previous_tool: Tool,
+    /// Cache derivado de `perspective.view_mode()` — **no es fuente independiente**.
+    ///
+    /// Fuente canónica: [`Perspective`]. Este campo es un cache para evitar
+    /// recomputar `view_mode()` en cada frame y se mantiene sincronizado
+    /// exclusivamente vía [`GrafitoApp::set_perspective`] /
+    /// [`GrafitoApp::sync_current_view`]. Invariante:
+    /// `debug_assert_eq!(current_view, perspective.view_mode())`.
+    /// No asignar `current_view` directamente fuera de `set_perspective` /
+    /// `sync_current_view`.
+    pub current_view: ViewMode,
+    /// Perspectiva activa (estilo GeoGebra) — **fuente canónica única**.
+    ///
+    /// [`Perspective::canvas_mode`] y [`Perspective::view_mode`] derivan
+    /// [`crate::CanvasMode`] y [`crate::ViewMode`]. `current_view` y cualquier
+    /// uso de `CanvasMode` deben derivarse de aquí. Ver `set_perspective`.
+    pub perspective: Perspective,
+    pub camera: Camera3D,
+    pub show_grid: bool,
+    pub snap_to_grid: bool,
+    pub snap_config: crate::snap::SnapConfig,
+    /// Contorno complejo dibujado a mano: ajustes, trazo vivo y último valor.
+    pub complex_contour: crate::complex_contour::ComplexContourState,
+    pub exam_mode: bool,
+    /// Salida de examen pendiente de confirmación (modal D2, anti-toque).
+    /// `true` = mostrar modal; el lockdown sigue activo hasta confirmar.
+    pub exam_exit_confirm: bool,
+    pub dark_mode: bool,
+    pub pending_points: Vec<Point2>,
+    pub pending_points_3d: Vec<Point3D>,
+    pub last_mouse_pos: Option<Pos2>,
+    /// Origen del canvas que recibió el último puntero, para convertir las
+    /// coordenadas globales de egui a coordenadas locales del canvas.
+    pub canvas_origin: Option<Pos2>,
+    pub canvas_drag_start: Option<Pos2>,
+    pub canvas_is_panning: bool,
+    /// Indica si el arrastre Select actual ya produjo su primera mutación de punto.
+    pub point_drag_has_mutated: bool,
+    /// Indica si el gesto Eraser actual ya registró su único snapshot de undo.
+    pub eraser_stroke_has_mutated: bool,
+    /// Object captured under the pointer at the start of the active Select drag.
+    pub select_drag_object: Option<ObjectId>,
+    /// Avoids repeating the same numeric-solver toast on every drag frame.
+    pub point_drag_error_reported: bool,
+    pub selected_object: Option<ObjectId>,
+    /// Pulso `Indicate` estilo Manim sobre la selección (~1.2 s, expira solo).
+    /// `None` = inactivo; se dispara con `trigger_indicate` y se expira por
+    /// frame en `update` (con `request_repaint` mientras late).
+    pub(crate) indicate: Option<crate::indicate::IndicateHighlight>,
+    pub preview_object: Option<GeoObject>,
+    pub input_text: String,
+    /// Texto de celdas aún no confirmado; nunca se reconcilia con geometría.
+
+    /// Solicita foco para la primera entrada de comandos visible del próximo frame.
+    pub(crate) command_input_focus_requested: bool,
+    pub cas_result: String,
+
+    pub keyboard_tab: usize,
+    pub keyboard_visible: bool,
+    /// El usuario tocó el toggle explícito (menú Herramientas o botón del
+    /// panel): la perspectiva deja de imponer su default y se respeta la
+    /// elección hasta que la cambie de nuevo.
+    pub keyboard_visible_explicit: bool,
+    /// Fuerza temporalmente el teclado completo en una ventana corta.
+    pub keyboard_expanded: bool,
+    pub table_func_idx: usize,
+    pub table_x_min: String,
+    pub table_x_max: String,
+    pub table_step: String,
+    pub cas_history: VecDeque<String>,
+    pub sidebar_tab: usize,
+    pub recent_files: VecDeque<String>,
+    document_lifecycle: DocumentLifecycle,
+    deferred_file_actions: DeferredFileActions,
+    /// Instante de construcción: origen para el hint sutil de arranque.
+    /// La primera frame es instantánea (sin overlay); los gates calientan en
+    /// background. Solo se usa para `elapsed()` + el log one-shot.
+    pub startup_instant: Instant,
+    /// One-shot F10-D (cold start instrumentado): log de first_frame una vez.
+    startup_first_frame_logged: bool,
+    /// Avatar local de Mora, cargado una vez cuando el asistente se vuelve visible.
+    /// LRU: tamaño 1, se libera con `ctx.forget_image("mora_avatar")` en `on_close`/`Drop` para evitar fuga GPU.
+    pub(crate) mora_texture: Option<egui::TextureHandle>,
+    /// Evita volver a decodificar el recurso embebido si el fallback ya fue necesario.
+    pub(crate) mora_texture_load_attempted: bool,
+    /// Registry de plugins del asistente, cargado una sola vez.
+    pub(crate) plugin_registry: Option<grafito_plugins::PluginRegistry>,
+    /// Worker de carga de plugins: el `read_dir` recursivo + manifiestos salen
+    /// del primer frame (antes bloqueaban la UI en el arranque).
+    pub(crate) pending_plugins_job:
+        Option<std::sync::mpsc::Receiver<grafito_plugins::PluginRegistry>>,
+    /// Guarda si ya se intentó cargar los plugins una vez.
+    pub(crate) plugins_loaded: bool,
+    /// J2: el vault salió de `main` (directiva usuario). Sin explorer,
+    /// sin notas, sin jobs: el Canvas persiste en archivos JSON planos
+    /// (`grafito_core::persistence`), nunca usó el vault.
+    /// Grupo Math del rail expandido (F7: álgebra/herram/datos/prob).
+    /// EE1 hook de capturas: ventana a 1600x900 en el primer `update`
+    /// (una sola vez, solo si el shot lo pidió).
+    pub(crate) shot_viewport_resize: bool,
+    /// Cache de bloques del transcript del asistente (persistente entre frames).
+    pub(crate) assistant_blocks_cache: grafito_ui::assistant::AssistantBlocksCache,
+    /// Overlay de pizarra nativa (estilo macOS).
+    pub whiteboard_open: bool,
+    pub whiteboard: crate::whiteboard_ui::WhiteboardSession,
+    /// Libro de hojas de la pizarra (tipo Notepad — múltiples pizarras una por una).
+    pub whiteboard_book: crate::whiteboard_ui::WhiteboardBook,
+    /// Drawer izquierdo de hojas anclado (si false, auto-hide al borde izquierdo).
+    #[allow(dead_code)]
+    pub whiteboard_left_pinned: bool,
+    /// Asistente visible (y ocultable) dentro de la pizarra.
+    #[allow(dead_code)]
+    pub show_whiteboard_assistant: bool,
+    /// Memoria pedagógica del usuario (nivel, ramas, exámenes) del tutor.
+    pub profile: grafito_profile::StudentProfile,
+    /// Historial de undo acotado `MAX_UNDO=50` y `MAX_UNDO_BYTES=50MiB`.
+    /// Usa `VecDeque<Document>` con `pop_front` O(1) (corrige `Vec` O(n) shift).
+    /// Presupuesto vía `Document::estimated_bytes()`; ver `push_history_snapshot`.
+    /// Evolución running counter O(1) en `crate::controllers::DocumentController`.
+    pub undo_stack: VecDeque<Document>,
+    /// Historial de redo acotado igual que undo (`MAX_UNDO=50`,
+    /// `MAX_UNDO_BYTES=50MiB`, ver `enforce_redo_budgets`); limpiado en cada
+    /// `push_history_snapshot`.
+    pub redo_stack: VecDeque<ChangeSet>,
+    /// Contador running O(1) de bytes en undo_stack — evita scan O(n) por push.
+    /// Se actualiza con saturating_add/sub en push/pop y se enforce con MAX_UNDO/BYTES.
+    /// Ver `crate::controllers::DocumentController::undo_total_bytes`.
+    pub undo_total_bytes: usize,
+    /// Objetos omitidos del frame por el presupuesto de vértices GPU
+    /// (`FRAME_VERTEX_BUDGET` en render_2d): se recalcula en cada
+    /// `draw_objects` (0 = escena dentro del tope). Ver insignia honesta.
+    pub(crate) frame_budget_skipped: usize,
+    /// Página actual de la bienvenida first-run (siempre 0 con 1 pantalla;
+    /// se conserva para re-entradas desde Ayuda → Bienvenida).
+    pub(crate) welcome_page: usize,
+    /// Onboarding desactivado a pedido del usuario: arranca `!onboarding_completed`, nunca forzado.
+    pub show_onboarding: bool,
+    /// Checkbox "No mostrar de nuevo" de la bienvenida (transitorio de
+    /// sesión): solo persiste al cerrar con "Probar ahora"/"Empezar
+    /// vacío"; Skip/Esc nunca persisten (igual que hoy).
+    pub(crate) welcome_dont_show_again: bool,
+    /// Jobs de I/O en background para no bloquear UI thread (60fps) — save/open/export.
+    /// Pattern `spawn_profile_save` (assistant.rs:41-51) con `sync_channel(1)` + `request_repaint`.
+    /// `None` = idle; `Some(receiver)` = polling con `try_recv` en `update`.
+    pub(crate) pending_save_job: Option<PendingSaveJob>,
+    pub(crate) pending_open_job: Option<PendingOpenJob>,
+    /// Archivo pasado por CLI (`grafito doc.json`) pendiente de abrir en
+    /// background (AS3 cold-start): `new()` ya no hace I/O de documentos en el
+    /// hilo UI — guarda la ruta aquí y el primer `update` la abre con
+    /// `spawn_document_open` (`maybe_start_startup_open` + `poll_background_jobs`).
+    /// `None` = sin pendiente (arranque normal con documento vacío).
+    startup_pending_doc: Option<PathBuf>,
+    pub(crate) pending_export_job: Option<PendingExportJob>,
+    /// Carpeta de la última exportación exitosa de la sesión (W3).
+    /// Permite "Mostrar en carpeta" sin guardar rutas de archivo: sólo el
+    /// directorio padre. `None` = aún no se exportó nada.
+    pub last_export_dir: Option<PathBuf>,
+    /// Job de importación `.ggb` en background (F1-1): lectura + parse fuera del
+    /// UI thread, resultado aplicado con undo único vía `process_input`.
+    pub(crate) pending_ggb_import_job: Option<PendingGgbImportJob>,
+    /// Job de exportación `.ggb` en background (P3a): serialización + ZIP +
+    /// escritura atómica fuera del UI thread.
+    pub(crate) pending_ggb_export_job: Option<PendingGgbExportJob>,
+    pub(crate) pending_import_job: Option<PendingImportJob>,
+    pub(crate) pending_text_job: Option<PendingTextWriteJob>,
+    pub(crate) pending_clipboard_job: Option<PendingClipboardJob>,
+    /// Acción encadenada tras un guardado async (New/Open con cambios sin guardar).
+    /// `resolve_unsaved_decision` consume `lifecycle.pending_action`, así que la acción
+    /// viaja aquí y `poll_background_jobs` la ejecuta al confirmar el save.
+    pending_chained_action: Option<DocumentAction>,
+    /// ── A4: slot cap-1 de superficie implícita para el frame ──
+    ///
+    /// DECISIÓN: el comando A1 eager (`ImplicitSurface` en `commands.rs`) queda
+    /// como fallback honesto fail-closed (solo crea el objeto si el campo está
+    /// definido en toda la caja). El slot es refinamiento progresivo non-blocking:
+    /// `poll` una vez por `update`, `request_repaint` mientras hay pendiente y
+    /// render de `last_valid` en `render_3d.rs` para no parpadear ante `Failed`.
+    /// P1b: productor real cableado — `maybe_submit_implicit_slot` envía la
+    /// primera superficie visible (grueso 12³) y el overlay muestra ese
+    /// `last_valid` mientras refina; sin superficie visible se limpia (sin fantasma).
+    pub(crate) implicit_surface_slot: crate::implicit_surface_compute::ImplicitSurfaceSlot,
+    /// Clave de la superficie ya enviada al slot (evita re-submit por frame).
+    pub(crate) implicit_slot_key: Option<u64>,
+    /// Versión del documento con la que se calculó la clave por última
+    /// vez. Sin esto, cada frame pagaba scan O(n) + sort de variables en
+    /// idle aunque nada hubiera cambiado (la clave sería idéntica).
+    pub(crate) implicit_slot_version: Option<u64>,
+    pub attractor_cache: std::collections::HashMap<ObjectId, (u64, Vec<Point3D>)>,
+    /// Caché de texturas de relleno para curvas implícitas. Usa `RwLock`
+    /// para permitir mutación desde `draw_implicit_curve_fill` (que recibe
+    /// `&self`). La clave es el `ObjectId` de la `ImplicitCurveObj`.
+    pub fill_textures: std::sync::RwLock<crate::render_2d::FillTextureCacheStore>,
+    pub(crate) active_color_picker: Option<ActiveColorPicker>,
+    pub color_favorites: [grafito_geometry::Color; 5],
+    pub tool_ghost: Option<GeoObject>,
+    pub tool_state: crate::tool_dispatcher::ToolState,
+    pub gpu_renderer: Option<Arc<RwLock<Option<grafito_render::Renderer>>>>,
+    pub gpu_scene_readiness: Option<crate::canvas::GpuSceneReadiness>,
+    /// Estado visual por frame; no se serializa ni se inserta en `Document::variables`.
+    pub(crate) transient_render_state: TransientRenderState,
+    /// Caché `(version, hay_homotopía_animada)` del scan de
+    /// `dispatch_frame_scheduler`: evita la pasada O(N) por frame.
+    pub(crate) mapping_anim_cache: Option<(u64, bool)>,
+    /// Caché `(versión, expandida, locale, texto)` de resúmenes de fila del panel
+    /// Álgebra: evita `match` + `format!` por fila por frame. Una entrada
+    /// por objeto; se poda si supera 20 000 (objetos borrados). El `locale`
+    /// (`code()`, B-A143) invalida al cambiar el idioma.
+    pub(crate) algebra_expr_cache:
+        std::collections::HashMap<grafito_core::ObjectId, (u64, bool, &'static str, String)>,
+    /// Último pick del cursor: con el mouse quieto no se re-corre el scan
+    /// espacial por frame.
+    pub(crate) hover_pick_cache: HoverPickCache,
+    /// Activa una orbita de camara 3D y una rotacion de proyecciones 4D por defecto.
+    pub(crate) multidimensional_motion_enabled: bool,
+    /// Velocidad de giro explícita de `SetSpinSpeed[grados]` (0 = quieto).
+    /// `None` = manda el interruptor/velocidad de la app. Se sincroniza del
+    /// documento cada frame (`__view_spin_speed`).
+    pub(crate) explicit_spin_speed_dps: Option<f32>,
+    /// Guard de reentrada de guiones `OnUpdate` (Ola 2.7): evita cascadas.
+    pub(crate) on_update_running: bool,
+    /// Multiplicador transitorio compartido por la órbita 3D y la fase 4D.
+    pub(crate) multidimensional_motion_speed: f32,
+    /// Vista 3D del canvas (dueño canvas.rs): la escribe el selector del
+    /// panel Vista y la leen el dibujo, el pick y el advance loop por frame.
+    /// Default perspectiva (GeoGebra).
+    pub view3d: crate::canvas::View3D,
+    /// Travelling 3D activo (paridad Manim `MovingCamera`): mientras hay uno,
+    /// el advance loop muestrea la cámara animada por frame en vez de
+    /// orbitar. `None` = órbita ambiental. Sin productor UI todavía (P2).
+    pub(crate) camera_travelling: Option<crate::render_3d::CameraTravelling>,
+    pub use_gpu: bool,
+    pub last_interaction_time: Instant,
+    pub is_view_changing: bool,
+    last_canvas_resize_at: Option<Instant>,
+    pub pending_action: PendingAction,
+    pub toasts: grafito_ui::toast::ToastManager,
+    pub hovered_analysis: Option<HoveredAnalysis>,
+    pub hover_candidate_pos: Option<Point2>,
+    pub hover_candidate_time: f64,
+    pub hover_cached_analysis: Option<Option<HoveredAnalysis>>,
+    pub document_snapshot: std::sync::Arc<Document>,
+    pub snapshot_version: u64,
+    pub snapshot_render_quality: RenderQuality,
+    pub command_palette: grafito_ui::command_palette::CommandPaletteState,
+    /// Herramientas personalizadas `.ggt` (store en memoria; persistencia por archivo).
+    pub custom_tools: grafito_command::ggbscript::CustomToolStore,
+    /// Última época vista de `custom_tools`: las entradas de paleta se
+    /// reconstruyen solo cuando el store cambia, no cada frame.
+    pub custom_tools_revision: u64,
+    /// Diálogo "Guardar herramienta" (nombre) y último error mostrable.
+    pub show_custom_tool_dialog: bool,
+    pub custom_tool_name: String,
+    /// Habla en curso de la tarjeta de pasos (voz espeak-ng): `None` =
+    /// silencio. Sin hilos: se sondea por frame (`poll_steps_tts`);
+    /// `stop_steps_tts` la mata (kill+wait) al detener, cambiar de turno,
+    /// limpiar el transcript y salir (`on_exit`).
+    pub(crate) steps_tts: Option<crate::tts_cli::StepsTtsSpeech>,
+    /// Caché de sesión de presencia de `espeak-ng` (`None` = aún no
+    /// chequeado este frame de arranque; el toggle re-chequea en vivo).
+    pub(crate) steps_tts_available_cached: Option<bool>,
+    /// Grabación STT en curso (mic del composer): `None` = sin grabar.
+    /// Sin hilos: se sondea por frame (`poll_stt`); al tope
+    /// ([`crate::stt_cli::STT_MAX_SECS`]) o a la 2ª pulsación se detiene
+    /// y se transcribe (`stop_stt` la mata con kill+wait + borra el WAV).
+    pub(crate) stt_recording: Option<crate::stt_cli::SttRecording>,
+    /// Transcripción STT en curso (`whisper-cli` sobre el WAV grabado):
+    /// `None` = sin transcribir. Sondeo por frame (`poll_stt`); al
+    /// terminar INSERTA el texto en el composer (jamás auto-envía) y
+    /// borra el WAV (jamás persiste).
+    pub(crate) stt_transcribing: Option<crate::stt_cli::SttTranscribeJob>,
+    /// Caché de sesión de disponibilidad STT (motor + modelo + grabador +
+    /// mic; `None` = aún no chequeado; el toggle re-chequea en vivo).
+    pub(crate) stt_available_cached: Option<bool>,
+    /// Estado sin I/O del asistente matemático.
+    pub assistant: grafito_ui::assistant::AssistantPanelState,
+    /// Trabajos remotos y claves de sesión que nunca se serializan.
+    pub(crate) assistant_runtime: crate::assistant::AssistantRuntime,
+    /// El drawer derecho contextual puede cerrarse sin perder su estado.
+    pub right_drawer_open: bool,
+    /// Pestaña visible del dock único de Geometry 3D.
+    pub(crate) workspace_dock_tab: crate::WorkspaceDockTab,
+    /// En modo compacto, el dock de Geometry 3D se abre bajo demanda.
+    pub(crate) compact_geometry_utility_open: bool,
+    /// El drawer izquierdo puede cerrarse para devolver espacio al canvas.
+    /// El rail y el menú Paneles siguen permitiendo restaurarlo.
+    pub left_drawer_open: bool,
+    /// En modo compacto, el menú Paneles abre temporalmente el drawer izquierdo.
+    pub compact_drawer_open: bool,
+    /// S4 Nivel 0: ya se avisó que el panel se oculta bajo 480 (borde:
+    /// se resetea al ensanchar, así el toast sale una sola vez por cruce).
+    pub(crate) nivel0_hidden_announced: bool,
+    /// BB3-P1-5: ya se avisó del dead-click del rail (drawer pedido pero sin
+    /// ancho para pintarse, franja 480-520). Borde: se resetea cuando el
+    /// drawer vuelve a caber o deja de pedirse, una sola vez por bloqueo.
+    pub(crate) drawer_blocked_announced: bool,
+    /// El asistente puede ocultarse sin detener sus trabajos remotos pendientes.
+    pub assistant_visible: bool,
+    /// Móvil <740: popup de la hamburguesa abierto (solo UI, sin persistir).
+    pub(crate) mobile_menu_open: bool,
+    /// Página del drawer móvil (drill-in): raíz o sección fullscreen.
+    pub(crate) mobile_menu_page: crate::ui::MobileMenuPage,
+    /// Tiempo del frame actual, usado por todas las notificaciones nuevas.
+    pub ui_time: f64,
+    /// Protocolo de construcción: historial de pasos que crean objetos o
+    /// restricciones. Se muestra en el panel derecho de la perspectiva
+    /// Geometry2D.
+    pub construction_log: Vec<ConstructionStep>,
+    /// Visibilidad del panel derecho "Protocolo de Construcción".
+    pub show_construction_protocol: bool,
+    /// Datos numéricos para el panel de Estadística (ingresados por el usuario).
+    pub statistics_data: Vec<f64>,
+    /// Buffer de texto crudo para el `TextEdit` del panel de Estadística.
+    /// Se parsea a `statistics_data` sólo al perder foco, para no destruir
+    /// la entrada del usuario frame a frame.
+    pub statistics_input_buf: String,
+    /// Error persistente del último intento de parsear datos estadísticos.
+    pub statistics_input_error: Option<String>,
+    /// Estado del popup de autocompletado de la barra de entrada.
+    pub autocomplete: InputAutocomplete,
+    /// Visibilidad de la ventana modal "Acerca de Grafito".
+    pub show_about: bool,
+    /// Visibilidad de la ventana "Colab Pro" (pareo + jobs pesados).
+    pub show_colab_window: bool,
+    /// Enlace Colab (dueño único del proxy; estado + worker en background).
+    pub(crate) colab: crate::colab_link::ColabLink,
+    /// Selección del panel Colab (efímera, no persiste).
+    pub(crate) colab_panel: crate::colab_panel::ColabPanelState,
+    /// Visibilidad de la hoja de atajos de teclado (claves `cheat.*` i18n).
+    pub show_cheat_sheet: bool,
+    /// Visibilidad del panel de animación trigonométrica (círculo unitario).
+    pub show_trig_animation: bool,
+    /// Ángulo actual para la animación trigonométrica (en radianes).
+    pub trig_angle: f64,
+    /// Si la animación trigonométrica está corriendo.
+    pub trig_animating: bool,
+    /// Velocidad de la animación trigonométrica (rad/seg).
+    pub trig_speed: f64,
+    /// Función a visualizar: 0=sin, 1=cos, 2=tan, 3=cot, 4=sec, 5=csc.
+    pub trig_function: u8,
+    /// Presentación visual de la animación trigonométrica.
+    pub(crate) trig_view_mode: TrigViewMode,
+    /// Cache de la curva trigonométrica visible; el marcador se anima aparte.
+    pub(crate) trig_graph_cache: std::sync::RwLock<Option<TrigGraphCache>>,
+    /// Configuración — avatar super configurable.
+    pub show_mascot_config: bool,
+    pub avatar_draft: grafito_profile::AvatarConfig,
+    pub config_name_error: Option<String>,
+    /// Enseñanza paso a paso — burbujas, pizarra y manim.
+    pub teaching_ui: crate::teaching_ui::TeachingUiState,
+    /// Celebración contenida (nivel visceral): primera correcta + primer paso
+    /// a paso por sesión. Flags de sesión, jamás persisten ni se serializan.
+    pub(crate) celebration: crate::celebration::CelebrationState,
+    /// Presupuesto de repintado coalescido del frame (F17). Los widgets piden
+    /// vía [`GrafitoApp::request_repaint_budget`]; el scheduler unificado
+    /// aplica el mínimo al final del frame (`apply`). Se resetea al inicio de
+    /// cada `update`.
+    pub(crate) repaint_budget: RepaintBudget,
+    /// Autosave debouncer — tick en `update` (nunca en `Ui::`), escribe sidecar
+    /// en background thread si `should_autosave(now)`.
+    pub(crate) autosave: AutosaveDebouncer,
+    /// Versión del documento vista en el último tick de autosave (para detectar
+    /// mutaciones que no pasaron por `save_snapshot` y marcar dirty fallback).
+    pub(crate) autosave_last_version: u64,
+    /// ── A8 Recovery al arranque ──
+    /// Job en background que llama `load_autosave_candidate` (nunca I/O en `Ui::`).
+    /// `None` = idle; `Some` = polling con `try_recv` en `update`.
+    pub(crate) pending_recovery_job: Option<PendingAutosaveRecoveryJob>,
+    /// Oferta lista para el modal (sidecar más nuevo ya validado). `Ui::` solo lee.
+    pub(crate) recovery_offer: Option<AutosaveRecoveryOffer>,
+    /// Sidecar más nuevo pero corrupto: el modal ofrece descartarlo.
+    pub(crate) recovery_corrupt: Option<AutosaveRecoveryCorrupt>,
+    /// Última ruta ya chequeada en esta sesión (evita re-spawn por frame).
+    /// Se resetea implícitamente al cambiar `current_path` (ver `maybe_start_recovery_check`).
+    pub(crate) recovery_checked_path: Option<PathBuf>,
+    /// Opt-in explícito para Aula/red avanzada (loopback sin red).
+    pub advanced_red_opt_in: bool,
+    /// Idioma de la UI (ES/EN) — O2 i18n: persiste en `AppConfig.locale`,
+    /// se edita desde Ayuda con `locale_selector` (Piel pura, sin I/O en Ui).
+    pub(crate) locale: AppLocale,
+    /// Movimiento reducido (WCAG 2.3.3): se carga de `AppConfig` (que a su vez
+    /// lo toma del entorno) y se puede cambiar en Ajustes → Apariencia.
+    pub(crate) reduced_motion: bool,
+    /// Panel de Aula (F0 sin red) — loopback con ShareCode + QR dibujado con líneas egui.
+    pub classroom: crate::classroom::ClassroomPanel,
+}
+
+/// Pantallas de la bienvenida first-run liviana (F1): una sola (qué es
+/// Grafito + Mili + 2 botones). `WELCOME_PAGES` pinnea el total en 1.
+pub(crate) const WELCOME_PAGES: usize = 1;
+
+pub(crate) const DEFAULT_KEYBOARD_VISIBLE: bool = false;
+pub(crate) const DEFAULT_CONSTRUCTION_PROTOCOL_VISIBLE: bool = false;
+
+/// Construye un documento inicial vacío: los ejemplos se cargan sólo a petición.
+pub(crate) fn initial_document() -> Document {
+    let mut document = Document::new();
+    document.set_view(ViewTransform::new(1280.0, 720.0));
+    document.view_mut().scale = 50.0;
+    document.render_quality = RenderQuality::Normal;
+    document
+}
+
+/// Los atajos globales no deben competir con un editor de texto enfocado.
+pub(crate) const fn global_shortcuts_allowed(wants_keyboard_input: bool) -> bool {
+    !wants_keyboard_input
+}
+
+#[derive(Debug, Clone)]
+pub struct HoveredAnalysis {
+    pub point: Point2,
+    pub label: String,
+    pub is_snap: bool,
+    pub feature: Option<grafito_geometry::analysis::AnalysisFeature>,
+    pub snap_kind: Option<crate::snap::SnapKind>,
+}
+
+/// Entrada del protocolo de construcción (estilo GeoGebra Construction Protocol).
+///
+/// Cada vez que se añade un objeto o restricción al documento se registra un
+/// paso con la acción que lo originó, las etiquetas de los objetos de entrada
+/// y la etiqueta del objeto resultante.
+#[derive(Debug, Clone)]
+pub struct ConstructionStep {
+    pub n: usize,
+    pub action: String,
+    pub inputs: Vec<String>,
+    pub output: String,
+    pub disabled: bool,
+    pub timestamp: f64,
+}
+
+/// Estado del autocompletado de la barra de entrada.
+#[derive(Debug, Clone, Default)]
+pub struct InputAutocomplete {
+    pub open: bool,
+    pub selected: usize,
+    /// El usuario movió la selección con ↑↓: Enter confirma la sugerencia
+    /// en vez de enviar el texto (si solo escribió, Enter envía).
+    pub navigated: bool,
+}
+
+/// Item sugerido por el autocompletado.
+#[derive(Debug, Clone)]
+pub struct AutocompleteItem {
+    pub text: String,
+    pub detail: String,
+    pub bracket: bool,
+}
+
+impl GrafitoApp {
+    /// Abre el selector para el color general de un objeto existente.
+    pub(crate) fn open_object_color_picker(&mut self, object_id: ObjectId) -> bool {
+        let Some(object) = self.document.get_object(object_id) else {
+            return false;
+        };
+        self.active_color_picker = Some(ActiveColorPicker {
+            object_id,
+            target: ColorPickerTarget::ObjectColor,
+            picker: grafito_ui::color_picker::HsvColorPicker::new(object.color()),
+        });
+        true
+    }
+
+    /// Abre el selector para el relleno habilitado de un politopo regular 4D.
+    pub(crate) fn open_regular_polychoron_fill_color_picker(
+        &mut self,
+        object_id: ObjectId,
+    ) -> bool {
+        let Some(GeoObject::RegularPolychoron4D(polychoron)) = self.document.get_object(object_id)
+        else {
+            return false;
+        };
+        let Some(fill_color) = polychoron.fill_color else {
+            return false;
+        };
+        self.active_color_picker = Some(ActiveColorPicker {
+            object_id,
+            target: ColorPickerTarget::RegularPolychoronFill,
+            picker: grafito_ui::color_picker::HsvColorPicker::new(fill_color),
+        });
+        true
+    }
+
+    pub(crate) fn trig_spec(index: u8) -> TrigFunctionSpec {
+        TRIG_FUNCTIONS
+            .get(index as usize)
+            .copied()
+            .unwrap_or(TRIG_FUNCTIONS[0])
+    }
+
+    pub(crate) fn trig_value(index: u8, t: f64) -> f64 {
+        Self::trig_value_opt(index, t).unwrap_or(f64::NAN)
+    }
+
+    /// Valor trigonométrico con singularidades honestas: `None` donde la
+    /// función no está definida (`tan`/`sec` con `cos θ ≈ 0`,
+    /// `cot`/`csc` con `sin θ ≈ 0`, `t` no finito o cociente no finito).
+    /// Los llamadores (`panels.rs`, `render_2d.rs`) ya filtran con
+    /// `is_finite` y muestran "no está definido" en vez de pintar `inf`.
+    pub(crate) fn trig_value_opt(index: u8, t: f64) -> Option<f64> {
+        if !t.is_finite() {
+            return None;
+        }
+        let finito = |v: f64| v.is_finite().then_some(v);
+        match index as usize {
+            0 => finito(t.sin()),
+            1 => finito(t.cos()),
+            2 => {
+                if t.cos().abs() < TRIG_SINGULAR_EPS {
+                    None
+                } else {
+                    finito(t.tan())
+                }
+            }
+            3 => {
+                let (s, c) = (t.sin(), t.cos());
+                if s.abs() < TRIG_SINGULAR_EPS {
+                    None
+                } else {
+                    finito(c / s)
+                }
+            }
+            4 => {
+                let c = t.cos();
+                if c.abs() < TRIG_SINGULAR_EPS {
+                    None
+                } else {
+                    finito(1.0 / c)
+                }
+            }
+            5 => {
+                let s = t.sin();
+                if s.abs() < TRIG_SINGULAR_EPS {
+                    None
+                } else {
+                    finito(1.0 / s)
+                }
+            }
+            _ => finito(t.sin()),
+        }
+    }
+
+    pub(crate) fn trig_identity(index: u8) -> &'static str {
+        match index as usize {
+            0 => "sin θ es la altura del punto sobre el círculo unitario.",
+            1 => "cos θ es la distancia horizontal al eje vertical.",
+            2 => "tan θ = sin θ / cos θ; crece mucho cerca de cos θ = 0.",
+            3 => "cot θ = cos θ / sin θ; no está definida cuando sin θ = 0.",
+            4 => "sec θ = 1 / cos θ; mide el inverso de la proyección horizontal.",
+            5 => "csc θ = 1 / sin θ; mide el inverso de la altura.",
+            _ => "sin θ es la altura del punto sobre el círculo unitario.",
+        }
+    }
+
+    /// Identidad trigonométrica display-localizada (B-A98:
+    /// `trig.identity_sin/cos/tan/cot/sec/csc`). El Es sale del canónico
+    /// [`Self::trig_identity`] por construcción (paridad byte-idéntica,
+    /// pineada en `tests.rs`); el resto sale del catálogo. Pura, sin I/O.
+    pub(crate) fn trig_identity_for(index: u8, locale: grafito_ui::i18n::Locale) -> &'static str {
+        use grafito_ui::i18n::Locale as Loc;
+        if locale == Loc::Es {
+            return Self::trig_identity(index);
+        }
+        let suffix = match index as usize {
+            1 => "identity_cos",
+            2 => "identity_tan",
+            3 => "identity_cot",
+            4 => "identity_sec",
+            5 => "identity_csc",
+            _ => "identity_sin",
+        };
+        grafito_ui::i18n::trig_msg(suffix, locale)
+    }
+
+    pub(crate) fn set_trig_animation_visible(&mut self, visible: bool) {
+        self.assert_view_invariant();
+        self.show_trig_animation = visible && trig_animation_supported(self.current_view);
+        if self.show_trig_animation {
+            self.right_drawer_open = true;
+        }
+        if !self.show_trig_animation {
+            self.trig_animating = false;
+        }
+        self.cleanup_trig_document_artifacts();
+    }
+
+    pub(crate) fn set_trig_function(&mut self, index: u8) {
+        let clamped = (index as usize).min(TRIG_FUNCTIONS.len() - 1) as u8;
+        if self.trig_function != clamped {
+            self.trig_function = clamped;
+            if let Ok(mut cache) = self.trig_graph_cache.write() {
+                *cache = None;
+            }
+        }
+        self.cleanup_trig_document_artifacts();
+    }
+
+    pub(crate) fn cleanup_trig_document_artifacts(&mut self) {
+        let index = (self.trig_function as usize).min(TRIG_FUNCTIONS.len() - 1) as u8;
+        if self.trig_function != index {
+            self.trig_function = index;
+        }
+
+        let legacy_ids = self
+            .document
+            .objects_iter()
+            .filter_map(|(id, obj)| {
+                let label = obj.label();
+                (label == TRIG_GRAPH_LABEL || label == TRIG_VALUE_LABEL).then_some(*id)
+            })
+            .collect::<Vec<_>>();
+        for id in legacy_ids {
+            self.document.remove_object(id);
+        }
+
+        let legacy_vars = self
+            .document
+            .variables
+            .keys()
+            .filter(|name| name.as_str() == "trig_angle" || name.starts_with("trig_"))
+            .cloned()
+            .collect::<Vec<_>>();
+        for name in legacy_vars {
+            self.document.remove_variable(&name);
+        }
+    }
+
+    fn gpu_renderer_ready(&self) -> bool {
+        renderer_is_ready(self.gpu_renderer.as_ref())
+    }
+
+    /// Gate pendiente del arranque, si hay alguno (estilo VSCode/Zed).
+    ///
+    /// Pura y testeable. Orden: el doc CLI manda (es lo más relevante para el
+    /// usuario), luego GPU → escena 2D → plugins. `None` = todo listo: el
+    /// llamador deja de dibujar la pill, sin "Listo" ni 100 %. Jamás conteos
+    /// ni % falso: solo el nombre honesto de la fase pendiente.
+    ///
+    /// Sin GPU (`gpu_renderer`/`gpu_scene_readiness` en `None`, fallback CPU)
+    /// esos gates se dan por resueltos: en CPU no hay nada que calentar y la
+    /// pill jamás queda colgada en "Iniciando GPU…".
+    fn startup_pending_stage(&self) -> Option<&'static str> {
+        let opening_startup_doc = self.startup_pending_doc.is_some()
+            || (self.pending_open_job.is_some()
+                && self.document_lifecycle.current_path().is_none());
+        if opening_startup_doc {
+            return Some("Abriendo documento…");
+        }
+        if self.gpu_renderer.is_some() && !self.gpu_renderer_ready() {
+            return Some("Iniciando GPU…");
+        }
+        let scene_pending = self.gpu_scene_readiness.is_some()
+            && self.gpu_scene_2d_readiness() == crate::canvas::Scene2DReadiness::Pending;
+        if scene_pending {
+            return Some("Preparando escena…");
+        }
+        if !self.plugins_loaded {
+            return Some("Cargando extensiones…");
+        }
+        None
+    }
+
+    /// ¿Se muestra el hint sutil? Solo si hay gate pendiente Y pasó el umbral.
+    ///
+    /// Pura y testeable: evita el flash de spinner en arranques rápidos
+    /// (todos los gates suelen resolver en <300 ms; ver costos en
+    /// `STARTUP_SLOW_HINT_MS`). La etiqueta de fase es la live-region: se
+    /// renderiza siempre que la pill es visible y el lector anuncia cada
+    /// cambio de fase.
+    /// Mantiene la proyección ligada al rectángulo real del canvas sin
+    /// invalidar el índice espacial ni preparar GPU cuando el tamaño no cambió.
+    fn sync_canvas_screen_size(&mut self, canvas_size: egui::Vec2) -> bool {
+        if !self.document.set_screen_size(canvas_size.x, canvas_size.y) {
+            return false;
+        }
+        let now = Instant::now();
+        self.document.render_quality = RenderQuality::Preview;
+        self.is_view_changing = true;
+        self.last_interaction_time = now;
+        self.last_canvas_resize_at = Some(now);
+        true
+    }
+
+    fn gpu_scene_2d_readiness(&self) -> crate::canvas::Scene2DReadiness {
+        let key = crate::canvas::Cache2DKey {
+            version: self.document.version,
+            nonce: self.document.cache_nonce,
+            view: *self.document.view(),
+            render_quality: self.document.render_quality,
+            dark_mode: self.dark_mode,
+            transient_revision: self.transient_render_state.revision(),
+        };
+        self.gpu_scene_readiness
+            .as_ref()
+            .map_or(crate::canvas::Scene2DReadiness::Pending, |readiness| {
+                readiness.status_2d(&key)
+            })
+    }
+
+    fn gpu_scene_3d_readiness(
+        &self,
+        screen_w: f32,
+        screen_h: f32,
+    ) -> crate::canvas::Scene3DReadiness {
+        let key = crate::canvas::Cache3DKey {
+            version: self.document.version,
+            camera: self.camera,
+            render_quality: self.document.render_quality,
+            dark_mode: self.dark_mode,
+            screen_w,
+            screen_h,
+        };
+        self.gpu_scene_readiness
+            .as_ref()
+            .map_or(crate::canvas::Scene3DReadiness::Pending, |readiness| {
+                readiness.status_3d(&key)
+            })
+    }
+
+    pub(crate) fn replace_document(&mut self, document: Document, path: Option<PathBuf>) {
+        // R1: el reemplazo + limpieza de historial vive en
+        // `DocumentController::replace_document`.
+        let mut doc_ctl = DocumentController::from_parts(
+            std::mem::replace(&mut self.document, Document::new()),
+            std::mem::take(&mut self.undo_stack),
+            std::mem::take(&mut self.redo_stack),
+            self.undo_total_bytes,
+        );
+        doc_ctl.replace_document(document);
+        let (document, undo_stack, redo_stack, undo_total_bytes) = doc_ctl.into_parts();
+        self.document = document;
+        self.undo_stack = undo_stack;
+        self.redo_stack = redo_stack;
+        self.undo_total_bytes = undo_total_bytes;
+        if let Some(path) = path {
+            self.document_lifecycle
+                .establish_opened_document(path, &self.document);
+        } else {
+            self.document_lifecycle
+                .establish_new_document(&self.document);
+        }
+        self.autosave.mark_saved();
+        self.autosave_last_version = self.document.version;
+        self.clear_document_bound_transient_state();
+        self.document_snapshot = std::sync::Arc::new(self.document.clone());
+        self.snapshot_version = self.document.version;
+        self.snapshot_render_quality = self.document.render_quality;
+        self.attractor_cache.clear();
+        if let Ok(mut fill_textures) = self.fill_textures.write() {
+            fill_textures.clear();
+        }
+        if let Some(readiness) = &self.gpu_scene_readiness {
+            readiness.clear();
+        }
+        // Ola 2.7: el OnLoad corre al abrir/importar, nunca en cada frame.
+        self.run_on_load_script_if_present();
+    }
+
+    /// Limpia el estado de UI cuyos valores pertenecen al documento reemplazado.
+    fn clear_document_bound_transient_state(&mut self) {
+        self.pending_points.clear();
+        self.pending_points_3d.clear();
+        self.selected_object = None;
+        self.preview_object = None;
+        self.input_text.clear();
+        self.command_input_focus_requested = false;
+        self.cas_result.clear();
+        self.cas_history.clear();
+        self.statistics_input_error = None;
+        self.statistics_data.clear();
+        self.statistics_input_buf.clear();
+        self.table_func_idx = 0;
+        self.active_color_picker = None;
+        self.tool_ghost = None;
+        self.pending_action = PendingAction::None;
+        self.canvas_drag_start = None;
+        self.canvas_is_panning = false;
+        self.point_drag_has_mutated = false;
+        self.eraser_stroke_has_mutated = false;
+        self.select_drag_object = None;
+        self.point_drag_error_reported = false;
+        self.hovered_analysis = None;
+        self.hover_candidate_pos = None;
+        self.hover_cached_analysis = None;
+        self.autocomplete = InputAutocomplete::default();
+        self.assistant.focus = None;
+        // R1: el transitorio del panel vive en `AssistantController`.
+        let mut assistant_ctl = AssistantController {
+            state: std::mem::take(&mut self.assistant),
+            visible: self.assistant_visible,
+        };
+        assistant_ctl.clear_transient();
+        self.assistant = assistant_ctl.state;
+        self.construction_log.clear();
+        self.transient_render_state = TransientRenderState::default();
+        self.reset_tool_input();
+    }
+
+    /// Limpia todo el estado transitorio de herramientas y sus referencias a objetos.
+    pub fn reset_tool_input(&mut self) {
+        self.pending_points.clear();
+        self.pending_points_3d.clear();
+        self.tool_state.clear();
+    }
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // F10-D cold start instrumentado: t0 del constructor; al final de
+        // `new` se loguea la duración + first_frame en el primer `update`.
+        let startup_t0 = Instant::now();
+        // Scandinavian: Instala Inter Variable como fuente principal (calm, 500/600)
+        {
+            let mut fonts = egui::FontDefinitions::default();
+            fonts.font_data.insert(
+                "Inter".to_owned(),
+                egui::FontData::from_static(include_bytes!("../../../assets/InterVariable.ttf")),
+            );
+            fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .insert(0, "Inter".to_owned());
+            fonts
+                .families
+                .entry(egui::FontFamily::Monospace)
+                .or_default()
+                .insert(0, "Inter".to_owned());
+            cc.egui_ctx.set_fonts(fonts);
+        }
+        configure_egui_tessellation(&cc.egui_ctx);
+        let (gpu_renderer, gpu_scene_readiness) = if let Some(render_state) = &cc.wgpu_render_state
+        {
+            let renderer: Arc<RwLock<Option<grafito_render::Renderer>>> =
+                Arc::new(RwLock::new(None));
+            let scene_readiness = crate::canvas::GpuSceneReadiness::default();
+            let renderer_clone = Arc::clone(&renderer);
+            let device_clone = Arc::clone(&render_state.device);
+            let queue_clone = Arc::clone(&render_state.queue);
+            let target_format = render_state.target_format;
+            let egui_ctx = cc.egui_ctx.clone();
+            // Usa Weak para no retener el renderer si la app se cerró antes de compilar.
+            let weak_renderer = std::sync::Arc::downgrade(&renderer_clone);
+
+            std::thread::spawn(move || {
+                let new_renderer = grafito_render::Renderer::new(
+                    &device_clone,
+                    &queue_clone,
+                    target_format,
+                    crate::MSAA_SAMPLES as u32,
+                );
+                if let Some(renderer) = weak_renderer.upgrade() {
+                    if let Ok(mut lock) = renderer.write() {
+                        *lock = Some(new_renderer);
+                    }
+                }
+                // Solo repinta si el viewport sigue válido — evita request_repaint
+                // póstumo si la ventana ya se cerró. Equivalente a `if ctx.viewport_id().is_valid()`.
+                if egui_ctx.viewport_id() == egui::ViewportId::ROOT {
+                    egui_ctx.request_repaint();
+                }
+                log::info!("Background shader compilation finished.");
+            });
+
+            let resources = crate::canvas::GpuCanvasResources {
+                renderer: Arc::clone(&renderer),
+                buffers_2d: None,
+                buffers_3d: None,
+                cache_2d: None,
+                cache_3d: None,
+                scene_readiness: scene_readiness.clone(),
+                // Frente B6: slot background de compute 2D (cap 1, inicia libre).
+                gpu_compute_slot: crate::canvas::GpuComputeSlot::default(),
+            };
+            render_state
+                .renderer
+                .write()
+                .callback_resources
+                .insert(resources);
+            register_gpu_function_evaluator(Box::new(AppGpuFunctionEvaluator {
+                renderer: Arc::clone(&renderer),
+                device: Arc::clone(&render_state.device),
+                queue: Arc::clone(&render_state.queue),
+            }));
+            (Some(renderer), Some(scene_readiness))
+        } else {
+            (None, None)
+        };
+        let gpu_available = gpu_renderer.is_some();
+        // ── A8 arranque: si se pasó un archivo por CLI (`grafito doc.json`),
+        // se abre en background en el primer `update` (`maybe_start_startup_open`)
+        // para no bloquear el primer paint (AS3 cold-start: antes era I/O
+        // sincrónica de hasta 10 MB aquí, en el hilo UI, antes de la primera frame).
+        // I/O en constructor (no en `Ui::`); el sidecar se chequea en background.
+        let document = initial_document();
+        let document_lifecycle = DocumentLifecycle::new(&document);
+        let mut startup_recent: Option<String> = None;
+        let mut startup_pending_doc: Option<PathBuf> = None;
+        if let Some(startup_path) = Self::startup_file_arg() {
+            if startup_path.is_file() {
+                startup_recent = Some(startup_path.to_string_lossy().into_owned());
+                startup_pending_doc = Some(startup_path);
+            } else {
+                log::warn!(
+                    "startup file {} no existe o no es archivo regular",
+                    startup_path.display()
+                );
+            }
+        }
+
+        let config = load_config();
+        let dark_mode = config.dark_mode;
+        if dark_mode {
+            DARK.apply(&cc.egui_ctx);
+        } else {
+            LIGHT.apply(&cc.egui_ctx);
+        }
+        let mut assistant = grafito_ui::assistant::AssistantPanelState::default();
+        assistant.apply_preferences(config.assistant_provider, config.assistant_model.clone());
+        assistant.allow_fusion_fallback = config.allow_fusion_fallback;
+        assistant.full_permission = config.assistant_full_permission;
+        assistant.agent_mode = config.assistant_agent_mode;
+        assistant.reasoning_enabled = config.assistant_reasoning_enabled;
+        assistant.web_search_enabled = config.assistant_web_search_enabled;
+        assistant.socratic_enabled = config.assistant_socratic_enabled;
+
+        let snapshot_version = document.version;
+        let snapshot_render_quality = document.render_quality;
+        let document_snapshot = std::sync::Arc::new(document.clone());
+        let profile = crate::utils::load_profile();
+        let avatar_draft = profile.avatar.clone();
+        let advanced_red_opt_in = config.advanced_red_opt_in;
+        let locale = config.locale;
+        let reduced_motion = config.reduced_motion;
+        let show_onboarding = !config.onboarding_completed;
+        // B-A201: aviso `outbox_notice` localizado desde el arranque.
+        let mut classroom =
+            crate::classroom::ClassroomPanel::new_with_locale(locale.as_ui_locale());
+        classroom.set_opt_in(advanced_red_opt_in);
+        let autosave_last_version = document.version;
+
+        // `current_view` es cache derivado de `perspective` — fuente canónica
+        // `Perspective::view_mode()` / `Perspective::canvas_mode()`.
+        let perspective = Perspective::Geometry2D;
+        let current_view = perspective.view_mode();
+        debug_assert_eq!(current_view, ViewMode::D2);
+        debug_assert_eq!(perspective.canvas_mode(), crate::CanvasMode::D2);
+        let mut app = Self {
+            document,
+            current_tool: Tool::default(),
+            previous_tool: Tool::default(),
+            current_view,
+            perspective,
+            camera: Camera3D::new(1280.0 / 720.0),
+            show_grid: config.show_grid,
+            snap_to_grid: config.snap_to_grid,
+            snap_config: config.snap,
+            complex_contour: crate::complex_contour::ComplexContourState::default(),
+            exam_mode: false,
+            exam_exit_confirm: false,
+            dark_mode,
+            pending_points: Vec::new(),
+            pending_points_3d: Vec::new(),
+            last_mouse_pos: None,
+            canvas_origin: None,
+            canvas_drag_start: None,
+            canvas_is_panning: false,
+            point_drag_has_mutated: false,
+            eraser_stroke_has_mutated: false,
+            select_drag_object: None,
+            point_drag_error_reported: false,
+            selected_object: None,
+            indicate: None,
+            preview_object: None,
+            input_text: String::new(),
+            command_input_focus_requested: false,
+            cas_result: String::new(),
+            keyboard_tab: 0,
+            keyboard_visible: DEFAULT_KEYBOARD_VISIBLE,
+            keyboard_visible_explicit: false,
+            keyboard_expanded: false,
+            table_func_idx: 0,
+            table_x_min: "-5".to_string(),
+            table_x_max: "5".to_string(),
+            table_step: "1.0".to_string(),
+            cas_history: VecDeque::new(),
+            sidebar_tab: 0,
+            startup_instant: Instant::now(),
+            startup_first_frame_logged: false,
+            mora_texture: None,
+            mora_texture_load_attempted: false,
+            plugin_registry: None,
+            pending_plugins_job: None,
+            plugins_loaded: false,
+            shot_viewport_resize: false,
+            assistant_blocks_cache: grafito_ui::assistant::AssistantBlocksCache::default(),
+            whiteboard_open: false,
+            whiteboard: crate::whiteboard_ui::WhiteboardSession::default(),
+            whiteboard_book: crate::whiteboard_ui::WhiteboardBook::default(),
+            whiteboard_left_pinned: false,
+            show_whiteboard_assistant: true,
+            profile,
+            recent_files: startup_recent
+                .map(|recent| {
+                    let mut queue = VecDeque::new();
+                    queue.push_back(recent);
+                    queue
+                })
+                .unwrap_or_default(),
+            document_lifecycle,
+            deferred_file_actions: DeferredFileActions::default(),
+            undo_stack: VecDeque::new(),
+            redo_stack: VecDeque::new(),
+            undo_total_bytes: 0,
+            frame_budget_skipped: 0,
+            welcome_page: 0,
+            show_onboarding,
+            welcome_dont_show_again: false,
+            pending_save_job: None,
+            pending_open_job: None,
+            startup_pending_doc,
+            pending_export_job: None,
+            last_export_dir: None,
+            pending_ggb_import_job: None,
+            pending_ggb_export_job: None,
+            pending_import_job: None,
+            pending_text_job: None,
+            pending_clipboard_job: None,
+            pending_chained_action: None,
+            implicit_surface_slot: crate::implicit_surface_compute::ImplicitSurfaceSlot::new(),
+            implicit_slot_key: None,
+            implicit_slot_version: None,
+            attractor_cache: std::collections::HashMap::new(),
+            fill_textures: std::sync::RwLock::new(
+                crate::render_2d::FillTextureCacheStore::default(),
+            ),
+            active_color_picker: None,
+            tool_ghost: None,
+            tool_state: crate::tool_dispatcher::ToolState::default(),
+            gpu_renderer,
+            gpu_scene_readiness,
+            transient_render_state: TransientRenderState::default(),
+            mapping_anim_cache: None,
+            algebra_expr_cache: std::collections::HashMap::new(),
+            hover_pick_cache: None,
+            multidimensional_motion_enabled: true,
+            explicit_spin_speed_dps: None,
+            on_update_running: false,
+            multidimensional_motion_speed: DEFAULT_MULTIDIMENSIONAL_MOTION_SPEED,
+            view3d: crate::canvas::View3D::default(),
+            camera_travelling: None,
+            use_gpu: gpu_available,
+            last_interaction_time: Instant::now(),
+            is_view_changing: false,
+            last_canvas_resize_at: None,
+            pending_action: PendingAction::None,
+            toasts: grafito_ui::toast::ToastManager::default(),
+            hovered_analysis: None,
+            hover_candidate_pos: None,
+            hover_candidate_time: 0.0,
+            hover_cached_analysis: None,
+            color_favorites: [
+                grafito_geometry::Color::new(0.9, 0.1, 0.1, 1.0),
+                grafito_geometry::Color::new(0.1, 0.6, 0.1, 1.0),
+                grafito_geometry::Color::new(0.1, 0.3, 0.9, 1.0),
+                grafito_geometry::Color::new(0.9, 0.6, 0.1, 1.0),
+                grafito_geometry::Color::new(0.5, 0.1, 0.9, 1.0),
+            ],
+            document_snapshot,
+            snapshot_version,
+            snapshot_render_quality,
+            command_palette: grafito_ui::command_palette::CommandPaletteState::default(),
+            custom_tools: grafito_command::ggbscript::CustomToolStore::new(),
+            custom_tools_revision: 0,
+            show_custom_tool_dialog: false,
+            custom_tool_name: String::new(),
+            assistant,
+            steps_tts: None,
+            steps_tts_available_cached: None,
+            stt_recording: None,
+            stt_transcribing: None,
+            stt_available_cached: None,
+            assistant_runtime: crate::assistant::AssistantRuntime::default(),
+            right_drawer_open: true,
+            workspace_dock_tab: crate::WorkspaceDockTab::Inspector,
+            compact_geometry_utility_open: false,
+            left_drawer_open: false,
+            compact_drawer_open: false,
+            nivel0_hidden_announced: false,
+            drawer_blocked_announced: false,
+            mobile_menu_page: crate::ui::MobileMenuPage::Root,
+            assistant_visible: true,
+            mobile_menu_open: false,
+            ui_time: 0.0,
+            construction_log: Vec::new(),
+            show_construction_protocol: DEFAULT_CONSTRUCTION_PROTOCOL_VISIBLE,
+            statistics_data: Vec::new(),
+            statistics_input_buf: String::new(),
+            statistics_input_error: None,
+            autocomplete: InputAutocomplete::default(),
+            show_about: false,
+            show_colab_window: false,
+            colab: crate::colab_link::ColabLink::default(),
+            colab_panel: crate::colab_panel::ColabPanelState::default(),
+            show_cheat_sheet: false,
+            show_trig_animation: false,
+            trig_angle: 0.0,
+            trig_animating: false,
+            trig_speed: 0.5,
+            trig_function: 0,
+            trig_view_mode: TrigViewMode::Didactic,
+            trig_graph_cache: std::sync::RwLock::new(None),
+            show_mascot_config: false,
+            avatar_draft,
+            config_name_error: None,
+            teaching_ui: crate::teaching_ui::TeachingUiState::default(),
+            celebration: crate::celebration::CelebrationState::default(),
+            repaint_budget: RepaintBudget::default(),
+            autosave: AutosaveDebouncer::new(),
+            autosave_last_version,
+            // ── A8 recovery: arranca sin oferta; el primer `update` lanza el
+            // chequeo en background si `current_path` es `Some` (CLI o apertura).
+            pending_recovery_job: None,
+            recovery_offer: None,
+            recovery_corrupt: None,
+            recovery_checked_path: None,
+            advanced_red_opt_in,
+            locale,
+            reduced_motion,
+            classroom,
+        };
+        // F10-D cold start instrumentado (S): duración real del constructor.
+        // El first_frame se loguea en el primer `update` (hint sutil de arranque).
+        log::info!(
+            "startup: new() listo en {}ms ({} objetos, gpu={})",
+            startup_t0.elapsed().as_millis(),
+            app.document.object_count(),
+            app.use_gpu,
+        );
+        // EE1 hook de capturas (verificación visual, no feature): si
+        // `GRAFITO_SHOT` está puesta abre la vista demo solo en memoria.
+        crate::shot::maybe_apply_shot(&mut app);
+        app
+    }
+
+    /// Ruta única para que los widgets pidan repintado periódico coalescido (F17).
+    ///
+    /// Los widgets de la Piel NO deben llamar `ctx.request_repaint_after`
+    /// directamente con intervalos arbitrarios: deben pasar por aquí para que
+    /// [`RepaintBudget`] acumule el mínimo del frame y el scheduler unificado
+    /// lo aplique una sola vez al final de `update`.
+    pub(crate) fn request_repaint_budget(&mut self, delay: Duration) {
+        self.repaint_budget.request(delay);
+    }
+
+    /// Aplica el presupuesto de repintado acumulado del frame (F17).
+    /// Lo invoca el scheduler unificado al final de `update` (y
+    /// `draw_whiteboard_overlay`, que hace early-return antes de ese punto).
+    pub(crate) fn apply_repaint_budget(&mut self, ctx: &egui::Context) {
+        self.repaint_budget.apply(ctx);
+    }
+
+    /// Epoch segundos para autosave (SystemTime -> secs, 0 si falla).
+    pub(crate) fn autosave_now_epoch() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    /// Marca el documento como sucio para autosave (debounce).
+    pub(crate) fn mark_autosave_dirty(&mut self) {
+        let now = Self::autosave_now_epoch();
+        self.autosave.mark_dirty(now);
+    }
+
+    /// Tick de autosave en `update` (nunca en `Ui::`): si `should_autosave(now)`
+    /// escribe sidecar en background thread + `mark_saved()`. Reutiliza patrón
+    /// `spawn_profile_save` (thread Builder + request_repaint), nunca bloquea UI.
+    /// También detecta cambios de `document.version` no capturados por
+    /// `mark_autosave_dirty()` (fallback para mutaciones via free functions).
+    pub(crate) fn tick_autosave(&mut self, ctx: &egui::Context) {
+        // Fallback: si el documento cambió desde el último tick y aún no está dirty,
+        // marcarlo. Esto cubre mutaciones que no pasaron por `save_snapshot`.
+        if self.document.version != self.autosave_last_version && !self.autosave.is_dirty() {
+            self.mark_autosave_dirty();
+        }
+        self.autosave_last_version = self.document.version;
+        let now = Self::autosave_now_epoch();
+        if !self.autosave.should_autosave(now) {
+            return;
+        }
+        let Some(main_path) = self
+            .document_lifecycle
+            .current_path()
+            .map(|p| p.to_path_buf())
+        else {
+            return;
+        };
+        let doc = self.document.clone();
+        let egui_ctx = ctx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("autosave".into())
+            .spawn(move || {
+                if let Err(err) =
+                    grafito_core::persistence::write_autosave_sidecar(&doc, &main_path)
+                {
+                    log::warn!("autosave sidecar failed for {}: {err}", main_path.display());
+                }
+                egui_ctx.request_repaint();
+            });
+        if spawned.is_ok() {
+            self.autosave.mark_saved();
+        } else {
+            log::warn!("autosave: spawn failed");
+        }
+    }
+
+    // ── A8 Recovery al arranque (Piel pura) ──────────────────────────────
+    // El sidecar se escribe en background (`tick_autosave`); aquí se ofrece
+    // recuperar al arranque / al abrir un archivo con sidecar más nuevo.
+    // Todo I/O en background (`spawn_recovery_check` + `poll_recovery_job`);
+    // `draw_recovery_modal` solo lee memoria (cero I/O en `Ui::`).
+
+    /// Núcleo testeable de [`GrafitoApp::startup_file_arg`]: primer arg no-flag.
+    /// Puro, sin I/O, sin pánicos. Ignora flags (`-h`, `--profile`) y vacíos.
+    pub(crate) fn startup_file_arg_from(args: &[String]) -> Option<PathBuf> {
+        for arg in args {
+            if arg.is_empty() || arg.starts_with('-') {
+                continue;
+            }
+            if arg.contains('\0') {
+                continue;
+            }
+            let path = PathBuf::from(arg);
+            if path.as_os_str().is_empty() {
+                continue;
+            }
+            return Some(path);
+        }
+        None
+    }
+
+    /// Archivo pasado por CLI (`grafito doc.json`) para el arranque.
+    /// Lee `std::env::args` (sin I/O de archivos); el contenido se carga en `new`.
+    pub(crate) fn startup_file_arg() -> Option<PathBuf> {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        Self::startup_file_arg_from(&args)
+    }
+
+    /// Lanza el chequeo de sidecar en background (nunca bloquea UI).
+    /// Pattern `spawn_profile_save` con `sync_channel(1)` + `request_repaint`.
+    /// Retorna `None` si el spawn falla (el caller loguea y marca chequeado).
+    pub(crate) fn spawn_recovery_check(
+        main_path: PathBuf,
+        ctx: &egui::Context,
+    ) -> Option<PendingAutosaveRecoveryJob> {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let egui_ctx = ctx.clone();
+        let path_for_thread = main_path.clone();
+        let spawned = std::thread::Builder::new()
+            .name("autosave-recovery".into())
+            .spawn(move || {
+                let result = grafito_core::persistence::load_autosave_candidate(&path_for_thread)
+                    .map_err(|err| err.to_string());
+                let _ = tx.send(result);
+                egui_ctx.request_repaint();
+            });
+        if spawned.is_err() {
+            log::warn!("recovery: spawn failed for {}", main_path.display());
+            return None;
+        }
+        Some(PendingAutosaveRecoveryJob {
+            receiver: rx,
+            main_path,
+        })
+    }
+
+    /// Arranca la apertura del archivo CLI en background (AS3 cold-start).
+    /// Piel pura: sin I/O, solo spawnea `spawn_document_open` una vez; el
+    /// resultado (éxito o error honesto) llega por `poll_background_jobs`,
+    /// que ya publica el toast "Documento abierto desde…". Si el usuario ya
+    /// abrió algo (hay `current_path` o un job en curso), el pendiente se
+    /// descarta sin ruido.
+    pub(crate) fn maybe_start_startup_open(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.startup_pending_doc.take() else {
+            return;
+        };
+        if self.pending_open_job.is_some() || self.document_lifecycle.current_path().is_some() {
+            return;
+        }
+        self.pending_open_job = Some(PendingOpenJob {
+            receiver: spawn_document_open(path, ctx),
+        });
+        self.notify(
+            "Abriendo documento inicial…",
+            grafito_ui::toast::ToastKind::Info,
+        );
+    }
+
+    /// Arranca el chequeo una vez por ruta (al arranque y al abrir archivos).
+    /// No hace I/O: solo spawnea el job en background. Si la ruta cambió desde
+    /// el último chequeo, descarta oferta/job viejos (el usuario navegó a otro archivo).
+    pub(crate) fn maybe_start_recovery_check(&mut self, ctx: &egui::Context) {
+        let Some(current) = self
+            .document_lifecycle
+            .current_path()
+            .map(|p| p.to_path_buf())
+        else {
+            return;
+        };
+        // Si el usuario cambió de archivo, la oferta/job viejos quedan obsoletos.
+        if let Some(job_path) = self.pending_recovery_job.as_ref().map(|job| &job.main_path) {
+            if *job_path != current {
+                self.pending_recovery_job = None;
+            }
+        }
+        if let Some(offer_path) = self.recovery_offer.as_ref().map(|offer| &offer.main_path) {
+            if *offer_path != current {
+                self.recovery_offer = None;
+            }
+        }
+        if let Some(corrupt_path) = self
+            .recovery_corrupt
+            .as_ref()
+            .map(|corrupt| &corrupt.main_path)
+        {
+            if *corrupt_path != current {
+                self.recovery_corrupt = None;
+            }
+        }
+        if self.pending_recovery_job.is_some()
+            || self.recovery_offer.is_some()
+            || self.recovery_corrupt.is_some()
+        {
+            return;
+        }
+        if self.recovery_checked_path.as_ref() == Some(&current) {
+            return;
+        }
+        match Self::spawn_recovery_check(current.clone(), ctx) {
+            Some(job) => {
+                self.pending_recovery_job = Some(job);
+            }
+            None => {
+                // Spawn falló: marcar chequeado para no reintentar por frame.
+                self.recovery_checked_path = Some(current);
+            }
+        }
+    }
+
+    /// Poll del job en background (nunca I/O, solo `try_recv`).
+    /// `Ok(None)` = sin sidecar o no más nuevo → marcar chequeado, sin modal.
+    /// `Ok(Some)` = oferta lista → modal. `Err` = sidecar más nuevo pero
+    /// corrupto → modal de descarte.
+    pub(crate) fn poll_recovery_job(&mut self) {
+        let Some(job) = self.pending_recovery_job.take() else {
+            return;
+        };
+        match job.receiver.try_recv() {
+            Ok(Ok(None)) => {
+                self.recovery_checked_path = Some(job.main_path);
+            }
+            Ok(Ok(Some(candidate))) => {
+                let offer = AutosaveRecoveryOffer {
+                    main_path: candidate.main_path.clone(),
+                    sidecar_path: candidate.sidecar_path.clone(),
+                    document: candidate.document,
+                    main_modified_epoch: candidate.main_modified_epoch,
+                    sidecar_modified_epoch: candidate.sidecar_modified_epoch,
+                    show_diff: false,
+                };
+                self.recovery_offer = Some(offer);
+                self.recovery_corrupt = None;
+                self.recovery_checked_path = Some(job.main_path);
+            }
+            Ok(Err(err)) => {
+                // Solo mostrar corrupto si hay sidecar del que hablar; si no hay
+                // nombre de archivo no hay nada que descartar.
+                match grafito_core::persistence::autosave_sidecar_path(&job.main_path) {
+                    Some(sidecar) => {
+                        self.recovery_corrupt = Some(AutosaveRecoveryCorrupt {
+                            main_path: job.main_path.clone(),
+                            sidecar_path: sidecar,
+                            error: err,
+                        });
+                        self.recovery_offer = None;
+                        self.recovery_checked_path = Some(job.main_path);
+                    }
+                    None => {
+                        self.recovery_checked_path = Some(job.main_path);
+                    }
+                }
+            }
+            Err(TryRecvError::Empty) => {
+                self.pending_recovery_job = Some(job);
+            }
+            Err(TryRecvError::Disconnected) => {
+                // Worker caído: avisar en vez de fingir "no hay autosave".
+                self.recovery_checked_path = Some(job.main_path);
+                self.notify(
+                    "No se pudo revisar el autosave del arranque",
+                    grafito_ui::toast::ToastKind::Error,
+                );
+            }
+        }
+    }
+
+    /// Resumen puro del diff opcional (conteo objetos + fecha epoch).
+    /// Sin I/O: compara la oferta ya cargada con el documento en memoria.
+    /// Retorna `None` si no hay oferta.
+    pub(crate) fn recovery_diff_summary(&self) -> Option<String> {
+        let offer = self.recovery_offer.as_ref()?;
+        let autosave_objects = offer.document.object_count();
+        let current_objects = self.document.object_count();
+        let main_fecha = offer
+            .main_modified_epoch
+            .map_or("sin guardado".to_string(), |epoch| format!("epoch {epoch}"));
+        Some(format!(
+            "Autosave: {autosave_objects} objetos · epoch {} / Guardado: {current_objects} objetos · {main_fecha}",
+            offer.sidecar_modified_epoch
+        ))
+    }
+
+    /// Acepta la oferta: restaura el sidecar como documento actual.
+    /// Llamar FUERA del closure de `Ui::` (el modal solo setea flags).
+    /// Borrado del sidecar best-effort (ignora `NotFound`); si falla se loguea.
+    /// Retorna `true` si había oferta y se restauró.
+    pub(crate) fn accept_recovery_offer(&mut self) -> bool {
+        let Some(offer) = self.recovery_offer.take() else {
+            return false;
+        };
+        let main_path = offer.main_path.clone();
+        let sidecar_path = offer.sidecar_path.clone();
+        self.replace_document(offer.document, Some(main_path.clone()));
+        self.remember_recent_file(&main_path);
+        self.recovery_corrupt = None;
+        self.recovery_checked_path = Some(main_path.clone());
+        if std::fs::remove_file(&sidecar_path).is_err() {
+            // Best-effort: el sidecar puede no existir (carrera con guardado).
+            // Solo loguear si no es NotFound para no ensuciar el log.
+            if std::fs::metadata(&sidecar_path).is_ok() {
+                log::warn!("recovery: no se pudo borrar {}", sidecar_path.display());
+            }
+        }
+        self.notify(
+            format!("Autosave recuperado desde {}", sidecar_path.display()),
+            grafito_ui::toast::ToastKind::Success,
+        );
+        true
+    }
+
+    /// Descarta la oferta y (si `delete_sidecar`) borra el sidecar en disco.
+    /// `delete_sidecar=false` = posponer (se mantiene el archivo para el próximo arranque).
+    /// Llamar FUERA del closure de `Ui::`. Retorna `true` si había algo que cerrar.
+    pub(crate) fn dismiss_recovery_offer(&mut self, delete_sidecar: bool) -> bool {
+        let mut had_anything = false;
+        if let Some(offer) = self.recovery_offer.take() {
+            had_anything = true;
+            self.recovery_checked_path = Some(offer.main_path.clone());
+            if delete_sidecar {
+                let _ = std::fs::remove_file(&offer.sidecar_path);
+            }
+        }
+        if let Some(corrupt) = self.recovery_corrupt.take() {
+            had_anything = true;
+            self.recovery_checked_path = Some(corrupt.main_path.clone());
+            if delete_sidecar {
+                let _ = std::fs::remove_file(&corrupt.sidecar_path);
+            }
+        }
+        if had_anything {
+            self.notify(
+                "Se sigue con el documento guardado",
+                grafito_ui::toast::ToastKind::Info,
+            );
+        }
+        had_anything
+    }
+
+    /// Modal `recovery.title_found` — Piel pura, cero I/O en `Ui::`.
+    /// Lee `recovery_offer` / `recovery_corrupt` ya cargados; los clicks solo
+    /// setean flags locales y la acción (accept/dismiss/toggle) ocurre FUERA
+    /// del closure. Botones: [Recuperar autosave] [Seguir con guardado] [Ver diff].
+    pub(crate) fn draw_recovery_modal(&mut self, ctx: &egui::Context) {
+        // Caso corrupto: no hay nada recuperable, solo descartar o seguir.
+        if self.recovery_corrupt.is_some() {
+            self.draw_recovery_corrupt_modal(ctx);
+            return;
+        }
+        if self.recovery_offer.is_none() {
+            return;
+        }
+        let mut do_recover = false;
+        let mut do_keep = false;
+        let mut do_toggle_diff = false;
+        let mut do_postpone = false;
+        // Copia solo para display dentro del closure (evita borrow prolongado).
+        // El subtítulo sale de `recovery.subtitle_newer` (B-A183).
+        let locale = self.config_locale();
+        let (subtitle_text, diff_summary, show_diff) = {
+            let Some(offer) = self.recovery_offer.as_ref() else {
+                return;
+            };
+            let subtitle = grafito_ui::i18n::t("recovery.subtitle_newer", locale)
+                .replace("{path}", &offer.main_path.display().to_string());
+            let diff = self.recovery_diff_summary().unwrap_or_default();
+            (subtitle, diff, offer.show_diff)
+        };
+        let mut open = true;
+        let theme = grafito_ui::theme::current_theme(ctx);
+        egui::Window::new(grafito_ui::i18n::t("recovery.title_found", locale).to_string())
+            .id(egui::Id::new("autosave_recovery_modal"))
+            .collapsible(false)
+            .resizable(false)
+            .default_width(420.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .order(egui::Order::Foreground)
+            .open(&mut open)
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .fill(theme.panel_bg)
+                    .stroke(egui::Stroke::new(1.0, theme.separator))
+                    .rounding(grafito_ui::tokens::RADIUS_LG)
+                    .inner_margin(egui::Margin::symmetric(
+                        grafito_ui::tokens::SPACE_LG,
+                        grafito_ui::tokens::SPACE_MD,
+                    )),
+            )
+            .show(ctx, |ui| {
+                // #88 Modales responsive: margen de 16 px por lado en angosto.
+                ui.set_min_width(crate::ui::dialog_content_min_width(
+                    ui.ctx().screen_rect().width(),
+                ));
+                ui.set_max_width(420.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        egui::RichText::new(&subtitle_text)
+                            .size(grafito_ui::tokens::TYPE_SM)
+                            .color(theme.text_primary),
+                    );
+                });
+                ui.add_space(grafito_ui::tokens::SPACE_SM);
+                if show_diff {
+                    ui.separator();
+                    ui.add_space(grafito_ui::tokens::SPACE_XS);
+                    ui.label(
+                        egui::RichText::new(&diff_summary)
+                            .size(grafito_ui::tokens::TYPE_XS)
+                            .color(theme.text_secondary),
+                    );
+                    ui.add_space(grafito_ui::tokens::SPACE_XS);
+                    ui.separator();
+                    ui.add_space(grafito_ui::tokens::SPACE_SM);
+                }
+                // Botones como valores (sin `ui`): el contenedor decide.
+                let recover = egui::Button::new(
+                    egui::RichText::new(grafito_ui::i18n::t("recovery.recover", locale))
+                        .size(grafito_ui::tokens::TYPE_SM)
+                        .color(egui::Color32::WHITE)
+                        .strong(),
+                )
+                .rounding(grafito_ui::tokens::RADIUS_SM)
+                .fill(theme.accent)
+                .stroke(egui::Stroke::NONE);
+                let keep = egui::Button::new(
+                    egui::RichText::new(grafito_ui::i18n::t("recovery.keep", locale))
+                        .size(grafito_ui::tokens::TYPE_SM)
+                        .color(theme.text_secondary),
+                )
+                .rounding(grafito_ui::tokens::RADIUS_SM)
+                .fill(theme.panel_bg)
+                .stroke(egui::Stroke::new(1.0, theme.separator));
+                let diff_label = if show_diff {
+                    grafito_ui::i18n::t("recovery.hide_diff", locale)
+                } else {
+                    grafito_ui::i18n::t("recovery.show_diff", locale)
+                };
+                let diff_btn = egui::Button::new(
+                    egui::RichText::new(diff_label)
+                        .size(grafito_ui::tokens::TYPE_SM)
+                        .color(theme.text_secondary),
+                )
+                .rounding(grafito_ui::tokens::RADIUS_SM)
+                .fill(theme.panel_bg)
+                .stroke(egui::Stroke::new(1.0, theme.separator));
+                // #88: la fila (388 px) desborda en 320 → se apila.
+                let total_w = 3.0 * 124.0 + 2.0 * grafito_ui::tokens::SPACE_SM;
+                if crate::ui::dialog_buttons_stack(ui.available_width(), total_w) {
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = grafito_ui::tokens::SPACE_XS;
+                        let w = ui.available_width();
+                        if ui.add_sized([w, 40.0], recover).clicked() {
+                            do_recover = true;
+                        }
+                        if ui.add_sized([w, 40.0], keep).clicked() {
+                            do_keep = true;
+                        }
+                        if ui.add_sized([w, 40.0], diff_btn).clicked() {
+                            do_toggle_diff = true;
+                        }
+                    });
+                } else {
+                    ui.horizontal(|ui| {
+                        let pad = ((ui.available_width() - total_w) / 2.0).max(0.0);
+                        ui.add_space(pad);
+                        ui.spacing_mut().item_spacing.x = grafito_ui::tokens::SPACE_SM;
+                        if ui.add_sized(egui::vec2(124.0, 32.0), recover).clicked() {
+                            do_recover = true;
+                        }
+                        if ui.add_sized(egui::vec2(124.0, 32.0), keep).clicked() {
+                            do_keep = true;
+                        }
+                        if ui.add_sized(egui::vec2(124.0, 32.0), diff_btn).clicked() {
+                            do_toggle_diff = true;
+                        }
+                        ui.add_space(pad);
+                    });
+                }
+                ui.add_space(grafito_ui::tokens::SPACE_XS);
+            });
+        // ── Acciones FUERA del closure de Ui (aquí sí se permite I/O breve) ──
+        // A11Y (D1): Esc pospone (opción segura: conserva el sidecar para el
+        // próximo arranque, igual que la X). No borra nada.
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            do_postpone = true;
+        }
+        if do_toggle_diff {
+            if let Some(offer) = self.recovery_offer.as_mut() {
+                offer.show_diff = !offer.show_diff;
+            }
+            return;
+        }
+        if do_recover {
+            self.accept_recovery_offer();
+        } else if do_keep {
+            // Seguir con guardado = descartar sidecar, quedarse con el main.
+            self.dismiss_recovery_offer(true);
+        } else if do_postpone || !open {
+            // X o Esc = posponer esta sesión (se mantiene el archivo para el próximo arranque).
+            self.dismiss_recovery_offer(false);
+        }
+    }
+
+    /// Modal de sidecar corrupto — Piel pura, cero I/O en `Ui::`.
+    /// Ofrece [Descartar sidecar] (borra) o [Seguir con guardado] (pospone sin borrar).
+    fn draw_recovery_corrupt_modal(&mut self, ctx: &egui::Context) {
+        let mut do_discard = false;
+        let mut do_keep = false;
+        let mut open = true;
+        // El mensaje sale de `recovery.corrupt_msg` (B-A183); path y error
+        // van crudos en los templates `{path}`/`{err}`.
+        let locale = self.config_locale();
+        let message = {
+            let Some(corrupt) = self.recovery_corrupt.as_ref() else {
+                return;
+            };
+            grafito_ui::i18n::t("recovery.corrupt_msg", locale)
+                .replace("{path}", &corrupt.main_path.display().to_string())
+                .replace("{err}", &corrupt.error)
+        };
+        let theme = grafito_ui::theme::current_theme(ctx);
+        egui::Window::new(grafito_ui::i18n::t("recovery.corrupt_title", locale).to_string())
+            .id(egui::Id::new("autosave_recovery_corrupt_modal"))
+            .collapsible(false)
+            .resizable(false)
+            .default_width(420.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .order(egui::Order::Foreground)
+            .open(&mut open)
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .fill(theme.panel_bg)
+                    .stroke(egui::Stroke::new(1.0, theme.separator))
+                    .rounding(grafito_ui::tokens::RADIUS_LG)
+                    .inner_margin(egui::Margin::symmetric(
+                        grafito_ui::tokens::SPACE_LG,
+                        grafito_ui::tokens::SPACE_MD,
+                    )),
+            )
+            .show(ctx, |ui| {
+                // #88 Modales responsive: margen de 16 px por lado en angosto.
+                ui.set_min_width(crate::ui::dialog_content_min_width(
+                    ui.ctx().screen_rect().width(),
+                ));
+                ui.set_max_width(420.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        egui::RichText::new(&message)
+                            .size(grafito_ui::tokens::TYPE_SM)
+                            .color(theme.text_primary),
+                    );
+                });
+                ui.add_space(grafito_ui::tokens::SPACE_LG);
+                ui.horizontal(|ui| {
+                    let total_w = 2.0 * 124.0 + grafito_ui::tokens::SPACE_SM;
+                    let pad = ((ui.available_width() - total_w) / 2.0).max(0.0);
+                    ui.add_space(pad);
+                    ui.spacing_mut().item_spacing.x = grafito_ui::tokens::SPACE_SM;
+                    let discard = egui::Button::new(
+                        egui::RichText::new(grafito_ui::i18n::t("recovery.discard", locale))
+                            .size(grafito_ui::tokens::TYPE_SM)
+                            .color(egui::Color32::WHITE)
+                            .strong(),
+                    )
+                    .rounding(grafito_ui::tokens::RADIUS_SM)
+                    .fill(theme.accent)
+                    .stroke(egui::Stroke::NONE);
+                    if ui.add_sized(egui::vec2(124.0, 32.0), discard).clicked() {
+                        do_discard = true;
+                    }
+                    let keep = egui::Button::new(
+                        egui::RichText::new(grafito_ui::i18n::t("recovery.keep", locale))
+                            .size(grafito_ui::tokens::TYPE_SM)
+                            .color(theme.text_secondary),
+                    )
+                    .rounding(grafito_ui::tokens::RADIUS_SM)
+                    .fill(theme.panel_bg)
+                    .stroke(egui::Stroke::new(1.0, theme.separator));
+                    if ui.add_sized(egui::vec2(124.0, 32.0), keep).clicked() {
+                        do_keep = true;
+                    }
+                    ui.add_space(pad);
+                });
+                ui.add_space(grafito_ui::tokens::SPACE_XS);
+            });
+        if do_discard {
+            self.dismiss_recovery_offer(true);
+        } else if do_keep
+            || !open
+            || ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
+            // `!open` (X) o Esc = posponer esta sesión: se mantiene el archivo.
+            // Esc nunca borra (opción segura).
+            self.dismiss_recovery_offer(false);
+        }
+    }
+
+    /// Persiste preferencias de interfaz; las claves del asistente viven sólo en el llavero.
+    /// Idioma actual de la UI para los helpers localizados (toolbar/paleta).
+    pub(crate) fn config_locale(&self) -> grafito_ui::i18n::Locale {
+        self.locale.as_ui_locale()
+    }
+
+    /// Cambia el idioma en vivo y lo persiste (Piel pura: el selector solo
+    /// setea el flag, la escritura ocurre aquí fuera del closure de Ui).
+    pub(crate) fn set_locale(&mut self, locale: grafito_ui::i18n::Locale) {
+        self.locale = AppLocale::from_ui_locale(locale);
+        self.save_app_config();
+    }
+
+    pub(crate) fn save_app_config(&self) {
+        // Snapshot de lo que la UI cambió; el merge con lo persistido (toggles
+        // de plugins que se guardan en su propia ruta) y el write van a un
+        // worker: cada toggle bloqueaba el hilo de UI con read + write.
+        let requested = AppConfig {
+            dark_mode: self.dark_mode,
+            show_grid: self.show_grid,
+            snap_to_grid: self.snap_to_grid,
+            snap: self.snap_config.clone(),
+            assistant_provider: self.assistant.provider,
+            assistant_model: self.assistant.model.clone(),
+            allow_fusion_fallback: self.assistant.allow_fusion_fallback,
+            assistant_full_permission: self.assistant.full_permission,
+            assistant_agent_mode: self.assistant.agent_mode,
+            assistant_reasoning_enabled: self.assistant.reasoning_enabled,
+            assistant_web_search_enabled: self.assistant.web_search_enabled,
+            assistant_socratic_enabled: self.assistant.socratic_enabled,
+            onboarding_completed: false,
+            enabled_plugins: Vec::new(),
+            disabled_plugins: Vec::new(),
+            advanced_red_opt_in: self.advanced_red_opt_in,
+            // O2 i18n: el idioma se edita en vivo y persiste aquí.
+            locale: self.locale,
+            reduced_motion: self.reduced_motion,
+        };
+        let payload = requested.clone();
+        let spawned = std::thread::Builder::new()
+            .name("config-save".into())
+            .spawn(move || save_config_merging(requested));
+        if let Err(error) = spawned {
+            // Sin worker disponible: guardar igual (no perder la preferencia).
+            log::warn!("no se pudo lanzar el worker de config ({error}); guardando en UI");
+            save_config_merging(payload);
+        }
+    }
+
+    pub(crate) fn re_evaluate_constraints(&mut self, order: &[usize]) {
+        #[cfg(feature = "profile")]
+        puffin::profile_scope!("constraints");
+        self.document.re_evaluate_constraints(order);
+    }
+
+    pub(crate) fn has_visible_multidimensional_object(&self) -> bool {
+        self.document
+            .objects_iter()
+            .any(|(_, object)| object.is_visible() && object.is_3d())
+    }
+
+    pub(crate) fn has_visible_four_d_projection(&self) -> bool {
+        self.document.objects_iter().any(|(_, object)| {
+            object.is_visible()
+                && (matches!(object, GeoObject::HyperSurface4D(_))
+                    || is_typed_four_d_projection(object))
+        })
+    }
+
+    pub(crate) fn has_visible_typed_four_d_projection(&self) -> bool {
+        self.document
+            .objects_iter()
+            .any(|(_, object)| object.is_visible() && is_typed_four_d_projection(object))
+    }
+
+    pub(crate) fn pause_multidimensional_motion(&mut self) {
+        pause_default_multidimensional_motion(&mut self.multidimensional_motion_enabled);
+    }
+
+    pub(crate) fn set_multidimensional_motion_speed(&mut self, speed: f32) -> bool {
+        let speed = normalize_multidimensional_motion_speed(speed);
+        if self.multidimensional_motion_speed == speed {
+            return false;
+        }
+        self.multidimensional_motion_speed = speed;
+        true
+    }
+
+    /// Ola 1.7: lee `__view_spin_speed` (grados/s, `SetSpinSpeed`) y lo
+    /// aplica al campo explícito. La variable ausente deja la conducta de la
+    /// app; `0` estaciona la órbita aunque el interruptor esté encendido.
+    pub(crate) fn sync_spin_speed_from_document(&mut self) {
+        let value = self
+            .document
+            .variables
+            .get("__view_spin_speed")
+            .copied()
+            .filter(|value| value.is_finite())
+            .map(|value| (value as f32).clamp(0.0, 360.0));
+        self.explicit_spin_speed_dps = value;
+    }
+
+    /// Ola 2.7: ejecuta el `OnLoad` del documento recién reemplazado (una vez
+    /// por carga) y después los `OnUpdate` que correspondan. Best-effort: un
+    /// error se notifica y no aborta la carga.
+    pub(crate) fn run_on_load_script_if_present(&mut self) {
+        if self.document.on_load_script.is_none() {
+            return;
+        }
+        use grafito_command::commands::CommandOutcome;
+        let before = self.document.clone();
+        let outcome = match grafito_command::ggbscript::run_load_script(&mut self.document) {
+            Ok(steps) => CommandOutcome::Message(format!("OnLoad: {steps} pasos")),
+            Err(error) => CommandOutcome::Error(format!("OnLoad: {error}")),
+        };
+        let mutated = crate::lifecycle::command_mutated_document(&outcome, &before, &self.document);
+        save_command_snapshot_if_mutated(
+            &outcome,
+            before,
+            &self.document,
+            &mut self.undo_stack,
+            &mut self.redo_stack,
+        );
+        if mutated {
+            self.mark_autosave_dirty();
+        }
+        let updates = self.run_on_update_scripts();
+        match outcome {
+            CommandOutcome::Error(message) => {
+                self.notify(message, grafito_ui::toast::ToastKind::Error);
+            }
+            CommandOutcome::Message(message) if mutated || updates > 0 => {
+                self.notify(message, grafito_ui::toast::ToastKind::Info);
+            }
+            _ => {}
+        }
+    }
+
+    /// Ola 2.7: corre los guiones `OnUpdate` una vez por commit con tope y
+    /// guard de reentrada. Devuelve cuántos corrieron. El primer error se
+    /// notifica y corta (los guiones siguientes no se ejecutan sobre un
+    /// documento posiblemente inconsistente).
+    pub(crate) fn run_on_update_scripts(&mut self) -> usize {
+        if self.on_update_running {
+            return 0;
+        }
+        use grafito_command::commands::CommandOutcome;
+        let labels = grafito_command::ggbscript::on_update_script_labels(&self.document);
+        if labels.is_empty() {
+            return 0;
+        }
+        self.on_update_running = true;
+        let mut ran = 0usize;
+        for label in labels.into_iter().take(MAX_ON_UPDATE_SCRIPTS_PER_COMMIT) {
+            let before = self.document.clone();
+            let outcome =
+                match grafito_command::ggbscript::run_update_script(&mut self.document, &label) {
+                    Ok(steps) => {
+                        ran = ran.saturating_add(1);
+                        CommandOutcome::Message(format!("OnUpdate[{label}]: {steps} pasos"))
+                    }
+                    Err(error) => CommandOutcome::Error(format!("OnUpdate[{label}]: {error}")),
+                };
+            let mutated =
+                crate::lifecycle::command_mutated_document(&outcome, &before, &self.document);
+            save_command_snapshot_if_mutated(
+                &outcome,
+                before,
+                &self.document,
+                &mut self.undo_stack,
+                &mut self.redo_stack,
+            );
+            if mutated {
+                self.mark_autosave_dirty();
+            }
+            if let CommandOutcome::Error(message) = &outcome {
+                self.notify(message.clone(), grafito_ui::toast::ToastKind::Error);
+                break;
+            }
+        }
+        self.on_update_running = false;
+        ran
+    }
+
+    pub(crate) fn advance_multidimensional_motion(&mut self, dt: f64) -> bool {
+        self.assert_view_invariant();
+        if let Some(dps) = self.explicit_spin_speed_dps {
+            // Giro comandado: la órbita de cámara responde al ángulo exacto
+            // (0 = quieto) sin depender del interruptor ambiental. El 4D
+            // sigue gobernado por la velocidad de la app.
+            let visible = self.has_visible_multidimensional_object();
+            let camera_advanced = dps > 0.0
+                && visible
+                && crate::canvas::tick_view3d_ambient(
+                    self.view3d,
+                    &mut self.camera,
+                    dt.min(0.1) as f32,
+                    dps.to_radians(),
+                );
+            let four_d_advanced = visible
+                && self.multidimensional_motion_enabled
+                && self.has_visible_four_d_projection()
+                && self.transient_render_state.advance_four_d_phase(
+                    DEFAULT_4D_ROTATION_RADIANS_PER_SECOND
+                        * normalize_multidimensional_motion_speed(
+                            self.multidimensional_motion_speed,
+                        ) as f64
+                        * dt.min(0.1),
+                );
+            return camera_advanced || four_d_advanced;
+        }
+        if !should_animate_multidimensional_scene(
+            self.current_view,
+            self.multidimensional_motion_enabled,
+            self.has_visible_multidimensional_object(),
+        ) {
+            return false;
+        }
+
+        let speed = normalize_multidimensional_motion_speed(self.multidimensional_motion_speed);
+        self.multidimensional_motion_speed = speed;
+        // Travelling activo: la cámara animada manda por frame (paridad
+        // Manim `MovingCamera` vía `camera3d_from_anim_perspective`); sin
+        // travelling, órbita ambiental solo en perspectiva — las vistas
+        // ortográficas no tienen azimut y el tick no toca la cámara.
+        let camera_advanced = match self.camera_travelling.as_ref() {
+            Some(travelling) => travelling.apply_at(&mut self.camera, self.ui_time),
+            None => crate::canvas::tick_view3d_ambient(
+                self.view3d,
+                &mut self.camera,
+                dt.min(0.1) as f32,
+                DEFAULT_3D_ORBIT_RADIANS_PER_SECOND * speed,
+            ),
+        };
+        let four_d_advanced = self.has_visible_four_d_projection()
+            && self.transient_render_state.advance_four_d_phase(
+                DEFAULT_4D_ROTATION_RADIANS_PER_SECOND * speed as f64 * dt.min(0.1),
+            );
+        if !camera_advanced && !four_d_advanced {
+            return false;
+        }
+
+        true
+    }
+
+    fn commit_numeric_constraint<F>(&mut self, add_constraint: F) -> Result<(), String>
+    where
+        F: FnOnce(&mut Document) -> Result<(), String>,
+    {
+        let before = self.document.clone();
+        try_stage_numeric_constraint(&mut self.document, add_constraint)?;
+        self.save_snapshot(before);
+        Ok(())
+    }
+
+    /// Devuelve un `Arc<Document>` para el callback GPU.
+    /// Solo clona el documento cuando el `version` cambia (contenido modificado).
+    /// Para cambios de view (pan/zoom), actualiza el view in-place vía `make_mut`.
+    fn document_for_callback(&mut self) -> std::sync::Arc<Document> {
+        if self.document.version != self.snapshot_version
+            || self.document.render_quality != self.snapshot_render_quality
+        {
+            self.document_snapshot = std::sync::Arc::new(self.document.clone());
+            self.snapshot_version = self.document.version;
+            self.snapshot_render_quality = self.document.render_quality;
+        } else {
+            let snap = std::sync::Arc::make_mut(&mut self.document_snapshot);
+            snap.set_view(*self.document.view());
+        }
+        self.document_snapshot.clone()
+    }
+
+    pub(crate) fn save_state(&mut self) {
+        self.save_snapshot(self.document.clone());
+    }
+
+    /// Sincroniza `undo_total_bytes` si hubo pushes legacy sin contador (panels.rs, tests).
+    fn sync_undo_total_bytes(&mut self) {
+        let recomputed = self
+            .undo_stack
+            .iter()
+            .map(|d| d.estimated_bytes())
+            .fold(0usize, |a, b| a.saturating_add(b));
+        if recomputed != self.undo_total_bytes {
+            self.undo_total_bytes = recomputed;
+        }
+    }
+
+    pub(crate) fn save_snapshot(&mut self, snapshot: Document) {
+        self.sync_undo_total_bytes();
+        // R1: el push + presupuestos viven en `DocumentController`.
+        let mut ctl = DocumentController::from_parts(
+            std::mem::replace(&mut self.document, Document::new()),
+            std::mem::take(&mut self.undo_stack),
+            std::mem::take(&mut self.redo_stack),
+            self.undo_total_bytes,
+        );
+        ctl.push_snapshot(snapshot);
+        let (document, undo_stack, redo_stack, undo_total_bytes) = ctl.into_parts();
+        self.document = document;
+        self.undo_stack = undo_stack;
+        self.redo_stack = redo_stack;
+        self.undo_total_bytes = undo_total_bytes;
+        self.mark_autosave_dirty();
+    }
+
+    /// Guarda un único estado previo sólo cuando una interacción de panel
+    /// alteró el contenido persistible del documento. Esto evita que los
+    /// repaints y los `bump_version` internos generen entradas de undo.
+    #[allow(dead_code)] // TODO P2: remover cuando se migre a ValidatedDocument wrapper (usado en tests de snapshot semántico)
+    pub(crate) fn save_snapshot_if_semantically_changed(
+        &mut self,
+        before: Document,
+        undo_depth: usize,
+    ) {
+        if self.undo_stack.len() != undo_depth {
+            return;
+        }
+        if documents_semantically_differ(&before, &self.document) {
+            refresh_unversioned_document_change(&before, &mut self.document);
+            self.save_snapshot(before);
+        }
+    }
+
+    pub(crate) fn handle_command_outcome(
+        &mut self,
+        outcome: grafito_command::commands::CommandOutcome,
+        time: f64,
+        input_was: &str,
+    ) {
+        apply_command_outcome(
+            &outcome,
+            &mut self.cas_result,
+            &mut self.cas_history,
+            &mut self.toasts,
+            time,
+            input_was,
+        );
+        // Celebración contenida: primer solver paso a paso exitoso de la
+        // sesión. Solo LEE el outcome (sin tocar motor/CAS): `Message` con
+        // fence de la tarjeta + una sola vez por sesión (flag no persistido).
+        // Racha con historial: ADEMÁS el primer Steps completado de CADA día
+        // es evidencia verificada (el solver no deja nota en el perfil: día
+        // en sesión, sin persistir, tope 64). Va fuera del flag de
+        // celebración (una sola vez por sesión) para no perder días largos.
+        if let grafito_command::commands::CommandOutcome::Message(message) = &outcome {
+            if crate::celebration::is_steps_success(input_was, message) {
+                let day = grafito_profile::streak_day(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|duration| duration.as_secs())
+                        .unwrap_or(0),
+                );
+                Self::note_streak_steps_day(&mut self.assistant.streak_steps_days, day);
+            }
+            if self
+                .celebration
+                .should_celebrate_steps(crate::celebration::is_steps_success(input_was, message))
+            {
+                let locale = self.config_locale();
+                self.celebration.celebrate_steps(time * 1_000.0);
+                self.notify_at(
+                    crate::celebration::first_steps_toast(locale),
+                    grafito_ui::toast::ToastKind::Success,
+                    time,
+                );
+            }
+        }
+    }
+
+    pub(crate) fn notify_at(
+        &mut self,
+        message: impl Into<String>,
+        kind: grafito_ui::toast::ToastKind,
+        time: f64,
+    ) {
+        self.toasts
+            .push(wrap_toast_message(&message.into(), 52), kind, time);
+    }
+
+    pub(crate) fn notify(
+        &mut self,
+        message: impl Into<String>,
+        kind: grafito_ui::toast::ToastKind,
+    ) {
+        self.notify_with_action(message, kind, None);
+    }
+
+    /// Aviso con acción opcional (errores con salida copiable: hoy MP4 sin
+    /// ffmpeg). `None` = camino viejo intacto. Sin auto-retry, sin cambiar
+    /// severidades: la acción solo copia al portapapeles.
+    pub(crate) fn notify_with_action(
+        &mut self,
+        message: impl Into<String>,
+        kind: grafito_ui::toast::ToastKind,
+        action: Option<grafito_ui::toast::ToastAction>,
+    ) {
+        self.toasts.push_with_action(
+            wrap_toast_message(&message.into(), 52),
+            kind,
+            self.ui_time,
+            action,
+        );
+    }
+
+    /// Ejecuta la intención del botón del toast (el `draw` es puro: solo
+    /// emite). Hoy la única acción cerrada es copiar al portapapeles.
+    /// Llamar fuera del `Area` de toasts, una vez por frame.
+    pub(crate) fn drain_toast_actions(&mut self, ctx: &egui::Context) {
+        if let Some(action) = self.toasts.take_pending_action() {
+            match action {
+                grafito_ui::toast::ToastAction::CopyText(text) => ctx.copy_text(text),
+            }
+        }
+    }
+
+    /// Dispara el pulso `Indicate` estilo Manim sobre un objeto (~1.2 s,
+    /// expira solo). Id inexistente o tiempo no-finito → `Err` honesto y el
+    /// estado queda intacto (nunca fantasma).
+    pub(crate) fn trigger_indicate(&mut self, id: ObjectId) -> Result<(), String> {
+        if self.document.get_object(id).is_none() {
+            return Err(format!("Indicar: el objeto {id} no existe"));
+        }
+        let highlight = crate::indicate::IndicateHighlight::try_new(id, self.ui_time * 1000.0)?;
+        self.indicate = Some(highlight);
+        Ok(())
+    }
+
+    /// Expira el pulso si venció o si su objeto ya no existe. Devuelve `true`
+    /// mientras sigue activo (el llamador pide otro frame).
+    /// `now_ms` no-finito cuenta como vencido (sin fantasma).
+    pub(crate) fn tick_indicate(&mut self, now_ms: f64) -> bool {
+        let vencido = self.indicate.as_ref().is_some_and(|highlight| {
+            highlight.expirado(now_ms) || self.document.get_object(highlight.target()).is_none()
+        });
+        if vencido {
+            self.indicate = None;
+            false
+        } else {
+            self.indicate.is_some()
+        }
+    }
+
+    pub(crate) fn pending_document_action(&self) -> Option<DocumentAction> {
+        self.document_lifecycle.pending_action()
+    }
+
+    pub(crate) fn document_save_error(&self) -> Option<&str> {
+        self.document_lifecycle.save_error()
+    }
+
+    pub(crate) fn current_document_path(&self) -> Option<&Path> {
+        self.document_lifecycle.current_path()
+    }
+
+    pub(crate) fn handle_file_command(&mut self, command: FileCommand) {
+        let _ = self.deferred_file_actions.queue_command(command);
+    }
+
+    pub(crate) fn queue_unsaved_decision(&mut self, decision: UnsavedDecision) {
+        let _ = self.deferred_file_actions.queue_decision(decision);
+    }
+
+    fn process_deferred_file_action(&mut self, ctx: &egui::Context) {
+        let Some(intent) = self.deferred_file_actions.take_after_editors() else {
+            return;
+        };
+        match intent {
+            DeferredFileIntent::Command(command) => {
+                self.execute_file_command_after_editors(command, ctx)
+            }
+            DeferredFileIntent::Decision(decision) => {
+                self.execute_unsaved_decision_after_editors(decision, ctx)
+            }
+        }
+    }
+
+    fn execute_file_command_after_editors(&mut self, command: FileCommand, ctx: &egui::Context) {
+        match command {
+            FileCommand::New => self.request_document_action(DocumentAction::New, ctx),
+            FileCommand::Open => self.request_document_action(DocumentAction::Open, ctx),
+            FileCommand::Save => {
+                if self.pending_document_action().is_some() {
+                    self.execute_unsaved_decision_after_editors(UnsavedDecision::Save, ctx);
+                } else {
+                    let _ = self.save_document(SaveMode::Save, ctx);
+                }
+            }
+            FileCommand::SaveAs => {
+                if let Some(action) = self.pending_document_action() {
+                    let _ = self
+                        .document_lifecycle
+                        .resolve_unsaved_decision(UnsavedDecision::Save);
+                    self.save_before_document_action(SaveMode::SaveAs, action, ctx);
+                } else {
+                    let _ = self.save_document(SaveMode::SaveAs, ctx);
+                }
+            }
+            FileCommand::Exit => self.request_document_action(DocumentAction::Exit, ctx),
+        }
+    }
+
+    fn execute_unsaved_decision_after_editors(
+        &mut self,
+        decision: UnsavedDecision,
+        ctx: &egui::Context,
+    ) {
+        let Some(resolution) = self.document_lifecycle.resolve_unsaved_decision(decision) else {
+            return;
+        };
+        match resolution {
+            UnsavedResolution::Save(action) => {
+                self.save_before_document_action(SaveMode::Save, action, ctx)
+            }
+            UnsavedResolution::Proceed(action) => self.perform_document_action(action, ctx),
+            UnsavedResolution::Cancelled => {}
+        }
+    }
+
+    fn save_before_document_action(
+        &mut self,
+        mode: SaveMode,
+        action: DocumentAction,
+        ctx: &egui::Context,
+    ) {
+        // Guardado async: la acción encadenada viaja en `pending_chained_action`
+        // y `poll_background_jobs` la ejecuta al confirmar el save. Si el diálogo
+        // se cancela o el spawn falla, la cadena se descarta (igual que antes).
+        match self.save_document(mode, ctx) {
+            SaveAttempt::Saved(saved_action) => {
+                self.perform_document_action(saved_action.unwrap_or(action), ctx);
+            }
+            SaveAttempt::Pending => {
+                self.pending_chained_action = Some(action);
+            }
+            SaveAttempt::Cancelled | SaveAttempt::Failed => {
+                self.pending_chained_action = None;
+            }
+        }
+    }
+
+    fn request_document_action(&mut self, action: DocumentAction, ctx: &egui::Context) {
+        if let DocumentActionRequest::Proceed(action) =
+            self.document_lifecycle
+                .request_action(action, &self.document, false)
+        {
+            self.perform_document_action(action, ctx);
+        }
+    }
+
+    fn perform_document_action(&mut self, action: DocumentAction, ctx: &egui::Context) {
+        match action {
+            DocumentAction::New => self.replace_document(initial_document(), None),
+            DocumentAction::Open => self.choose_and_open_document(ctx),
+            DocumentAction::Exit => {
+                self.document_lifecycle.approve_close();
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+    }
+
+    fn handle_native_close_request(&mut self, ctx: &egui::Context) {
+        let close_requested = ctx.input(|i| i.viewport().close_requested());
+        if !close_requested {
+            return;
+        }
+        if self
+            .deferred_file_actions
+            .intercept_native_close(self.document_lifecycle.close_is_approved())
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            return;
+        }
+        // LRU cleanup: liberar texturas retenidas antes de cerrar ventana para no fugar GPU.
+        // (El branding de arranque vive en About/Onboarding bajo demanda; acá
+        // solo queda el avatar de Mora.)
+        if self.mora_texture.is_some() {
+            ctx.forget_image("mora_avatar");
+            self.mora_texture = None;
+        }
+    }
+
+    pub(crate) fn active_right_panel(&self) -> Option<crate::RightPanelContent> {
+        let panel = if self.show_trig_animation {
+            Some(crate::RightPanelContent::TrigAnimation)
+        } else {
+            self.perspective.layout().right_panel
+        };
+
+        match panel {
+            Some(crate::RightPanelContent::DomainColoring) => self
+                .document
+                .objects_iter()
+                .any(|(_, object)| matches!(object, GeoObject::ComplexGrid(_)))
+                .then_some(crate::RightPanelContent::DomainColoring),
+            Some(crate::RightPanelContent::ConstructionProtocol)
+                if !self.show_construction_protocol =>
+            {
+                None
+            }
+            other => other,
+        }
+    }
+
+    /// Devuelve el conjunto de etiquetas de objetos actualmente en el
+    /// documento. Útil para snapshot+diff al registrar pasos de construcción.
+    pub(crate) fn object_labels_snapshot(&self) -> std::collections::HashSet<String> {
+        self.document
+            .objects_iter()
+            .filter(|(_, o)| !o.label().is_empty())
+            .map(|(_, o)| o.label().to_string())
+            .collect()
+    }
+
+    /// Registra un paso en el protocolo de construcción. Cota `MAX_CONSTRUCTION_LOG=500`
+    /// — mantiene orden cronológico y trunca las más antiguas (`drain`).
+    pub(crate) fn record_construction_step(
+        &mut self,
+        action: &str,
+        inputs: Vec<String>,
+        output: &str,
+    ) {
+        let n = self.construction_log.len().saturating_add(1);
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        self.construction_log.push(ConstructionStep {
+            n,
+            action: action.to_string(),
+            inputs,
+            output: output.to_string(),
+            disabled: false,
+            timestamp,
+        });
+        if self.construction_log.len() > MAX_CONSTRUCTION_LOG {
+            let excess = self
+                .construction_log
+                .len()
+                .saturating_sub(MAX_CONSTRUCTION_LOG);
+            self.construction_log.drain(0..excess);
+        }
+    }
+
+    /// Registra un paso comparando las etiquetas del documento antes y
+    /// después de una operación. Los nuevos objetos son el `output`; las
+    /// etiquetas mencionadas en `action` son los `inputs`.
+    pub(crate) fn record_step_from_diff(
+        &mut self,
+        action: &str,
+        before: &std::collections::HashSet<String>,
+        record_document_mutation: bool,
+    ) {
+        let after = self.object_labels_snapshot();
+        let new_labels: Vec<String> = after.difference(before).cloned().collect();
+        if new_labels.is_empty() {
+            if record_document_mutation {
+                let inputs: Vec<String> = before
+                    .iter()
+                    .filter(|label| action.contains(label.as_str()))
+                    .cloned()
+                    .collect();
+                self.record_construction_step(action, inputs, "Documento actualizado");
+            }
+            return;
+        }
+        let output = new_labels.join(", ");
+        let inputs: Vec<String> = before
+            .iter()
+            .filter(|l| action.contains(l.as_str()))
+            .cloned()
+            .collect();
+        self.record_construction_step(action, inputs, &output);
+    }
+
+    /// Añade un objeto al documento y registra el paso correspondiente en el
+    /// protocolo de construcción.
+    pub(crate) fn add_object_logged(
+        &mut self,
+        obj: GeoObject,
+        action: &str,
+    ) -> Result<ObjectId, String> {
+        let id = commit_object_insertions(
+            &mut self.document,
+            &mut self.undo_stack,
+            &mut self.redo_stack,
+            vec![obj],
+        )?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "Object insertion produced no identifier".to_string())?;
+        self.mark_autosave_dirty();
+        let output = self
+            .document
+            .get_object(id)
+            .map(|o| o.label().to_string())
+            .unwrap_or_default();
+        self.record_construction_step(action, Vec::new(), &output);
+        Ok(id)
+    }
+
+    pub(crate) fn insert_object_from_tool(
+        &mut self,
+        obj: GeoObject,
+        action: &str,
+        time: f64,
+    ) -> Option<ObjectId> {
+        match self.add_object_logged(obj, action) {
+            Ok(id) => Some(id),
+            Err(error) => {
+                self.handle_command_outcome(
+                    grafito_command::commands::CommandOutcome::Error(error),
+                    time,
+                    action,
+                );
+                None
+            }
+        }
+    }
+
+    /// Ejecuta un comando de texto, gestiona su `CommandOutcome` y registra
+    /// el paso de construcción resultante (snapshot+diff de etiquetas).
+    pub(crate) fn execute_command_and_record_with_outcome(
+        &mut self,
+        cmd: &str,
+        time: f64,
+    ) -> grafito_command::commands::CommandOutcome {
+        let before_document = self.document.clone();
+        let before = self.object_labels_snapshot();
+        let mut buf = cmd.to_string();
+        let outcome = crate::commands::process_input(&mut self.document, &mut buf);
+        let mutated_document = command_mutated_document(&outcome, &before_document, &self.document);
+        save_command_snapshot_if_mutated(
+            &outcome,
+            before_document,
+            &self.document,
+            &mut self.undo_stack,
+            &mut self.redo_stack,
+        );
+        if mutated_document {
+            self.mark_autosave_dirty();
+        }
+        self.handle_command_outcome(outcome.clone(), time, cmd);
+        self.record_step_from_diff(cmd, &before, mutated_document);
+        // Ola 2.7: los guiones OnUpdate corren tras un commit mutante real,
+        // salvo cuando el propio comando solo guarda scripts (no se
+        // auto-ejecutan al almacenarse).
+        if mutated_document && !is_script_store_command(cmd) {
+            self.run_on_update_scripts();
+        }
+        outcome
+    }
+
+    pub(crate) fn execute_command_and_record(
+        &mut self,
+        cmd: &str,
+        time: f64,
+    ) -> grafito_command::commands::CommandOutcome {
+        self.execute_command_and_record_with_outcome(cmd, time)
+    }
+
+    /// Ejecuta la barra compartida. Una entrada válida se limpia; ante error se
+    /// conserva y recupera el foco para que el usuario pueda corregirla.
+    pub(crate) fn submit_input_text(&mut self, time: f64) {
+        if self.input_text.trim().is_empty() {
+            return;
+        }
+        if sidebar_uses_cas_worksheet(self.sidebar_tab) {
+            self.submit_cas_worksheet_cell(time);
+            return;
+        }
+
+        let input_was = self.input_text.clone();
+        let outcome = self.execute_command_and_record_with_outcome(&input_was, time);
+        if clear_submitted_input_on_success(&mut self.input_text, &outcome) {
+            self.preview_object = None;
+        } else {
+            self.command_input_focus_requested = true;
+        }
+        self.autocomplete.open = false;
+        self.autocomplete.selected = 0;
+    }
+
+    /// Envía una celda CAS persistente. A diferencia de la barra compartida,
+    /// conserva diagnósticos como celdas locales y registra undo incluso para
+    /// un error del intérprete que no dejó geometría parcial.
+    pub(crate) fn submit_cas_worksheet_cell(&mut self, time: f64) {
+        if self.input_text.trim().is_empty() {
+            return;
+        }
+
+        let input_was = self.input_text.clone();
+        let before_document = self.document.clone();
+        let before_labels = self.object_labels_snapshot();
+        let outcome = crate::commands::process_cas_worksheet_cell(&mut self.document, &input_was);
+        let mutated_document = documents_semantically_differ(&before_document, &self.document);
+        save_cas_worksheet_snapshot_if_mutated(
+            before_document,
+            &self.document,
+            &mut self.undo_stack,
+            &mut self.redo_stack,
+        );
+        if mutated_document {
+            self.mark_autosave_dirty();
+        }
+        self.handle_command_outcome(outcome.clone(), time, &input_was);
+        if clear_submitted_input_on_success(&mut self.input_text, &outcome) {
+            self.preview_object = None;
+        } else {
+            self.command_input_focus_requested = true;
+        }
+        self.autocomplete.open = false;
+        self.autocomplete.selected = 0;
+
+        if mutated_document && before_labels != self.object_labels_snapshot() {
+            self.record_step_from_diff(&input_was, &before_labels, true);
+        }
+    }
+
+    /// Elimina la historia CAS local como una única operación deshacible.
+    #[allow(dead_code)]
+    pub(crate) fn clear_cas_worksheet(&mut self, time: f64) {
+        let before_document = self.document.clone();
+        if !self.document.clear_cas_worksheet() {
+            return;
+        }
+        self.save_snapshot(before_document);
+        self.cas_result = "Hoja CAS limpiada".to_string();
+        self.notify_at(
+            "Hoja CAS limpiada",
+            grafito_ui::toast::ToastKind::Info,
+            time,
+        );
+    }
+
+    /// Etiqueta de un objeto por id (cadena vacía si no existe).
+    pub(crate) fn label_of(&self, id: ObjectId) -> String {
+        self.document
+            .get_object(id)
+            .map(|o| o.label().to_string())
+            .unwrap_or_default()
+    }
+
+    /// Etiquetas de objetos añadidas al documento desde el snapshot `before`.
+    pub(crate) fn new_labels_since(
+        &self,
+        before: &std::collections::HashSet<String>,
+    ) -> Vec<String> {
+        let after = self.object_labels_snapshot();
+        after.difference(before).cloned().collect()
+    }
+
+    pub(crate) fn export_with_dialog(
+        &mut self,
+        format: crate::export::ExportFormat,
+        ctx: Option<&egui::Context>,
+    ) {
+        // D2 lockdown: en examen no sale nada del documento.
+        if self.exam_blocks("Export") {
+            return;
+        }
+        // S2: sin `desktop-dialogs` devuelve `None` con toast honesto.
+        let path = self.save_file_native(
+            format.display_name(),
+            &[format.extension()],
+            Some(&format!("grafito_export.{}", format.extension())),
+        );
+        let Some(path) = path else {
+            return;
+        };
+
+        // FileController: el diálogo rfd queda en UI thread (modal nativo);
+        // render+write van a worker y el summary se aplica en `poll_background_jobs`.
+        // Sin `ctx` (llamadas fuera del frame) se conserva el path sincrónico legacy.
+        let Some(ctx) = ctx else {
+            let result = match format {
+                crate::export::ExportFormat::Svg => {
+                    crate::export::export_svg(&self.document, &path)
+                }
+                crate::export::ExportFormat::Png => {
+                    crate::export::export_png(&self.document, &path)
+                }
+                crate::export::ExportFormat::Tikz => {
+                    crate::export::export_tikz(&self.document, &path)
+                }
+            };
+            if result.is_ok() {
+                self.last_export_dir = path.parent().map(|dir| dir.to_path_buf());
+            }
+            apply_export_outcome(result, &mut self.cas_result, &mut self.toasts, self.ui_time);
+            return;
+        };
+        self.pending_export_job = Some(PendingExportJob {
+            receiver: spawn_export(self.document.clone(), path, format, ctx),
+        });
+        self.notify("Exportando…", grafito_ui::toast::ToastKind::Info);
+    }
+
+    /// W3 — Abre la carpeta de la última exportación en el explorador.
+    ///
+    /// Piel fina: el `open`/`xdg-open`/`explorer` corre en un thread
+    /// (cero bloqueo del UI thread). Honesto si falla: sin carpeta en la
+    /// sesión o carpeta ya inexistente → toast de error, sin `unwrap`.
+    pub(crate) fn reveal_last_export(&mut self) {
+        let Some(dir) = self.last_export_dir.clone() else {
+            self.notify(
+                "Todavía no exportaste nada en esta sesión.",
+                grafito_ui::toast::ToastKind::Info,
+            );
+            return;
+        };
+        if !dir.is_dir() {
+            self.notify(
+                "La carpeta de la última exportación ya no existe.",
+                grafito_ui::toast::ToastKind::Error,
+            );
+            return;
+        }
+        let spawned = std::thread::Builder::new()
+            .name("reveal-export".into())
+            .spawn(move || {
+                #[cfg(target_os = "macos")]
+                let status = std::process::Command::new("open").arg(&dir).status();
+                #[cfg(target_os = "windows")]
+                let status = std::process::Command::new("explorer").arg(&dir).status();
+                #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+                let status = std::process::Command::new("xdg-open").arg(&dir).status();
+                let _ = status;
+            });
+        if spawned.is_err() {
+            self.notify(
+                reveal_export_spawn_error_message(),
+                grafito_ui::toast::ToastKind::Error,
+            );
+        } else {
+            self.notify(
+                "Abriendo la carpeta de tu exportación…",
+                grafito_ui::toast::ToastKind::Info,
+            );
+        }
+    }
+
+    /// Ejecuta la acción elegida desde la paleta de comandos (Ctrl+K).
+    ///
+    /// Los comandos de tipo herramienta seleccionan el `Tool` correspondiente;
+    /// las acciones inmediatas (vista/archivo/exportación) se ejecutan directo;
+    /// el resto se inserta en la barra de entrada como `Nombre[` para que el
+    /// usuario complete los argumentos y se procese vía `process_input`.
+    pub(crate) fn apply_palette_command(&mut self, name: &str, ctx: &egui::Context) {
+        // 0) Herramienta personalizada (.ggt): ejecuta sus pasos por el
+        //    pipeline normal de comandos (misma allowlist y presupuesto).
+        if let Some(tool_name) =
+            name.strip_prefix(grafito_ui::command_palette::CUSTOM_TOOL_SELECTION_PREFIX)
+        {
+            self.run_custom_tool(tool_name, ctx);
+            return;
+        }
+        // 1) Selección de herramienta.
+        let tool = match name {
+            "Point Tool" => Some(Tool::Point),
+            "Line Tool" => Some(Tool::Line),
+            "Circle Tool" => Some(Tool::Circle),
+            "Polygon Tool" => Some(Tool::Polygon),
+            "Function Tool" => Some(Tool::Function),
+            "Pencil" => Some(Tool::Pencil),
+            "Eraser" => Some(Tool::Eraser),
+            _ => None,
+        };
+        if let Some(tool) = tool {
+            self.current_tool = tool;
+            self.previous_tool = tool;
+            self.tool_ghost = None;
+            self.reset_tool_input();
+            return;
+        }
+
+        // 2) Acciones inmediatas de vista y archivo.
+        match name {
+            "Zoom to Fit" => {
+                self.zoom_to_fit();
+                return;
+            }
+            "Toggle Grid" => {
+                self.show_grid = !self.show_grid;
+                return;
+            }
+            "Toggle Dark Mode" => {
+                self.dark_mode = !self.dark_mode;
+                if self.dark_mode {
+                    DARK.apply(ctx);
+                } else {
+                    LIGHT.apply(ctx);
+                }
+                return;
+            }
+            "Indicate Selection" => {
+                match self.selected_object {
+                    Some(id) => match self.trigger_indicate(id) {
+                        Ok(()) => {
+                            self.cas_result = "Indicando selección (~1.2 s)".to_string();
+                        }
+                        Err(error) => {
+                            self.cas_result = error.clone();
+                            self.notify(error, grafito_ui::toast::ToastKind::Error);
+                        }
+                    },
+                    None => {
+                        self.notify(
+                            "Indicar: sin selección — elegí un objeto en el lienzo",
+                            grafito_ui::toast::ToastKind::Error,
+                        );
+                    }
+                }
+                return;
+            }
+            "Step by Step" => {
+                // Abre el visor: deja StepByStep[ listo en la entrada para
+                // completar la operación y ver la traza con revelado
+                // progresivo en el transcript. Sin ejecutar nada.
+                self.input_text = "StepByStep[".to_string();
+                self.command_input_focus_requested = true;
+                self.notify(
+                    "Completá la operación: StepByStep[Derivative[x^2, x]]",
+                    grafito_ui::toast::ToastKind::Info,
+                );
+                return;
+            }
+            "Save" => {
+                self.handle_file_command(FileCommand::Save);
+                return;
+            }
+            "Export SVG" => {
+                self.export_with_dialog(crate::export::ExportFormat::Svg, Some(ctx));
+                return;
+            }
+            "Export PNG" => {
+                self.export_with_dialog(crate::export::ExportFormat::Png, Some(ctx));
+                return;
+            }
+            "Export TikZ" => {
+                self.export_with_dialog(crate::export::ExportFormat::Tikz, Some(ctx));
+                return;
+            }
+            _ => {}
+        }
+
+        // 3) Resto: insertar una plantilla real de comando. Algunos items de
+        //    la paleta son sólo acciones o nombres visuales, no sintaxis CAS.
+        if let Some(template) = grafito_ui::command_palette::all_commands()
+            .into_iter()
+            .find(|cmd| cmd.name == name)
+            .and_then(|cmd| cmd.input_template())
+        {
+            self.input_text = template;
+        }
+    }
+
+    /// Ejecuta una herramienta personalizada (.ggt) paso a paso por el
+    /// pipeline normal de comandos (misma allowlist y presupuesto por paso).
+    ///
+    /// P1a-2 atómico: snapshot pre-script + rollback. Si un paso falla, el
+    /// documento vuelve al estado previo (comparable por serializado), se
+    /// truncan los undo parciales y se restaura redo/log. El toast avisa
+    /// "(cambios revertidos)". Si todo ok, colapsa los N snapshots en uno
+    /// solo para que un undo revierta la herramienta entera.
+    pub(crate) fn run_custom_tool(&mut self, tool_name: &str, ctx: &egui::Context) {
+        // D2 lockdown: las tools mutan el documento por el pipeline normal.
+        if self.exam_blocks("Herramientas") {
+            return;
+        }
+        let Some(def) = self.custom_tools.get(tool_name).cloned() else {
+            self.notify(
+                format!("Herramienta '{tool_name}' no encontrada"),
+                grafito_ui::toast::ToastKind::Error,
+            );
+            return;
+        };
+        let time = ctx.input(|i| i.time);
+        let total = def.steps.len();
+        // Snapshot pre-script (documento + historial + log). El redo se
+        // MUEVE (no se clona): hasta 50 ChangeSets (~50 MiB) por ejecución.
+        // Restaurarlo al final es exacto porque los pasos no pueden hacer
+        // undo/redo (no son comandos despachables): el redo solo puede
+        // quedar intacto (pasos de lectura) o vaciado por `push_snapshot`
+        // (pasos que mutan). `undo_len_antes` distingue ambos casos.
+        let doc_before = self.document.clone();
+        let undo_len_antes = self.undo_stack.len();
+        let undo_bytes_antes = self.undo_total_bytes;
+        let mut redo_antes = Some(std::mem::take(&mut self.redo_stack));
+        let log_len_antes = self.construction_log.len();
+        let cas_antes = self.cas_result.clone();
+        let mut done = 0_usize;
+        for step in &def.steps {
+            match self.execute_command_and_record_with_outcome(step, time) {
+                grafito_command::commands::CommandOutcome::Error(message) => {
+                    // Rollback atómico: documento + undo parcial + redo + log.
+                    self.document = doc_before;
+                    while self.undo_stack.len() > undo_len_antes {
+                        if let Some(popped) = self.undo_stack.pop_back() {
+                            self.undo_total_bytes = self
+                                .undo_total_bytes
+                                .saturating_sub(popped.estimated_bytes());
+                        } else {
+                            break;
+                        }
+                    }
+                    // Si el presupuesto evictó entradas viejas durante los pasos,
+                    // el contador puede haber quedado por debajo; lo restauramos
+                    // al valor previo sólo si no hay inconsistencia (len igual).
+                    if self.undo_stack.len() == undo_len_antes {
+                        self.undo_total_bytes = undo_bytes_antes;
+                    }
+                    self.redo_stack = redo_antes.take().unwrap_or_default();
+                    self.construction_log.truncate(log_len_antes);
+                    self.cas_result = cas_antes;
+                    self.selected_object = None;
+                    self.preview_object = None;
+                    self.notify(
+                        format!(
+                            "{tool_name}: paso {} de {total} falló: {message} (cambios revertidos)",
+                            done + 1
+                        ),
+                        grafito_ui::toast::ToastKind::Error,
+                    );
+                    return;
+                }
+                _ => done += 1,
+            }
+        }
+        // Éxito: colapsa los N snapshots del tool en uno solo (undo atómico).
+        if done > 0 && self.undo_stack.len() > undo_len_antes {
+            while self.undo_stack.len() > undo_len_antes {
+                if let Some(popped) = self.undo_stack.pop_back() {
+                    self.undo_total_bytes = self
+                        .undo_total_bytes
+                        .saturating_sub(popped.estimated_bytes());
+                } else {
+                    break;
+                }
+            }
+            // Push único del estado previo con contador O(1) + presupuestos.
+            let bytes = doc_before.estimated_bytes();
+            self.undo_stack.push_back(doc_before);
+            self.redo_stack.clear();
+            self.undo_total_bytes = self.undo_total_bytes.saturating_add(bytes);
+            enforce_undo_budgets(&mut self.undo_stack, &mut self.undo_total_bytes);
+        }
+        // Si ningún paso mutó, el redo tomado sigue siendo el vigente:
+        // devolverlo (los pasos de lectura no lo tocan). Si hubo mutación,
+        // `push_snapshot` ya lo vació con semántica normal.
+        if self.undo_stack.len() == undo_len_antes {
+            if let Some(redo) = redo_antes.take() {
+                if !redo.is_empty() {
+                    self.redo_stack = redo;
+                }
+            }
+        }
+        self.notify(
+            format!("{tool_name}: {done} de {total} pasos aplicados"),
+            grafito_ui::toast::ToastKind::Success,
+        );
+    }
+
+    /// Diálogo custom-tool .ggt (`custom.dlg_title`): nombre + pasos del
+    /// historial CAS reciente; persiste el `.ggt` elegido por diálogo.
+    ///
+    /// Tope de pasos tomados del historial (W-A, ver
+    /// [`Self::custom_tool_history_usage`]).
+    ///
+    /// Contador honesto del historial para el diálogo (W-A, puro y testeable).
+    /// Retorna `(usados, total)` con `usados = total.min(LIMIT)`.
+    pub(crate) fn custom_tool_history_usage(total: usize) -> (usize, usize) {
+        (total.min(CUSTOM_TOOL_HISTORY_LIMIT), total)
+    }
+
+    /// Validación live del nombre de custom tool (W-A, pura y testeable).
+    ///
+    /// Retorna `(puede_guardar, aviso)`: vacío o formato inválido bloquea el
+    /// Guardar con mensaje; duplicado permite guardar (reemplaza) pero avisa;
+    /// nombre nuevo válido no avisa. Mismas reglas que `check_tool_name`
+    /// (ASCII letra/`_` inicial, resto alfanum/`_`).
+    /// Wrapper Es intacto (tests W-A); prod usa `_for` con locale.
+    /// Sin caller prod → `#[cfg(test)]` (precedente B-A143/B-A157).
+    #[cfg(test)]
+    pub(crate) fn custom_tool_name_feedback(
+        name: &str,
+        store: &grafito_command::ggbscript::CustomToolStore,
+    ) -> (bool, Option<String>) {
+        Self::custom_tool_name_feedback_for(name, store, grafito_ui::i18n::Locale::Es)
+    }
+
+    /// Validación live del nombre de custom tool con locale (B-A184, pura).
+    /// El wrapper [`Self::custom_tool_name_feedback`] delega con Es intacto
+    /// (tests W-A intactos); el resto sale de `custom.dlg_*`.
+    pub(crate) fn custom_tool_name_feedback_for(
+        name: &str,
+        store: &grafito_command::ggbscript::CustomToolStore,
+        locale: grafito_ui::i18n::Locale,
+    ) -> (bool, Option<String>) {
+        use grafito_ui::i18n::t;
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return (false, Some(t("custom.dlg_name_empty", locale).to_string()));
+        }
+        let mut chars = trimmed.chars();
+        let first_ok = chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+        let rest_ok = chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !first_ok || !rest_ok {
+            return (
+                false,
+                Some(t("custom.dlg_name_invalid", locale).to_string()),
+            );
+        }
+        if store.get(trimmed).is_some() {
+            return (true, Some(t("custom.dlg_name_exists", locale).to_string()));
+        }
+        (true, None)
+    }
+
+    /// Texto "usando N de M" del diálogo custom-tool (B-A184, puro).
+    pub(crate) fn custom_tool_usage_text_for(
+        used: usize,
+        total: usize,
+        limit: usize,
+        locale: grafito_ui::i18n::Locale,
+    ) -> String {
+        grafito_ui::i18n::t("custom.dlg_usage", locale)
+            .replace("{used}", &used.to_string())
+            .replace("{total}", &total.to_string())
+            .replace("{limit}", &limit.to_string())
+    }
+
+    /// Toast "guardada" del diálogo custom-tool (B-A184, puro).
+    pub(crate) fn custom_tool_saved_text_for(
+        name: &str,
+        locale: grafito_ui::i18n::Locale,
+    ) -> String {
+        grafito_ui::i18n::t("custom.dlg_saved", locale).replace("{name}", name)
+    }
+
+    /// Toast "cargada" del diálogo custom-tool (B-A184, puro).
+    pub(crate) fn custom_tool_loaded_text_for(
+        name: &str,
+        locale: grafito_ui::i18n::Locale,
+    ) -> String {
+        grafito_ui::i18n::t("custom.dlg_loaded", locale).replace("{name}", name)
+    }
+
+    /// Toast de error de lectura .ggt (B-A184, puro).
+    pub(crate) fn custom_tool_read_error_text_for(
+        error: &str,
+        locale: grafito_ui::i18n::Locale,
+    ) -> String {
+        grafito_ui::i18n::t("custom.dlg_read_error", locale).replace("{error}", error)
+    }
+
+    pub(crate) fn draw_custom_tool_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_custom_tool_dialog {
+            return;
+        }
+        // W-A: contador honesto + validación live calculados ANTES del closure
+        // (el closure solo lee copias; el store se presta por referencia).
+        // B-A184: chrome por `custom.dlg_*` con `config_locale()`.
+        let locale = self.config_locale();
+        let (used, total) = Self::custom_tool_history_usage(self.cas_history.len());
+        let (can_save, name_feedback) =
+            Self::custom_tool_name_feedback_for(&self.custom_tool_name, &self.custom_tools, locale);
+        let usage =
+            Self::custom_tool_usage_text_for(used, total, CUSTOM_TOOL_HISTORY_LIMIT, locale);
+        let title = grafito_ui::i18n::t("custom.dlg_title", locale).to_string();
+        let save_label = grafito_ui::i18n::t("custom.dlg_save", locale).to_string();
+        let load_label = grafito_ui::i18n::t("custom.dlg_load", locale).to_string();
+        let mut open = true;
+        let mut save_requested = false;
+        let mut load_requested = false;
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                // W-A: "usando N de M del historial" (antes truncaba a 64 en
+                // silencio con "los últimos N").
+                ui.label(usage);
+                ui.text_edit_singleline(&mut self.custom_tool_name);
+                // Validación live: vacío/duplicado se ve ANTES de Guardar.
+                if let Some(feedback) = name_feedback {
+                    let theme = grafito_ui::theme::current_theme(ui.ctx());
+                    ui.label(
+                        egui::RichText::new(feedback)
+                            .size(grafito_ui::tokens::TYPE_XS)
+                            .color(theme.text_secondary),
+                    );
+                }
+                ui.horizontal(|ui| {
+                    save_requested = ui
+                        .add_enabled(can_save, egui::Button::new(save_label))
+                        .clicked();
+                    load_requested = ui.button(load_label).clicked();
+                });
+            });
+        // A11Y (D1): Esc cierra el persistente sin guardar (igual que la X).
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            open = false;
+        }
+        if !open {
+            self.show_custom_tool_dialog = false;
+            return;
+        }
+        if load_requested {
+            self.show_custom_tool_dialog = false;
+            self.load_custom_tool_from_dialog();
+        } else if save_requested {
+            self.save_custom_tool_from_history();
+        }
+    }
+
+    /// Guarda el historial CAS como `.ggt` (define + archivo vía diálogo).
+    /// I/O acotado a un JSON chico (cota `MAX_GGT_BYTES` del parser).
+    pub(crate) fn save_custom_tool_from_history(&mut self) {
+        use grafito_command::ggbscript as ggt;
+        // B-A184: filtro rfd + toast por `custom.dlg_*`.
+        let locale = self.config_locale();
+        let history: Vec<String> = self
+            .cas_history
+            .iter()
+            .take(CUSTOM_TOOL_HISTORY_LIMIT)
+            .cloned()
+            .collect();
+        let name = self.custom_tool_name.trim().to_string();
+        let json = match self.custom_tools.define_from_history(&name, &history) {
+            Ok(json) => json,
+            Err(message) => {
+                self.notify(message, grafito_ui::toast::ToastKind::Error);
+                return;
+            }
+        };
+        let filter = grafito_ui::i18n::t("custom.dlg_file_filter", locale).to_string();
+        let Some(path) =
+            self.save_file_native(filter.as_str(), &["ggt"], Some(&format!("{name}.ggt")))
+        else {
+            return;
+        };
+        let base = path.parent().unwrap_or(std::path::Path::new("."));
+        let file = path
+            .file_name()
+            .map(std::path::Path::new)
+            .unwrap_or(path.as_path());
+        match ggt::save_ggt_file(base, file, &json) {
+            Ok(()) => {
+                self.show_custom_tool_dialog = false;
+                self.custom_tool_name.clear();
+                self.notify(
+                    Self::custom_tool_saved_text_for(&name, locale),
+                    grafito_ui::toast::ToastKind::Success,
+                );
+            }
+            Err(message) => self.notify(message, grafito_ui::toast::ToastKind::Error),
+        }
+    }
+
+    /// Carga un `.ggt` desde diálogo al store (revalidado por el parser).
+    pub(crate) fn load_custom_tool_from_dialog(&mut self) {
+        use grafito_command::ggbscript as ggt;
+        // B-A184: filtro rfd + toasts por `custom.dlg_*`.
+        let locale = self.config_locale();
+        let filter = grafito_ui::i18n::t("custom.dlg_file_filter", locale).to_string();
+        let Some(path) = self.pick_file_native(filter.as_str(), &["ggt"]) else {
+            return;
+        };
+        let base = path.parent().unwrap_or(std::path::Path::new("."));
+        let file = path
+            .file_name()
+            .map(std::path::Path::new)
+            .unwrap_or(path.as_path());
+        if let Err(message) = ggt::validate_ggt_path(base, file) {
+            self.notify(message, grafito_ui::toast::ToastKind::Error);
+            return;
+        }
+        let text = match std::fs::read_to_string(base.join(file)) {
+            Ok(text) => text,
+            Err(error) => {
+                self.notify(
+                    Self::custom_tool_read_error_text_for(&error.to_string(), locale),
+                    grafito_ui::toast::ToastKind::Error,
+                );
+                return;
+            }
+        };
+        match self.custom_tools.load_json(&text) {
+            Ok(name) => self.notify(
+                Self::custom_tool_loaded_text_for(&name, locale),
+                grafito_ui::toast::ToastKind::Success,
+            ),
+            Err(message) => self.notify(message, grafito_ui::toast::ToastKind::Error),
+        }
+    }
+
+    pub(crate) fn undo(&mut self) {
+        // Stack vacío = no-op silencioso (igual que antes).
+        if self.undo_stack.is_empty() {
+            return;
+        }
+        // R1: transición + presupuestos en `DocumentController`; los efectos
+        // de app (`selected_object`, `cas_result`) quedan en el shim.
+        let mut ctl = DocumentController::from_parts(
+            std::mem::replace(&mut self.document, Document::new()),
+            std::mem::take(&mut self.undo_stack),
+            std::mem::take(&mut self.redo_stack),
+            self.undo_total_bytes,
+        );
+        let result = ctl.undo();
+        let (document, undo_stack, redo_stack, undo_total_bytes) = ctl.into_parts();
+        self.document = document;
+        self.undo_stack = undo_stack;
+        self.redo_stack = redo_stack;
+        self.undo_total_bytes = undo_total_bytes;
+        match result {
+            Ok(()) => {
+                self.selected_object = None;
+            }
+            Err(error) => {
+                self.cas_result = format!("No se pudo deshacer: {error}");
+            }
+        }
+    }
+
+    pub(crate) fn redo(&mut self) {
+        // Stack vacío = no-op silencioso (igual que antes).
+        if self.redo_stack.is_empty() {
+            return;
+        }
+        // R1: ver `undo` (el controller ya limpia redo si el restore falla).
+        let mut ctl = DocumentController::from_parts(
+            std::mem::replace(&mut self.document, Document::new()),
+            std::mem::take(&mut self.undo_stack),
+            std::mem::take(&mut self.redo_stack),
+            self.undo_total_bytes,
+        );
+        let result = ctl.redo();
+        let (document, undo_stack, redo_stack, undo_total_bytes) = ctl.into_parts();
+        self.document = document;
+        self.undo_stack = undo_stack;
+        self.redo_stack = redo_stack;
+        self.undo_total_bytes = undo_total_bytes;
+        match result {
+            Ok(()) => {
+                self.selected_object = None;
+            }
+            Err(error) => {
+                self.cas_result = format!("No se pudo rehacer: {error}");
+            }
+        }
+    }
+
+    /// S2: picker nativo de archivo. Con `desktop-dialogs` usa rfd; sin la
+    /// feature (Android) avisa honesto y devuelve `None` (= cancelar sin
+    /// tocar nada). Misma UI, degradación explícita, nunca path falso.
+    #[cfg(feature = "desktop-dialogs")]
+    pub(crate) fn pick_file_native(
+        &mut self,
+        filter_name: &str,
+        exts: &[&str],
+    ) -> Option<std::path::PathBuf> {
+        rfd::FileDialog::new()
+            .add_filter(filter_name, exts)
+            .pick_file()
+    }
+    #[cfg(not(feature = "desktop-dialogs"))]
+    pub(crate) fn pick_file_native(
+        &mut self,
+        _filter_name: &str,
+        _exts: &[&str],
+    ) -> Option<std::path::PathBuf> {
+        self.notify(
+            grafito_ui::i18n::t("hint.unavailable", self.config_locale()),
+            grafito_ui::toast::ToastKind::Info,
+        );
+        None
+    }
+
+    /// S2: diálogo nativo de guardado. Mismo contrato que `pick_file_native`.
+    #[cfg(feature = "desktop-dialogs")]
+    pub(crate) fn save_file_native(
+        &mut self,
+        filter_name: &str,
+        exts: &[&str],
+        file_name: Option<&str>,
+    ) -> Option<std::path::PathBuf> {
+        let mut dialog = rfd::FileDialog::new().add_filter(filter_name, exts);
+        if let Some(name) = file_name {
+            dialog = dialog.set_file_name(name);
+        }
+        dialog.save_file()
+    }
+    #[cfg(not(feature = "desktop-dialogs"))]
+    pub(crate) fn save_file_native(
+        &mut self,
+        _filter_name: &str,
+        _exts: &[&str],
+        _file_name: Option<&str>,
+    ) -> Option<std::path::PathBuf> {
+        self.notify(
+            grafito_ui::i18n::t("hint.unavailable", self.config_locale()),
+            grafito_ui::toast::ToastKind::Info,
+        );
+        None
+    }
+
+    fn save_document(&mut self, mode: SaveMode, ctx: &egui::Context) -> SaveAttempt {
+        let path = self
+            .document_lifecycle
+            .current_save_path(mode)
+            .map(Path::to_path_buf)
+            .or_else(|| {
+                self.save_file_native("Grafito Document", &["json"], Some("Sin titulo.json"))
+            });
+        let Some(path) = path else {
+            return SaveAttempt::Cancelled;
+        };
+
+        // FileController: el diálogo rfd queda en UI thread (modal nativo);
+        // el write va a worker y el resultado se aplica en `poll_background_jobs`,
+        // que continúa la acción pendiente vía `record_save_success`.
+        let Some(receiver) = spawn_document_save(self.document.clone(), path, ctx) else {
+            let error = "no se pudo lanzar el guardado en background".to_string();
+            log::error!("Save failed: {error}");
+            self.document_lifecycle.record_save_failure(error.clone());
+            self.cas_result = format!("No se pudo guardar: {error}");
+            self.notify(
+                format!("Error al guardar: {error}"),
+                grafito_ui::toast::ToastKind::Error,
+            );
+            return SaveAttempt::Failed;
+        };
+        self.pending_save_job = Some(PendingSaveJob { receiver });
+        self.notify("Guardando documento…", grafito_ui::toast::ToastKind::Info);
+        SaveAttempt::Pending
+    }
+
+    fn poll_background_jobs(&mut self, ctx: &egui::Context) {
+        // J2: sin vault. Quedan los jobs de guardado/autosave del Canvas
+        // (archivos JSON planos, ver `grafito_core::persistence`).
+        // Save
+        if let Some(job) = self.pending_save_job.take() {
+            match job.receiver.try_recv() {
+                Ok(Ok(path)) => {
+                    let pending_action = self
+                        .document_lifecycle
+                        .record_save_success(path.clone(), &self.document);
+                    self.remember_recent_file(&path);
+                    self.autosave.mark_saved();
+                    self.autosave_last_version = self.document.version;
+                    if let Some(sidecar) = grafito_core::persistence::autosave_sidecar_path(&path) {
+                        let _ = std::fs::remove_file(sidecar);
+                    }
+                    self.notify(
+                        format!("Documento guardado en {}", path.display()),
+                        grafito_ui::toast::ToastKind::Success,
+                    );
+                    // Continúa la acción encadenada: primero la del lifecycle (si la
+                    // hubiera), si no la guardada en `save_before_document_action`.
+                    if let Some(action) =
+                        pending_action.or_else(|| self.pending_chained_action.take())
+                    {
+                        self.perform_document_action(action, ctx);
+                    }
+                    ctx.request_repaint();
+                }
+                Ok(Err(err)) => {
+                    self.document_lifecycle.record_save_failure(err.clone());
+                    self.cas_result = format!("No se pudo guardar: {err}");
+                    self.notify(
+                        format!("Error al guardar: {err}"),
+                        grafito_ui::toast::ToastKind::Error,
+                    );
+                    ctx.request_repaint();
+                }
+                Err(TryRecvError::Empty) => {
+                    self.pending_save_job = Some(job);
+                }
+                Err(TryRecvError::Disconnected) => {
+                    // Worker caído sin resultado: no es error (nada se
+                    // perdió), es cancelación sin cambios. Info, no Error.
+                    self.notify(save_cancelled_message(), grafito_ui::toast::ToastKind::Info);
+                }
+            }
+        }
+        // Open
+        if let Some(job) = self.pending_open_job.take() {
+            match job.receiver.try_recv() {
+                Ok(Ok((path, doc))) => {
+                    self.replace_document(doc, Some(path.clone()));
+                    self.remember_recent_file(&path);
+                    self.notify(
+                        format!("Documento abierto desde {}", path.display()),
+                        grafito_ui::toast::ToastKind::Success,
+                    );
+                    ctx.request_repaint();
+                }
+                Ok(Err(err)) => {
+                    self.notify(
+                        format!("Error al cargar: {err}"),
+                        grafito_ui::toast::ToastKind::Error,
+                    );
+                    ctx.request_repaint();
+                }
+                Err(TryRecvError::Empty) => {
+                    self.pending_open_job = Some(job);
+                }
+                Err(TryRecvError::Disconnected) => {
+                    // Worker caído: jamás dejar "Abriendo…" eterno en silencio.
+                    self.cas_result = "No se pudo abrir el documento".to_string();
+                    self.notify(
+                        "No se pudo abrir el documento (el proceso de lectura terminó)",
+                        grafito_ui::toast::ToastKind::Error,
+                    );
+                    ctx.request_repaint();
+                }
+            }
+        }
+        // Export
+        if let Some(job) = self.pending_export_job.take() {
+            match job.receiver.try_recv() {
+                // Mismo UX que el path sincrónico (`apply_export_outcome`): el worker
+                // ya calculó el summary, aquí solo se publica.
+                Ok(Ok((path, summary))) => {
+                    self.cas_result = summary.clone();
+                    self.last_export_dir = path.parent().map(|dir| dir.to_path_buf());
+                    self.toasts.push(
+                        wrap_toast_message(&summary, 52),
+                        grafito_ui::toast::ToastKind::Success,
+                        self.ui_time,
+                    );
+                    ctx.request_repaint();
+                }
+                Ok(Err(err)) => {
+                    self.cas_result = err.clone();
+                    self.toasts.push(
+                        wrap_toast_message(&err, 52),
+                        grafito_ui::toast::ToastKind::Error,
+                        self.ui_time,
+                    );
+                    ctx.request_repaint();
+                }
+                Err(TryRecvError::Empty) => {
+                    self.pending_export_job = Some(job);
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.cas_result = "No se pudo exportar: el proceso terminó".to_string();
+                    self.notify(
+                        "No se pudo exportar (el proceso terminó sin resultado)",
+                        grafito_ui::toast::ToastKind::Error,
+                    );
+                    ctx.request_repaint();
+                }
+            }
+        }
+        // Import .ggb (F1-1): Piel pura — I/O + parse ya ocurrieron en background.
+        if let Some(job) = self.pending_ggb_import_job.take() {
+            match job.receiver.try_recv() {
+                Ok(Ok(report)) => {
+                    let path = job.path;
+                    self.apply_ggb_import_report(report, &path);
+                    ctx.request_repaint();
+                }
+                Ok(Err(err)) => {
+                    self.notify(
+                        format!("Error al importar .ggb desde {}: {err}", job.path.display()),
+                        grafito_ui::toast::ToastKind::Error,
+                    );
+                    ctx.request_repaint();
+                }
+                Err(TryRecvError::Empty) => {
+                    self.pending_ggb_import_job = Some(job);
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.notify(
+                        "Importación .ggb cancelada",
+                        grafito_ui::toast::ToastKind::Error,
+                    );
+                }
+            }
+        }
+        // Export .ggb (P3a): el worker ya serializó + escribió atómicamente.
+        if let Some(job) = self.pending_ggb_export_job.take() {
+            match job.receiver.try_recv() {
+                Ok(Ok(summary)) => {
+                    self.last_export_dir = job.path.parent().map(|dir| dir.to_path_buf());
+                    self.notify(summary, grafito_ui::toast::ToastKind::Info);
+                    ctx.request_repaint();
+                }
+                Ok(Err(err)) => {
+                    self.notify(
+                        format!("Error al exportar .ggb a {}: {err}", job.path.display()),
+                        grafito_ui::toast::ToastKind::Error,
+                    );
+                    ctx.request_repaint();
+                }
+                Err(TryRecvError::Empty) => {
+                    self.pending_ggb_export_job = Some(job);
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.notify(
+                        "Exportación .ggb cancelada",
+                        grafito_ui::toast::ToastKind::Error,
+                    );
+                }
+            }
+        }
+        // Import CSV/TSV: el commit ocurre aquí (mismo hilo que el sync) con
+        // los mismos mensajes; la lectura ≤2MB ya ocurrió en el worker.
+        if let Some(job) = self.pending_import_job.take() {
+            match job.receiver.try_recv() {
+                Ok(Ok(table)) => {
+                    let row_count = table.xs.len();
+                    match crate::panels::commit_local_xy_table(
+                        &mut self.document,
+                        &mut self.undo_stack,
+                        &mut self.redo_stack,
+                        table,
+                    ) {
+                        Ok(data_id) => {
+                            let label = self
+                                .document
+                                .get_object(data_id)
+                                .map(|object| object.label().to_string())
+                                .unwrap_or_else(|| "tabla".to_string());
+                            self.cas_result = format!(
+                                "Tabla local '{label}' importada con {row_count} pares; la ruta no se guardó."
+                            );
+                            self.notify(
+                                self.cas_result.clone(),
+                                grafito_ui::toast::ToastKind::Success,
+                            );
+                        }
+                        Err(error) => {
+                            self.cas_result = format!("No se pudo guardar la tabla local: {error}");
+                            self.notify(
+                                self.cas_result.clone(),
+                                grafito_ui::toast::ToastKind::Error,
+                            );
+                        }
+                    }
+                    ctx.request_repaint();
+                }
+                Ok(Err(error)) => {
+                    self.cas_result = format!("No se pudo importar la tabla: {error}");
+                    self.notify(self.cas_result.clone(), grafito_ui::toast::ToastKind::Error);
+                    ctx.request_repaint();
+                }
+                Err(TryRecvError::Empty) => {
+                    self.pending_import_job = Some(job);
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.cas_result =
+                        "No se pudo importar la tabla: el proceso terminó".to_string();
+                    self.notify(
+                        "No se pudo importar la tabla (el proceso terminó sin resultado)",
+                        grafito_ui::toast::ToastKind::Error,
+                    );
+                    ctx.request_repaint();
+                }
+            }
+        }
+        // Escritura genérica de texto (export LaTeX del protocolo).
+        if let Some(job) = self.pending_text_job.take() {
+            match job.receiver.try_recv() {
+                Ok(Ok(path)) => {
+                    self.cas_result = format!("Protocolo exportado a LaTeX -> {}", path.display());
+                    self.notify(
+                        self.cas_result.clone(),
+                        grafito_ui::toast::ToastKind::Success,
+                    );
+                    ctx.request_repaint();
+                }
+                Ok(Err(error)) => {
+                    self.cas_result = format!("No se pudo exportar el protocolo: {error}");
+                    self.notify(self.cas_result.clone(), grafito_ui::toast::ToastKind::Error);
+                    ctx.request_repaint();
+                }
+                Err(TryRecvError::Empty) => {
+                    self.pending_text_job = Some(job);
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.cas_result =
+                        "No se pudo exportar el protocolo: el proceso terminó".to_string();
+                    self.notify(
+                        "No se pudo exportar el protocolo (el proceso terminó sin resultado)",
+                        grafito_ui::toast::ToastKind::Error,
+                    );
+                    ctx.request_repaint();
+                }
+            }
+        }
+        // Portapapeles PNG: arboard corre en worker (`spawn_png_clipboard`);
+        // acá solo se publica el summary/error con toast.
+        if let Some(job) = self.pending_clipboard_job.take() {
+            match job.receiver.try_recv() {
+                Ok(Ok(summary)) => {
+                    self.cas_result = summary.clone();
+                    self.notify(summary, grafito_ui::toast::ToastKind::Success);
+                    ctx.request_repaint();
+                }
+                Ok(Err(error)) => {
+                    self.cas_result = error.clone();
+                    self.notify(error, grafito_ui::toast::ToastKind::Error);
+                    ctx.request_repaint();
+                }
+                Err(TryRecvError::Empty) => {
+                    self.pending_clipboard_job = Some(job);
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.cas_result = "No se pudo copiar PNG: el proceso terminó".to_string();
+                    self.notify(
+                        "No se pudo copiar PNG (el proceso terminó sin resultado)",
+                        grafito_ui::toast::ToastKind::Error,
+                    );
+                    ctx.request_repaint();
+                }
+            }
+        }
+        self.poll_implicit_surface_slot(ctx);
+    }
+
+    /// A4: avanza el slot de superficie implícita una vez por frame.
+    ///
+    /// `poll` solo hace `try_recv` (jamás bloquea el hilo UI); mientras hay
+    /// pendiente se pide otro frame vía `request_repaint`, y al llegar
+    /// `Ready`/`Failed` se repinta una vez para publicar `last_valid` (que la
+    /// UI renderiza en `render_3d.rs` sin parpadear ante `Failed`).
+    /// P1b: antes de `poll`, `maybe_submit_implicit_slot` envía la primera
+    /// superficie visible si el slot está idle y con clave distinta.
+    pub(crate) fn poll_implicit_surface_slot(&mut self, ctx: &egui::Context) {
+        self.maybe_submit_implicit_slot();
+        match self.implicit_surface_slot.poll() {
+            crate::implicit_surface_compute::SurfaceSlotPoll::Pending => {
+                if self.implicit_surface_slot.has_pending() {
+                    ctx.request_repaint();
+                }
+            }
+            crate::implicit_surface_compute::SurfaceSlotPoll::Ready(_)
+            | crate::implicit_surface_compute::SurfaceSlotPoll::Failed(_) => {
+                ctx.request_repaint();
+            }
+        }
+    }
+
+    /// P1b: productor real del slot progresivo.
+    ///
+    /// Busca la primera `ImplicitSurface3D` visible; si no hay, limpia el
+    /// slot (sin fantasma) y olvida la clave. Si hay y la clave
+    /// (expr+cotas+cells+vars) difiere de la enviada y no hay job en vuelo,
+    /// envía un grueso acotado (`min(cells,12)`, máx 12³ = 1728 celdas) con
+    /// campo `owned` (`expr` + snapshot de vars vía `evaluate`, sin AST
+    /// compartido para seguir `Send + 'static`). El overlay dibuja ese
+    /// `last_valid` mientras el eager A1 muestra el fino: progresivo real.
+    /// `Err` de validación (cotas/cells) → no se envía, el eager ya avisó.
+    pub(crate) fn maybe_submit_implicit_slot(&mut self) {
+        // Gate por versión: con el documento intacto la clave sería
+        // idéntica y todos los caminos retornan (clave igual / pendiente /
+        // válido). Sin esto, scan O(n) + sort de variables cada frame.
+        if self.implicit_slot_version == Some(self.document.version) {
+            return;
+        }
+        self.implicit_slot_version = Some(self.document.version);
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        /// Superficie visible resumida para el slot (expr + caja + cells).
+        type SurfaceSummary = (String, (f64, f64, f64, f64, f64, f64), usize);
+        let mut first: Option<SurfaceSummary> = None;
+        for obj in self.document.objects().values() {
+            if let GeoObject::ImplicitSurface3D(s) = obj {
+                if s.visible {
+                    first = Some((
+                        s.expr.clone(),
+                        (s.x_min, s.x_max, s.y_min, s.y_max, s.z_min, s.z_max),
+                        s.cells,
+                    ));
+                    break;
+                }
+            }
+        }
+        let Some((expr, (x0, x1, y0, y1, z0, z1), cells)) = first else {
+            // Sin superficie visible: limpieza total (job en vuelo + válido),
+            // sin fantasma en el overlay aunque un job viejo termine tarde
+            // (su `send` falla silencioso con el receiver ya soltado).
+            self.implicit_surface_slot.clear();
+            self.implicit_slot_key = None;
+            return;
+        };
+        let mut hasher = DefaultHasher::new();
+        expr.hash(&mut hasher);
+        x0.to_bits().hash(&mut hasher);
+        x1.to_bits().hash(&mut hasher);
+        y0.to_bits().hash(&mut hasher);
+        y1.to_bits().hash(&mut hasher);
+        z0.to_bits().hash(&mut hasher);
+        z1.to_bits().hash(&mut hasher);
+        cells.hash(&mut hasher);
+        let mut sorted: Vec<(&String, &f64)> = self.document.variables.iter().collect();
+        sorted.sort_by(|a, b| a.0.cmp(b.0));
+        for (k, v) in sorted {
+            k.hash(&mut hasher);
+            v.to_bits().hash(&mut hasher);
+        }
+        let key = hasher.finish();
+        if self.implicit_slot_key == Some(key) || self.implicit_surface_slot.has_pending() {
+            return;
+        }
+        if self.implicit_surface_slot.last_valid().is_some() && self.implicit_slot_key.is_some() {
+            return;
+        }
+        let coarse = cells.clamp(1, 12);
+        let vars: Vec<(String, f64)> = self
+            .document
+            .variables
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        let expr_owned = expr.clone();
+        let field: crate::implicit_surface_compute::ImplicitField =
+            std::sync::Arc::new(move |x: f64, y: f64, z: f64| {
+                let mut full = vars.clone();
+                full.push(("x".to_string(), x));
+                full.push(("y".to_string(), y));
+                full.push(("z".to_string(), z));
+                grafito_geometry::expr::evaluate(&expr_owned, &full)
+                    .ok()
+                    .filter(|v| v.is_finite() && v.abs() < 1e6)
+            });
+        let min = Point3D::new(x0, y0, z0);
+        let max = Point3D::new(x1, y1, z1);
+        if self
+            .implicit_surface_slot
+            .submit_new(field, min, max, coarse)
+            .is_ok()
+        {
+            self.implicit_slot_key = Some(key);
+        }
+    }
+
+    fn choose_and_open_document(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.pick_file_native("Grafito Document", &["json"]) else {
+            return;
+        };
+
+        // FileController: el diálogo rfd queda en UI thread (modal nativo);
+        // la lectura va a worker y el replace se aplica en `poll_background_jobs`.
+        self.pending_open_job = Some(PendingOpenJob {
+            receiver: spawn_document_open(path, ctx),
+        });
+        self.notify("Abriendo documento…", grafito_ui::toast::ToastKind::Info);
+    }
+
+    /// P3a: Archivo → Exportar → "GeoGebra (.ggb)…". El diálogo `rfd` vive en
+    /// UI thread; serialización + ZIP + escritura atómica van al worker
+    /// `ggb-export` y el resumen se aplica en `poll_background_jobs`.
+    /// PDF multipágina desde el menú Archivo → Exportar (mismo worker que el
+    /// panel de exportación: `spawn_pdf_export` + `PendingExportJob`).
+    pub(crate) fn choose_and_export_pdf(&mut self, ctx: &egui::Context) {
+        if self.exam_blocks("Export") {
+            return;
+        }
+        let Some(path) = self.save_file_native("PDF", &["pdf"], Some("grafito_export.pdf")) else {
+            return;
+        };
+        self.pending_export_job = Some(PendingExportJob {
+            receiver: crate::export::spawn_pdf_export(self.document.clone(), path, ctx),
+        });
+        self.notify("Exportando PDF…", grafito_ui::toast::ToastKind::Info);
+    }
+
+    /// Export lección Markdown (Obsidian): recetas re-ejecutables del
+    /// documento en un .md para el vault. Diálogo en UI thread; el write
+    /// va al worker genérico (`PendingTextWriteJob`, paridad protocol-Latex).
+    pub(crate) fn choose_and_export_lesson_md(&mut self, ctx: &egui::Context) {
+        // D2 lockdown: en examen no sale nada del documento.
+        if self.exam_blocks("Export") {
+            return;
+        }
+        let Some(path) = self.save_file_native("Markdown", &["md"], Some("leccion-grafito.md"))
+        else {
+            return;
+        };
+        let title = path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Lección Grafito".to_string());
+        let markdown = crate::export::document_to_lesson_markdown(&self.document, &title);
+        self.pending_text_job = Some(PendingTextWriteJob {
+            receiver: crate::app::spawn_text_write(path, markdown, ctx),
+        });
+        self.notify(
+            "Exportando lección Markdown…",
+            grafito_ui::toast::ToastKind::Info,
+        );
+    }
+
+    /// Export 1-clic de la lección al vault Obsidian configurado
+    /// (`vault_root()` del módulo vault_tools): sin diálogo — el nombre sale
+    /// con timestamp UTC (`leccion-YYYYMMDD-HHMM.md`), el write corre en
+    /// worker (`PendingTextWriteJob`) y crea la carpeta del vault si falta.
+    pub(crate) fn export_lesson_to_vault(&mut self, ctx: &egui::Context) {
+        // D2 lockdown: en examen no sale nada del documento.
+        if self.exam_blocks("Export") {
+            return;
+        }
+        let Ok(vault_dir) = grafito_assistant::vault_tools::vault_root() else {
+            self.notify(
+                "Vault no configurado: definí GRAFITO_VAULT_DIR",
+                grafito_ui::toast::ToastKind::Error,
+            );
+            return;
+        };
+        let now = fecha_civil_utc();
+        // Nombre anti-colisión (dos export en el mismo minuto no se pisan).
+        let file_name = {
+            let base = format!(
+                "leccion-{:04}{:02}{:02}-{:02}{:02}",
+                now.0, now.1, now.2, now.3, now.4
+            );
+            crate::export::export_path_unico(&vault_dir, &base, "md")
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| format!("{base}.md"))
+        };
+        let path = vault_dir.join(file_name.clone());
+        let title = file_name.trim_end_matches(".md").to_string();
+        let markdown = crate::export::document_to_lesson_markdown(&self.document, &title);
+        self.pending_text_job = Some(PendingTextWriteJob {
+            receiver: spawn_lesson_write(path, markdown, ctx),
+        });
+        self.notify(
+            "Exportando lección al vault Obsidian…",
+            grafito_ui::toast::ToastKind::Info,
+        );
+    }
+
+    pub(crate) fn choose_and_export_ggb(&mut self, ctx: &egui::Context) {
+        // D2 lockdown: en examen no sale nada del documento.
+        if self.exam_blocks("Export") {
+            return;
+        }
+        let Some(path) = self.save_file_native("GeoGebra", &["ggb"], Some("grafito_export.ggb"))
+        else {
+            return;
+        };
+        if self.pending_ggb_export_job.is_some() {
+            self.notify(
+                "Ya hay una exportación .ggb en curso",
+                grafito_ui::toast::ToastKind::Info,
+            );
+            return;
+        }
+        let document = self.document.clone();
+        let path_clone = path.clone();
+        let ctx_clone = ctx.clone();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let _ = std::thread::Builder::new()
+            .name("ggb-export".into())
+            .spawn(move || {
+                let result = (|| -> Result<String, String> {
+                    let (items, adapter_omitidos) =
+                        crate::export::document_to_ggb_items(&document);
+                    if items.is_empty() {
+                        return Err(format!(
+                            "nada exportable a .ggb ({} objetos omitidos: solo puntos, segmentos, círculos y polígonos viajan)",
+                            adapter_omitidos.len()
+                        ));
+                    }
+                    let (bytes, report) = grafito_ggb::export::export_ggb_bytes(&items)
+                        .map_err(|e| e.to_string())?;
+                    crate::export::write_file_atomic(&path_clone, &bytes).map_err(|e| {
+                        format!("no se pudo escribir {}: {e}", path_clone.display())
+                    })?;
+                    let mut summary = format!("ggb exportado: {} objetos", report.escritos);
+                    let detalle = grafito_ggb::export::omitidos_resumen(
+                        &report,
+                        &adapter_omitidos,
+                        3,
+                    );
+                    if detalle != "sin omitidos" {
+                        summary.push_str(&format!(" ({detalle})"));
+                    }
+                    Ok(summary)
+                })();
+                let _ = tx.send(result);
+                ctx_clone.request_repaint();
+            });
+        self.pending_ggb_export_job = Some(PendingGgbExportJob { receiver: rx, path });
+        self.notify("Exportando .ggb…", grafito_ui::toast::ToastKind::Info);
+    }
+
+    /// F1-1: Archivo → "Importar GeoGebra (.ggb)…" con filtro `.ggb` (rfd).
+    /// Piel pura: el diálogo `rfd` vive en UI thread pero el `std::fs::read` +
+    /// parse ocurren en background thread `ggb-import` con `sync_channel(1)` +
+    /// `request_repaint`; el resultado se aplica en `poll_background_jobs`.
+    pub(crate) fn choose_and_import_ggb(&mut self, ctx: &egui::Context) {
+        // D2 lockdown: en examen no entra nada externo al documento
+        // (paridad con Export; antes el drawer lo permitía).
+        if self.exam_blocks("Import") {
+            return;
+        }
+        let Some(path) = self.pick_file_native("GeoGebra", &["ggb"]) else {
+            return;
+        };
+        if self.pending_ggb_import_job.is_some() {
+            self.notify(
+                "Ya hay una importación .ggb en curso",
+                grafito_ui::toast::ToastKind::Info,
+            );
+            return;
+        }
+        let ctx_clone = ctx.clone();
+        let path_clone = path.clone();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let _ = std::thread::Builder::new()
+            .name("ggb-import".into())
+            .spawn(move || {
+                let result = std::fs::read(&path_clone)
+                    .map_err(|e| format!("no se pudo leer {}: {e}", path_clone.display()))
+                    .and_then(|bytes| import_ggb_bytes_local(&bytes));
+                let _ = tx.send(result);
+                ctx_clone.request_repaint();
+            });
+        self.pending_ggb_import_job = Some(PendingGgbImportJob { receiver: rx, path });
+    }
+
+    /// Aplica un reporte `.ggb` comando-por-comando vía `process_input` con un
+    /// único undo (`save_snapshot(before)` sólo si hubo cambio semántico) y
+    /// toast honesto con `summary()` + `omitted_detail()` (nunca silencioso).
+    fn apply_ggb_import_report(&mut self, report: GgbImportReport, source: &Path) {
+        let file_name = source
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| source.display().to_string());
+        if report.mapped.is_empty() {
+            let msg = format!(
+                "{} desde {file_name}: {}",
+                report.summary(),
+                report.omitted_detail()
+            );
+            self.cas_result = msg.clone();
+            self.notify(msg, grafito_ui::toast::ToastKind::Error);
+            return;
+        }
+        let before = self.document.clone();
+        let mut applied: usize = 0;
+        let mut failures: Vec<String> = Vec::new();
+        for cmd in report.commands() {
+            let mut buf = cmd.clone();
+            match crate::commands::process_input(&mut self.document, &mut buf) {
+                grafito_command::commands::CommandOutcome::Ok
+                | grafito_command::commands::CommandOutcome::Message(_) => {
+                    applied = applied.saturating_add(1);
+                }
+                grafito_command::commands::CommandOutcome::Error(err) => {
+                    if failures.len() < 3 {
+                        failures.push(err);
+                    }
+                }
+            }
+        }
+        if documents_semantically_differ(&before, &self.document) {
+            self.save_snapshot(before);
+        }
+        let mut msg = format!(
+            "{} desde {file_name}: {applied} aplicados. {}",
+            report.summary(),
+            report.omitted_detail()
+        );
+        if !failures.is_empty() {
+            msg.push_str(&format!(" Fallos: {}", failures.join("; ")));
+        }
+        self.cas_result = msg.clone();
+        let kind = if applied == 0 {
+            grafito_ui::toast::ToastKind::Error
+        } else if failures.is_empty() && report.omitted.is_empty() {
+            grafito_ui::toast::ToastKind::Success
+        } else {
+            grafito_ui::toast::ToastKind::Info
+        };
+        self.notify(msg, kind);
+    }
+
+    fn remember_recent_file(&mut self, path: &Path) {
+        use std::path::Component;
+        if path.to_string_lossy().contains('\0')
+            || path.components().any(|c| matches!(c, Component::ParentDir))
+        {
+            return;
+        }
+        // Canonicalize for deduplication and stable storage; fall back to raw path if not yet on disk.
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let canonical_str = canonical.to_string_lossy().into_owned();
+        if canonical_str.contains('\0')
+            || canonical
+                .components()
+                .any(|c| matches!(c, Component::ParentDir))
+        {
+            return;
+        }
+        self.recent_files.retain(|recent| {
+            let recent_canonical = Path::new(recent)
+                .canonicalize()
+                .unwrap_or_else(|_| PathBuf::from(recent));
+            recent_canonical.to_string_lossy() != canonical_str
+        });
+        if self.recent_files.len() >= 10 {
+            self.recent_files.pop_front();
+        }
+        self.recent_files.push_back(canonical_str);
+        // Enforce hard cap of 10 entries.
+        while self.recent_files.len() > 10 {
+            self.recent_files.pop_front();
+        }
+    }
+
+    pub(crate) fn delete_selected(&mut self) {
+        if let Some(id) = self.selected_object {
+            self.save_state();
+            self.document.remove_object(id);
+            self.selected_object = None;
+        }
+    }
+
+    /// Expresión `f(z)` del objeto complejo seleccionado (si lo hay):
+    /// prefill del contorno a mano.
+    pub(crate) fn selected_complex_expr(&self) -> Option<String> {
+        let id = self.selected_object?;
+        match self.document.get_object(id)? {
+            GeoObject::ComplexGrid(grid) => Some(grid.expr.clone()),
+            GeoObject::ComplexMapping(mapping) => Some(mapping.expr.clone()),
+            _ => None,
+        }
+    }
+
+    /// Arma el contorno complejo: fija el modo, valida `f(z)` y activa la
+    /// herramienta. Con el campo vacío intenta el prefill del seleccionado.
+    /// `Err` honesto (además del toast) para los tests.
+    pub(crate) fn arm_complex_contour(
+        &mut self,
+        mode: crate::complex_contour::ComplexContourMode,
+    ) -> Result<(), String> {
+        if self.complex_contour.settings.expr.trim().is_empty() {
+            if let Some(expr) = self.selected_complex_expr() {
+                self.complex_contour.settings.expr = expr;
+            }
+        }
+        let expr = self.complex_contour.settings.expr.trim().to_string();
+        if expr.is_empty() {
+            let message =
+                "Contorno: escribí f(z) en el panel de Números Complejos (p. ej. 1/z).".to_string();
+            self.notify(message.clone(), grafito_ui::toast::ToastKind::Error);
+            return Err(message);
+        }
+        if grafito_complex::math::complex_expr::parse(&expr).is_err() {
+            let message = format!("Contorno: f(z) inválida: {expr}");
+            self.notify(message.clone(), grafito_ui::toast::ToastKind::Error);
+            return Err(message);
+        }
+        self.complex_contour.settings.mode = mode;
+        self.complex_contour.live = None;
+        self.complex_contour.last_value = None;
+        self.current_tool = Tool::ComplexContour;
+        self.clear_pending_action();
+        self.reset_tool_input();
+        Ok(())
+    }
+
+    /// Desarma el contorno (Esc, cambio de herramienta): tira el trazo vivo.
+    pub(crate) fn disarm_complex_contour(&mut self) {
+        self.complex_contour.live = None;
+    }
+
+    /// Cierra el trazo vivo: inserta `PencilObj` + `ComplexIntegralObj` en un
+    /// solo paso de undo y publica el valor. `time` es el reloj de egui.
+    pub(crate) fn finish_complex_contour(&mut self) {
+        use crate::complex_contour::FinishedContour;
+        if self.complex_contour.live.is_none() {
+            return;
+        }
+        let settings = self.complex_contour.settings.clone();
+        let view_scale = self.document.view().scale;
+        let mut finished = std::mem::take(&mut self.complex_contour).finish(view_scale);
+
+        // Valor final: para el círculo se calcula analítico en el momento; para
+        // el trazo ya lo trae `finish` (acumulador en vivo).
+        let (value, action, empty_hint) = match &finished {
+            FinishedContour::Empty => (None, "", ""),
+            FinishedContour::Freehand { value, .. } => (
+                value.clone(),
+                "Contorno complejo",
+                "Contorno: sin valor (¿polo sobre el trazo?)",
+            ),
+            FinishedContour::Circle { center, radius } => {
+                let value = grafito_complex::math::complex_expr::parse(settings.expr.trim())
+                    .ok()
+                    .and_then(|parsed| {
+                        grafito_complex::math::complex_calculus::circle_contour_integral(
+                            &parsed,
+                            num_complex::Complex64::new(center.x, center.y),
+                            *radius,
+                            grafito_complex::math::complex_calculus::CIRCLE_QUADRATURE_ARCS,
+                            &crate::complex_contour::document_complex_vars(&self.document),
+                            &self.document.complex_base_symbol.clone(),
+                        )
+                        .ok()
+                    })
+                    .map(|raw| crate::complex_contour::displayed_value(raw, settings.residues))
+                    .map(grafito_complex::math::complex_calculus::format_complex_rounded);
+                (
+                    value,
+                    "Contorno circular",
+                    "Círculo: sin valor (¿polo sobre la circunferencia?)",
+                )
+            }
+        };
+
+        let objects = crate::complex_contour::build_contour_objects(
+            std::mem::replace(&mut finished, FinishedContour::Empty),
+            &settings,
+            self.color_favorites[0],
+        );
+        if objects.is_empty() {
+            return;
+        }
+        match crate::app::commit_object_insertions(
+            &mut self.document,
+            &mut self.undo_stack,
+            &mut self.redo_stack,
+            objects,
+        ) {
+            Ok(ids) => {
+                if let Some(id) = ids.first() {
+                    self.selected_object = Some(*id);
+                }
+                self.mark_autosave_dirty();
+                self.complex_contour.last_value = value.clone();
+                let prefix = if settings.residues { "ΣRes" } else { "∮" };
+                let message = match value {
+                    Some(value) => format!("{prefix} = {value}"),
+                    None => empty_hint.to_string(),
+                };
+                self.notify(message, grafito_ui::toast::ToastKind::Info);
+                self.record_construction_step(action, Vec::new(), "");
+            }
+            Err(error) => {
+                self.notify(
+                    format!("Contorno: {error}"),
+                    grafito_ui::toast::ToastKind::Error,
+                );
+            }
+        }
+        // La herramienta queda armada para el siguiente trazo.
+    }
+
+    pub(crate) fn start_pending_action(&mut self, tool: Tool) {
+        self.pending_action = match tool {
+            Tool::DistanceConstraint => PendingAction::Distance { first: None },
+            Tool::AngleConstraint => PendingAction::Angle { first: None },
+            Tool::Tangent => PendingAction::Tangent { first: None },
+            Tool::Coincident => PendingAction::Coincident { first: None },
+            Tool::Horizontal => PendingAction::Horizontal { line: None },
+            Tool::Vertical => PendingAction::Vertical { line: None },
+            Tool::EqualLength => PendingAction::EqualLength { first: None },
+            Tool::Symmetry => PendingAction::Symmetry {
+                point: None,
+                mirror_point: None,
+                line: None,
+            },
+            Tool::EllipseByFoci => PendingAction::EllipseByFoci { f1: None, f2: None },
+            Tool::ParabolaByFocusDirectrix => PendingAction::ParabolaByFocusDirectrix {
+                focus: None,
+                directrix: None,
+            },
+            Tool::HyperbolaByFoci => PendingAction::HyperbolaByFoci { f1: None, f2: None },
+            Tool::ConicByFivePoints => PendingAction::ConicByFivePoints { points: Vec::new() },
+            Tool::PolygonUnion => PendingAction::BooleanUnion { first: None },
+            Tool::PolygonIntersection => PendingAction::BooleanIntersection { first: None },
+            Tool::PolygonDifference => PendingAction::BooleanDifference { first: None },
+            Tool::PolygonXor => PendingAction::BooleanXor { first: None },
+            _ => PendingAction::None,
+        };
+    }
+
+    pub(crate) fn clear_pending_action(&mut self) {
+        self.pending_action = PendingAction::None;
+    }
+
+    pub(crate) fn is_constraint_tool(tool: Tool) -> bool {
+        matches!(
+            tool,
+            Tool::DistanceConstraint
+                | Tool::AngleConstraint
+                | Tool::Tangent
+                | Tool::Coincident
+                | Tool::Horizontal
+                | Tool::Vertical
+                | Tool::EqualLength
+                | Tool::Symmetry
+                | Tool::EllipseByFoci
+                | Tool::ParabolaByFocusDirectrix
+                | Tool::HyperbolaByFoci
+                | Tool::ConicByFivePoints
+                | Tool::PolygonUnion
+                | Tool::PolygonIntersection
+                | Tool::PolygonDifference
+                | Tool::PolygonXor
+        )
+    }
+
+    pub(crate) fn sync_pending_action_with_tool(&mut self) {
+        if pending_action_needs_reinitialization(
+            self.current_tool,
+            self.previous_tool,
+            &self.pending_action,
+        ) {
+            self.reset_tool_input();
+            self.tool_ghost = None;
+            if Self::is_constraint_tool(self.current_tool) {
+                self.start_pending_action(self.current_tool);
+            } else {
+                self.clear_pending_action();
+            }
+            self.previous_tool = self.current_tool;
+        }
+    }
+
+    /// Verifica el invariante `current_view == perspective.view_mode()`.
+    ///
+    /// `Perspective` es la fuente canónica; `current_view` es cache derivado.
+    /// Usar en `debug_assert!` al inicio de funciones que lean `current_view`.
+    #[allow(dead_code)]
+    #[inline]
+    pub(crate) fn assert_view_invariant(&self) {
+        debug_assert_eq!(
+            self.current_view,
+            self.perspective.view_mode(),
+            "GrafitoApp invariant violated: current_view ({:?}) != perspective.view_mode() ({:?}) for {:?}",
+            self.current_view,
+            self.perspective.view_mode(),
+            self.perspective
+        );
+    }
+
+    /// Sincroniza el cache `current_view` desde la `perspective` canónica.
+    ///
+    /// Única vía para mutar `current_view` fuera de `set_perspective`. Mantiene
+    /// `current_view = perspective.view_mode()` y `CanvasMode` vía
+    /// `perspective.canvas_mode()` / `perspective.layout().canvas_mode`.
+    #[allow(dead_code)]
+    #[inline]
+    pub(crate) fn sync_current_view(&mut self) {
+        // R1: el invariante `current_view = perspective.view_mode()` vive en
+        // `ViewController::sync_view`; acá solo se copia el cache.
+        let mut vc = ViewController::with_perspective_and_camera(self.perspective, self.camera);
+        vc.sync_view();
+        self.current_view = vc.current_view;
+        debug_assert_eq!(
+            self.current_view,
+            self.perspective.view_mode(),
+            "sync_current_view post-condition failed"
+        );
+    }
+
+    /// D2 lockdown de examen: única vía para cambiar `exam_mode`.
+    ///
+    /// Encender es directo. Apagar NO apaga: abre el modal de confirmación
+    /// (`draw_exam_exit_modal`) y el lockdown sigue activo hasta confirmar.
+    /// Sin escape por cambio de perspectiva (`set_perspective` nunca apaga).
+    /// W-A: el banner (`draw_exam_banner`) y Esc usan esta vía para que la
+    /// salida sea visible pero siempre confirmada.
+    pub(crate) fn set_exam_mode(&mut self, on: bool) {
+        if on {
+            self.exam_mode = true;
+            self.exam_exit_confirm = false;
+        } else if self.exam_mode {
+            self.exam_exit_confirm = true;
+        }
+    }
+
+    /// Checkbox de modo examen con salida confirmada (anti-toque accidental).
+    ///
+    /// Reemplaza al `ui.checkbox(&mut app.exam_mode, …)` directo: desmarcar
+    /// abre el modal en vez de apagar el lockdown.
+    pub(crate) fn exam_mode_checkbox(&mut self, ui: &mut egui::Ui) {
+        let mut marcado = self.exam_mode;
+        let locale = self.config_locale();
+        // Switch a la derecha como el resto del drawer (S6b): la caja del
+        // checkbox quedaba enana entre filas de 56 px.
+        grafito_ui::assistant::drill_switch(
+            ui,
+            grafito_ui::i18n::t("menu.persp.exam_mode", locale),
+            "",
+            &mut marcado,
+            true,
+        );
+        if marcado != self.exam_mode {
+            self.set_exam_mode(marcado);
+        }
+    }
+
+    /// ¿Debe verse el banner de examen? W-A: SIEMPRE que `exam_mode`, en 2D
+    /// y 3D (antes solo en 2D y sin vía de salida visible).
+    pub(crate) fn exam_banner_should_show(exam_mode: bool) -> bool {
+        exam_mode
+    }
+
+    /// Arma el veredicto desde la racha ya existente en el perfil.
+    ///
+    /// Ver [`ExamExitVerdict`]: sin aciertos/total ni nota porque el lockdown
+    /// no los expone (no se inventan). Piel pura: sin I/O, sin persistencia.
+    pub(crate) fn exam_exit_verdict(
+        streak: u32,
+        locale: grafito_ui::i18n::Locale,
+    ) -> ExamExitVerdict {
+        ExamExitVerdict {
+            warm: grafito_ui::i18n::t("exam.modal_verdict", locale).to_string(),
+            streak: grafito_ui::assistant::assistant_streak_text(streak, locale),
+        }
+    }
+
+    /// Tope de días Steps en sesión para la racha (ver
+    /// `AssistantPanelState::streak_steps_days`).
+    pub(crate) const STREAK_STEPS_DAYS_CAP: usize = 64;
+
+    /// Suma un día Steps a la racha (sesión, sin persistir): sin duplicados
+    /// y con tope. Puro y testeable (el hook del solver solo calcula el día
+    /// con `streak_day` y llama acá).
+    pub(crate) fn note_streak_steps_day(days: &mut Vec<u64>, day: u64) {
+        if !days.contains(&day) {
+            days.push(day);
+            if days.len() > Self::STREAK_STEPS_DAYS_CAP {
+                days.remove(0);
+            }
+        }
+    }
+
+    /// Próximo paso ante Esc en examen (W-A, puro y testeable).
+    ///
+    /// - Sin examen → `None` (Esc es de otro diálogo).
+    /// - En examen sin modal → `RequestConfirm` (abre el modal, no sale directo).
+    /// - Con modal abierto → `CancelModal` (Esc cancela, el lockdown sigue).
+    pub(crate) fn exam_escape_next(exam_mode: bool, exit_confirm: bool) -> ExamEscapeAction {
+        if !exam_mode {
+            ExamEscapeAction::None
+        } else if exit_confirm {
+            ExamEscapeAction::CancelModal
+        } else {
+            ExamEscapeAction::RequestConfirm
+        }
+    }
+
+    /// Banner de examen SIEMPRE visible con salida explícita (W-A).
+    ///
+    /// Piel pura salvo el clic en "Salir", que llama
+    /// [`Self::set_exam_mode`] (abre el modal de confirmación, jamás sale
+    /// directo). Llamar al inicio del `CentralPanel` tanto en 2D como en 3D.
+    /// Estilo escandinavo: barra quiet con punto de estado, no un muro rojo.
+    pub(crate) fn draw_exam_banner(&mut self, ui: &mut egui::Ui) {
+        if !Self::exam_banner_should_show(self.exam_mode) {
+            return;
+        }
+        let theme = grafito_ui::theme::current_theme(ui.ctx());
+        let locale = self.config_locale();
+        egui::TopBottomPanel::top("exam_banner")
+            .show_separator_line(false)
+            .frame(
+                egui::Frame::none()
+                    .fill(theme.panel_bg)
+                    .stroke(theme.hairline_stroke())
+                    .inner_margin(egui::Margin {
+                        left: grafito_ui::tokens::SPACE_MD,
+                        right: grafito_ui::tokens::SPACE_MD,
+                        top: grafito_ui::tokens::SPACE_SM,
+                        bottom: grafito_ui::tokens::SPACE_SM,
+                    }),
+            )
+            .show_inside(ui, |ui| {
+                ui.horizontal(|ui| {
+                    // Punto de estado (4 px) + título + alcance del lockdown.
+                    let (dot_rect, _) =
+                        ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                    ui.painter()
+                        .circle_filled(dot_rect.center(), 4.0, theme.danger);
+                    ui.add_space(grafito_ui::tokens::SPACE_XS);
+                    ui.label(
+                        egui::RichText::new(grafito_ui::i18n::t("menu.persp.exam_mode", locale))
+                            .color(theme.text_primary)
+                            .size(grafito_ui::tokens::TYPE_SM)
+                            .strong(),
+                    );
+                    ui.label(
+                        egui::RichText::new(grafito_ui::i18n::t("exam.banner_scope", locale))
+                            .color(theme.text_tertiary)
+                            .size(grafito_ui::tokens::TYPE_XS),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add_sized(
+                                [92.0, grafito_ui::tokens::HIT_TARGET_MIN + 4.0],
+                                egui::Button::new(
+                                    egui::RichText::new(grafito_ui::i18n::t(
+                                        "exam.exit_btn",
+                                        locale,
+                                    ))
+                                    .size(grafito_ui::tokens::TYPE_XS),
+                                )
+                                .rounding(grafito_ui::tokens::RADIUS_SM),
+                            )
+                            .on_hover_text(grafito_ui::i18n::t("exam.exit_btn_hint", locale))
+                            .clicked()
+                        {
+                            self.set_exam_mode(false);
+                        }
+                    });
+                });
+            });
+    }
+
+    /// ¿Bloquea el examen esta acción? (asistente, internet, export).
+    ///
+    /// Si el lockdown está activo, avisa con toast y retorna `true` para
+    /// que el caller haga early-return. Piel: solo toast, cero I/O.
+    pub(crate) fn exam_blocks(&mut self, que: &str) -> bool {
+        if !self.exam_mode {
+            return false;
+        }
+        let locale = self.config_locale();
+        self.notify(
+            exam_blocks_text_for(que, locale),
+            grafito_ui::toast::ToastKind::Error,
+        );
+        true
+    }
+
+    /// Modal de salida de examen (confirmación explícita, sin escape accidental).
+    ///
+    /// Piel pura: solo lee `exam_exit_confirm` y registra la decisión; el
+    /// lockdown sigue activo hasta que se confirma.
+    pub(crate) fn draw_exam_exit_modal(&mut self, ctx: &egui::Context) {
+        if !self.exam_exit_confirm {
+            return;
+        }
+        let mut confirmar = false;
+        let mut cancelar = false;
+        let mut abierto = true;
+        let theme = grafito_ui::theme::current_theme(ctx);
+        let locale = self.config_locale();
+        egui::Window::new(grafito_ui::i18n::t("exam.modal_title", locale).to_string())
+            .id(egui::Id::new("exam_exit_modal"))
+            .collapsible(false)
+            .resizable(false)
+            .default_width(420.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .order(egui::Order::Foreground)
+            .open(&mut abierto)
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .fill(theme.panel_bg)
+                    .stroke(egui::Stroke::new(1.0, theme.separator))
+                    .rounding(grafito_ui::tokens::RADIUS_LG)
+                    .inner_margin(egui::Margin::symmetric(
+                        grafito_ui::tokens::SPACE_LG,
+                        grafito_ui::tokens::SPACE_MD,
+                    )),
+            )
+            .show(ctx, |ui| {
+                // #88 Modales responsive: margen de 16 px por lado en angosto.
+                ui.set_min_width(crate::ui::dialog_content_min_width(
+                    ui.ctx().screen_rect().width(),
+                ));
+                ui.set_max_width(420.0);
+                ui.label(
+                    egui::RichText::new(grafito_ui::i18n::t("exam.modal_heading", locale))
+                        .size(grafito_ui::tokens::TYPE_BASE)
+                        .strong()
+                        .color(theme.text_primary),
+                );
+                ui.add_space(grafito_ui::tokens::SPACE_XS);
+                ui.label(
+                    egui::RichText::new(grafito_ui::i18n::t("exam.modal_body", locale))
+                        .size(grafito_ui::tokens::TYPE_SM)
+                        .color(theme.text_tertiary),
+                );
+                // Veredicto (nivel reflexivo): salida cálida + racha si hay.
+                // Piel pura: `exam_exit_verdict` solo lee la racha verificada
+                // en días (igual que el header); sin aciertos/nota porque el
+                // flujo no los expone (no se inventan: si el dato no existe,
+                // la línea no se pinta).
+                let now_epoch = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_secs())
+                    .unwrap_or(0);
+                let (verified, _) = self
+                    .profile
+                    .verified_streak(now_epoch, &self.assistant.streak_steps_days);
+                let verdict = Self::exam_exit_verdict(verified, locale);
+                ui.add_space(grafito_ui::tokens::SPACE_XS);
+                ui.label(
+                    egui::RichText::new(verdict.warm)
+                        .size(grafito_ui::tokens::TYPE_SM)
+                        .color(theme.text_secondary),
+                );
+                if let Some(streak_line) = verdict.streak {
+                    ui.label(
+                        egui::RichText::new(streak_line)
+                            .size(grafito_ui::tokens::TYPE_XS)
+                            .color(theme.text_tertiary),
+                    );
+                }
+                ui.add_space(grafito_ui::tokens::SPACE_MD);
+                let button_w = (ui.available_width() - grafito_ui::tokens::SPACE_SM) / 2.0;
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = grafito_ui::tokens::SPACE_SM;
+                    if ui
+                        .add_sized(
+                            [button_w, grafito_ui::tokens::HIT_TARGET_MIN + 4.0],
+                            egui::Button::new(
+                                egui::RichText::new(grafito_ui::i18n::t(
+                                    "exam.modal_confirm",
+                                    locale,
+                                ))
+                                .size(grafito_ui::tokens::TYPE_XS),
+                            )
+                            .rounding(grafito_ui::tokens::RADIUS_SM),
+                        )
+                        .clicked()
+                    {
+                        confirmar = true;
+                    }
+                    if ui
+                        .add_sized(
+                            [button_w, grafito_ui::tokens::HIT_TARGET_MIN + 4.0],
+                            egui::Button::new(
+                                egui::RichText::new(grafito_ui::i18n::t("exam.modal_stay", locale))
+                                    .size(grafito_ui::tokens::TYPE_XS),
+                            )
+                            .rounding(grafito_ui::tokens::RADIUS_SM),
+                        )
+                        .clicked()
+                    {
+                        cancelar = true;
+                    }
+                });
+            });
+        if confirmar {
+            self.exam_mode = false;
+            self.exam_exit_confirm = false;
+        } else if cancelar || !abierto {
+            // Cerrar con X también cancela: el lockdown sigue activo.
+            self.exam_exit_confirm = false;
+        }
+    }
+
+    /// Cambia la perspectiva activa y sincroniza `current_view`, la herramienta
+    /// por defecto y los paneles. La perspectiva es sólo una vista de trabajo:
+    /// nunca debe borrar ni reemplazar el documento del usuario.
+    ///
+    /// `Perspective` es la fuente canónica; `current_view` se deriva
+    /// automáticamente vía `perspective.view_mode()` y `CanvasMode` vía
+    /// `perspective.canvas_mode()`. Esta es la única función que debe mutar
+    /// `perspective`; `current_view` nunca se asigna directamente fuera de aquí
+    /// (o `sync_current_view`). Garantiza
+    /// `debug_assert_eq!(current_view, perspective.view_mode())` al salir.
+    ///
+    /// P1a-1 lockdown: en `exam_mode` el cambio a otra perspectiva se bloquea
+    /// (early-return + toast, sin mutar). Misma perspectiva = no-op permitido.
+    /// Para chequear sin mutar y con `Err` honesto usar
+    /// [`Self::try_set_perspective`].
+    pub(crate) fn set_perspective(&mut self, p: Perspective) {
+        if self.perspective == p {
+            // Incluso si la perspectiva no cambia, el cache debe permanecer
+            // consistente (defensa contra mutaciones externas accidentales).
+            debug_assert_eq!(
+                self.current_view,
+                self.perspective.view_mode(),
+                "set_perspective early-return invariant violated"
+            );
+            return;
+        }
+        // R1: guard de examen + sync del cache en `ViewController` (dueño de
+        // perspective/view). El toast sale de `exam.view_blocked` (B-A181).
+        let mut vc = ViewController::with_perspective_and_camera(self.perspective, self.camera);
+        if vc.try_set_perspective(p, self.exam_mode).is_err() {
+            let locale = self.config_locale();
+            self.notify(
+                grafito_ui::i18n::t("exam.view_blocked", locale),
+                grafito_ui::toast::ToastKind::Error,
+            );
+            return;
+        }
+        self.perspective = vc.perspective;
+        self.current_view = vc.current_view;
+        // Reset de estado transitorio: la perspectiva anterior puede tener
+        // objetos seleccionados que no existen o no se renderizan en la nueva.
+        self.selected_object = None;
+        self.preview_object = None;
+        self.active_color_picker = None;
+        self.tool_ghost = None;
+        self.canvas_drag_start = None;
+        self.canvas_is_panning = false;
+        self.select_drag_object = None;
+        self.point_drag_error_reported = false;
+        self.eraser_stroke_has_mutated = false;
+        // Limpiar la animación trig al cambiar de perspectiva para que no se
+        // solape con el panel derecho de la nueva perspectiva.
+        self.show_trig_animation = false;
+        self.trig_animating = false;
+
+        self.perspective = p;
+        // Sincroniza el cache derivado: `current_view = perspective.view_mode()`.
+        // `CanvasMode` se deriva análogamente vía `p.canvas_mode()` / `layout.canvas_mode`.
+        let layout = p.layout();
+        debug_assert_eq!(
+            layout.canvas_mode,
+            p.canvas_mode(),
+            "PerspectiveLayout canvas_mode must match Perspective::canvas_mode() for {:?}",
+            p
+        );
+        self.current_view = p.view_mode();
+        debug_assert_eq!(
+            self.current_view,
+            self.perspective.view_mode(),
+            "set_perspective post-condition: current_view must equal perspective.view_mode()"
+        );
+        self.current_tool = layout.default_tool;
+        self.previous_tool = layout.default_tool;
+        self.reset_tool_input();
+        self.clear_pending_action();
+        // Visibilidad del teclado matemático según la perspectiva, salvo
+        // elección explícita del usuario (el toggle no se pierde al cambiar
+        // de vista: antes cada `set_perspective` lo pisaba y el teclado
+        // "nunca aparecía").
+        if !self.keyboard_visible_explicit {
+            self.keyboard_visible = layout.show_math_keyboard;
+        }
+        self.keyboard_expanded = false;
+        // Ajuste del panel izquierdo: mapea el contenido declarado al tab
+        // existente más cercano del sidebar.
+        self.sidebar_tab = layout.left_panel.default_sidebar_tab();
+        self.left_drawer_open = true;
+        self.compact_drawer_open = false;
+        // Panel derecho: Protocolo de Construcción se muestra sólo cuando la
+        // perspectiva lo solicita explícitamente.
+        self.show_construction_protocol = matches!(
+            layout.right_panel,
+            Some(crate::RightPanelContent::ConstructionProtocol)
+        );
+        self.right_drawer_open = self.active_right_panel().is_some();
+        self.compact_geometry_utility_open = false;
+        self.workspace_dock_tab = if p == Perspective::Geometry3D {
+            crate::WorkspaceDockTab::Inspector
+        } else {
+            crate::WorkspaceDockTab::Assistant
+        };
+        // Exam mode: la perspectiva Examen es la única que fuerza exam_mode=true.
+        // D2 lockdown: cambiar de perspectiva JAMÁS apaga el examen (sin escape
+        // por cambio de vista); la única salida es `set_exam_mode(false)` con
+        // confirmación en `draw_exam_exit_modal`.
+        if matches!(p, Perspective::Exam) {
+            self.exam_mode = true;
+        }
+        // Siempre bump_version para invalidar caches GPU.
+        self.document.bump_version();
+        self.assert_view_invariant();
+    }
+
+    /// Vía fallible con lockdown de examen (P1a-1, VIBLE: toast + `Err`).
+    ///
+    /// Chequea ANTES de mutar: en `exam_mode` y otra perspectiva retorna `Err`
+    /// honesto sin tocar documento/vista. Misma perspectiva = `Ok` (no-op).
+    pub(crate) fn try_set_perspective(&mut self, p: Perspective) -> Result<(), String> {
+        // R1: el guard vive en `ViewController`; el toast sale de
+        // `exam.view_blocked` (B-A181) y el `Err` el mensaje del controller.
+        let mut vc = ViewController::with_perspective_and_camera(self.perspective, self.camera);
+        if let Err(error) = vc.try_set_perspective(p, self.exam_mode) {
+            let locale = self.config_locale();
+            self.notify(
+                grafito_ui::i18n::t("exam.view_blocked", locale),
+                grafito_ui::toast::ToastKind::Error,
+            );
+            return Err(error);
+        }
+        self.set_perspective(p);
+        // Física promete física: con documento vacío carga el ejemplo
+        // (misma guarda que el botón "Cargar ejemplo"). Las demás
+        // perspectivas no autocargan: su layout ya las distingue.
+        if p == Perspective::Fisica && self.document.object_count() == 0 {
+            // Autocarga con voz: sin toast el ejemplo aparecía "mágico"
+            // y el novato no sabía qué tocar (misma guarda que el botón).
+            if self.load_perspective_examples(p).is_ok() {
+                let locale = self.config_locale();
+                self.notify(
+                    grafito_ui::i18n::t("shell.example_loaded", locale),
+                    grafito_ui::toast::ToastKind::Success,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Asegura que el panel de álgebra quede visible (tab 0 + drawer abierto).
+    ///
+    /// R1: existía como call-site en 6 flujos del asistente
+    /// (`assistant.rs`) pero su definición se perdió en el incidente; se
+    /// repone acá (dueño `app.rs`: sidebar/drawers son estado de shell).
+    /// Tras preparar un comando, la entrada algebraica queda a la vista.
+    pub(crate) fn ensure_algebra_panel_visible(&mut self) {
+        self.sidebar_tab = 0;
+        self.left_drawer_open = true;
+    }
+
+    /// Grupos visibles ya filtrados por el nivel del perfil del estudiante (progressive disclosure).
+    /// Combina `PerspectiveLayout::visible_tool_groups` con `profile.level` vía constants
+    /// `TOOLBAR_LEVEL_PRIMARY_MAX` / `SECONDARY_MAX` (sin magia 4/10).
+    pub(crate) fn filtered_visible_tool_groups(&self) -> Vec<grafito_ui::toolbar::ToolGroupId> {
+        toolbar_groups_for_level_filtered(
+            self.perspective.layout().visible_tool_groups,
+            self.profile.level,
+        )
+    }
+
+    /// Opens the Assistant in the contextual Geometry 3D host when applicable.
+    pub(crate) fn open_assistant_workspace(&mut self) {
+        self.assistant_visible = true;
+        if self.perspective == Perspective::Geometry3D {
+            self.workspace_dock_tab = crate::WorkspaceDockTab::Assistant;
+            self.right_drawer_open = true;
+            self.compact_geometry_utility_open = true;
+        }
+    }
+
+    /// Índice del tab Aula en el sidebar (detrás de los 5 tabs base:
+    /// 0=Álgebra, 1=Herram., 2=Datos, 3=Prob., 4=Vista). Solo visible opt-in.
+    pub(crate) const AULA_TAB_INDEX: usize = 5;
+    pub(crate) fn is_aula_tab_visible(&self) -> bool {
+        self.classroom.should_show_aula_tab()
+    }
+
+    /// Carga objetos de ejemplo apropiados para la perspectiva dada.
+    ///
+    /// Se invoca al cambiar de perspectiva cuando el documento está vacío,
+    /// ofreciendo un punto de partida similar a GeoGebra.
+    pub(crate) fn load_perspective_examples(&mut self, p: Perspective) -> Result<(), String> {
+        let time = 0.0;
+        let run = |document: &mut Document, cmd: &str| {
+            let mut buf = cmd.to_string();
+            let outcome = crate::commands::process_input(document, &mut buf);
+            match outcome {
+                grafito_command::commands::CommandOutcome::Error(error) => Err(error),
+                outcome => Ok(outcome),
+            }
+        };
+        let before = self.document.clone();
+        let mut staged = self.document.detached_clone_for_staging();
+        let mut outcomes = Vec::new();
+        let mut load_statistics_data = false;
+        match p {
+            Perspective::Geometry2D => {
+                staged.try_add_object(GeoObject::Point(
+                    PointObj::new(Point2::new(0.0, 0.0)).with_label("A"),
+                ))?;
+                staged.try_add_object(GeoObject::Point(
+                    PointObj::new(Point2::new(3.0, 2.0)).with_label("B"),
+                ))?;
+                staged.try_add_object(GeoObject::Line(
+                    LineObj::new(Point2::new(-2.0, -1.0), Point2::new(4.0, 3.0)).with_label("l"),
+                ))?;
+                staged.try_add_object(GeoObject::Circle(
+                    CircleObj::new(Point2::new(1.0, 1.0), 2.0).with_label("c"),
+                ))?;
+                staged.try_add_object(GeoObject::Function(
+                    FunctionObj::new("sin(x)").with_label("f(x)"),
+                ))?;
+            }
+            Perspective::Geometry3D => {
+                staged.try_add_object(GeoObject::Cube3D(
+                    Cube3DObj::new(Point3D::new(0.0, 0.0, 0.0), 2.0).with_label("C1"),
+                ))?;
+                staged.try_add_object(GeoObject::Sphere3D(
+                    Sphere3DObj::new(Point3D::new(2.0, 1.0, 0.0), 1.0).with_label("S1"),
+                ))?;
+            }
+            Perspective::AlgebraCas => {
+                staged.try_add_object(GeoObject::Function(
+                    FunctionObj::new("x^2").with_label("f(x)"),
+                ))?;
+                staged.try_add_object(GeoObject::Function(
+                    FunctionObj::new("sin(x)").with_label("g(x)"),
+                ))?;
+            }
+            Perspective::Calculus => {
+                staged.try_add_object(GeoObject::Function(
+                    FunctionObj::new("x^3").with_label("f(x)"),
+                ))?;
+                outcomes.push((
+                    "Integral[x^3, x, 0, x]",
+                    run(&mut staged, "Integral[x^3, x, 0, x]")?,
+                ));
+            }
+            Perspective::Probability => {
+                outcomes.push(("Normal[0, 1]", run(&mut staged, "Normal[0, 1]")?));
+            }
+            Perspective::Statistics => {
+                let command = "ScatterPlot[{1,2,3,4,5}, {2,3,5,4,6}]";
+                outcomes.push((command, run(&mut staged, command)?));
+                load_statistics_data = true;
+            }
+            Perspective::Complex => {
+                // ComplexMapping[1/z, I] requiere un target etiquetado "I".
+                // Usamos "<" (Less) en vez de "=" para que el fill del interior
+                // se renderice — el renderer fill excluye RelationOperator::Eq.
+                outcomes.push(("x^2 + y^2 < 1", run(&mut staged, "x^2 + y^2 < 1")?));
+                outcomes.push((
+                    "ComplexMapping[1/z, I]",
+                    run(&mut staged, "ComplexMapping[1/z, I]")?,
+                ));
+            }
+            Perspective::Dynamics => {
+                outcomes.push(("Lorenz[]", run(&mut staged, "Lorenz[]")?));
+            }
+            Perspective::DataAnalysis => {
+                let command = "ScatterPlot[{1,2,3,4,5}, {2,3,5,4,6}]";
+                outcomes.push((command, run(&mut staged, command)?));
+                load_statistics_data = true;
+            }
+            Perspective::Fisica => {
+                // Onda viajera verificada (2 fotos t=0 y t=T/4): el
+                // laboratorio insignia de la rama ondas.
+                outcomes.push((
+                    "VelocidadOnda[2.0, 3.0]",
+                    run(&mut staged, "VelocidadOnda[2.0, 3.0]")?,
+                ));
+                // Gravedad Tierra-Luna (verificada e2e): mensaje con F.
+                // Sin `?`: si fallara, la onda ya cargada no se pierde.
+                if let Ok(outcome) = run(&mut staged, "LeyGravitacion[5.972e24, 7.342e22, 3.844e8]")
+                {
+                    outcomes.push(("LeyGravitacion[5.972e24, 7.342e22, 3.844e8]", outcome));
+                }
+                // Tiro oblicuo (mecánica): curva paramétrica viva.
+                outcomes.push((
+                    "TrayectoriaProyectil[20, 45, 1.5]",
+                    run(&mut staged, "TrayectoriaProyectil[20, 45, 1.5]")?,
+                ));
+                // Dipolo eléctrico (electromagnetismo): campo 2D por
+                // superposición, una sola flecha-objeto (no llena el doc).
+                outcomes.push((
+                    "CampoCargas[1, -1, 0, -1, 1, 0]",
+                    run(&mut staged, "CampoCargas[1, -1, 0, -1, 1, 0]")?,
+                ));
+                // Cuerda vibrante modo 3 (ondas): envolvente + 4 nodos fijos.
+                outcomes.push((
+                    "OndaEstacionaria[10, 3, 1]",
+                    run(&mut staged, "OndaEstacionaria[10, 3, 1]")?,
+                ));
+                // Ley de Ohm (solo lectura): I=3 A en el mensaje, no toca el doc.
+                // Sin `?`: si fallara, los objetos ya cargados no se pierden.
+                if let Ok(outcome) = run(&mut staged, "LeyOhm[12, 4]") {
+                    outcomes.push(("LeyOhm[12, 4]", outcome));
+                }
+            }
+            Perspective::Exam => {
+                // Modo examen: documento vacío intencionalmente.
+            }
+        }
+
+        if documents_semantically_differ(&before, &staged) {
+            staged.version = before.version.wrapping_add(1);
+            self.document = staged;
+            self.save_snapshot(before);
+        }
+        for (command, outcome) in outcomes {
+            self.handle_command_outcome(outcome, time, command);
+        }
+        if load_statistics_data {
+            self.statistics_data = vec![2.0, 3.0, 5.0, 4.0, 6.0];
+            self.statistics_input_buf = "2, 3, 5, 4, 6".to_string();
+            self.statistics_input_error = None;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn pending_action_hint(&self) -> Option<String> {
+        Some(match &self.pending_action {
+            PendingAction::None => return None,
+            PendingAction::Distance { first } if first.is_none() => {
+                "Distancia: selecciona el primer punto".to_string()
+            }
+            PendingAction::Distance { .. } => "Distancia: selecciona el segundo punto".to_string(),
+            PendingAction::Angle { first } if first.is_none() => {
+                "Ángulo: selecciona la primera recta".to_string()
+            }
+            PendingAction::Angle { .. } => "Ángulo: selecciona la segunda recta".to_string(),
+            PendingAction::Tangent { first } if first.is_none() => {
+                "Tangente: selecciona la circunferencia".to_string()
+            }
+            PendingAction::Tangent { .. } => "Tangente: selecciona la recta".to_string(),
+            PendingAction::Coincident { first } if first.is_none() => {
+                "Coincidente: selecciona el primer punto".to_string()
+            }
+            PendingAction::Coincident { .. } => {
+                "Coincidente: selecciona el segundo punto".to_string()
+            }
+            PendingAction::Horizontal { .. } => "Horizontal: selecciona una recta".to_string(),
+            PendingAction::Vertical { .. } => "Vertical: selecciona una recta".to_string(),
+            PendingAction::EqualLength { first } if first.is_none() => {
+                "Longitud igual: selecciona el primer segmento".to_string()
+            }
+            PendingAction::EqualLength { .. } => {
+                "Longitud igual: selecciona el segundo segmento".to_string()
+            }
+            PendingAction::Symmetry { point, .. } if point.is_none() => {
+                "Simetría: selecciona el punto original".to_string()
+            }
+            PendingAction::Symmetry { mirror_point, .. } if mirror_point.is_none() => {
+                "Simetría: selecciona el punto imagen".to_string()
+            }
+            PendingAction::Symmetry { line, .. } if line.is_none() => {
+                "Simetría: selecciona el eje".to_string()
+            }
+            PendingAction::Symmetry { .. } => "Simetría: confirma la restricción".to_string(),
+            PendingAction::EllipseByFoci { f1, .. } if f1.is_none() => {
+                "Elipse: selecciona el primer foco".to_string()
+            }
+            PendingAction::EllipseByFoci { f2, .. } if f2.is_none() => {
+                "Elipse: selecciona el segundo foco".to_string()
+            }
+            PendingAction::EllipseByFoci { .. } => "Elipse: selecciona un punto".to_string(),
+            PendingAction::ParabolaByFocusDirectrix { focus, .. } if focus.is_none() => {
+                "Parábola: selecciona el foco".to_string()
+            }
+            PendingAction::ParabolaByFocusDirectrix { directrix, .. } if directrix.is_none() => {
+                "Parábola: selecciona la directriz".to_string()
+            }
+            PendingAction::ParabolaByFocusDirectrix { .. } => "Parábola: confirma".to_string(),
+            PendingAction::HyperbolaByFoci { f1, .. } if f1.is_none() => {
+                "Hipérbola: selecciona el primer foco".to_string()
+            }
+            PendingAction::HyperbolaByFoci { f2, .. } if f2.is_none() => {
+                "Hipérbola: selecciona el segundo foco".to_string()
+            }
+            PendingAction::HyperbolaByFoci { .. } => "Hipérbola: selecciona un punto".to_string(),
+            PendingAction::ConicByFivePoints { points } => {
+                format!("Cónica: selecciona el punto {} de 5", points.len() + 1)
+            }
+            PendingAction::BooleanUnion { first } if first.is_none() => {
+                "Unión: selecciona el primer polígono".to_string()
+            }
+            PendingAction::BooleanUnion { .. } => {
+                "Unión: selecciona el segundo polígono".to_string()
+            }
+            PendingAction::BooleanIntersection { first } if first.is_none() => {
+                "Intersección: selecciona el primer polígono".to_string()
+            }
+            PendingAction::BooleanIntersection { .. } => {
+                "Intersección: selecciona el segundo polígono".to_string()
+            }
+            PendingAction::BooleanDifference { first } if first.is_none() => {
+                "Diferencia: selecciona el primer polígono".to_string()
+            }
+            PendingAction::BooleanDifference { .. } => {
+                "Diferencia: selecciona el segundo polígono".to_string()
+            }
+            PendingAction::BooleanXor { first } if first.is_none() => {
+                "XOR: selecciona el primer polígono".to_string()
+            }
+            PendingAction::BooleanXor { .. } => "XOR: selecciona el segundo polígono".to_string(),
+        })
+    }
+
+    fn is_point(&self, id: ObjectId) -> bool {
+        matches!(self.document.get_object(id), Some(GeoObject::Point(_)))
+    }
+
+    fn is_line(&self, id: ObjectId) -> bool {
+        matches!(self.document.get_object(id), Some(GeoObject::Line(_)))
+    }
+
+    fn is_circle(&self, id: ObjectId) -> bool {
+        matches!(self.document.get_object(id), Some(GeoObject::Circle(_)))
+    }
+
+    fn is_polygon(&self, id: ObjectId) -> bool {
+        matches!(self.document.get_object(id), Some(GeoObject::Polygon(_)))
+    }
+
+    fn line_direction(&self, id: ObjectId) -> Option<Point2> {
+        if let Some(GeoObject::Line(l)) = self.document.get_object(id) {
+            let dx = l.end.x - l.start.x;
+            let dy = l.end.y - l.start.y;
+            let len = (dx * dx + dy * dy).sqrt();
+            if len > 1e-12 {
+                return Some(Point2::new(dx / len, dy / len));
+            }
+        }
+        None
+    }
+
+    fn angle_between_lines(&self, a: ObjectId, b: ObjectId) -> Option<f64> {
+        let d1 = self.line_direction(a)?;
+        let d2 = self.line_direction(b)?;
+        let dot = d1.x * d2.x + d1.y * d2.y;
+        let angle = dot.clamp(-1.0, 1.0).acos().to_degrees();
+        Some(angle)
+    }
+
+    pub(crate) fn handle_pending_object_click(&mut self, id: ObjectId, time: f64) {
+        use std::mem;
+        let action = mem::take(&mut self.pending_action);
+        let before = self.object_labels_snapshot();
+        match action {
+            PendingAction::None => {
+                self.pending_action = PendingAction::None;
+                return;
+            }
+            PendingAction::Distance { first } => {
+                if !self.is_point(id) {
+                    self.pending_action = PendingAction::Distance { first };
+                    self.handle_command_outcome(
+                        grafito_command::commands::CommandOutcome::Error(
+                            "Distance: requiere dos puntos".to_string(),
+                        ),
+                        time,
+                        "Distance",
+                    );
+                    return;
+                }
+                if let Some(first) = first {
+                    if let (Some(p1), Some(p2)) = (
+                        self.document.point_position(first),
+                        self.document.point_position(id),
+                    ) {
+                        let target = p1.distance(&p2);
+                        match self.commit_numeric_constraint(|document| {
+                            document
+                                .try_add_distance_constraint(first, id, target)
+                                .map(|_| ())
+                        }) {
+                            Ok(()) => self.record_construction_step(
+                                "Distance",
+                                vec![self.label_of(first), self.label_of(id)],
+                                "",
+                            ),
+                            Err(error) => self.handle_command_outcome(
+                                grafito_command::commands::CommandOutcome::Error(error),
+                                time,
+                                "Distance",
+                            ),
+                        }
+                    }
+                } else {
+                    self.pending_action = PendingAction::Distance { first: Some(id) };
+                    return;
+                }
+            }
+            PendingAction::Angle { first } => {
+                if !self.is_line(id) {
+                    self.pending_action = PendingAction::Angle { first };
+                    self.handle_command_outcome(
+                        grafito_command::commands::CommandOutcome::Error(
+                            "Angle: requiere dos rectas".to_string(),
+                        ),
+                        time,
+                        "Angle",
+                    );
+                    return;
+                }
+                if let Some(first) = first {
+                    if let Some(target) = self.angle_between_lines(first, id) {
+                        match self.commit_numeric_constraint(|document| {
+                            document
+                                .try_add_angle_constraint(first, id, target)
+                                .map(|_| ())
+                        }) {
+                            Ok(()) => self.record_construction_step(
+                                "Angle",
+                                vec![self.label_of(first), self.label_of(id)],
+                                "",
+                            ),
+                            Err(error) => self.handle_command_outcome(
+                                grafito_command::commands::CommandOutcome::Error(error),
+                                time,
+                                "Angle",
+                            ),
+                        }
+                    }
+                } else {
+                    self.pending_action = PendingAction::Angle { first: Some(id) };
+                    return;
+                }
+            }
+            PendingAction::Tangent { first } => {
+                let valid = if first.is_none() {
+                    self.is_circle(id)
+                } else {
+                    self.is_line(id)
+                };
+                if !valid {
+                    self.pending_action = PendingAction::Tangent { first };
+                    let message = if first.is_none() {
+                        "Tangent: requiere una circunferencia"
+                    } else {
+                        "Tangent: requiere una recta"
+                    };
+                    self.handle_command_outcome(
+                        grafito_command::commands::CommandOutcome::Error(message.to_string()),
+                        time,
+                        "Tangent",
+                    );
+                    return;
+                }
+                if let Some(first) = first {
+                    match self.commit_numeric_constraint(|document| {
+                        document.try_add_tangent_constraint(first, id).map(|_| ())
+                    }) {
+                        Ok(()) => self.record_construction_step(
+                            "Tangent",
+                            vec![self.label_of(first), self.label_of(id)],
+                            "",
+                        ),
+                        Err(error) => self.handle_command_outcome(
+                            grafito_command::commands::CommandOutcome::Error(error),
+                            time,
+                            "Tangent",
+                        ),
+                    }
+                } else {
+                    self.pending_action = PendingAction::Tangent { first: Some(id) };
+                    return;
+                }
+            }
+            PendingAction::Coincident { first } => {
+                if !self.is_point(id) {
+                    self.pending_action = PendingAction::Coincident { first };
+                    self.handle_command_outcome(
+                        grafito_command::commands::CommandOutcome::Error(
+                            "Coincident: requiere dos puntos".to_string(),
+                        ),
+                        time,
+                        "Coincident",
+                    );
+                    return;
+                }
+                if let Some(first) = first {
+                    match self.commit_numeric_constraint(|document| {
+                        document
+                            .try_add_coincident_constraint(first, id)
+                            .map(|_| ())
+                    }) {
+                        Ok(()) => self.record_construction_step(
+                            "Coincident",
+                            vec![self.label_of(first), self.label_of(id)],
+                            "",
+                        ),
+                        Err(error) => self.handle_command_outcome(
+                            grafito_command::commands::CommandOutcome::Error(error),
+                            time,
+                            "Coincident",
+                        ),
+                    }
+                } else {
+                    self.pending_action = PendingAction::Coincident { first: Some(id) };
+                    return;
+                }
+            }
+            PendingAction::Horizontal { line } => {
+                if !self.is_line(id) {
+                    self.pending_action = PendingAction::Horizontal { line };
+                    self.handle_command_outcome(
+                        grafito_command::commands::CommandOutcome::Error(
+                            "Horizontal: requiere una recta".to_string(),
+                        ),
+                        time,
+                        "Horizontal",
+                    );
+                    return;
+                }
+                match self.commit_numeric_constraint(|document| {
+                    document.try_add_horizontal_constraint(id).map(|_| ())
+                }) {
+                    Ok(()) => {
+                        self.record_construction_step("Horizontal", vec![self.label_of(id)], "")
+                    }
+                    Err(error) => self.handle_command_outcome(
+                        grafito_command::commands::CommandOutcome::Error(error),
+                        time,
+                        "Horizontal",
+                    ),
+                }
+            }
+            PendingAction::Vertical { line: _ } => {
+                if !self.is_line(id) {
+                    self.pending_action = PendingAction::Vertical { line: None };
+                    self.handle_command_outcome(
+                        grafito_command::commands::CommandOutcome::Error(
+                            "Vertical: requiere una recta".to_string(),
+                        ),
+                        time,
+                        "Vertical",
+                    );
+                    return;
+                }
+                match self.commit_numeric_constraint(|document| {
+                    document.try_add_vertical_constraint(id).map(|_| ())
+                }) {
+                    Ok(()) => {
+                        self.record_construction_step("Vertical", vec![self.label_of(id)], "")
+                    }
+                    Err(error) => self.handle_command_outcome(
+                        grafito_command::commands::CommandOutcome::Error(error),
+                        time,
+                        "Vertical",
+                    ),
+                }
+            }
+            PendingAction::EqualLength { first } => {
+                if !self.is_line(id) {
+                    self.pending_action = PendingAction::EqualLength { first };
+                    self.handle_command_outcome(
+                        grafito_command::commands::CommandOutcome::Error(
+                            "EqualLength: requiere dos segmentos".to_string(),
+                        ),
+                        time,
+                        "EqualLength",
+                    );
+                    return;
+                }
+                if let Some(first) = first {
+                    match self.commit_numeric_constraint(|document| {
+                        document
+                            .try_add_equal_length_constraint(first, id)
+                            .map(|_| ())
+                    }) {
+                        Ok(()) => self.record_construction_step(
+                            "EqualLength",
+                            vec![self.label_of(first), self.label_of(id)],
+                            "",
+                        ),
+                        Err(error) => self.handle_command_outcome(
+                            grafito_command::commands::CommandOutcome::Error(error),
+                            time,
+                            "EqualLength",
+                        ),
+                    }
+                } else {
+                    self.pending_action = PendingAction::EqualLength { first: Some(id) };
+                    return;
+                }
+            }
+            PendingAction::Symmetry {
+                point,
+                mirror_point,
+                line,
+            } => {
+                let expected_point = point.is_none();
+                let expected_mirror = point.is_some() && mirror_point.is_none();
+                let valid = if expected_point || expected_mirror {
+                    self.is_point(id)
+                } else {
+                    self.is_line(id)
+                };
+                if !valid {
+                    self.pending_action = PendingAction::Symmetry {
+                        point,
+                        mirror_point,
+                        line,
+                    };
+                    let message = if expected_point || expected_mirror {
+                        "Symmetry: requiere un punto"
+                    } else {
+                        "Symmetry: requiere una recta"
+                    };
+                    self.handle_command_outcome(
+                        grafito_command::commands::CommandOutcome::Error(message.to_string()),
+                        time,
+                        "Symmetry",
+                    );
+                    return;
+                }
+                if expected_point {
+                    self.pending_action = PendingAction::Symmetry {
+                        point: Some(id),
+                        mirror_point,
+                        line,
+                    };
+                    return;
+                } else if expected_mirror {
+                    self.pending_action = PendingAction::Symmetry {
+                        point,
+                        mirror_point: Some(id),
+                        line,
+                    };
+                    return;
+                } else if let (Some(p), Some(m)) = (point, mirror_point) {
+                    match self.commit_numeric_constraint(|document| {
+                        document.try_add_symmetry_constraint(p, m, id).map(|_| ())
+                    }) {
+                        Ok(()) => self.record_construction_step(
+                            "Symmetry",
+                            vec![self.label_of(p), self.label_of(m), self.label_of(id)],
+                            "",
+                        ),
+                        Err(error) => self.handle_command_outcome(
+                            grafito_command::commands::CommandOutcome::Error(error),
+                            time,
+                            "Symmetry",
+                        ),
+                    }
+                } else {
+                    // Estado inconsistente: devolver la acción para reintentar
+                    self.pending_action = PendingAction::Symmetry {
+                        point,
+                        mirror_point,
+                        line,
+                    };
+                    return;
+                }
+            }
+            PendingAction::EllipseByFoci { f1, f2 } => {
+                if !self.is_point(id) {
+                    self.pending_action = PendingAction::EllipseByFoci { f1, f2 };
+                    return;
+                }
+                if f1.is_none() {
+                    self.pending_action = PendingAction::EllipseByFoci { f1: Some(id), f2 };
+                    return;
+                } else if f2.is_none() {
+                    self.pending_action = PendingAction::EllipseByFoci { f1, f2: Some(id) };
+                    return;
+                } else if let (Some(f1_id), Some(f2_id)) = (f1, f2) {
+                    let inputs = [f1_id, f2_id, id];
+                    match commit_ellipse_by_foci(
+                        &mut self.document,
+                        &mut self.undo_stack,
+                        &mut self.redo_stack,
+                        inputs[0],
+                        inputs[1],
+                        inputs[2],
+                    ) {
+                        Ok(()) => {
+                            self.mark_autosave_dirty();
+                            let labels: Vec<String> =
+                                inputs.iter().map(|&i| self.label_of(i)).collect();
+                            let output = self.new_labels_since(&before).join(", ");
+                            self.record_construction_step("EllipseByFoci", labels, &output);
+                        }
+                        Err(error) => self.handle_command_outcome(
+                            grafito_command::commands::CommandOutcome::Error(error),
+                            time,
+                            "EllipseByFoci",
+                        ),
+                    }
+                }
+            }
+            PendingAction::ParabolaByFocusDirectrix { focus, directrix } => {
+                let expected_focus = focus.is_none();
+                let valid = if expected_focus {
+                    self.is_point(id)
+                } else {
+                    self.is_line(id)
+                };
+                if !valid {
+                    self.pending_action =
+                        PendingAction::ParabolaByFocusDirectrix { focus, directrix };
+                    return;
+                }
+                if expected_focus {
+                    self.pending_action = PendingAction::ParabolaByFocusDirectrix {
+                        focus: Some(id),
+                        directrix,
+                    };
+                    return;
+                } else if let Some(focus_id) = focus {
+                    let inputs = [focus_id, id];
+                    match commit_parabola_by_focus_directrix(
+                        &mut self.document,
+                        &mut self.undo_stack,
+                        &mut self.redo_stack,
+                        inputs[0],
+                        inputs[1],
+                    ) {
+                        Ok(()) => {
+                            self.mark_autosave_dirty();
+                            let labels: Vec<String> =
+                                inputs.iter().map(|&i| self.label_of(i)).collect();
+                            let output = self.new_labels_since(&before).join(", ");
+                            self.record_construction_step(
+                                "ParabolaByFocusDirectrix",
+                                labels,
+                                &output,
+                            );
+                        }
+                        Err(error) => self.handle_command_outcome(
+                            grafito_command::commands::CommandOutcome::Error(error),
+                            time,
+                            "ParabolaByFocusDirectrix",
+                        ),
+                    }
+                }
+            }
+            PendingAction::HyperbolaByFoci { f1, f2 } => {
+                if !self.is_point(id) {
+                    self.pending_action = PendingAction::HyperbolaByFoci { f1, f2 };
+                    return;
+                }
+                if f1.is_none() {
+                    self.pending_action = PendingAction::HyperbolaByFoci { f1: Some(id), f2 };
+                    return;
+                } else if f2.is_none() {
+                    self.pending_action = PendingAction::HyperbolaByFoci { f1, f2: Some(id) };
+                    return;
+                } else if let (Some(f1_id), Some(f2_id)) = (f1, f2) {
+                    let inputs = [f1_id, f2_id, id];
+                    match commit_hyperbola_by_foci(
+                        &mut self.document,
+                        &mut self.undo_stack,
+                        &mut self.redo_stack,
+                        inputs[0],
+                        inputs[1],
+                        inputs[2],
+                    ) {
+                        Ok(()) => {
+                            self.mark_autosave_dirty();
+                            let labels: Vec<String> =
+                                inputs.iter().map(|&i| self.label_of(i)).collect();
+                            let output = self.new_labels_since(&before).join(", ");
+                            self.record_construction_step("HyperbolaByFoci", labels, &output);
+                        }
+                        Err(error) => self.handle_command_outcome(
+                            grafito_command::commands::CommandOutcome::Error(error),
+                            time,
+                            "HyperbolaByFoci",
+                        ),
+                    }
+                }
+            }
+            PendingAction::ConicByFivePoints { mut points } => {
+                if !self.is_point(id) {
+                    self.pending_action = PendingAction::ConicByFivePoints { points };
+                    return;
+                }
+                points.push(id);
+                if points.len() < 5 {
+                    self.pending_action = PendingAction::ConicByFivePoints { points };
+                    return;
+                }
+                let labels: Vec<String> = points.iter().map(|&i| self.label_of(i)).collect();
+                match commit_conic_by_five_points(
+                    &mut self.document,
+                    &mut self.undo_stack,
+                    &mut self.redo_stack,
+                    &points,
+                ) {
+                    Ok(()) => {
+                        self.mark_autosave_dirty();
+                        let output = self.new_labels_since(&before).join(", ");
+                        self.record_construction_step("ConicByFivePoints", labels, &output);
+                    }
+                    Err(error) => self.handle_command_outcome(
+                        grafito_command::commands::CommandOutcome::Error(error),
+                        time,
+                        "ConicByFivePoints",
+                    ),
+                }
+            }
+            PendingAction::BooleanUnion { .. }
+            | PendingAction::BooleanIntersection { .. }
+            | PendingAction::BooleanDifference { .. }
+            | PendingAction::BooleanXor { .. } => {
+                if !self.is_polygon(id) {
+                    self.pending_action = action;
+                    return;
+                }
+                if let Some(first) = match &action {
+                    PendingAction::BooleanUnion { first }
+                    | PendingAction::BooleanIntersection { first }
+                    | PendingAction::BooleanDifference { first }
+                    | PendingAction::BooleanXor { first } => *first,
+                    _ => None,
+                } {
+                    let first_label = self
+                        .document
+                        .get_object(first)
+                        .map(|o| o.label().to_string())
+                        .unwrap_or_default();
+                    let second_label = self
+                        .document
+                        .get_object(id)
+                        .map(|o| o.label().to_string())
+                        .unwrap_or_default();
+                    let cmd_name = action.boolean_cmd_name().unwrap_or("PolygonUnion");
+                    let cmd = format!("{}[{}, {}]", cmd_name, first_label, second_label);
+                    self.execute_command_and_record(&cmd, time);
+                } else {
+                    self.pending_action = action.with_boolean_first(id);
+                    return;
+                }
+            }
+        }
+        self.current_tool = Tool::Select;
+        self.tool_ghost = None;
+        self.pending_action = PendingAction::None;
+    }
+
+    pub(crate) fn zoom_to_fit(&mut self) {
+        let mut bounds: Option<(Point2, Point2)> = None;
+        for (_, obj) in self.document.objects_iter() {
+            if !obj.is_visible() {
+                continue;
+            }
+            let pts = match obj {
+                GeoObject::Point(p) => vec![p.position],
+                GeoObject::Line(l) => vec![l.start, l.end],
+                GeoObject::Circle(c) => vec![
+                    Point2::new(c.center.x - c.radius, c.center.y - c.radius),
+                    Point2::new(c.center.x + c.radius, c.center.y + c.radius),
+                ],
+                GeoObject::Polygon(poly) => poly.vertices.clone(),
+                _ => vec![],
+            };
+            for pt in pts {
+                match bounds {
+                    None => bounds = Some((pt, pt)),
+                    Some((ref mut min, ref mut max)) => {
+                        min.x = min.x.min(pt.x);
+                        min.y = min.y.min(pt.y);
+                        max.x = max.x.max(pt.x);
+                        max.y = max.y.max(pt.y);
+                    }
+                }
+            }
+        }
+        if let Some((min, max)) = bounds {
+            let cx = (min.x + max.x) / 2.0;
+            let cy = (min.y + max.y) / 2.0;
+            let dx = (max.x - min.x).max(10.0);
+            let dy = (max.y - min.y).max(10.0);
+            let scale = (1000.0 / dx).min(600.0 / dy) * 0.8;
+            self.document.view_mut().scale = scale;
+            self.document.view_mut().offset =
+                grafito_geometry::Point2::new(-cx * scale, cy * scale);
+            self.document.bump_version();
+            self.is_view_changing = true;
+            self.last_interaction_time = std::time::Instant::now();
+        } else {
+            // Sin objetos: centrar al origen con escala por defecto (antes no hacía nada y parecía roto)
+            let screen = self.document.view().screen_size;
+            let x_log = self.document.view().x_log;
+            let y_log = self.document.view().y_log;
+            *self.document.view_mut() = grafito_geometry::ViewTransform {
+                offset: grafito_geometry::Point2::new(0.0, 0.0),
+                scale: 50.0,
+                screen_size: screen,
+                x_log,
+                y_log,
+            };
+            self.document.bump_version();
+            self.is_view_changing = true;
+            self.last_interaction_time = std::time::Instant::now();
+            self.document.render_quality = grafito_core::RenderQuality::High;
+        }
+    }
+
+    /// Zoom por pasos (botones +/−, pinch): mismo efecto colateral que el zoom
+    /// por rueda (calidad Preview durante el gesto). `factor` se clamp-ea al
+    /// rango del gesto de rueda; `ViewTransform::zoom` ignora no-finitos.
+    /// `local` en píxeles relativos al canvas (como el handler de scroll).
+    pub(crate) fn zoom_stepped_view(&mut self, factor: f32, local: glam::Vec2) {
+        self.is_view_changing = true;
+        self.last_interaction_time = std::time::Instant::now();
+        self.document.render_quality = RenderQuality::Preview;
+        self.document
+            .view_mut()
+            .zoom(factor.clamp(0.8, 1.25), local);
+    }
+}
+
+#[cfg(test)]
+mod transient_render_state_tests {
+    use super::{
+        advance_default_camera_orbit_at_speed, normalize_multidimensional_motion_speed,
+        pause_default_multidimensional_motion, reset_3d_view_and_pause_motion,
+        should_animate_multidimensional_scene, should_prepare_gpu_3d, should_repaint_3d_warmup,
+        toggle_default_multidimensional_motion, TransientRenderState,
+        DEFAULT_MULTIDIMENSIONAL_MOTION_SPEED, MAX_MULTIDIMENSIONAL_MOTION_SPEED,
+        MIN_MULTIDIMENSIONAL_MOTION_SPEED,
+    };
+    use crate::canvas::Scene3DReadiness;
+    use crate::ViewMode;
+
+    #[test]
+    fn homotopy_clock_advances_revision_without_persistent_document_state() {
+        let document = grafito_core::Document::new();
+        let mut state = TransientRenderState::default();
+
+        assert!(state.advance_homotopy(0.25));
+        assert_eq!(state.homotopy_time(), 0.25);
+        assert_eq!(state.revision(), 1);
+        assert!(!document.variables.contains_key("t_homotopy"));
+    }
+
+    #[test]
+    fn four_d_phase_advances_without_mutating_the_document_and_wraps() {
+        let document = grafito_core::Document::new();
+        let mut state = TransientRenderState::default();
+
+        assert!(state.advance_four_d_phase(std::f64::consts::TAU + 0.25));
+        assert!((state.four_d_phase() - 0.25).abs() < 1e-12);
+        assert_eq!(document.version, 0);
+        assert!(!document.variables.contains_key("four_d_phase"));
+    }
+
+    #[test]
+    fn default_motion_requires_a_visible_3d_scene_and_can_be_paused() {
+        assert!(should_animate_multidimensional_scene(
+            ViewMode::D3,
+            true,
+            true
+        ));
+        assert!(!should_animate_multidimensional_scene(
+            ViewMode::D2,
+            true,
+            true
+        ));
+        assert!(!should_animate_multidimensional_scene(
+            ViewMode::D3,
+            false,
+            true
+        ));
+        assert!(!should_animate_multidimensional_scene(
+            ViewMode::D3,
+            true,
+            false
+        ));
+
+        let mut motion_enabled = true;
+        assert!(pause_default_multidimensional_motion(&mut motion_enabled));
+        assert!(!motion_enabled);
+        assert!(!pause_default_multidimensional_motion(&mut motion_enabled));
+        assert!(toggle_default_multidimensional_motion(&mut motion_enabled));
+        assert!(motion_enabled);
+    }
+
+    #[test]
+    fn default_camera_orbit_changes_only_the_azimuth_for_a_finite_delta() {
+        let mut camera = grafito_geometry::Camera3D::new(4.0 / 3.0);
+        let original = camera;
+
+        assert!(advance_default_camera_orbit_at_speed(
+            &mut camera,
+            0.5,
+            DEFAULT_MULTIDIMENSIONAL_MOTION_SPEED,
+        ));
+        assert_ne!(camera.theta, original.theta);
+        assert_eq!(camera.phi, original.phi);
+        assert!(!advance_default_camera_orbit_at_speed(
+            &mut camera,
+            f64::NAN,
+            DEFAULT_MULTIDIMENSIONAL_MOTION_SPEED,
+        ));
+
+        camera.theta = 1_000.0;
+        assert!(advance_default_camera_orbit_at_speed(
+            &mut camera,
+            0.1,
+            DEFAULT_MULTIDIMENSIONAL_MOTION_SPEED,
+        ));
+        assert!((0.0..std::f32::consts::TAU).contains(&camera.theta));
+    }
+
+    #[test]
+    fn resetting_the_3d_view_pauses_default_motion() {
+        let mut camera = grafito_geometry::Camera3D::new(4.0 / 3.0);
+        camera.orbit(0.4, -0.2);
+        let mut motion_enabled = true;
+
+        reset_3d_view_and_pause_motion(&mut camera, 1200.0, 600.0, &mut motion_enabled);
+
+        assert!(!motion_enabled);
+        assert_eq!(camera, grafito_geometry::Camera3D::new(2.0));
+    }
+
+    #[test]
+    fn multidimensional_motion_speed_is_bounded_and_scales_the_orbit() {
+        assert_eq!(
+            normalize_multidimensional_motion_speed(f32::NAN),
+            DEFAULT_MULTIDIMENSIONAL_MOTION_SPEED
+        );
+        assert_eq!(
+            normalize_multidimensional_motion_speed(-1.0),
+            MIN_MULTIDIMENSIONAL_MOTION_SPEED
+        );
+        assert_eq!(
+            normalize_multidimensional_motion_speed(99.0),
+            MAX_MULTIDIMENSIONAL_MOTION_SPEED
+        );
+
+        let mut normal = grafito_geometry::Camera3D::new(4.0 / 3.0);
+        let mut fast = normal;
+        let initial_theta = normal.theta;
+        assert!(advance_default_camera_orbit_at_speed(&mut normal, 0.1, 1.0));
+        assert!(advance_default_camera_orbit_at_speed(&mut fast, 0.1, 2.0));
+        let normal_delta = normal.theta - initial_theta;
+        let fast_delta = fast.theta - initial_theta;
+        assert!((fast_delta - normal_delta * 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn automatic_motion_uses_cpu_preview_without_leaving_gpu_warmup_spinning() {
+        assert!(!should_prepare_gpu_3d(
+            true,
+            true,
+            false,
+            true,
+            false,
+            Scene3DReadiness::Pending,
+        ));
+        assert!(should_prepare_gpu_3d(
+            true,
+            true,
+            false,
+            false,
+            false,
+            Scene3DReadiness::Pending,
+        ));
+        assert!(!should_prepare_gpu_3d(
+            true,
+            true,
+            false,
+            false,
+            false,
+            Scene3DReadiness::CpuOnly,
+        ));
+        assert!(!should_prepare_gpu_3d(
+            true,
+            true,
+            false,
+            false,
+            true,
+            Scene3DReadiness::GpuReady,
+        ));
+        assert!(should_repaint_3d_warmup(Scene3DReadiness::Pending));
+        assert!(!should_repaint_3d_warmup(Scene3DReadiness::GpuReady));
+        assert!(!should_repaint_3d_warmup(Scene3DReadiness::CpuOnly));
+    }
+}
+
+impl GrafitoApp {
+    /// A8 recovery (nunca I/O en `Ui::`): chequeo sidecar en background + poll.
+    /// Si hay sidecar más nuevo, `draw_recovery_modal` (junto a onboarding) lo
+    /// ofrece. Ola 2: extraído de `update` sin cambiar firma pública.
+    fn handle_recovery_tick(&mut self, ctx: &egui::Context) {
+        self.maybe_start_recovery_check(ctx);
+        self.poll_recovery_job();
+    }
+
+    /// Scheduler unificado de repintado: acumula flags warmup/animating/busy y
+    /// pide un solo `request_repaint_after` por frame (presupuesto único 16 ms
+    /// base, 33 ms motion multidimensional, 150 ms settle — ver comentario F17).
+    /// Ola 2: extraído de `update` sin cambiar firma pública ni comportamiento;
+    /// `draw_layers` (capas UI) queda inline a propósito: comparte el `shell`
+    /// computado arriba y partirlo exigiría mover estado entre fns.
+    /// Retorna `(dt, mapping_animating)` que `update` reutiliza abajo
+    /// (`plan_2d_scene`, motion multidimensional).
+    fn dispatch_frame_scheduler(&mut self, ctx: &egui::Context) -> (f64, bool) {
+        // Unified repaint scheduler: gather warmup/animating/busy flags.
+        let mut needs_repaint = false;
+        let needs_repaint_delay = Duration::from_millis(16);
+
+        if self.is_view_changing {
+            if self.last_interaction_time.elapsed() > VIEW_SETTLE_DURATION {
+                self.is_view_changing = false;
+                self.document.render_quality = RenderQuality::High;
+            } else {
+                // Seguir repintando hasta que se cumpla el plazo de hysteresis
+                // para que la promoción a High dispare aunque no haya más input.
+                needs_repaint = true;
+            }
+        }
+
+        let (dt, ui_time) = ctx.input(|i| (i.stable_dt.min(0.1) as f64, i.time));
+        self.ui_time = ui_time;
+
+        // Indicate estilo Manim: expira solo (~1.2 s); mientras late pide
+        // otro frame para animar el pulso.
+        if self.tick_indicate(ui_time * 1000.0) {
+            needs_repaint = true;
+        }
+
+        // En modo explorador trigonométrico, saltar las animaciones de
+        // variables del documento para evitar recomputes de fondo.
+        let variable_animating =
+            !self.show_trig_animation && self.document.advance_variable_animations(dt);
+        if variable_animating {
+            self.document.render_quality = RenderQuality::Preview;
+            self.is_view_changing = true;
+            self.last_interaction_time = Instant::now();
+            needs_repaint = true;
+        }
+
+        // Animación trigonométrica: sólo corre mientras el panel está visible.
+        if self.show_trig_animation && self.trig_animating {
+            self.trig_angle += self.trig_speed * dt;
+            // Mantener en [-2π, 2π] para evitar overflow
+            let two_pi = 2.0 * std::f64::consts::PI;
+            if self.trig_angle > two_pi {
+                self.trig_angle -= two_pi;
+            } else if self.trig_angle < -two_pi {
+                self.trig_angle += two_pi;
+            }
+            self.document.render_quality = RenderQuality::Preview;
+            needs_repaint = true;
+        } else if !self.show_trig_animation && self.trig_animating {
+            self.trig_animating = false;
+        }
+
+        // Animación de homotopía en mapeo complejo: el scan O(N) corre solo
+        // cuando `version` cambió (una vez por mutación, no por frame). La
+        // versión es el único reloj de mutación, así que el caché no puede
+        // desincronizarse como un flag mantenido a mano en cada hook.
+        let mapping_animating = match self.mapping_anim_cache {
+            Some((v, b)) if v == self.document.version => b,
+            _ => {
+                let mut found = false;
+                for (_, obj) in self.document.objects_iter() {
+                    if let GeoObject::ComplexMapping(cm) = obj {
+                        if cm.visible && cm.animate_homotopy {
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                self.mapping_anim_cache = Some((self.document.version, found));
+                found
+            }
+        };
+        if mapping_animating {
+            self.transient_render_state.advance_homotopy(dt);
+            self.document.render_quality = RenderQuality::Preview;
+            self.is_view_changing = true;
+            self.last_interaction_time = Instant::now();
+            needs_repaint = true;
+        }
+
+        // Single scheduler for animating/warmup/busy — replaces dispersed request_repaint calls.
+        {
+            let warmup = self.is_view_changing;
+            let trig_anim = self.show_trig_animation && self.trig_animating;
+            // Órbita 3D solo en vista D3 (helper pineado con tests): sin el
+            // gate, cualquier objeto 3D visible pedía 60 fps eternos aunque
+            // la vista activa fuera 2D y nada se moviera en pantalla.
+            let ambient_3d = should_animate_multidimensional_scene(
+                self.current_view,
+                self.multidimensional_motion_enabled,
+                self.has_visible_multidimensional_object(),
+            );
+            let animating = variable_animating || trig_anim || mapping_animating || ambient_3d;
+            // Dedo quieto no es trabajo: `any_down` solo pide frame si hay
+            // movimiento/zoom (arrastrar sigue repintando; apoyado no).
+            let busy = ctx.input(|input| {
+                (input.pointer.any_down()
+                    && (input.pointer.delta() != egui::Vec2::ZERO || input.zoom_delta() != 1.0))
+                    || self.assistant.is_pending
+            });
+            if animating || warmup || busy || needs_repaint {
+                let delay = if animating && self.multidimensional_motion_enabled {
+                    needs_repaint_delay.min(MULTIDIMENSIONAL_MOTION_REPAINT_INTERVAL)
+                } else {
+                    needs_repaint_delay
+                };
+                // F17: por el presupuesto coalescido (se aplica una vez al
+                // final de `update` en `apply_repaint_budget`), no directo.
+                self.repaint_budget.request(delay);
+            }
+        }
+        (dt, mapping_animating)
+    }
+}
+
+impl eframe::App for GrafitoApp {
+    /// Clear con el papel del tema (no el negro default de eframe): cualquier
+    /// hueco sin pintar se ve papel en vez de un bloque negro — en claro el
+    /// negro default gritaba, en oscuro se fundía y escondía el hueco.
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        let _ = visuals;
+        let paper = if self.dark_mode {
+            grafito_ui::theme::DARK.canvas_bg
+        } else {
+            grafito_ui::theme::LIGHT.canvas_bg
+        };
+        paper.to_normalized_gamma_f32()
+    }
+
+    /// Flush síncrono al salir: el debounce de `tick_autosave` pierde las
+    /// ediciones si la actividad muere sin `close_requested` (Android
+    /// `on_pause` ≠ cierre desktop). Síncrono a propósito: es la última
+    /// oportunidad de escribir. En desktop no cambia nada (el sidecar ya
+    /// estaba al día o se escribe ahora).
+    fn on_exit(&mut self) {
+        // El habla no sobrevive al cierre: kill+wait antes de todo (el
+        // timeout y el sondeo ya la acotan en sesión; acá es garantía).
+        self.stop_steps_tts();
+        // El dictado tampoco: mata grabación/transcripción y borra el
+        // WAV temporal (el audio jamás persiste, ni al cerrar a medias).
+        self.stop_stt();
+        if !self.autosave.is_dirty() {
+            return;
+        }
+        let Some(path) = self
+            .document_lifecycle
+            .current_path()
+            .map(|p| p.to_path_buf())
+        else {
+            return;
+        };
+        match grafito_core::persistence::write_autosave_sidecar(&self.document, &path) {
+            Ok(_) => self.autosave.mark_saved(),
+            Err(err) => log::warn!("on_exit autosave flush failed: {err}"),
+        }
+    }
+
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(feature = "profile")]
+        puffin::GlobalProfiler::lock().new_frame();
+        #[cfg(feature = "profile")]
+        puffin::profile_scope!("app_update");
+        // Optional puffin_egui profiler window — keep behind a cfg(false) to avoid
+        // egui version duplication (puffin_egui 0.28 vs egui 0.29). Enable manually
+        // when a compatible egui version is available.
+        #[cfg(all(feature = "profile", any()))]
+        puffin_egui::profiler_window(ctx);
+
+        // F17: reset del presupuesto de repintado coalescido del frame.
+        self.repaint_budget = RepaintBudget::default();
+
+        // EE1 hook de capturas: ventana 1600x900 una sola vez (el shot lo
+        // pidió en `new()`; acá hay `ctx` para el `ViewportCommand`).
+        if self.shot_viewport_resize {
+            self.shot_viewport_resize = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(
+                crate::shot::SHOT_WINDOW_SIZE.into(),
+            ));
+        }
+
+        if self.whiteboard_open {
+            crate::whiteboard_ui::draw_whiteboard_overlay(self, ctx);
+            return;
+        }
+
+        self.handle_native_close_request(ctx);
+        // AS3 cold-start: el archivo CLI se abre en background en el primer
+        // frame (nunca I/O de documentos en `new()`), con hint sutil si tarda.
+        self.maybe_start_startup_open(ctx);
+        self.poll_background_jobs(ctx);
+        // Aula: sincronizar opt-in (Piel pura, sin I/O) — campo classroom
+        self.classroom.set_opt_in(self.advanced_red_opt_in);
+        // D2 outbox: aviso honesto de carga corrupta, una sola vez (el load
+        // fue en `ClassroomPanel::new`, arranque; acá solo se muestra).
+        if let Some(aviso) = self.classroom.take_outbox_notice() {
+            self.notify(aviso, grafito_ui::toast::ToastKind::Error);
+        }
+        // Autosave tick (nunca en Ui::): escribe sidecar en background si debounce vencido
+        self.tick_autosave(ctx);
+        // A8 recovery (nunca I/O en Ui::): ver `handle_recovery_tick`.
+        self.handle_recovery_tick(ctx);
+
+        // Scheduler unificado de repintado (ver `dispatch_frame_scheduler`).
+        // Retorna `(dt, mapping_animating)`: los consume `plan_2d_scene` y el
+        // motion multidimensional más abajo en `update`.
+        let (dt, mapping_animating) = self.dispatch_frame_scheduler(ctx);
+
+        self.handle_keyboard_shortcuts(ctx);
+
+        let theme = grafito_ui::theme::current_theme(ctx);
+        {
+            #[cfg(feature = "profile")]
+            puffin::profile_scope!("ui");
+
+            let viewport_width = ctx.screen_rect().width();
+            let initial_right_panel = self.active_right_panel();
+            let initial_shell = crate::ShellLayout::for_viewport(
+                viewport_width,
+                self.perspective,
+                self.sidebar_tab,
+                initial_right_panel.is_some(),
+                self.right_drawer_open,
+                self.left_drawer_open,
+            );
+            let initial_geometry_utility_available = crate::uses_geometry_utility_dock(
+                self.perspective,
+                initial_right_panel,
+                initial_shell.width_class,
+                true,
+            );
+            // S4 Nivel 0 móvil: bajo 480 el rail y los drawers se ocultan
+            // (pill + FAB + entrada mandan). Desktop intacto por el gate.
+            let nivel0 = crate::ui::mobile_level0(viewport_width);
+            // S4 Nivel 0: el panel que estaba abierto "desaparece" al
+            // cruzar a <480. Avisar UNA vez por cruce (borde con flag;
+            // se resetea al ensanchar) sin tocar sidebar_tab: el estado
+            // se conserva y vuelve solo al recuperar ancho.
+            if nivel0 {
+                if !self.nivel0_hidden_announced
+                    && (self.left_drawer_open || self.compact_drawer_open)
+                {
+                    self.nivel0_hidden_announced = true;
+                    let locale = self.config_locale();
+                    self.notify(
+                        nivel0_hidden_toast(locale),
+                        grafito_ui::toast::ToastKind::Info,
+                    );
+                }
+            } else {
+                self.nivel0_hidden_announced = false;
+            }
+            crate::ui::draw_top_bar(
+                self,
+                ctx,
+                initial_shell.show_sidebar && !nivel0,
+                initial_shell.width_class == crate::ShellWidthClass::Compact,
+                (initial_shell.show_right_drawer || initial_geometry_utility_available) && !nivel0,
+            );
+            self.sync_pending_action_with_tool();
+            // Progressive disclosure wiring — filter perspective's visible groups by profile.level
+            // Uses TOOLBAR_LEVEL_PRIMARY_MAX/SECONDARY_MAX constants (no magic 4/10) via helpers.
+            let _visible_tool_groups = self.filtered_visible_tool_groups();
+            // Keep typed variant exercised to avoid dead helper (covers PedagogicalLevel mapping)
+            let _typed_visible = toolbar_groups_for_pedagogical_level(
+                self.perspective.layout().visible_tool_groups,
+                grafito_pedagogy::PedagogicalLevel::from_level_value(self.profile.level),
+            );
+            debug_assert_eq!(
+                _visible_tool_groups.len(),
+                _typed_visible.len(),
+                "lightweight and typed filtering must agree"
+            );
+            let right_panel = self.active_right_panel();
+            let shell = crate::ShellLayout::for_viewport(
+                viewport_width,
+                self.perspective,
+                self.sidebar_tab,
+                right_panel.is_some(),
+                self.right_drawer_open,
+                self.left_drawer_open,
+            )
+            .with_compact_left_drawer(self.compact_drawer_open, self.sidebar_tab)
+            // S4 Nivel 0: el drawer no se pinta (<480); la Entrada inferior
+            // es la única y siempre va visible (ver `with_nivel0`).
+            .with_nivel0(nivel0);
+            let geometry_utility_dock_available = crate::geometry_utility_dock_available(
+                self.perspective,
+                right_panel,
+                shell.width_class,
+            );
+            let geometry_utility_dock = geometry_utility_dock_available && self.right_drawer_open;
+            let compact_geometry_utility_dock = crate::uses_compact_geometry_utility_dock(
+                self.perspective,
+                shell.width_class,
+                self.compact_geometry_utility_open,
+            );
+            // W-C: egui colapsa el SidePanel a `available` cuando el mínimo no
+            // entra (`clamp(...).at_most(available_rect)`): pintar texto del
+            // drawer en 0-60px deja slivers en el borde izquierdo. Debajo de
+            // PANEL_LEFT_MIN no se pinta el drawer; el rail sigue ofreciendo
+            // reapertura (ver `ui::left_drawer_content_visible`).
+            let left_drawer_fits =
+                crate::ui::left_drawer_content_visible(ctx.available_rect().width());
+            // S4 Nivel 0 móvil: sin drawer izquierdo bajo 480 (el canvas manda).
+            // S8: el tab Aula pasa igual (dibuja su propio bottom-sheet).
+            let aula_sheet_through = self.sidebar_tab == Self::AULA_TAB_INDEX;
+            let left_drawer_fits = left_drawer_fits
+                && (!crate::ui::mobile_level0(viewport_width) || aula_sheet_through);
+            // BB3-P1-5: dead-click del rail (franja 480-520, fuera de Nivel
+            // 0): el click prendió los flags pero el drawer no cabe y no se
+            // pinta. Avisar UNA vez por bloqueo (borde con flag; se resetea
+            // al caber o al dejar de pedirse), sin tocar sidebar_tab.
+            if crate::ui::rail_drawer_blocked(
+                viewport_width,
+                ctx.available_rect().width(),
+                shell.show_left_drawer,
+            ) {
+                if !self.drawer_blocked_announced {
+                    self.drawer_blocked_announced = true;
+                    let locale = self.config_locale();
+                    self.notify(
+                        drawer_blocked_toast(locale),
+                        grafito_ui::toast::ToastKind::Info,
+                    );
+                }
+            } else {
+                self.drawer_blocked_announced = false;
+            }
+            if shell.show_left_drawer && left_drawer_fits {
+                // Clamp Aula tab cuando no está habilitada
+                if !self.is_aula_tab_visible() && self.sidebar_tab == Self::AULA_TAB_INDEX {
+                    self.sidebar_tab = 0;
+                }
+                // 5 tabs: 0=Álgebra, 1=Herram., 2=Datos, 3=Prob., 4=Vista
+                // (+ Aula en AULA_TAB_INDEX cuando está habilitada). Vista es
+                // solo visual; Exportar vive en Herramientas, la hoja en Datos
+                // y la probabilidad en Prob.
+                match self.sidebar_tab {
+                    0 => match self.perspective {
+                        Perspective::Complex => {
+                            crate::panels::draw_complex_panel(self, ctx);
+                        }
+                        _ => crate::algebra::draw_algebra_panel(self, ctx),
+                    },
+                    1 => match self.perspective {
+                        Perspective::Fisica => crate::panels::draw_fisica_panel(self, ctx),
+                        Perspective::Dynamics => crate::panels::draw_attractor_panel(self, ctx),
+                        _ => crate::tools_panel::draw_tools_panel(self, ctx),
+                    },
+                    2 => crate::panels::draw_data_panel(self, ctx),
+                    3 => crate::panels::draw_statistics_panel(self, ctx),
+                    4 => crate::panels::draw_view_panel(self, ctx),
+                    i if i == Self::AULA_TAB_INDEX && self.is_aula_tab_visible() => {
+                        crate::classroom::draw_classroom_panel(self, ctx)
+                    }
+                    // J2: el tab 6 del vault ya no existe; si persiste en
+                    // config cae al vacío honesto.
+                    _ => crate::panels::draw_empty_panel(self, ctx),
+                }
+                // Móvil (<740): el drawer es fullscreen → X flotante para
+                // cerrarlo (en desktop cierra el rail/tab). 44px táctil,
+                // bajo la top bar (con inset Android).
+                if viewport_width < grafito_ui::tokens::PALETTE_BOTTOM_SHEET_BREAKPOINT {
+                    let close_theme = grafito_ui::theme::current_theme(ctx);
+                    let close_label =
+                        grafito_ui::i18n::t("classroom.close", self.config_locale()).to_string();
+                    egui::Area::new(egui::Id::new("mobile_panel_close"))
+                        .anchor(
+                            egui::Align2::RIGHT_TOP,
+                            // Y POSITIVO hacia abajo: bajo la top bar. El
+                            // negativo anterior la mandaba fuera de pantalla
+                            // (hacia arriba) y la X era inalcanzable.
+                            egui::vec2(
+                                -16.0,
+                                grafito_ui::tokens::TOP_BAR_HEIGHT
+                                    + 8.0
+                                    + grafito_ui::tokens::safe_inset_top(),
+                            ),
+                        )
+                        .order(egui::Order::Foreground)
+                        .show(ctx, |ui| {
+                            let (rect, resp) = ui
+                                .allocate_exact_size(egui::vec2(44.0, 44.0), egui::Sense::click());
+                            let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+                            resp.widget_info(|| {
+                                egui::WidgetInfo::labeled(
+                                    egui::WidgetType::Button,
+                                    true,
+                                    close_label.clone(),
+                                )
+                            });
+                            if ui.is_rect_visible(rect) {
+                                // Fondo sólido: flota sobre el contenido del
+                                // panel y necesita contraste propio.
+                                ui.painter().circle_filled(
+                                    rect.center(),
+                                    22.0,
+                                    close_theme.panel_bg,
+                                );
+                                if resp.has_focus() {
+                                    close_theme.paint_focus_ring(ui.painter(), rect);
+                                }
+                                let pad = 15.0;
+                                for (a, b) in [
+                                    (
+                                        egui::pos2(rect.min.x + pad, rect.min.y + pad),
+                                        egui::pos2(rect.max.x - pad, rect.max.y - pad),
+                                    ),
+                                    (
+                                        egui::pos2(rect.max.x - pad, rect.min.y + pad),
+                                        egui::pos2(rect.min.x + pad, rect.max.y - pad),
+                                    ),
+                                ] {
+                                    ui.painter().line_segment(
+                                        [a, b],
+                                        egui::Stroke::new(2.0, close_theme.text_primary),
+                                    );
+                                }
+                            }
+                            if resp.clicked()
+                                || (resp.has_focus()
+                                    && ui.input(|i| {
+                                        i.key_pressed(egui::Key::Enter)
+                                            || i.key_pressed(egui::Key::Space)
+                                    }))
+                            {
+                                self.compact_drawer_open = false;
+                                self.left_drawer_open = false;
+                            }
+                        });
+                }
+            }
+            // Fallback rail para Aula cuando está habilitada pero el rail de ui.rs no expone el tab
+            // (ownership restringido a app.rs). Dibujamos un botón flotante mínimo sobre el rail
+            // si opt-in, para permitir acceso manual sin tocar ui.rs/panels.rs.
+            // S8 Nivel 0: el fallback vuelve como abridor del bottom-sheet
+            // de Aula (el drawer lateral sigue oculto en <480 por S4).
+            if self.is_aula_tab_visible() {
+                let aula_active = self.sidebar_tab == Self::AULA_TAB_INDEX;
+                // B-A197: `locale` pre-borrow (E0502: el closure de `show`
+                // asigna `self.sidebar_tab`).
+                let aula_locale = self.config_locale();
+                // No I/O en Ui:: salvo background: este botón solo muta estado en memoria.
+                egui::Area::new(egui::Id::new("aula_rail_fallback"))
+                    .anchor(
+                        egui::Align2::LEFT_TOP,
+                        egui::vec2(
+                            grafito_ui::tokens::SPACE_XS,
+                            grafito_ui::tokens::TOP_BAR_HEIGHT * 4.0
+                                + grafito_ui::tokens::SPACE_XL
+                                + grafito_ui::tokens::SPACE_XS,
+                        ),
+                    )
+                    .show(ctx, |ui| {
+                        let btn = egui::Button::new(
+                            egui::RichText::new(grafito_ui::i18n::t("rail.tab_aula", aula_locale))
+                                .size(grafito_ui::tokens::TYPE_XS)
+                                .strong(),
+                        )
+                        .selected(aula_active)
+                        .rounding(grafito_ui::tokens::RADIUS_SM);
+                        if ui
+                            .add_sized(
+                                egui::vec2(
+                                    grafito_ui::tokens::RAIL_WIDTH - grafito_ui::tokens::SPACE_SM,
+                                    grafito_ui::tokens::SPACE_XL + grafito_ui::tokens::SPACE_XS,
+                                ),
+                                btn,
+                            )
+                            .clicked()
+                        {
+                            self.sidebar_tab = Self::AULA_TAB_INDEX;
+                            self.left_drawer_open = true;
+                            self.compact_drawer_open = true;
+                        }
+                    });
+            }
+
+            // La barra inferior («0 objetos» + hint) se dibuja DESPUÉS del
+            // asistente en modo side-panel: así queda limitada a la columna
+            // central (igual que ya hace el drawer izquierdo) y nunca pisa
+            // la tarjeta del composer. En modo bottom-sheet (o asistente
+            // oculto) se mantiene el orden viejo (barra al borde inferior).
+            // Estable por frame: `available` oscila al reservar paneles
+            // (side↔sheet en 740-900); el viewport no. Misma llave que
+            // `draw_assistant_panel`.
+            let assistant_bottom_sheet =
+                grafito_ui::assistant::assistant_uses_bottom_sheet(ctx.screen_rect().width());
+            let assistant_limits_status_bar = self.assistant_visible && !assistant_bottom_sheet;
+            if !assistant_limits_status_bar {
+                // Ola 1.1: la barra «Entrada…» vuelve al layout, gobernada por
+                // ShellLayout (visible salvo que el drawer ya muestre entrada).
+                crate::ui::draw_bottom_bar(self, ctx, shell.show_bottom_input);
+            }
+
+            // Los drawers laterales reservan toda la altura antes del teclado.
+            // Así el teclado queda limitado a la columna central y no recorta
+            // el transcript ni el compositor del asistente.
+            let keyboard_layout = crate::keyboard::math_keyboard_layout(
+                self.keyboard_visible,
+                self.keyboard_expanded,
+                ctx.screen_rect().height(),
+            );
+            // Reserva el panel REAL (Full angosto = 208+48 por teclas 44,
+            // no 208: con height() el desktop/hoja tapaba 48 px del composer).
+            let keyboard_height = if keyboard_layout == crate::keyboard::MathKeyboardLayout::Full {
+                crate::keyboard::math_keyboard_panel_h(self.keyboard_tab, ctx.screen_rect().width())
+            } else {
+                keyboard_layout.height()
+            };
+            // Sincroniza nombre de usuario para header Mora personalizado
+            self.assistant.user_name = self.profile.display_name().to_owned();
+            // S4b Nivel 0: el dock lateral cede al canvas; el compacto
+            // inferior (bottom-sheet) sigue vivo. Desktop intacto.
+            let nivel0_dock = crate::ui::mobile_level0(viewport_width);
+            if geometry_utility_dock_available && !nivel0_dock {
+                self.sync_assistant_for_frame(ctx);
+                if geometry_utility_dock {
+                    crate::ui::draw_geometry_utility_dock(self, ctx);
+                }
+            } else if compact_geometry_utility_dock {
+                self.sync_assistant_for_frame(ctx);
+                crate::ui::draw_compact_geometry_utility_dock(self, ctx);
+            } else {
+                self.draw_assistant(ctx, keyboard_height);
+                // Configuración unificada: una sola ventana (Configuración)
+                self.show_mascot_config = false;
+            }
+            // La animación vive dentro del turno del chat (transcript con
+            // `AssistantMedia`): sin ventana compañera.
+
+            use crate::RightPanelContent;
+            // S4b Nivel 0: inspector lateral oculto (el canvas manda; las
+            // funciones siguen en Ctrl+K). Desktop intacto por el gate.
+            if shell.show_right_drawer && !geometry_utility_dock_available && !nivel0_dock {
+                match right_panel {
+                    None => {} // sin panel derecho
+                    Some(RightPanelContent::ConstructionProtocol) => {
+                        crate::panels::draw_construction_protocol(self, ctx);
+                    }
+                    Some(RightPanelContent::Regression) => {
+                        crate::panels::draw_right_regression_panel(self, ctx);
+                    }
+                    Some(RightPanelContent::Properties) => {
+                        crate::panels::draw_right_properties_panel(self, ctx);
+                    }
+                    Some(RightPanelContent::DomainColoring) => {
+                        crate::panels::draw_right_domain_coloring_panel(self, ctx);
+                    }
+                    Some(RightPanelContent::Parameters) => {
+                        crate::panels::draw_right_parameters_panel(self, ctx);
+                    }
+                    Some(RightPanelContent::TrigAnimation) => {
+                        crate::panels::draw_trig_animation_panel(self, ctx);
+                    }
+                }
+            }
+
+            if assistant_limits_status_bar {
+                // Modo side-panel visible: la barra inferior va acá (después
+                // del asistente y los drawers) para quedar limitada a la
+                // columna central, sin pisar el composer.
+                crate::ui::draw_bottom_bar(self, ctx, shell.show_bottom_input);
+            }
+            if keyboard_layout != crate::keyboard::MathKeyboardLayout::Hidden {
+                crate::keyboard::draw_math_keyboard(self, ctx, keyboard_layout);
+            }
+        }
+
+        // Central canvas: 2D or 3D view.
+        // ─── 6. CENTRAL CANVAS ───────────────────────────────────────────────
+        // J2: pestaña única (tira fina con el Canvas); el centro es
+        // siempre el canvas (sin re-indentar el match).
+        {
+            match self.current_view {
+                ViewMode::D2 => {
+                    self.camera.aspect = 1.6;
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::none().fill(theme.canvas_bg))
+                        .show(ctx, |ui| {
+                            // W-A: banner SIEMPRE visible con "Salir examen".
+                            self.draw_exam_banner(ui);
+
+                            let canvas_rect = ui.available_rect_before_wrap();
+                            let canvas_size = canvas_rect.size();
+                            self.canvas_origin = Some(canvas_rect.min);
+                            if self.sync_canvas_screen_size(canvas_size) {
+                                // F17: one-shot coalescido (mismo inmediato visible).
+                                self.request_repaint_budget(Duration::ZERO);
+                            }
+                            let canvas_resize_preview = canvas_resize_preview_active(
+                                self.last_canvas_resize_at,
+                                Instant::now(),
+                            );
+                            {
+                                #[cfg(feature = "profile")]
+                                puffin::profile_scope!("input");
+                                self.handle_canvas_input(ui, canvas_rect);
+                            }
+
+                            // Compact canvas controls — top-right corner, dentro del canvas
+                            // Scandinavian: botón quiet con hairline 10%, RADIUS 4, sobre Order::Foreground
+                            let zf_rect = egui::Rect::from_min_size(
+                                egui::pos2(canvas_rect.right() - 44.0, canvas_rect.top() + 8.0),
+                                egui::vec2(38.0, 28.0),
+                            );
+                            // Usar ui.put (Button widget) en lugar de painter+interact manual:
+                            // asegura hit-test correcto por encima de handle_canvas_input (click_and_drag del canvas)
+                            // y feedback hover/pressed visible. [] junto sin espacio + wrap Extend evita
+                            // que '[' y ']' se apilen verticalmente en 34px.
+                            let zf_btn = egui::Button::new(
+                                egui::RichText::new("[]")
+                                    .size(grafito_ui::tokens::TYPE_SM)
+                                    .color(theme.text_primary),
+                            )
+                            .wrap_mode(egui::TextWrapMode::Extend)
+                            .fill(theme.toolbar_bg)
+                            .stroke(egui::Stroke::new(1.0, theme.separator.gamma_multiply(0.10)))
+                            .rounding(4.0);
+                            let zf_resp = ui.put(zf_rect, zf_btn);
+                            // Hover text accesible y tooltip Scandinavian
+                            let zf_resp = zf_resp.on_hover_text("Ajustar Vista — centrar en (0,0)");
+                            zf_resp.widget_info(|| {
+                                egui::WidgetInfo::labeled(
+                                    egui::WidgetType::Button,
+                                    true,
+                                    "Ajustar vista",
+                                )
+                            });
+                            if zf_resp.clicked() {
+                                self.zoom_to_fit();
+                                // F17: one-shot coalescido (mismo inmediato visible).
+                                self.request_repaint_budget(Duration::ZERO);
+                            }
+                            // Ola 0.6: zoom por pasos +/− (mismo gesto que la rueda,
+                            // anclado al centro del canvas). Debajo del [].
+                            let canvas_center = glam::Vec2::new(
+                                canvas_rect.width() / 2.0,
+                                canvas_rect.height() / 2.0,
+                            );
+                            for (dy, glyph, tip, factor) in [
+                                (44.0, "+", "Acercar (×1.25)", 1.25f32),
+                                (80.0, "−", "Alejar (÷1.25)", 1.0f32 / 1.25f32),
+                            ] {
+                                let btn_rect = egui::Rect::from_min_size(
+                                    egui::pos2(
+                                        canvas_rect.right() - 44.0,
+                                        canvas_rect.top() + 8.0 + dy,
+                                    ),
+                                    egui::vec2(38.0, 28.0),
+                                );
+                                let btn = egui::Button::new(
+                                    egui::RichText::new(glyph)
+                                        .size(grafito_ui::tokens::TYPE_SM)
+                                        .color(theme.text_primary),
+                                )
+                                .wrap_mode(egui::TextWrapMode::Extend)
+                                .fill(theme.toolbar_bg)
+                                .stroke(egui::Stroke::new(
+                                    1.0,
+                                    theme.separator.gamma_multiply(0.10),
+                                ))
+                                .rounding(4.0);
+                                let resp = ui.put(btn_rect, btn);
+                                let resp = resp.on_hover_text(tip);
+                                resp.widget_info(|| {
+                                    egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tip)
+                                });
+                                if resp.clicked() {
+                                    self.zoom_stepped_view(factor, canvas_center);
+                                    // F17: one-shot coalescido (mismo inmediato visible).
+                                    self.request_repaint_budget(Duration::ZERO);
+                                }
+                            }
+
+                            let scene_plan = crate::canvas::plan_2d_scene(
+                                self.use_gpu,
+                                self.gpu_renderer_ready(),
+                                self.gpu_scene_2d_readiness(),
+                                mapping_animating,
+                                self.is_view_changing,
+                                canvas_size,
+                            );
+                            let gpu_base = matches!(
+                                scene_plan.base_renderer,
+                                crate::canvas::BaseRenderer2D::Gpu
+                            );
+                            let mut painter = ui.painter().clone();
+                            painter.set_clip_rect(canvas_rect);
+                            {
+                                #[cfg(feature = "profile")]
+                                puffin::profile_scope_if!(
+                                    canvas_resize_preview,
+                                    "resize_cpu_grid_2d"
+                                );
+                                // Ola 0.5: `SetBackgroundColor[color]` guarda `__view_bg`;
+                                // vale en CPU y GPU (el callback usa clear transparente).
+                                if let Some(bg) = view_bg_color(&self.document) {
+                                    painter.rect_filled(canvas_rect, 0.0, bg);
+                                }
+                                self.draw_grid(&painter, canvas_rect);
+                                self.draw_axes(
+                                    &painter,
+                                    canvas_rect,
+                                    !canvas_resize_preview,
+                                    self.config_locale(),
+                                );
+                            }
+                            let transient_revision = self.transient_render_state.revision();
+                            let homotopy_time = self.transient_render_state.homotopy_time();
+                            let callback_document = scene_plan
+                                .schedule_gpu_prepare
+                                .then(|| self.document_for_callback());
+                            if scene_plan.schedule_gpu_prepare && !gpu_base {
+                                if let Some(document) = callback_document.as_ref() {
+                                    let callback = egui_wgpu::Callback::new_paint_callback(
+                                        canvas_rect,
+                                        crate::canvas::CanvasCallback {
+                                            document: document.clone(),
+                                            dark_mode: self.dark_mode,
+                                            transient_revision,
+                                            homotopy_time,
+                                            paint_base: scene_plan.callback_paints_base,
+                                            paint_object: None,
+                                        },
+                                    );
+                                    painter.add(egui::epaint::Shape::Callback(callback));
+                                }
+                            }
+
+                            let callback_painter = painter.clone();
+                            let callback_document_for_objects = callback_document;
+                            let dark_mode = self.dark_mode;
+                            {
+                                #[cfg(feature = "profile")]
+                                puffin::profile_scope_if!(
+                                    canvas_resize_preview,
+                                    "resize_cpu_objects_2d"
+                                );
+                                self.draw_objects(
+                                    &painter,
+                                    canvas_rect,
+                                    gpu_base,
+                                    move |object_id| {
+                                        let Some(document) = &callback_document_for_objects else {
+                                            return;
+                                        };
+                                        let callback = egui_wgpu::Callback::new_paint_callback(
+                                            canvas_rect,
+                                            crate::canvas::CanvasCallback {
+                                                document: document.clone(),
+                                                dark_mode,
+                                                transient_revision,
+                                                homotopy_time,
+                                                paint_base: true,
+                                                paint_object: Some(object_id),
+                                            },
+                                        );
+                                        callback_painter
+                                            .add(egui::epaint::Shape::Callback(callback));
+                                    },
+                                );
+                                // Indicate estilo Manim: anillo pulsante sobre la
+                                // selección, tras los objetos y con clip al canvas.
+                                self.draw_indicate_highlight(
+                                    &painter,
+                                    canvas_rect,
+                                    self.ui_time * 1000.0,
+                                );
+                            }
+                            if scene_plan.schedule_gpu_prepare && !gpu_base {
+                                // F17: prepare pendiente pide otro frame; coalescido.
+                                self.request_repaint_budget(Duration::ZERO);
+                            }
+
+                            // Tool ghost and preview are transient overlays, render with CPU on top.
+                            {
+                                #[cfg(feature = "profile")]
+                                puffin::profile_scope_if!(
+                                    canvas_resize_preview,
+                                    "resize_cpu_overlay_2d"
+                                );
+                                self.draw_trig_canvas_overlay(&painter, canvas_rect);
+                                let mut overlay_painter = ui.painter().clone();
+                                overlay_painter.set_clip_rect(canvas_rect);
+                                self.draw_tool_ghost(&overlay_painter, canvas_rect);
+
+                                if let Some(preview) = &self.preview_object {
+                                    match preview {
+                                        GeoObject::Function(fun) => {
+                                            let mut f = fun.clone();
+                                            f.color = Color::new(0.5, 0.5, 0.5, 0.6);
+                                            self.draw_object(
+                                                &overlay_painter,
+                                                canvas_rect,
+                                                &GeoObject::Function(f),
+                                            );
+                                        }
+                                        GeoObject::Point(p) => {
+                                            let mut pt = p.clone();
+                                            pt.color = Color::new(0.5, 0.5, 0.5, 0.6);
+                                            self.draw_object(
+                                                &overlay_painter,
+                                                canvas_rect,
+                                                &GeoObject::Point(pt),
+                                            );
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            // Canvas vacío: sin overlay de texto (el panel
+                            // Álgebra ya enseña la entrada; pintar encima de
+                            // la cuadrícula era ruido visual).
+                            let _ = canvas_rect;
+                        });
+                }
+                ViewMode::D3 => {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        // W-A: banner SIEMPRE visible también en 3D.
+                        self.draw_exam_banner(ui);
+                        let canvas_rect = ui.available_rect_before_wrap();
+                        self.canvas_origin = Some(canvas_rect.min);
+                        let canvas_size = canvas_rect.size();
+                        if self.sync_canvas_screen_size(canvas_size) {
+                            // F17: one-shot coalescido (mismo inmediato visible).
+                            self.request_repaint_budget(Duration::ZERO);
+                        }
+                        let w = canvas_size.x;
+                        let h = canvas_size.y;
+                        if w > 0.0 && h > 0.0 {
+                            self.camera.aspect = w / h;
+                        }
+                        let canvas_resize_preview = canvas_resize_preview_active(
+                            self.last_canvas_resize_at,
+                            Instant::now(),
+                        );
+                        // Input runs before automatic motion so a manual orbit, pan, or zoom
+                        // pauses the scene before this frame can advance it again.
+                        let input_typed_four_d_phase =
+                            typed_four_d_motion_phase(self.transient_render_state.four_d_phase());
+                        {
+                            #[cfg(feature = "profile")]
+                            puffin::profile_scope!("input");
+                            self.handle_canvas_3d_input(ui, canvas_rect, input_typed_four_d_phase);
+                        }
+                        self.sync_spin_speed_from_document();
+                        let automatic_motion_active = self.advance_multidimensional_motion(dt);
+                        if automatic_motion_active {
+                            // F17: redundante con el scheduler unificado (animating),
+                            // se mantiene explícito pero coalescido vía presupuesto.
+                            self.request_repaint_budget(MULTIDIMENSIONAL_MOTION_REPAINT_INTERVAL);
+                        }
+                        let typed_four_d_phase =
+                            typed_four_d_motion_phase(self.transient_render_state.four_d_phase());
+                        // The GPU WorldMesh has only persisted 4D angles. A paused nonzero
+                        // transient phase must therefore remain CPU-owned to freeze in place.
+                        let retained_typed_four_d_phase = !automatic_motion_active
+                            && self.has_visible_typed_four_d_projection()
+                            && typed_four_d_phase.is_some_and(|phase| phase != 0.0);
+                        let scene_readiness = self.gpu_scene_3d_readiness(w, h);
+                        let gpu_requested = should_prepare_gpu_3d(
+                            self.use_gpu,
+                            self.gpu_renderer_ready(),
+                            self.is_view_changing,
+                            automatic_motion_active,
+                            retained_typed_four_d_phase,
+                            scene_readiness,
+                        );
+                        let gpu_scene_ready = gpu_requested
+                            && scene_readiness == crate::canvas::Scene3DReadiness::GpuReady;
+                        let motion_preview = automatic_motion_active
+                            || self.is_view_changing
+                            || self.document.render_quality == RenderQuality::Preview;
+                        if gpu_requested {
+                            // Draw 3D grid BEFORE the GPU callback
+                            {
+                                #[cfg(feature = "profile")]
+                                puffin::profile_scope_if!(
+                                    canvas_resize_preview,
+                                    "resize_cpu_grid_3d"
+                                );
+                                // Clip como en 2D: el grid pinta texto (ejes/ticks) que
+                                // sin clip deja slivers en paneles vecinos.
+                                let mut grid_painter = ui.painter().clone();
+                                grid_painter.set_clip_rect(canvas_rect);
+                                self.draw_3d_grid(
+                                    &grid_painter,
+                                    canvas_rect,
+                                    w,
+                                    h,
+                                    false,
+                                    canvas_resize_preview,
+                                    self.view3d.to_ortho_projection(),
+                                );
+                            }
+
+                            let callback = egui_wgpu::Callback::new_paint_callback(
+                                canvas_rect,
+                                crate::canvas::Canvas3DCallback {
+                                    document: self.document_for_callback(),
+                                    camera: self.camera,
+                                    view3d: self.view3d,
+                                    dark_mode: self.dark_mode,
+                                    screen_w: w,
+                                    screen_h: h,
+                                    paint_scene: gpu_scene_ready,
+                                },
+                            );
+                            ui.painter().add(egui::epaint::Shape::Callback(callback));
+
+                            // The CPU renderer remains authoritative until this callback has
+                            // rendered a valid target for the active camera and scene.
+                            {
+                                #[cfg(feature = "profile")]
+                                puffin::profile_scope_if!(
+                                    canvas_resize_preview,
+                                    "resize_cpu_objects_3d"
+                                );
+                                self.draw_3d_objects(
+                                    ui.painter(),
+                                    canvas_rect,
+                                    w,
+                                    h,
+                                    crate::render_3d::Cpu3dRenderOptions {
+                                        overlay_only: gpu_scene_ready,
+                                        motion_preview,
+                                        typed_four_d_phase,
+                                    },
+                                    self.view3d.to_ortho_projection(),
+                                );
+                            }
+                            if should_repaint_3d_warmup(scene_readiness) {
+                                // F17: warmup pendiente pide otro frame; coalescido.
+                                self.request_repaint_budget(Duration::ZERO);
+                            }
+                        } else {
+                            {
+                                #[cfg(feature = "profile")]
+                                puffin::profile_scope_if!(
+                                    canvas_resize_preview,
+                                    "resize_cpu_grid_3d"
+                                );
+                                let mut grid_painter = ui.painter().clone();
+                                grid_painter.set_clip_rect(canvas_rect);
+                                self.draw_3d_grid(
+                                    &grid_painter,
+                                    canvas_rect,
+                                    w,
+                                    h,
+                                    false,
+                                    canvas_resize_preview,
+                                    self.view3d.to_ortho_projection(),
+                                );
+                            }
+                            {
+                                #[cfg(feature = "profile")]
+                                puffin::profile_scope_if!(
+                                    canvas_resize_preview,
+                                    "resize_cpu_objects_3d"
+                                );
+                                self.draw_3d_objects(
+                                    ui.painter(),
+                                    canvas_rect,
+                                    w,
+                                    h,
+                                    crate::render_3d::Cpu3dRenderOptions {
+                                        overlay_only: false,
+                                        motion_preview,
+                                        typed_four_d_phase,
+                                    },
+                                    self.view3d.to_ortho_projection(),
+                                );
+                            }
+                        }
+
+                        // Draw 3D tool ghost on top with CPU painter
+                        if let Some(GeoObject::Point3D(ghost)) = &self.tool_ghost {
+                            let painter = ui.painter();
+                            let origin = canvas_rect.min;
+                            if let Some(pt) = self.camera.project(&ghost.position, w, h) {
+                                let pos = origin + egui::Vec2::new(pt.0, pt.1);
+                                // Render ghost with reduced opacity
+                                let ghost_color = egui::Color32::from_rgba_premultiplied(
+                                    (ghost.color.r * 255.0).clamp(0.0, 255.0) as u8,
+                                    (ghost.color.g * 255.0).clamp(0.0, 255.0) as u8,
+                                    (ghost.color.b * 255.0).clamp(0.0, 255.0) as u8,
+                                    80, // ~30% opacity
+                                );
+                                painter.circle_filled(pos, ghost.size.min(8.0) * 1.3, ghost_color);
+                                painter.circle_stroke(
+                                    pos,
+                                    ghost.size.min(8.0) * 1.3,
+                                    egui::Stroke::new(
+                                        1.5,
+                                        egui::Color32::from_rgba_premultiplied(100, 150, 255, 120),
+                                    ),
+                                );
+                            }
+                        }
+                        // Chip de vista 3D: que siempre se sepa en qué vista se está
+                        // (la planta ortográfica es indistinguible del 2D a simple
+                        // vista y esa fue la confusión reportada).
+                        {
+                            let view_label = match self.view3d {
+                                crate::canvas::View3D::Perspective => "perspectiva",
+                                crate::canvas::View3D::Front => "alzado · XY",
+                                crate::canvas::View3D::Top => "planta · XZ",
+                                crate::canvas::View3D::Side => "perfil · YZ",
+                            };
+                            ui.painter().text(
+                                canvas_rect.min + egui::Vec2::new(8.0, 8.0),
+                                egui::Align2::LEFT_TOP,
+                                format!("3D · {view_label}"),
+                                egui::FontId::proportional(grafito_ui::tokens::TYPE_XS),
+                                theme.text_tertiary,
+                            );
+                        }
+                    });
+                }
+            }
+        } // J2: cierra el bloque del canvas único.
+
+        crate::ui::draw_color_picker(self, ctx);
+
+        // Arranque sin overlay (VSCode/Zed): primera frame instantánea, los
+        // gates calientan en background. Solo un hint sutil si algo tarda.
+        // F10-D cold start instrumentado: first_frame real una sola vez.
+        if !self.startup_first_frame_logged {
+            self.startup_first_frame_logged = true;
+            log::info!(
+                "startup: first_frame en {}ms ({} objetos)",
+                self.startup_instant.elapsed().as_millis(),
+                self.document.object_count(),
+            );
+        }
+        // Arranque: la fase ya no se dibuja. El cartel flotante en la esquina
+        // inferior derecha tapaba el asistente, competía con el cromo y
+        // aparecía en momentos arbitrarios, así que se eliminó a pedido. Solo
+        // queda el repaint, que es lo que permite a los jobs de carga
+        // progresar sin busy-loop (el presupuesto coalesce al mínimo).
+        //
+        // egui 0.29 no expone live-regions, así que no hay sustituto automático
+        // para lectores de pantalla. `startup_pending_stage` sigue siendo la
+        // fuente de verdad de qué falta y los tests la siguen cubriendo.
+        if self.startup_pending_stage().is_some() {
+            self.request_repaint_budget(Duration::from_millis(50));
+        }
+
+        // Paleta de comandos (Ctrl+K): ventana flotante de búsqueda rápida.
+        // Las herramientas personalizadas (.ggt) entran como sección propia,
+        // reconstruidas solo cuando el store cambia (época), no cada frame.
+        if self.custom_tools.revision() != self.custom_tools_revision {
+            self.custom_tools_revision = self.custom_tools.revision();
+            self.command_palette.custom_tools =
+                grafito_ui::command_palette::custom_tool_entries(&self.custom_tools);
+        }
+        if let Some(name) = {
+            // Física primero en Ctrl+K: los laboratorios (Dinámica)
+            // abren la paleta en su perspectiva, sin rediseño.
+            self.command_palette.fisica_first = self.perspective == Perspective::Fisica;
+            self.command_palette
+                .show_localized(ctx, self.config_locale())
+        } {
+            self.apply_palette_command(&name, ctx);
+        }
+        self.draw_custom_tool_dialog(ctx);
+
+        // Modal "Acerca de Grafito": muestra versión y resumen de los cambios
+        // de la release 1.1.4 en español. Se abre desde Ayuda > Acerca de.
+        if self.show_about {
+            self.draw_about_window(ctx);
+        }
+        // Colab Pro: pareo en un clic + jobs pesados (Más > Colab Pro…).
+        if self.show_colab_window {
+            crate::colab_panel::draw_colab_window(self, ctx);
+        }
+        // Ola 0.6: hoja de atajos (Ayuda > Atajos de teclado).
+        if self.show_cheat_sheet {
+            self.draw_cheat_sheet_window(ctx);
+        }
+        // Welcome first-run estilo imagen 1: tapa TODO el shell (sin barras
+        // ni canvas detrás). Early-return DESPUÉS de dibujarlo.
+        if self.welcome_takes_over() {
+            self.draw_onboarding_window(ctx);
+            self.apply_repaint_budget(ctx);
+            return;
+        }
+        // A8 recovery al arranque: modal si el sidecar es más nuevo que el main.
+        // Piel pura (cero I/O en Ui::, el job ya cargó todo en background).
+        self.draw_recovery_modal(ctx);
+        // D2 lockdown examen: salida solo con confirmación explícita.
+        // W-A: Esc con confirmación — sin modal pide confirmación (visible);
+        // con modal abierto lo cancela (el lockdown sigue). No roba el Esc
+        // de otros diálogos (onboarding/about/custom-tool van primero).
+        if !self.show_onboarding
+            && !self.show_about
+            && !self.show_cheat_sheet
+            && !self.show_custom_tool_dialog
+            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
+            match Self::exam_escape_next(self.exam_mode, self.exam_exit_confirm) {
+                ExamEscapeAction::RequestConfirm => self.set_exam_mode(false),
+                ExamEscapeAction::CancelModal => self.exam_exit_confirm = false,
+                ExamEscapeAction::None => {}
+            }
+        }
+        // Aula roles (Profesor/Alumno): Esc sale de Presentar/Seguir
+        // restaurando paneles + overlay mínimo. Va DESPUÉS del Esc de
+        // examen a propósito: el lockdown conserva prioridad (en examen,
+        // Esc pide confirmación de salida primero y el foco sigue).
+        // Con pizarra abierta no corre (early-return de `whiteboard_open`
+        // más arriba): el foco persiste y el overlay vuelve al cerrarla.
+        if !self.show_onboarding {
+            crate::classroom::classroom_focus_frame(self, ctx);
+        }
+        self.draw_exam_exit_modal(ctx);
+        // Configuración — ventana única (legado show_mascot_config delega a assistant.settings_open)
+        if self.show_mascot_config {
+            self.assistant.settings_open = true;
+            self.assistant.config_tab = 1;
+            self.show_mascot_config = false;
+        }
+        // Enseñanza paso a paso — burbujas morph + pizarra + manim 3b1b
+        {
+            let now = std::time::Instant::now();
+            let locale = self.config_locale();
+            self.teaching_ui.tick(now);
+            crate::teaching_ui::draw_teaching_overlay(
+                &mut self.teaching_ui,
+                ctx,
+                &mut self.repaint_budget,
+                locale,
+                self.reduced_motion,
+            );
+        }
+
+        // File actions and decisions run only after every editor has consumed
+        // this frame's text/IME events.
+        crate::ui::draw_unsaved_changes_dialog(self, ctx);
+        self.process_deferred_file_action(ctx);
+
+        // Toast anchor unificado a TOP_LEFT — `ToastManager::draw` (toast.rs) ya posiciona
+        // en `screen_rect.min + (12, 56)` (TOP_LEFT). Se elimina RIGHT_BOTTOM para evitar
+        // desalineación y se usa LEFT_TOP. Decisión: TOP_LEFT gana porque deja el centro libre
+        // para el canvas y no tapa el drawer derecho (ver ui.rs vs toast.rs).
+        // Etiqueta del botón del toast en el idioma de la UI (antes del
+        // `draw`, que es puro). La copia corre después, fuera del dibujo.
+        self.toasts.set_locale(self.config_locale());
+        egui::Area::new(egui::Id::new("toasts"))
+            .anchor(egui::Align2::LEFT_TOP, egui::Vec2::new(12.0, 12.0))
+            .show(ctx, |ui| {
+                let time = ui.ctx().input(|i| i.time);
+                self.toasts.draw(ui, time);
+            });
+        // El `draw` de toasts es puro (el botón solo emite la intención):
+        // la copia al portapapeles corre acá, fuera del dibujo.
+        self.drain_toast_actions(ctx);
+
+        // Celebración contenida: ráfagas vivas en un layer no-interactivo
+        // (jamás bloquea input; con `reduced_motion` no pinta nada).
+        {
+            let time_ms = ctx.input(|i| i.time) * 1_000.0;
+            let reduced = self.reduced_motion;
+            crate::celebration::draw_celebration_overlay(
+                ctx,
+                &mut self.celebration,
+                time_ms,
+                reduced,
+            );
+        }
+
+        // F17: aplicar el presupuesto de repintado coalescido de los widgets
+        // (orb, pulso, media, teaching, whiteboard). El mínimo del frame gana;
+        // egui lo coalesce con el pedido del scheduler unificado de arriba.
+        self.apply_repaint_budget(ctx);
+        // Esc recién acá: si ningún modal/overlay lo consumió, vuelve la
+        // herramienta a Select (antes competían 4 handlers por el mismo key).
+        self.handle_escape_fallback(ctx);
+    }
+}
+
+// ── F1-1 Importador `.ggb` mínimo (std-only, espejo de `grafito-ggb`) ────────
+// Cablea el import existente sin añadir dependencia (no se toca `Cargo.toml`):
+// presupuestos espejo `GGB_MAX_BYTES` 64MiB / `GGB_MAX_XML_BYTES` 10MiB /
+// `GGB_MAX_ELEMS` 5000 / `GGB_MAX_ZIP_ENTRIES` 4096. Soporta ZIP `Stored`
+// (método 0, el usado por los dorados) y rechaza `Deflated` (método 8) con
+// error honesto que indica usar el crate completo — nunca fallo silencioso.
+// Mapea `point` → `Point[(x, y)]` y `expression type=function` →
+// `Function[...]`; el resto genera `GgbOmitted` con razón.
+
+/// Cota de atributo espejo de `grafito-ggb::MAX_ATTR_BYTES` (8192).
+const GGB_MAX_ATTR_BYTES: usize = 8192;
+
+/// Puerta de entrada pura del import `.ggb` — espejo de
+/// `grafito_ggb::import_ggb_bytes`. Sin I/O: recibe bytes ya leídos en
+/// background thread.
+pub(crate) fn import_ggb_bytes_local(bytes: &[u8]) -> Result<GgbImportReport, String> {
+    let xml = ggb_extract_xml(bytes)?;
+    ggb_parse_report(&xml)
+}
+
+fn ggb_read_u16_le(bytes: &[u8], offset: usize) -> Option<u16> {
+    let lo = *bytes.get(offset)?;
+    let hi = *bytes.get(offset.checked_add(1)?)?;
+    Some(u16::from_le_bytes([lo, hi]))
+}
+
+fn ggb_read_u32_le(bytes: &[u8], offset: usize) -> Option<u32> {
+    let b0 = *bytes.get(offset)?;
+    let b1 = *bytes.get(offset.checked_add(1)?)?;
+    let b2 = *bytes.get(offset.checked_add(2)?)?;
+    let b3 = *bytes.get(offset.checked_add(3)?)?;
+    Some(u32::from_le_bytes([b0, b1, b2, b3]))
+}
+
+fn ggb_contains(hay: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return false;
+    }
+    hay.windows(needle.len()).any(|w| w == needle)
+}
+
+fn ggb_validate_entry_name(name: &str) -> Result<(), String> {
+    if name.starts_with('/') || name.starts_with('\\') {
+        return Err(format!("entrada peligrosa '{name}': ruta absoluta"));
+    }
+    let first = name.as_bytes().first().copied().unwrap_or(0);
+    let second = name.as_bytes().get(1).copied().unwrap_or(0);
+    if first.is_ascii_alphabetic() && second == b':' {
+        return Err(format!("entrada peligrosa '{name}': ruta con unidad"));
+    }
+    let normalized = name.replace('\\', "/");
+    let mut depth: usize = 0;
+    for part in normalized.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                depth = depth.checked_sub(1).ok_or_else(|| {
+                    format!("entrada peligrosa '{name}': ruta fuera del archivo (..)")
+                })?;
+            }
+            _ => {
+                depth = depth.saturating_add(1);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Extrae `geogebra.xml` de un contenedor ZIP `Stored` con presupuestos espejo.
+/// Rechaza `Deflated` con mensaje honesto (requiere crate completo).
+fn ggb_extract_xml(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    if bytes.is_empty() {
+        return Err("archivo .ggb vacío".to_string());
+    }
+    let total = bytes.len() as u64;
+    if total > GGB_MAX_BYTES {
+        return Err(format!(
+            "archivo .ggb demasiado grande: {total} B (límite {GGB_MAX_BYTES} B)"
+        ));
+    }
+    let mut offset: usize = 0;
+    let mut entries: usize = 0;
+    let mut found: Option<Vec<u8>> = None;
+    while let Some(header_end) = offset.checked_add(30) {
+        if header_end > bytes.len() {
+            break;
+        }
+        let Some(sig) = ggb_read_u32_le(bytes, offset) else {
+            break;
+        };
+        if sig == 0x0605_4b50 || sig == 0x0201_4b50 {
+            break;
+        }
+        if sig != 0x0403_4b50 {
+            if offset == 0 {
+                return Err("ZIP inválido: firma local no encontrada".to_string());
+            }
+            break;
+        }
+        let Some(flags_off) = offset.checked_add(6) else {
+            return Err("ZIP offset desbordado (flags)".to_string());
+        };
+        let Some(method_off) = offset.checked_add(8) else {
+            return Err("ZIP offset desbordado (método)".to_string());
+        };
+        let Some(comp_off) = offset.checked_add(18) else {
+            return Err("ZIP offset desbordado (tamaño)".to_string());
+        };
+        let Some(uncomp_off) = offset.checked_add(22) else {
+            return Err("ZIP offset desbordado (tamaño)".to_string());
+        };
+        let Some(name_len_off) = offset.checked_add(26) else {
+            return Err("ZIP offset desbordado (nombre)".to_string());
+        };
+        let Some(extra_len_off) = offset.checked_add(28) else {
+            return Err("ZIP offset desbordado (extra)".to_string());
+        };
+        let (
+            Some(flags),
+            Some(method),
+            Some(comp_size),
+            Some(uncomp_size),
+            Some(name_len),
+            Some(extra_len),
+        ) = (
+            ggb_read_u16_le(bytes, flags_off),
+            ggb_read_u16_le(bytes, method_off),
+            ggb_read_u32_le(bytes, comp_off),
+            ggb_read_u32_le(bytes, uncomp_off),
+            ggb_read_u16_le(bytes, name_len_off),
+            ggb_read_u16_le(bytes, extra_len_off),
+        )
+        else {
+            return Err("ZIP truncado en cabecera local".to_string());
+        };
+        let name_len_usize = usize::from(name_len);
+        let extra_len_usize = usize::from(extra_len);
+        let comp_usize =
+            usize::try_from(comp_size).map_err(|e| format!("tamaño comprimido inválido: {e}"))?;
+        let Some(name_start) = offset.checked_add(30) else {
+            return Err("ZIP offset desbordado (nombre)".to_string());
+        };
+        let Some(name_end) = name_start.checked_add(name_len_usize) else {
+            return Err("ZIP nombre desbordado".to_string());
+        };
+        let Some(extra_end) = name_end.checked_add(extra_len_usize) else {
+            return Err("ZIP extra desbordado".to_string());
+        };
+        let Some(data_end) = extra_end.checked_add(comp_usize) else {
+            return Err("ZIP datos desbordados".to_string());
+        };
+        if data_end > bytes.len() {
+            return Err("ZIP truncado: datos fuera de rango".to_string());
+        }
+        let Some(name_bytes) = bytes.get(name_start..name_end) else {
+            return Err("ZIP nombre fuera de rango".to_string());
+        };
+        let name =
+            std::str::from_utf8(name_bytes).map_err(|e| format!("ZIP nombre no UTF-8: {e}"))?;
+        ggb_validate_entry_name(name)?;
+        if flags & 0x0001 != 0 {
+            return Err(format!("entrada '{name}': cifrada no soportada"));
+        }
+        if flags & 0x0008 != 0 {
+            return Err(format!(
+                "entrada '{name}': descriptor de datos no soportado en import mínimo"
+            ));
+        }
+        if method != 0 && method != 8 {
+            return Err(format!(
+                "entrada '{name}': método {method} no soportado (solo Stored/Deflated)"
+            ));
+        }
+        if name == GGB_XML_NAME && found.is_none() {
+            if method == 8 {
+                return Err(
+                    "geogebra.xml con compresión deflate no soportada en import mínimo \
+                     (usa el crate grafito-ggb completo) — archivo no importado"
+                        .to_string(),
+                );
+            }
+            if u64::from(uncomp_size) > GGB_MAX_XML_BYTES {
+                return Err(format!(
+                    "geogebra.xml demasiado grande: {} B (límite {GGB_MAX_XML_BYTES} B)",
+                    uncomp_size
+                ));
+            }
+            let Some(data) = bytes.get(extra_end..data_end) else {
+                return Err("geogebra.xml fuera de rango".to_string());
+            };
+            if data.len() as u64 > GGB_MAX_XML_BYTES {
+                return Err(format!(
+                    "geogebra.xml demasiado grande: {} B (límite {GGB_MAX_XML_BYTES} B)",
+                    data.len()
+                ));
+            }
+            if ggb_contains(data, b"<!DOCTYPE") || ggb_contains(data, b"<!ENTITY") {
+                return Err("DOCTYPE/ENTITY rechazado (bomba de entidades)".to_string());
+            }
+            found = Some(data.to_vec());
+        }
+        entries = entries
+            .checked_add(1)
+            .ok_or_else(|| "contador de entradas desbordado".to_string())?;
+        if entries > GGB_MAX_ZIP_ENTRIES {
+            return Err(format!(
+                "demasiadas entradas ZIP: {entries} (límite {GGB_MAX_ZIP_ENTRIES})"
+            ));
+        }
+        offset = data_end;
+    }
+    found.ok_or_else(|| "geogebra.xml faltante en .ggb".to_string())
+}
+
+fn ggb_fmt_num(v: f64) -> String {
+    if !v.is_finite() {
+        return "0".to_string();
+    }
+    let s = format!("{v:.6}");
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    if s.is_empty() || s == "-0" {
+        "0".to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+fn ggb_sanitize_label(raw: &str) -> String {
+    let t = raw.trim();
+    if t.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    for ch in t.chars() {
+        if ch.is_alphanumeric() || ch == '_' || ch == '\'' {
+            out.push(ch);
+        } else if ch == ' ' || ch == '-' {
+            out.push('_');
+        }
+        if out.len() >= 64 {
+            break;
+        }
+    }
+    out
+}
+
+/// Extrae `nombre="valor"` (comillas `"` o `'`) de un tag XML sin dependencias.
+fn ggb_attr(tag: &str, name: &str) -> Option<String> {
+    let needle = format!("{name}=");
+    let mut from: usize = 0;
+    while let Some(rest) = tag.get(from..) {
+        let rel = rest.find(&needle)?;
+        let eq_end = from.checked_add(rel)?.checked_add(needle.len())?;
+        let after_eq = tag.get(eq_end..)?;
+        let trimmed = after_eq.trim_start();
+        let skipped = after_eq.len().saturating_sub(trimmed.len());
+        let val_start = eq_end.checked_add(skipped)?;
+        let quote = trimmed.chars().next()?;
+        if quote != '"' && quote != '\'' {
+            let next_from = val_start.checked_add(1)?;
+            if next_from >= tag.len() {
+                return None;
+            }
+            from = next_from;
+            continue;
+        }
+        let after_quote = trimmed.get(1..)?;
+        let end = after_quote.find(quote)?;
+        let value = after_quote.get(..end)?;
+        if value.len() > GGB_MAX_ATTR_BYTES {
+            return None;
+        }
+        return Some(value.to_string());
+    }
+    None
+}
+
+/// Parsea `geogebra.xml` a comandos Grafito con presupuestos espejo.
+/// Mapea `point` y `expression type=function`; el resto → omitido honesto.
+fn ggb_parse_report(xml: &[u8]) -> Result<GgbImportReport, String> {
+    let text = std::str::from_utf8(xml).map_err(|e| format!("geogebra.xml no UTF-8: {e}"))?;
+    if text.contains("<!DOCTYPE") || text.contains("<!ENTITY") {
+        return Err("DOCTYPE/ENTITY rechazado (bomba de entidades)".to_string());
+    }
+    let mut report = GgbImportReport {
+        mapped: Vec::new(),
+        omitted: Vec::new(),
+    };
+    let mut count: usize = 0;
+    let push_mapped =
+        |report: &mut GgbImportReport, kind: String, label: String, command: String| {
+            if command.len() > GGB_MAX_EXPR_CHARS {
+                report.omitted.push(GgbOmitted {
+                    kind,
+                    label,
+                    reason: format!("comando excede {GGB_MAX_EXPR_CHARS} caracteres"),
+                });
+                return;
+            }
+            if report.mapped.len() >= GGB_MAX_ELEMS {
+                report.omitted.push(GgbOmitted {
+                    kind,
+                    label,
+                    reason: format!("presupuesto MAX_ELEMS {GGB_MAX_ELEMS} excedido"),
+                });
+                return;
+            }
+            report.mapped.push(GgbMappedCommand { kind, command });
+        };
+
+    // ── <element …> ──────────────────────────────────────────────
+    let mut pos: usize = 0;
+    while let Some(after_pos) = text.get(pos..) {
+        let Some(rel) = after_pos.find("<element") else {
+            break;
+        };
+        let Some(start) = pos.checked_add(rel) else {
+            return Err("offset desbordado al parsear <element>".to_string());
+        };
+        let Some(rest) = text.get(start..) else {
+            break;
+        };
+        let Some(tag_end_rel) = rest.find('>') else {
+            return Err("elemento <element> sin cierre '>'".to_string());
+        };
+        let Some(tag_end) = start.checked_add(tag_end_rel) else {
+            return Err("offset desbordado en <element>".to_string());
+        };
+        let Some(opening_end) = tag_end.checked_add(1) else {
+            return Err("offset desbordado tras <element>".to_string());
+        };
+        let Some(opening) = text.get(start..opening_end) else {
+            return Err("elemento fuera de rango".to_string());
+        };
+        count = count
+            .checked_add(1)
+            .ok_or_else(|| "contador desbordado".to_string())?;
+        if count > GGB_MAX_ELEMS {
+            return Err(format!("límite MAX_ELEMS {GGB_MAX_ELEMS} excedido"));
+        }
+        let tipo_raw = ggb_attr(opening, "type").unwrap_or_default();
+        let label_raw = ggb_attr(opening, "label").unwrap_or_default();
+        let etiqueta = ggb_sanitize_label(&label_raw);
+        let is_self_closing = opening.trim_end().ends_with("/>");
+        let inner: &str = if is_self_closing {
+            ""
+        } else if let Some(content_start) = tag_end.checked_add(1) {
+            if let Some(after) = text.get(content_start..) {
+                if let Some(close_rel) = after.find("</element>") {
+                    if let Some(inner_end) = content_start.checked_add(close_rel) {
+                        text.get(content_start..inner_end).unwrap_or("")
+                    } else {
+                        return Err("offset desbordado en </element>".to_string());
+                    }
+                } else {
+                    ""
+                }
+            } else {
+                ""
+            }
+        } else {
+            return Err("offset desbordado tras <element>".to_string());
+        };
+        let tipo_lc = tipo_raw.trim().to_ascii_lowercase();
+        if tipo_lc == "point" {
+            let mut mapped_done = false;
+            if let Some(coords_rel) = inner.find("<coords") {
+                if let Some(coords_rest) = inner.get(coords_rel..) {
+                    if let Some(coords_end_rel) = coords_rest.find('>') {
+                        if let Some(coords_tag) =
+                            coords_rest.get(..coords_end_rel.saturating_add(1))
+                        {
+                            let x_opt =
+                                ggb_attr(coords_tag, "x").and_then(|s| s.parse::<f64>().ok());
+                            let y_opt =
+                                ggb_attr(coords_tag, "y").and_then(|s| s.parse::<f64>().ok());
+                            if let (Some(x), Some(y)) = (x_opt, y_opt) {
+                                if x.is_finite() && y.is_finite() {
+                                    let cmd =
+                                        format!("Point[({}, {})]", ggb_fmt_num(x), ggb_fmt_num(y));
+                                    push_mapped(
+                                        &mut report,
+                                        "Point".to_string(),
+                                        etiqueta.clone(),
+                                        cmd,
+                                    );
+                                    mapped_done = true;
+                                } else {
+                                    report.omitted.push(GgbOmitted {
+                                        kind: tipo_raw.clone(),
+                                        label: etiqueta.clone(),
+                                        reason: "coordenadas no finitas".to_string(),
+                                    });
+                                    mapped_done = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if !mapped_done {
+                let reason = if !inner.contains("<coords") {
+                    "point sin coords".to_string()
+                } else {
+                    "point con coords inválidas".to_string()
+                };
+                report.omitted.push(GgbOmitted {
+                    kind: tipo_raw.clone(),
+                    label: etiqueta.clone(),
+                    reason,
+                });
+            }
+        } else if tipo_lc.contains("3d")
+            || tipo_lc.contains("quadric")
+            || tipo_lc.contains("plane")
+            || tipo_lc.contains("sphere")
+        {
+            report.omitted.push(GgbOmitted {
+                kind: tipo_raw.clone(),
+                label: etiqueta.clone(),
+                reason: "3D/quadric omitido en núcleo aula F2".to_string(),
+            });
+        } else if tipo_lc == "conic" || tipo_lc == "conicpart" {
+            report.omitted.push(GgbOmitted {
+                kind: tipo_raw.clone(),
+                label: etiqueta.clone(),
+                reason: "cónica no soportada en import mínimo \
+                         (usa crate grafito-ggb completo para F2)"
+                    .to_string(),
+            });
+        } else if tipo_lc == "line" || tipo_lc == "segment" || tipo_lc == "ray" {
+            report.omitted.push(GgbOmitted {
+                kind: tipo_raw.clone(),
+                label: etiqueta.clone(),
+                reason: format!(
+                    "{tipo_raw} elemento sin comando — omitido \
+                     (usar comando {tipo_raw} explícito)"
+                ),
+            });
+        } else if tipo_lc == "numeric" {
+            report.omitted.push(GgbOmitted {
+                kind: tipo_raw.clone(),
+                label: etiqueta.clone(),
+                reason: "numeric sin slider ni celda — pendiente mapeo variable".to_string(),
+            });
+        } else {
+            report.omitted.push(GgbOmitted {
+                kind: tipo_raw.clone(),
+                label: etiqueta.clone(),
+                reason: "tipo no soportado en F2 (omitido honesto)".to_string(),
+            });
+        }
+        if is_self_closing {
+            pos = opening_end;
+        } else if let Some(content_start) = tag_end.checked_add(1) {
+            if let Some(after) = text.get(content_start..) {
+                if let Some(close_rel) = after.find("</element>") {
+                    let close_len = "</element>".len();
+                    if let Some(close_end) = content_start
+                        .checked_add(close_rel)
+                        .and_then(|v| v.checked_add(close_len))
+                    {
+                        pos = close_end;
+                    } else {
+                        return Err("offset desbordado al cerrar </element>".to_string());
+                    }
+                } else {
+                    pos = content_start;
+                }
+            } else {
+                break;
+            }
+        } else {
+            return Err("offset desbordado al avanzar </element>".to_string());
+        }
+        if pos >= text.len() {
+            break;
+        }
+    }
+
+    // ── <command …> → omitido honesto (el import mínimo no resuelve refs) ──
+    let mut cpos: usize = 0;
+    while let Some(after_pos) = text.get(cpos..) {
+        let Some(rel) = after_pos.find("<command") else {
+            break;
+        };
+        let Some(start) = cpos.checked_add(rel) else {
+            return Err("offset desbordado al parsear <command>".to_string());
+        };
+        let Some(rest) = text.get(start..) else {
+            break;
+        };
+        let Some(tag_end_rel) = rest.find('>') else {
+            return Err("comando <command> sin cierre '>'".to_string());
+        };
+        let Some(tag_end) = start.checked_add(tag_end_rel) else {
+            return Err("offset desbordado en <command>".to_string());
+        };
+        let Some(opening_end) = tag_end.checked_add(1) else {
+            return Err("offset desbordado tras <command>".to_string());
+        };
+        let Some(opening) = text.get(start..opening_end) else {
+            return Err("comando fuera de rango".to_string());
+        };
+        count = count
+            .checked_add(1)
+            .ok_or_else(|| "contador desbordado".to_string())?;
+        if count > GGB_MAX_ELEMS {
+            return Err(format!("límite MAX_ELEMS {GGB_MAX_ELEMS} excedido"));
+        }
+        let nombre = ggb_attr(opening, "name").unwrap_or_default();
+        let kind = if nombre.trim().is_empty() {
+            "command".to_string()
+        } else {
+            nombre.clone()
+        };
+        report.omitted.push(GgbOmitted {
+            kind,
+            label: String::new(),
+            reason: "comando omitido en import mínimo \
+                     (usa crate grafito-ggb completo para F2)"
+                .to_string(),
+        });
+        if let Some(content_start) = tag_end.checked_add(1) {
+            if let Some(after) = text.get(content_start..) {
+                if let Some(close_rel) = after.find("</command>") {
+                    let close_len = "</command>".len();
+                    if let Some(close_end) = content_start
+                        .checked_add(close_rel)
+                        .and_then(|v| v.checked_add(close_len))
+                    {
+                        cpos = close_end;
+                    } else {
+                        return Err("offset desbordado al cerrar </command>".to_string());
+                    }
+                } else {
+                    cpos = opening_end;
+                }
+            } else {
+                break;
+            }
+        } else {
+            return Err("offset desbordado al avanzar </command>".to_string());
+        }
+        if cpos >= text.len() {
+            break;
+        }
+    }
+
+    // ── <expression …> → Function si es función, si no omitido honesto ──
+    let mut epos: usize = 0;
+    while let Some(after_pos) = text.get(epos..) {
+        let Some(rel) = after_pos.find("<expression") else {
+            break;
+        };
+        let Some(start) = epos.checked_add(rel) else {
+            return Err("offset desbordado al parsear <expression>".to_string());
+        };
+        let Some(rest) = text.get(start..) else {
+            break;
+        };
+        let Some(tag_end_rel) = rest.find('>') else {
+            return Err("expresión <expression> sin cierre '>'".to_string());
+        };
+        let Some(tag_end) = start.checked_add(tag_end_rel) else {
+            return Err("offset desbordado en <expression>".to_string());
+        };
+        let Some(opening_end) = tag_end.checked_add(1) else {
+            return Err("offset desbordado tras <expression>".to_string());
+        };
+        let Some(opening) = text.get(start..opening_end) else {
+            return Err("expresión fuera de rango".to_string());
+        };
+        count = count
+            .checked_add(1)
+            .ok_or_else(|| "contador desbordado".to_string())?;
+        if count > GGB_MAX_ELEMS {
+            return Err(format!("límite MAX_ELEMS {GGB_MAX_ELEMS} excedido"));
+        }
+        let etiqueta = ggb_sanitize_label(&ggb_attr(opening, "label").unwrap_or_default());
+        let exp = ggb_attr(opening, "exp").unwrap_or_default();
+        let tipo = ggb_attr(opening, "type").unwrap_or_default();
+        let tipo_lc = tipo.trim().to_ascii_lowercase();
+        let es_funcion = tipo_lc == "function"
+            || tipo_lc == "functionnvar"
+            || exp.contains("->")
+            || exp.contains('(');
+        if es_funcion {
+            let exp_trim = exp.trim();
+            if exp_trim.is_empty() {
+                report.omitted.push(GgbOmitted {
+                    kind: "Function".to_string(),
+                    label: etiqueta.clone(),
+                    reason: "expresión vacía".to_string(),
+                });
+            } else if exp_trim.len() > GGB_MAX_EXPR_CHARS {
+                report.omitted.push(GgbOmitted {
+                    kind: "Function".to_string(),
+                    label: etiqueta.clone(),
+                    reason: format!("expresión excede {GGB_MAX_EXPR_CHARS} caracteres"),
+                });
+            } else {
+                let rhs = if exp_trim.contains('=') {
+                    exp_trim
+                        .split_once('=')
+                        .map(|x| x.1)
+                        .unwrap_or(exp_trim)
+                        .trim()
+                        .to_string()
+                } else {
+                    exp_trim.to_string()
+                };
+                if rhs.is_empty() {
+                    report.omitted.push(GgbOmitted {
+                        kind: "Function".to_string(),
+                        label: etiqueta.clone(),
+                        reason: "expresión vacía".to_string(),
+                    });
+                } else {
+                    let cmd = format!("Function[{rhs}]");
+                    push_mapped(&mut report, "Function".to_string(), etiqueta.clone(), cmd);
+                }
+            }
+        } else if !exp.trim().is_empty() {
+            report.omitted.push(GgbOmitted {
+                kind: format!("expression:{}", tipo.clone()),
+                label: etiqueta.clone(),
+                reason: "tipo de expresión no mapeado en F0/F1 (omitido honesto)".to_string(),
+            });
+        }
+        epos = opening_end;
+        if epos >= text.len() {
+            break;
+        }
+    }
+
+    Ok(report)
+}
+
+#[cfg(test)]
+mod ggb_import_local_tests {
+    use super::{import_ggb_bytes_local, GGB_XML_NAME};
+    use crate::commands::process_input;
+
+    fn crc32_ieee(data: &[u8]) -> u32 {
+        let mut crc: u32 = 0xFFFF_FFFF;
+        for &b in data {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                if crc & 1 == 1 {
+                    crc = (crc >> 1) ^ 0xEDB8_8320;
+                } else {
+                    crc >>= 1;
+                }
+            }
+        }
+        !crc
+    }
+
+    fn zip_store(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::new();
+        let mut offsets: Vec<u32> = Vec::new();
+        let mut sizes: Vec<(u32, u32)> = Vec::new();
+        for (name, data) in files {
+            offsets.push(u32::try_from(out.len()).unwrap_or(0));
+            let crc = crc32_ieee(data);
+            let size = u32::try_from(data.len()).unwrap_or(0);
+            sizes.push((crc, size));
+            out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+            out.extend_from_slice(&20u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&crc.to_le_bytes());
+            out.extend_from_slice(&size.to_le_bytes());
+            out.extend_from_slice(&size.to_le_bytes());
+            let name_bytes = name.as_bytes();
+            out.extend_from_slice(&(u16::try_from(name_bytes.len()).unwrap_or(0)).to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(name_bytes);
+            out.extend_from_slice(data);
+        }
+        let cd_start = u32::try_from(out.len()).unwrap_or(0);
+        for (idx, (name, _)) in files.iter().enumerate() {
+            let (crc, size) = sizes[idx];
+            let offset = offsets[idx];
+            out.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+            out.extend_from_slice(&20u16.to_le_bytes());
+            out.extend_from_slice(&20u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&crc.to_le_bytes());
+            out.extend_from_slice(&size.to_le_bytes());
+            out.extend_from_slice(&size.to_le_bytes());
+            let name_bytes = name.as_bytes();
+            out.extend_from_slice(&(u16::try_from(name_bytes.len()).unwrap_or(0)).to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&offset.to_le_bytes());
+            out.extend_from_slice(name_bytes);
+        }
+        let cd_size = u32::try_from(out.len())
+            .unwrap_or(0)
+            .saturating_sub(cd_start);
+        out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&(u16::try_from(files.len()).unwrap_or(0)).to_le_bytes());
+        out.extend_from_slice(&(u16::try_from(files.len()).unwrap_or(0)).to_le_bytes());
+        out.extend_from_slice(&cd_size.to_le_bytes());
+        out.extend_from_slice(&cd_start.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
+    }
+
+    fn ggb_with(xml: &str) -> Vec<u8> {
+        zip_store(&[(GGB_XML_NAME, xml.as_bytes())])
+    }
+
+    fn xml_header() -> String {
+        r#"<?xml version="1.0" encoding="utf-8"?><geogebra format="5.0"><construction>"#.to_string()
+    }
+
+    fn xml_footer() -> String {
+        "</construction></geogebra>".to_string()
+    }
+
+    #[test]
+    fn import_minimo_dos_puntos_mapea_y_reporta_honesto() {
+        let xml = format!(
+            "{}{odef}{}",
+            xml_header(),
+            xml_footer(),
+            odef = r#"<element type="point" label="A"><coords x="1" y="2" z="1" w="1"/></element><element type="point" label="B"><coords x="3" y="4" z="1" w="1"/></element>"#
+        );
+        let bytes = ggb_with(&xml);
+        let rep = import_ggb_bytes_local(&bytes).expect("dorado mínimo debe importar");
+        assert_eq!(rep.mapped.len(), 2);
+        assert!(rep.omitted.is_empty(), "omitidos {:?}", rep.omitted);
+        let cmds = rep.commands();
+        assert_eq!(cmds.len(), 2);
+        assert!(
+            cmds.iter().all(|c| c.starts_with("Point[")),
+            "comandos {cmds:?}"
+        );
+        let summary = rep.summary();
+        assert!(summary.contains("2 objetos"), "resumen {summary}");
+        assert!(summary.contains("Point x2"), "resumen {summary}");
+        assert_eq!(rep.omitted_detail(), "sin omitidos");
+        let mut doc = grafito_core::Document::new();
+        for mut c in cmds {
+            let outcome = process_input(&mut doc, &mut c);
+            assert!(
+                !matches!(outcome, grafito_command::commands::CommandOutcome::Error(_)),
+                "comando debe aplicar"
+            );
+        }
+        assert_eq!(doc.object_count(), 2);
+    }
+
+    #[test]
+    fn tipo_no_soportado_genera_omitido_honesto_no_silencioso() {
+        let xml = format!(
+            "{}<element type=\"point\" label=\"A\"><coords x=\"0\" y=\"0\" z=\"1\" w=\"1\"/></element><element type=\"angle\" label=\"a\"><value val=\"45\"/></element>{}",
+            xml_header(),
+            xml_footer()
+        );
+        let bytes = ggb_with(&xml);
+        let rep = import_ggb_bytes_local(&bytes).expect("debe importar con omitido");
+        assert_eq!(rep.mapped.len(), 1);
+        assert!(!rep.omitted.is_empty(), "esperaba omitido honesto");
+        assert!(rep.omitted.iter().any(|o| o.kind == "angle"));
+        let detail = rep.omitted_detail();
+        assert!(detail.contains("omitidos"), "detalle {detail}");
+        assert!(
+            rep.summary().contains("1 objetos"),
+            "resumen {}",
+            rep.summary()
+        );
+    }
+
+    #[test]
+    fn bytes_vacios_y_sin_xml_fallan_honesto() {
+        let err_vacio = import_ggb_bytes_local(&[]).unwrap_err();
+        assert!(!err_vacio.is_empty(), "error vacío no debe ser silencioso");
+        let sin_xml = zip_store(&[("otro.txt", b"hola")]);
+        let err_faltante = import_ggb_bytes_local(&sin_xml).unwrap_err();
+        assert!(
+            err_faltante.contains("geogebra.xml"),
+            "error {err_faltante}"
+        );
+    }
+
+    #[test]
+    fn deflate_rechazado_honesto_no_silencioso() {
+        let xml = format!(
+            "{}<element type=\"point\" label=\"A\"><coords x=\"0\" y=\"0\" z=\"1\" w=\"1\"/></element>{}",
+            xml_header(),
+            xml_footer()
+        );
+        let mut bytes = ggb_with(&xml);
+        // Parchea método Stored(0) → Deflated(8) en la primera cabecera local (offset 8).
+        if let Some(slot) = bytes.get_mut(8..10) {
+            slot.copy_from_slice(&8u16.to_le_bytes());
+        }
+        let err = import_ggb_bytes_local(&bytes).unwrap_err();
+        assert!(err.contains("deflate"), "debe mencionar deflate, got {err}");
+    }
+}
+
+/// Elección del usuario ante el onboarding (W-A, pura y testeable).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OnboardingChoice {
+    /// Botón "Probar ahora": siembra el ejemplo; solo oculta en sesión
+    /// (persiste solo si el checkbox "No mostrar de nuevo" está marcado).
+    TryExample,
+    /// Botón "Empezar vacío" (= Skip/Esc): solo oculta en sesión.
+    StartEmpty,
+    /// Cierre con el checkbox "No mostrar de nuevo" marcado: única que persiste.
+    NeverShow,
+    /// Cierre con X de la ventana: solo oculta en sesión.
+    DismissX,
+    /// Tecla Esc: solo oculta en sesión.
+    Escape,
+}
+
+/// Veredicto al salir de examen (nivel reflexivo). Puro y testeable.
+///
+/// Sin datos inventados: el lockdown de examen no expone aciertos/total ni
+/// nota (el mini-examen es un prompt sin corrección persistida y
+/// `record_exam` jamás se llama desde la app), así que esas líneas no
+/// existen. Solo sale lo disponible: microcopy cálido que contiene
+/// (`exam.modal_verdict`) + `racha N` si N≥2 (reutiliza
+/// `assistant.header.streak`; con 0-1 esa línea no se pinta).
+/// Piel pura: sin I/O, sin persistencia, sin tocar el bloqueo.
+pub(crate) struct ExamExitVerdict {
+    pub warm: String,
+    pub streak: Option<String>,
+}
+
+/// Próximo paso ante Esc en examen (W-A, ver `exam_escape_next`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExamEscapeAction {
+    /// Sin examen: Esc es de otro diálogo, no hacer nada acá.
+    None,
+    /// En examen sin modal: pedir confirmación (abre el modal).
+    RequestConfirm,
+    /// Con modal abierto: cancelar el modal (el lockdown sigue).
+    CancelModal,
+}
+
+impl GrafitoApp {
+    /// Bienvenida first-run liviana (F1) — 1 pantalla completa, Scandinavian quiet.
+    ///
+    /// Fondo = canvas; el bloque de copy entra arriba (qué es Grafito + Mili
+    /// en 3 líneas) con 2 botones: "Probar ahora" (siembra `y = x^2` y abre
+    /// a Mili) y "Empezar vacío". "No mostrar de nuevo" es un checkbox
+    /// que persiste al cerrar con los botones. `Skip` arriba-derecha, idioma
+    /// abajo-derecha. Sin ventana modal, sin título "Bienvenido a Grafito"
+    /// (la marca es GRAFITO).
+    ///
+    /// Gating: `show_onboarding` arranca `!onboarding_completed` en `new()`;
+    /// reabrible desde `Ayuda → Bienvenida`.
+    /// Skip/Esc = "Empezar vacío" (sin ejemplo, sin persistir: igual que hoy).
+    ///
+    /// Composition: el bloque de copy entra arriba (≈ 18 % del alto). La medida
+    /// se acota a 640 px para que el headline no corra y el subtítulo se lea
+    /// a 55–70 ch. Las acciones van pegadas al copy, sin abismo.
+    pub(crate) fn draw_onboarding_window(&mut self, ctx: &egui::Context) {
+        if !self.show_onboarding {
+            return;
+        }
+
+        use grafito_ui::i18n::onboarding_msg;
+        use grafito_ui::tokens as tok;
+        let locale = self.config_locale();
+        let theme = grafito_ui::theme::current_theme(ctx);
+        if self.welcome_page >= WELCOME_PAGES {
+            self.welcome_page = 0;
+        }
+        let page = self.welcome_page;
+        let skip_label = welcome_skip_label(locale);
+        // `Area` a pantalla completa y NO `CentralPanel`: el panel central
+        // solo ocupa el rect que dejan libre el rail, el drawer y el
+        // asistente, así que la bienvenida se dibujaría encima del shell en
+        // lugar de taparlo.
+        //
+        // El `Area` necesita `set_min_size` DOS veces y las dos son necesarias:
+        // en el `Ui` externo para dimensionar el Area, y otra vez DENTRO del
+        // `Frame` para que el fondo pintado sea de pantalla completa. Con solo
+        // la externa, el `Frame` se ajusta a su contenido (la columna de 640 px)
+        // y el negro cubre solo la columna: el panel del asistente y la barra
+        // superior quedan al descubierto a la derecha, que es exactamente la
+        // pantalla rota. (Quitar la interior rompió el fullscreen sin ningún
+        // error ni aviso.)
+        //
+        // `Foreground`: la bienvenida tapa el chrome (barra, rail, asistente).
+        // Sin orden explícito el `Area` comparte `Middle` con los paneles y el
+        // resultado depende del orden de creación.
+        egui::Area::new(egui::Id::new("grafito_welcome_fullscreen"))
+            .anchor(egui::Align2::LEFT_TOP, egui::Vec2::ZERO)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                let screen = ctx.screen_rect();
+                ui.set_min_size(screen.size());
+                egui::Frame::none().fill(theme.canvas_bg).show(ui, |ui| {
+                    ui.set_min_size(screen.size());
+                    // Un solo bloque de lectura, compacto y anclado arriba.
+                    // Nada de `bottom_up`: anclar la navegación al fondo dejaba
+                    // un abismo de ~350px entre el subtítulo y los botones, que
+                    // es justamente el espacio muerto que se iba a eliminar.
+                    // El bloque completo (marca, titular, subtítulo y navegación)
+                    // entra en el tercio superior: 0.14 deja todo visible sin
+                    // que el ojo recorra media pantalla vacía hasta la acción.
+                    let column_w = welcome_column_width(ui.available_width());
+                    let column_h = ui.available_height();
+                    let gutter =
+                        ((ui.available_width() - column_w) / 2.0).max(tok::WELCOME_MARGIN_X);
+                    let column_rect = egui::Rect::from_min_size(
+                        screen.min + egui::vec2(gutter, 0.0),
+                        egui::vec2(column_w, column_h),
+                    );
+                    // `scope_builder` con `max_rect`: fija el ancho de la columna de lectura
+                    // sin tocar el cursor vertical del `Ui`, que es lo que
+                    // permite anclar la navegación al fondo de la columna.
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(column_rect), |ui| {
+                        // Scroll honesto en viewports cortos: a 480 px el
+                        // titular DE de 3 líneas empujaba el progreso fuera
+                        // sin forma de verlo. Sin overflow no hay barra.
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false; 2])
+                            .show(ui, |ui| {
+                                ui.spacing_mut().item_spacing.y = tok::SPACE_MD;
+                                // En 480 px el bloque 0.14 (67 px) es aire muerto:
+                                // 24 px fijos dejan todo visible sin scroll.
+                                ui.add_space(if screen.height() < 560.0 {
+                                    tok::SPACE_XL
+                                } else {
+                                    screen.height() * tok::WELCOME_BLOCK_TOP_RATIO
+                                });
+
+                                // Hook: la marca. Chica y tenue — ancla, no mensaje.
+                                let lbl = ui.label(
+                                    egui::RichText::new("G R A F I T O")
+                                        .size(tok::TYPE_XS)
+                                        .strong()
+                                        .color(theme.text_tertiary),
+                                );
+                                let _ = lbl;
+
+                                // Bridge: el titular, con la medida de lectura acotada.
+                                let (headline, sub) = welcome_page_copy(page, locale);
+                                ui.label(
+                                    egui::RichText::new(headline)
+                                        .size(tok::TYPE_XL)
+                                        .strong()
+                                        .color(theme.text_primary),
+                                );
+
+                                // Detail: el subtítulo, columna más angosta para no
+                                // competir con el titular.
+                                // Envuelto (no fijo): en `horizontal` egui desactiva
+                                // el wrap y el subtítulo DE/FR salía en 1 línea
+                                // clipada a la derecha en vez de 2 legibles.
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(sub)
+                                            .size(tok::TYPE_MD)
+                                            .color(theme.text_secondary),
+                                    );
+                                });
+
+                                // Acciones: pegadas al copy, sin abismo. La acción
+                                // primaria es la única con acento; el resto es apoyo.
+                                // Envuelta (no fija): 2×120+8 desborda a 320;
+                                // en angosto baja a 1+1 sin recorte.
+                                ui.add_space(tok::SPACE_MD);
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.spacing_mut().item_spacing.x = tok::SPACE_SM;
+                                    // Botones a 44 en angosto (32 < piso táctil).
+                                    let btn_h =
+                                        if screen.width() < tok::PALETTE_BOTTOM_SHEET_BREAKPOINT {
+                                            tok::HIT_TARGET_AULA
+                                        } else {
+                                            tok::ONBOARDING_BUTTON_H
+                                        };
+
+                                    let try_now = ui.add_sized(
+                                        egui::vec2(tok::ONBOARDING_BUTTON_W, btn_h),
+                                        welcome_primary_button(
+                                            onboarding_msg("btn_example", locale),
+                                            theme,
+                                        ),
+                                    );
+                                    if try_now
+                                        .on_hover_text("Carga y=x² y presenta a Mili")
+                                        .clicked()
+                                    {
+                                        let time = ui.ctx().input(|input| input.time);
+                                        self.onboarding_try_example(time);
+                                        self.close_onboarding_from_button(
+                                            OnboardingChoice::TryExample,
+                                        );
+                                    }
+
+                                    let empty = ui.add_sized(
+                                        egui::vec2(tok::ONBOARDING_BUTTON_W, btn_h),
+                                        welcome_secondary_button(
+                                            onboarding_msg("btn_empty", locale),
+                                            theme,
+                                        ),
+                                    );
+                                    if empty.on_hover_text("Abrí un documento vacío").clicked() {
+                                        self.close_onboarding_from_button(
+                                            OnboardingChoice::StartEmpty,
+                                        );
+                                    }
+                                });
+
+                                // "No mostrar de nuevo" como checkbox: persiste
+                                // SOLO al cerrar con los botones (Skip/Esc nunca
+                                // persisten, igual que hoy).
+                                ui.add_space(tok::SPACE_SM);
+                                let dismiss_label = onboarding_msg("btn_dismiss", locale);
+                                grafito_ui::assistant::scandi_checkbox(
+                                    ui,
+                                    dismiss_label,
+                                    &mut self.welcome_dont_show_again,
+                                );
+                            });
+                    });
+                });
+            });
+
+        egui::Area::new(egui::Id::new("grafito_welcome_skip"))
+            .anchor(
+                egui::Align2::RIGHT_TOP,
+                egui::vec2(-tok::WELCOME_MARGIN_X, tok::WELCOME_MARGIN_X),
+            )
+            // `Foreground` como el Area principal: el botón vive sobre el
+            // fondo de pantalla completa y no puede quedar debajo de él.
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                // Piso táctil 44 en la esquina (el botón medía por
+                // contenido, ~28 px de alto).
+                ui.spacing_mut().interact_size.y = tok::HIT_TARGET_AULA;
+                if ui
+                    .button(
+                        egui::RichText::new(skip_label)
+                            .size(tok::TYPE_SM)
+                            .color(theme.text_secondary),
+                    )
+                    .clicked()
+                {
+                    self.apply_onboarding_choice(OnboardingChoice::DismissX);
+                }
+            });
+        egui::Area::new(egui::Id::new("grafito_welcome_locale"))
+            .anchor(
+                egui::Align2::RIGHT_BOTTOM,
+                egui::vec2(-tok::WELCOME_MARGIN_X, -tok::WELCOME_MARGIN_X),
+            )
+            // Igual que el botón de omitir: sobre el fondo, nunca debajo.
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                // Piso táctil 44 en la esquina (el combo medía ~24 px).
+                ui.spacing_mut().interact_size.y = tok::HIT_TARGET_AULA;
+                let mut loc = self.config_locale();
+                egui::ComboBox::from_id_salt("welcome_locale_combo")
+                    .selected_text(locale_label_for_combo(loc))
+                    .width(tok::ONBOARDING_BUTTON_W + tok::SPACE_XL)
+                    .show_ui(ui, |ui| {
+                        for cand in [
+                            grafito_ui::i18n::Locale::Es,
+                            grafito_ui::i18n::Locale::En,
+                            grafito_ui::i18n::Locale::Pt,
+                            grafito_ui::i18n::Locale::It,
+                            grafito_ui::i18n::Locale::Fr,
+                            grafito_ui::i18n::Locale::De,
+                        ] {
+                            ui.selectable_value(&mut loc, cand, locale_label_for_combo(cand));
+                        }
+                    });
+                if loc != self.config_locale() {
+                    self.set_locale(loc);
+                }
+            });
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            self.apply_onboarding_choice(OnboardingChoice::Escape);
+        }
+    }
+
+    /// El welcome tapa todo: `update` lo dibuja y vuelve ANTES del shell,
+    /// así no se ven las barras ni el canvas detrás (imagen 1).
+    pub(crate) fn welcome_takes_over(&self) -> bool {
+        self.show_onboarding
+    }
+
+    /// Aplica una elección del onboarding: siempre oculta en sesión y persiste
+    /// `onboarding_completed=true` SOLO si [`Self::onboarding_choice_persists`]
+    /// lo dice (hoy: solo `NeverShow`). Fuente única prod + tests.
+    fn apply_onboarding_choice(&mut self, choice: OnboardingChoice) {
+        self.show_onboarding = false;
+        if Self::onboarding_choice_persists(choice) {
+            let mut cfg = load_config();
+            cfg.onboarding_completed = true;
+            save_config(&cfg);
+        }
+    }
+
+    /// Cierra el onboarding desde "Probar ahora"/"Empezar vacío"
+    /// respetando el checkbox "No mostrar de nuevo": marcado persiste
+    /// (vía `NeverShow`, igual que el botón de antes); sin marcar solo
+    /// oculta en sesión. Skip/Esc no pasan por acá (nunca persisten).
+    fn close_onboarding_from_button(&mut self, choice: OnboardingChoice) {
+        if self.welcome_dont_show_again {
+            self.apply_onboarding_choice(OnboardingChoice::NeverShow);
+        } else {
+            self.apply_onboarding_choice(choice);
+        }
+    }
+
+    /// "Probar ahora" del onboarding (1 pantalla): siembra `y = x^2` por
+    /// el mismo camino que tipear + Enter (como el botón del vacío de
+    /// álgebra: `ALGEBRA_EMPTY_EXAMPLE` + `submit_input_text`), abre el
+    /// asistente con el saludo de Mili y avisa con el toast existente.
+    /// No cierra ni persiste: el llamador decide el cierre.
+    pub(crate) fn onboarding_try_example(&mut self, time: f64) {
+        use grafito_ui::i18n::{onboarding_msg, t};
+        self.input_text = crate::algebra::ALGEBRA_EMPTY_EXAMPLE.to_string();
+        self.submit_input_text(time);
+        self.ensure_algebra_panel_visible();
+        self.assistant_visible = true;
+        // El ejemplo sin guía es ciego: Mili saluda en el transcript vacío.
+        if self.assistant.conversation.is_empty() {
+            let locale = self.config_locale();
+            let saludo = t("assistant.greeting.fallback", locale).to_string();
+            self.assistant
+                .push_turn(grafito_assistant_types::ConversationTurn::assistant(saludo));
+        }
+        let locale = self.config_locale();
+        self.notify(
+            onboarding_msg("toast_example", locale),
+            grafito_ui::toast::ToastKind::Success,
+        );
+    }
+
+    /// Elección del onboarding para decidir persistencia (W-A, testeable sin I/O).
+    ///
+    /// Solo [`OnboardingChoice::NeverShow`] persiste
+    /// `onboarding_completed=true`; el resto solo oculta en sesión.
+    pub(crate) fn onboarding_choice_persists(choice: OnboardingChoice) -> bool {
+        matches!(choice, OnboardingChoice::NeverShow)
+    }
+}
+
+/// Medida de la columna de lectura de la bienvenida según el ancho disponible.
+///
+/// La columna nunca excede `WELCOME_COLUMN_WIDTH` ni se come los márgenes
+/// laterales: en viewports angostos el copy conserva aire a los lados.
+pub(crate) fn welcome_column_width(available_width: f32) -> f32 {
+    let margins = grafito_ui::tokens::WELCOME_MARGIN_X * 2.0;
+    (grafito_ui::tokens::WELCOME_COLUMN_WIDTH).min((available_width - margins).max(0.0))
+}
+
+/// Botón primario de la bienvenida: un solo acento sólido en toda la pantalla.
+///
+/// El acento aparece en UN lugar (60-30-10 en miniatura). Antes había tres
+/// botones del mismo peso en la última página, lo que convertía la pantalla en
+/// una fila de pills sin jerarquía.
+fn welcome_primary_button<'a>(
+    label: &'a str,
+    theme: &grafito_ui::theme::Theme,
+) -> egui::Button<'a> {
+    egui::Button::new(
+        egui::RichText::new(label)
+            .size(grafito_ui::tokens::TYPE_SM)
+            .strong()
+            .color(theme.keyboard_enter_text),
+    )
+    .rounding(grafito_ui::tokens::RADIUS_SM)
+    .fill(theme.keyboard_enter_bg)
+    .stroke(egui::Stroke::NONE)
+}
+
+/// Botón secundario: superficie de panel con hairline. Sin relleno de acento,
+/// así la acción primaria conserva el 10 % de acento que le corresponde.
+fn welcome_secondary_button<'a>(
+    label: &'a str,
+    theme: &grafito_ui::theme::Theme,
+) -> egui::Button<'a> {
+    egui::Button::new(egui::RichText::new(label).size(grafito_ui::tokens::TYPE_SM))
+        .rounding(grafito_ui::tokens::RADIUS_SM)
+        .fill(theme.panel_bg)
+        .stroke(theme.hairline_stroke())
+}
+
+/// Copy de la bienvenida de 1 pantalla (F1 liviano): qué es Grafito + Mili
+/// en 3 líneas — headline + sub, ES/EN/PT/IT/FR/DE.
+/// Local al crate app para no tocar el catálogo i18n pineado (0 keys nuevas,
+/// `MSG_COUNT` intacto). `page` se ignora (queda para la firma estable y el
+/// clamp de re-entradas viejas).
+fn welcome_page_copy(
+    page: usize,
+    locale: grafito_ui::i18n::Locale,
+) -> (&'static str, &'static str) {
+    use grafito_ui::i18n::Locale as L;
+    let _ = page.min(WELCOME_PAGES.saturating_sub(1));
+    match locale {
+        L::En => (
+            "Meet Grafito, your geometry board.",
+            "Draw, compute and explore — and talk to Mili, your tutor, at ✦.",
+        ),
+        L::Pt => (
+            "Conheça o Grafito, sua lousa geométrica.",
+            "Desenhe, calcule e explore — e fale com a Mili, sua tutora, em ✦.",
+        ),
+        L::It => (
+            "Scopri Grafito, la tua lavagna geometrica.",
+            "Disegna, calcola ed esplora — e parla con Mili, la tua tutor, in ✦.",
+        ),
+        L::Fr => (
+            "Découvrez Grafito, votre tableau géométrique.",
+            "Dessinez, calculez, explorez — et parlez à Mili, votre tutrice, en ✦.",
+        ),
+        L::De => (
+            "Lerne Grafito kennen, dein Geometrie-Board.",
+            "Zeichnen, rechnen, entdecken — und sprich mit Mili, deiner Tutorin, bei ✦.",
+        ),
+        _ => (
+            "Conocé Grafito, tu pizarra geométrica.",
+            "Dibujá, calculá y explorá — y hablá con Mili, tu tutora, en ✦.",
+        ),
+    }
+}
+
+/// Toast de borde Nivel 0 (<480): hardcodeado por locale como
+/// `welcome_page_copy` (0 keys i18n, 0 cambios MSG_COUNT).
+pub(crate) fn nivel0_hidden_toast(locale: grafito_ui::i18n::Locale) -> &'static str {
+    use grafito_ui::i18n::Locale as L;
+    match locale {
+        L::En => "Narrow screen: the side panel hides. Widen to get it back — your tab is kept.",
+        L::Pt => "Tela estreita: o painel lateral se oculta. Alargue para recuperá-lo — sua aba continua.",
+        L::It => "Schermo stretto: il pannello laterale si nasconde. Allarga per riaverlo — la scheda resta.",
+        L::Fr => "Écran étroit : le panneau latéral se masque. Élargissez pour le retrouver — votre onglet est gardé.",
+        L::De => "Schmaler Bildschirm: Das Seitenpanel blendet sich aus. Verbreitern zum Zurückholen — dein Tab bleibt.",
+        L::Es => "Pantalla angosta: el panel lateral se oculta. Ensanchá para recuperarlo — tu tab se conserva.",
+    }
+}
+
+/// Toast del dead-click del rail (BB3-P1-5, franja 480-520): el drawer se
+/// pidió pero no hay ancho para pintarlo. Hardcodeado por locale como
+/// `nivel0_hidden_toast` (0 keys i18n).
+pub(crate) fn drawer_blocked_toast(locale: grafito_ui::i18n::Locale) -> &'static str {
+    use grafito_ui::i18n::Locale as L;
+    match locale {
+        L::En => "No room for the side panel here. Widen a bit to see it — your tab is kept.",
+        L::Pt => "Sem espaço para o painel lateral aqui. Alargue um pouco — sua aba continua.",
+        L::It => "Qui non c'è spazio per il pannello. Allarga un po' — la scheda resta.",
+        L::Fr => "Pas de place pour le panneau ici. Élargissez un peu — votre onglet est gardé.",
+        L::De => "Hier ist kein Platz fürs Seitenpanel. Etwas verbreitern — dein Tab bleibt.",
+        L::Es => "Acá no entra el panel lateral. Ensanchá un poco para verlo — tu tab se conserva.",
+    }
+}
+
+fn welcome_skip_label(locale: grafito_ui::i18n::Locale) -> &'static str {
+    use grafito_ui::i18n::Locale as L;
+    match locale {
+        L::En => "Skip",
+        L::Pt => "Pular",
+        L::It => "Salta",
+        L::Fr => "Passer",
+        L::De => "Überspringen",
+        L::Es => "Omitir",
+    }
+}
+
+fn locale_label_for_combo(locale: grafito_ui::i18n::Locale) -> &'static str {
+    use grafito_ui::i18n::Locale as L;
+    match locale {
+        L::Es => "Español",
+        L::En => "English",
+        L::Pt => "Português",
+        L::It => "Italiano",
+        L::Fr => "Français",
+        L::De => "Deutsch",
+    }
+}
+
+impl GrafitoApp {
+    /// Ventana "Acerca de Grafito" — resumida, Scandinavian quiet.
+    pub(crate) fn draw_about_window(&mut self, ctx: &egui::Context) {
+        let theme = grafito_ui::theme::current_theme(ctx);
+        egui::Window::new("Acerca de Grafito")
+            .id(egui::Id::new("about_window"))
+            .collapsible(false)
+            .resizable(false)
+            .default_width(420.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .fill(theme.toolbar_bg)
+                    .stroke(egui::Stroke::new(1.0, theme.separator.gamma_multiply(0.10)))
+                    .inner_margin(egui::Margin::symmetric(20.0, 16.0)),
+            )
+            .show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        egui::RichText::new("Grafito")
+                            .size(grafito_ui::tokens::TYPE_XXL)
+                            .strong()
+                            .color(theme.accent),
+                    );
+                    ui.add_space(grafito_ui::tokens::SPACE_XS);
+                    ui.label(
+                        egui::RichText::new(format!("Versión {}", env!("CARGO_PKG_VERSION")))
+                            .size(grafito_ui::tokens::TYPE_SM)
+                            .color(theme.text_secondary),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!("Build {}", env!("GRAFITO_BUILD_HASH")))
+                            .size(grafito_ui::tokens::TYPE_XS)
+                            .color(theme.text_tertiary)
+                            .monospace(),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!("Idioma: {}", self.locale.code()))
+                            .size(grafito_ui::tokens::TYPE_XS)
+                            .color(theme.text_tertiary),
+                    );
+                    ui.add_space(grafito_ui::tokens::SPACE_MD);
+                    ui.label(
+                        egui::RichText::new(
+                            "Calculadora gráfica interactiva para geometría, álgebra, \
+                             cálculo, CAS y estadística. Rápida, precisa y simple.",
+                        )
+                        .size(grafito_ui::tokens::TYPE_SM)
+                        .color(theme.text_primary),
+                    );
+                    ui.add_space(grafito_ui::tokens::SPACE_SM);
+                    ui.separator();
+                    ui.add_space(grafito_ui::tokens::SPACE_SM);
+                    ui.label(
+                        egui::RichText::new("Creado por Lautaro Agustin Diez")
+                            .size(grafito_ui::tokens::TYPE_SM)
+                            .strong()
+                            .color(theme.text_primary),
+                    );
+                    ui.label(
+                        egui::RichText::new("HECHO EN ARGENTINA")
+                            .size(grafito_ui::tokens::TYPE_XS)
+                            .color(theme.text_secondary),
+                    );
+                    ui.add_space(grafito_ui::tokens::SPACE_SM);
+                    ui.label(
+                        egui::RichText::new("Licencia GPL-3.0-or-later · Código abierto")
+                            .size(grafito_ui::tokens::TYPE_XS)
+                            .color(theme.text_tertiary),
+                    );
+                });
+                ui.add_space(grafito_ui::tokens::SPACE_LG);
+                ui.separator();
+                ui.add_space(grafito_ui::tokens::SPACE_SM);
+                ui.vertical_centered(|ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("Cerrar").size(grafito_ui::tokens::TYPE_SM),
+                            )
+                            .min_size(egui::vec2(96.0, 30.0)),
+                        )
+                        .clicked()
+                    {
+                        self.show_about = false;
+                    }
+                });
+            });
+        // A11Y (D1): Esc cierra el persistente (igual que [Cerrar]).
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            self.show_about = false;
+        }
+    }
+
+    /// Ola 0.6: hoja de atajos de teclado (Ayuda > Atajos de teclado). Usa las
+    /// claves `cheat.*` localizadas, que hasta ahora no tenían caller.
+    pub(crate) fn draw_cheat_sheet_window(&mut self, ctx: &egui::Context) {
+        use grafito_ui::i18n::{cheat_sheet_msg, CHEAT_KEYS};
+        let theme = grafito_ui::theme::current_theme(ctx);
+        let locale = self.config_locale();
+        egui::Window::new(cheat_sheet_msg("title", locale))
+            .id(egui::Id::new("cheat_sheet_window"))
+            .collapsible(false)
+            .resizable(false)
+            .default_width(420.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .fill(theme.toolbar_bg)
+                    .stroke(egui::Stroke::new(1.0, theme.separator.gamma_multiply(0.10)))
+                    .inner_margin(egui::Margin::symmetric(20.0, 16.0)),
+            )
+            .show(ctx, |ui| {
+                for key in CHEAT_KEYS.iter().skip(1) {
+                    ui.label(
+                        egui::RichText::new(cheat_sheet_msg(key, locale))
+                            .size(grafito_ui::tokens::TYPE_SM)
+                            .color(theme.text_primary),
+                    );
+                    ui.add_space(grafito_ui::tokens::SPACE_XS);
+                }
+                ui.add_space(grafito_ui::tokens::SPACE_SM);
+                ui.separator();
+                ui.add_space(grafito_ui::tokens::SPACE_SM);
+                ui.vertical_centered(|ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new(cheat_sheet_msg("close", locale))
+                                    .size(grafito_ui::tokens::TYPE_SM),
+                            )
+                            .min_size(egui::vec2(96.0, 30.0)),
+                        )
+                        .clicked()
+                    {
+                        self.show_cheat_sheet = false;
+                    }
+                });
+            });
+        // A11Y (D1): Esc cierra igual que [Cerrar].
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            self.show_cheat_sheet = false;
+        }
+    }
+}
+
+/// Resumen histórico de cambios — conservado para referencia, no mostrado en UI resumida.
+#[allow(dead_code)]
+fn build_about_changelog() -> &'static [&'static str] {
+    &[
+        "Mapeos conformes algebraicos de primera clase (1/z, z^n, exp, log, sin, cos, Joukowski, Möbius, etc.).",
+        "13 nuevos mapeos algebraicos con detección automática desde la expresión.",
+        "Operadores de relación (Lt, Gt, Le, Ge, Eq, Ne) en el AST con precedencia y render.",
+        "Módulo conformal/ separado: complex_expr, algebraic_mappings, domain_coloring.",
+        "Suite de 70+ iconos vectoriales estilo macOS/iOS, idénticos en Windows, macOS y Linux.",
+        "Design tokens semánticos (Theme): escalas tipográficas, spacing y radios.",
+        "Splash screen al inicio con logo, nombre y versión.",
+        "Empty state y hover overlay en el panel de Álgebra.",
+        "Render de ComplexMapping con fórmula cerrada para expresiones reconocidas.",
+        "Filtro de segmentos degenerados en marching squares (sin relleno espurio).",
+        "Sidebar con iconos vectoriales coherentes con la toolbar.",
+        "Corrección de lexer: 1/z, log(z), z^2 ya no se confunden con multiplicación implícita.",
+        "Fill de ImplicitCurve con scanline real y stride adaptativo, sin pixelado ni lag.",
+        "AST cacheado en ImplicitCurveObj: 60+ FPS con expresiones complejas.",
+        "Cache del AST separa lhs y rhs correctamente.",
+        "Soporte para superscripts Unicode (x², y², z², t², θ², φ², x³, y³, z³) sin panics UTF-8.",
+        "Operadores <, >, <=, >= grafican correctamente (fill, contorno, exterior).",
+        "Paleta unificada: paneles, algebra, tools y keyboard usan el mismo Theme.",
+        "Validación de BesselJ/Y/I (orden saturado, NaN->0) y Sec/Csc/Cot en singularidad.",
+        "Color clamping RGBA a [0, 255] en to_color32, algebra, SVG y ghost rendering.",
+        "Reemplazo de unwrap() críticos por ?/ok_or en algebra, app, snap, dispatcher y commands.",
+        "Hit-test devuelve el objeto más cercano en solapamientos.",
+        "Restricciones numéricas con Jacobiano finito en configuraciones degeneradas.",
+        "ODE valida steps=0 y dimensiones inconsistentes sin panic.",
+        "Geometría robusta: safe_sample, cardioid, epicycloid, compute_fractal sin división por cero.",
+        "Estadística ignora NaN/Inf en histogramas.",
+        "Script aborta con error claro en recursión profunda; expand_all_cas limita a 50 iteraciones.",
+        "Plot/Integral usan replace_variable de límite de palabra (exp(t) no se rompe).",
+        "Toasts para errores de save_state/load_state.",
+        "Sistema de 10 perspectivas GeoGebra (Geometría, Álgebra, Cálculo, Estadística, Complejos, Dinámica, Datos, Examen).",
+        "Tool ghost universal con marcas de eje rojas/azules para interceptos.",
+        "Herramientas de medición: Area, Circumference, Center, Length, Slope.",
+        "Construcciones geométricas: Sector, Arc, Polygon booleans.",
+        "Cálculo diferencial/integral: TangentAt, NormalAt, ArcLength, CurvatureAt, VolumeOfRevolution, SurfaceOfRevolution.",
+        "Snap a intersecciones (Línea-Línea, Línea-Círculo, Círculo-Círculo, Función-Línea).",
+        "Reorganización de la toolbar en 12 grupos lógicos con iconos vectoriales.",
+        "Protocolo de Construcción estilo GeoGebra (reordenar, deshabilitar, exportar LaTeX).",
+        "Command Palette (Ctrl+K) con búsqueda fuzzy y export SVG/PNG/TikZ.",
+        "GPU compute shader para fill de regiones implícitas (máscara RGBA8).",
+        "Cómputo GPU unificado: function, implicit, parametric, vector, fill.",
+        "WGSL bytecode interpreter de 50 opcodes con protección de pila.",
+        "Caché de relleno de curva implícita estable al hacer pan/zoom.",
+        "Fase E: dead code removal (algebra_view, properties_panel, keyboard.rs antiguo).",
+        "Hysteresis de calidad de render: Preview durante pan/zoom, High tras 150ms idle.",
+        "9 tests nuevos para la cache de relleno.",
+        "Export a SVG, PNG y TikZ desde el menú y la paleta de comandos.",
+    ]
+}
+
+/// P1b: singleton estático — retención vía `Option<TextureHandle>`
+/// (`get_or_insert_with`, jamás se reemplaza ni se dropea en caliente),
+/// por eso NO usa la cola de gracia ni hash en el nombre como los fills
+/// animados (`render_2d`) o `teaching_anim_*_{hash}`. Avatar fijo: sin
+/// versionado, sin leak, sin submit en vuelo que lo referencie tras un
+/// reemplazo (no hay reemplazo). El logo de arranque ya no se retiene acá:
+/// el branding vive en About/Onboarding bajo demanda, no en el arranque.
+pub(crate) fn mora_avatar_texture<'a>(
+    ctx: &egui::Context,
+    mora_texture: &'a mut Option<egui::TextureHandle>,
+    image: egui::ColorImage,
+) -> &'a egui::TextureHandle {
+    mora_texture
+        .get_or_insert_with(|| ctx.load_texture("mora_avatar", image, egui::TextureOptions::LINEAR))
+}
+
+pub(crate) fn load_mora_avatar_texture_once(
+    ctx: &egui::Context,
+    mora_texture: &mut Option<egui::TextureHandle>,
+    load_attempted: &mut bool,
+    bytes: &[u8],
+) {
+    if *load_attempted {
+        return;
+    }
+    *load_attempted = true;
+    let Ok(image) = image::load_from_memory(bytes) else {
+        return;
+    };
+    let rgba = image.to_rgba8();
+    mora_avatar_texture(
+        ctx,
+        mora_texture,
+        egui::ColorImage::from_rgba_unmultiplied(
+            [rgba.width() as usize, rgba.height() as usize],
+            rgba.as_raw(),
+        ),
+    );
+}
+
+/// Fecha de compilación inyectada por build.rs (`YYYY-MM-DD`); `"dev"` si
+/// el binario se compiló sin ella. Única fuente (antes duplicada en main.rs).
+pub fn grafito_build_date() -> &'static str {
+    option_env!("GRAFITO_BUILD_DATE").unwrap_or("dev")
+}
+
+/// Hash corto del commit inyectado por build.rs. Acepta el alias nuevo
+/// `GRAFITO_GIT_HASH` y el histórico `GRAFITO_BUILD_HASH` (que tests siguen
+/// leyendo); `"dev"` si no hay ninguno. Única fuente.
+pub fn grafito_git_hash() -> &'static str {
+    option_env!("GRAFITO_GIT_HASH")
+        .or(option_env!("GRAFITO_BUILD_HASH"))
+        .unwrap_or("dev")
+}
+
+/// Título de la ventana nativa = `grafito_version_string` (nombre +
+/// semver + fecha + hash). Fue solo `Grafito`, pero el título sin
+/// versión hizo imposible distinguir el binario nuevo del viejo en la
+/// barra — se usa la versión visible como título.
+/// Versión visible `Grafito v<semver> (<fecha> <hash>)`, p.ej.
+/// `Grafito v1.0.0 (2026-09-10 1c52ffc)`. Única fuente para
+/// `--help/--version` de `run_app` y de `main.rs`. Pura y testeable.
+pub fn grafito_version_string() -> String {
+    format!(
+        "Grafito v{} ({} {})",
+        env!("CARGO_PKG_VERSION"),
+        grafito_build_date(),
+        grafito_git_hash()
+    )
+}
+
+/// Imprime la versión visible en una línea (fuente única).
+pub fn print_grafito_version() {
+    println!("{}", grafito_version_string());
+}
+
+/// Imprime el `--help` completo (fuente única para `run_app` y `main.rs`:
+/// primera línea con fecha+hash, resto idéntico en ambos).
+pub fn print_grafito_help() {
+    println!("{}", grafito_version_string());
+    println!("Calculadora gráfica matemática interactiva");
+    println!("(Geometría, Álgebra, Cálculo, CAS, Estadística, Complejos)");
+    println!();
+    println!("Usage: grafito [OPTIONS]");
+    println!("Options:");
+    println!("  -h, --help       Print help information");
+    println!("  -V, --version    Print version information");
+    #[cfg(feature = "profile")]
+    println!(
+        "  --profile        Start a puffin_http profiler server on port {}",
+        puffin_http::DEFAULT_PORT
+    );
+}
+
+/// Consume `--help/-h` y `--version/-V` antes de abrir la GUI (fuente única:
+/// `main.rs` lo llama primero y `run_app` lo reutiliza).
+///
+/// Devuelve `true` si consumió los args (el llamador retorna sin GUI).
+/// `--help` gana sobre `--version`; el resto de args se ignora acá.
+pub fn handle_version_args(args: impl IntoIterator<Item = String>) -> bool {
+    let mut version_requested = false;
+    for arg in args {
+        match arg.as_str() {
+            "--help" | "-h" => {
+                print_grafito_help();
+                return true;
+            }
+            "--version" | "-V" => version_requested = true,
+            _ => {}
+        }
+    }
+    if version_requested {
+        print_grafito_version();
+        return true;
+    }
+    false
+}
+
+/// Run the native Grafito desktop application.
+pub fn run_app() -> Result<(), eframe::Error> {
+    env_logger::init();
+
+    // `--help/--version` desde la fuente única (mismo texto que en main.rs).
+    if handle_version_args(std::env::args().skip(1)) {
+        return Ok(());
+    }
+
+    #[cfg(feature = "profile")]
+    let mut profile = false;
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            #[cfg(feature = "profile")]
+            "--profile" => profile = true,
+            _ => {}
+        }
+    }
+
+    #[cfg(feature = "profile")]
+    if profile {
+        let server_addr = format!("127.0.0.1:{}", puffin_http::DEFAULT_PORT);
+        match puffin_http::Server::new(&server_addr) {
+            Ok(server) => {
+                // Leak the server so its background thread lives for the app lifetime.
+                Box::leak(Box::new(server));
+                puffin::set_scopes_on(true);
+                log::info!("Puffin profiling server started on {}", server_addr);
+            }
+            Err(e) => log::warn!("Failed to start puffin profiling server: {}", e),
+        }
+    }
+
+    let icon = {
+        let image_data = include_bytes!("../../../assets/grafito-icon-256x256.png");
+        match image::load_from_memory(image_data) {
+            Ok(img) => {
+                let img = img.into_rgba8();
+                let (width, height) = img.dimensions();
+                egui::IconData {
+                    rgba: img.into_raw(),
+                    width,
+                    height,
+                }
+            }
+            Err(e) => {
+                log::warn!("Failed to load icon: {}. Using fallback.", e);
+                egui::IconData::default()
+            }
+        }
+    };
+
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            // FF2: con `GRAFITO_SHOT` el tamaño inicial ya es 1600x900
+            // (fuente única `shot::initial_window_size`); el
+            // `ViewportCommand` del primer frame queda de respaldo.
+            .with_inner_size(crate::shot::initial_window_size())
+            // Mínimo 320px: achicar la ventana previsualiza el layout
+            // móvil (sheet <740, Nivel 0 <480) en el propio PC.
+            .with_min_inner_size([320.0, 480.0])
+            .with_decorations(true)
+            .with_transparent(false)
+            .with_app_id("grafito")
+            .with_icon(std::sync::Arc::new(icon)),
+        multisampling: crate::MSAA_SAMPLES,
+        wgpu_options: egui_wgpu::WgpuConfiguration {
+            // Ola 5: latencia 1 (no el default 2 de wgpu): la app pinta por
+            // demanda + repaints presupuestados, no es un game-loop; lo que
+            // importa es input→fotón (lápiz, sliders, pan). Guía upstream:
+            // "Use 1 for low-latency, and 2 for high-throughput".
+            desired_maximum_frame_latency: Some(1),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    // Título con versión+hash (`grafito_version_string` ya trae el
+    // "Grafito v…" delante): el usuario distingue el binario nuevo
+    // del viejo en la barra. `run_native` copia el título al crear la
+    // ventana, el temporal alcanza.
+    eframe::run_native(
+        &grafito_version_string(),
+        options,
+        Box::new(|cc| Ok(Box::new(GrafitoApp::new(cc)))),
+    )
+}
+
+#[cfg(test)]
+mod version_visible_tests {
+    use super::{grafito_version_string, handle_version_args};
+
+    #[test]
+    fn window_title_lleva_version_y_hash() {
+        // El título ES la versión visible: así la barra distingue el
+        // binario nuevo del viejo (el "solo Grafito" escondía cuál
+        // corría).
+        let visible = grafito_version_string();
+        assert!(visible.starts_with("Grafito v"));
+        assert!(visible.contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn version_visible_lleva_semver_fecha_y_hash() {
+        // `Grafito v<semver> (<fecha> <hash>)`: `--help/--version`
+        // comparten esta única fuente (ya no es el título de ventana).
+        let visible = grafito_version_string();
+        assert!(visible.starts_with("Grafito v"));
+        assert!(visible.contains(env!("CARGO_PKG_VERSION")));
+        assert!(visible.contains('(') && visible.ends_with(')'));
+        let (fecha, hash) = (super::grafito_build_date(), super::grafito_git_hash());
+        assert!(visible.contains(fecha));
+        assert!(visible.contains(hash));
+    }
+
+    #[test]
+    fn args_version_no_abren_gui() {
+        assert!(handle_version_args(["--help".to_owned()]));
+        assert!(handle_version_args(["-h".to_owned()]));
+        assert!(handle_version_args(["--version".to_owned()]));
+        assert!(handle_version_args(["-V".to_owned()]));
+        // --help gana sobre --version.
+        assert!(handle_version_args([
+            "--version".to_owned(),
+            "--help".to_owned()
+        ]));
+    }
+
+    #[test]
+    fn args_comunes_siguen_al_flujo_normal() {
+        assert!(!handle_version_args(["nota.json".to_owned()]));
+        assert!(!handle_version_args(Vec::<String>::new()));
+        assert!(!handle_version_args(["--profile".to_owned()]));
+    }
+}
+
+#[cfg(test)]
+mod severity_honesty_tests {
+    use super::*;
+
+    #[test]
+    fn guardado_cancelado_es_info_sin_cambios() {
+        // Worker de guardado muerto sin resultado: Info (el documento en
+        // memoria está intacto, nada se perdió), jamás Error que asuste.
+        // Punta a punta vía `poll_background_jobs` con canal desconectado.
+        let mut app = dummy_grafito_app();
+        let ctx = egui::Context::default();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        drop(tx);
+        app.pending_save_job = Some(PendingSaveJob { receiver: rx });
+        app.poll_background_jobs(&ctx);
+        let toast = app.toasts.last_for_test().expect("hay aviso");
+        assert!(
+            matches!(toast.kind, grafito_ui::toast::ToastKind::Info),
+            "severidad honesta: Info, no Error"
+        );
+        assert!(
+            toast.message.contains("sin cambios"),
+            "sin susto: {}",
+            toast.message
+        );
+    }
+
+    #[test]
+    fn carpeta_sin_explorador_dice_causa_y_que_hacer() {
+        // El toast de `reveal_last_export` nombra la causa (el explorador
+        // no arrancó) y el qué-hacer (abrirla a mano).
+        let msg = reveal_export_spawn_error_message();
+        assert!(msg.contains("No se pudo abrir la carpeta"), "{msg}");
+        assert!(msg.contains("explorador"), "causa: {msg}");
+        assert!(msg.contains("abrila manualmente"), "qué-hacer: {msg}");
+    }
+
+    #[test]
+    fn boton_toast_copia_comando_fuera_del_draw() {
+        // Punta a punta de la intención: clic en el botón → `drain` →
+        // `copy_text`. El camino viejo (`notify` sin acción) no copia nada.
+        let mut app = dummy_grafito_app();
+        let ctx = egui::Context::default();
+        let cmd = "sudo pacman -S ffmpeg";
+        app.notify_with_action(
+            "falla sin ffmpeg",
+            grafito_ui::toast::ToastKind::Error,
+            Some(grafito_ui::toast::ToastAction::CopyText(cmd.into())),
+        );
+        let frame = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(400.0, 1_200.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        // Priming: registra el botón y publica su rect.
+        let _ = ctx.run(frame(Vec::new()), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.toasts.draw(ui, 0.5));
+        });
+        let button = app.toasts.action_rect_for_test(0).expect("hay botón");
+        let at = button.center();
+        let moved = vec![egui::Event::PointerMoved(at)];
+        let press = vec![egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        }];
+        let release = vec![egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::default(),
+        }];
+        let _ = ctx.run(frame(moved), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.toasts.draw(ui, 0.6));
+        });
+        let _ = ctx.run(frame(press), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.toasts.draw(ui, 0.7));
+        });
+        // El drain corre dentro del frame (como en producción) y la copia
+        // se lee del `FullOutput` devuelto: `ctx.output()` tras el `run`
+        // ya está vaciado por `end_pass`.
+        let out = ctx.run(frame(release), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.toasts.draw(ui, 0.8));
+            app.drain_toast_actions(ctx);
+        });
+        assert_eq!(out.platform_output.copied_text, cmd);
+        // El error persistente sigue (el botón no descarta).
+        assert_eq!(
+            app.toasts.last_for_test().expect("hay aviso").message,
+            "falla sin ffmpeg"
+        );
+
+        // Camino viejo intacto: sin acción no hay botón ni copia.
+        let mut plain = dummy_grafito_app();
+        let ctx2 = egui::Context::default();
+        plain.notify("hola", grafito_ui::toast::ToastKind::Info);
+        let _ = ctx2.run(frame(Vec::new()), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| plain.toasts.draw(ui, 0.5));
+        });
+        assert!(plain.toasts.action_rect_for_test(0).is_none());
+        plain.drain_toast_actions(&ctx2);
+        assert!(ctx2.output(|o| o.copied_text.clone()).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod startup_hint_tests {
+    use super::*;
+
+    #[test]
+    fn pending_stage_prioritizes_startup_doc() {
+        let mut app = dummy_grafito_app();
+        // Dummy sin GPU = fallback CPU (gates GPU/escena resueltos): solo
+        // falta plugins.
+        assert_eq!(app.startup_pending_stage(), Some("Cargando extensiones…"));
+        // Con documento CLI pendiente: manda el doc, sin conteos ni %.
+        app.startup_pending_doc = Some(PathBuf::from("/tmp/inicio.json"));
+        assert_eq!(app.startup_pending_stage(), Some("Abriendo documento…"));
+    }
+
+    #[test]
+    fn pending_stage_is_none_when_all_ready() {
+        let mut app = dummy_grafito_app();
+        // Todo listo (CPU + plugins): sin pill, sin "Listo", sin 100 %.
+        // La pill desaparece sola al dejar de dibujarse.
+        app.plugins_loaded = true;
+        assert_eq!(app.startup_pending_stage(), None);
+    }
+
+    #[test]
+    fn pending_stage_never_reports_done_or_percentage() {
+        // Contrato anti "% falso": las fases no contienen conteos, % ni "Listo".
+        let mut app = dummy_grafito_app();
+        for pending in [app.startup_pending_stage(), {
+            app.startup_pending_doc = Some(PathBuf::from("/tmp/a.json"));
+            app.startup_pending_stage()
+        }] {
+            let stage = pending.expect("dummy sin plugins siempre pendiente");
+            assert!(!stage.contains('%'), "sin % falso: {stage}");
+            assert!(!stage.contains("de 3"), "sin conteos: {stage}");
+            assert!(!stage.contains("100"), "sin 100%: {stage}");
+            assert_ne!(stage, "Listo", "sin 'Listo': la pill desaparece sola");
+        }
+    }
+
+    #[test]
+    fn pending_stage_reports_gpu_and_scene_gates() {
+        // Con GPU presente pero sin compilar: gate GPU honesto.
+        let mut app = dummy_grafito_app();
+        app.plugins_loaded = true;
+        app.gpu_renderer = Some(Arc::new(RwLock::new(None)));
+        assert_eq!(app.startup_pending_stage(), Some("Iniciando GPU…"));
+        // GPU lista pero escena pendiente: gate escena honesto.
+        // (Escena pendiente = `gpu_scene_readiness` presente y sin marca;
+        // `default()` arranca en `Pending`.)
+        app.gpu_renderer = None;
+        app.gpu_scene_readiness = Some(crate::canvas::GpuSceneReadiness::default());
+        assert_eq!(app.startup_pending_stage(), Some("Preparando escena…"));
+    }
+
+    #[test]
+    fn mora_texture_handle_is_retained_and_reused() {
+        let ctx = egui::Context::default();
+        let image = egui::ColorImage::new([1, 1], egui::Color32::WHITE);
+        let mut mora_texture = None;
+
+        let first = mora_avatar_texture(&ctx, &mut mora_texture, image.clone()).id();
+        let second = mora_avatar_texture(&ctx, &mut mora_texture, image).id();
+
+        assert_eq!(first, second);
+        assert!(mora_texture.is_some());
+    }
+
+    #[test]
+    fn failed_mora_texture_load_is_not_retried() {
+        let ctx = egui::Context::default();
+        let mut mora_texture = None;
+        let mut load_attempted = false;
+
+        load_mora_avatar_texture_once(&ctx, &mut mora_texture, &mut load_attempted, b"not a PNG");
+        assert!(load_attempted);
+        assert!(mora_texture.is_none());
+
+        load_mora_avatar_texture_once(
+            &ctx,
+            &mut mora_texture,
+            &mut load_attempted,
+            include_bytes!("../../../assets/mora.png"),
+        );
+        assert!(mora_texture.is_none());
+    }
+
+    #[test]
+    fn embedded_mora_asset_is_a_small_rgba_png() {
+        let image = image::load_from_memory(include_bytes!("../../../assets/mora.png"))
+            .expect("Mora asset must be a decodable PNG")
+            .to_rgba8();
+
+        assert_eq!(image.dimensions(), (128, 128));
+        assert!(include_bytes!("../../../assets/mora.png").len() < 32_000);
+    }
+}
+
+#[cfg(test)]
+mod canvas_resize_preview_tests {
+    use super::*;
+
+    #[test]
+    fn canvas_resize_preview_ends_after_the_settle_boundary() {
+        let now = Instant::now();
+
+        assert!(!canvas_resize_preview_active(None, now));
+        assert!(canvas_resize_preview_active(Some(now), now));
+        assert!(canvas_resize_preview_active(
+            Some(now - Duration::from_millis(150)),
+            now
+        ));
+        assert!(!canvas_resize_preview_active(
+            Some(now - Duration::from_millis(151)),
+            now
+        ));
+    }
+
+    #[test]
+    fn two_dimensional_resize_preview_hides_only_axis_numeric_decoration() {
+        let app_source = include_str!("app.rs");
+        let two_dimensional_start = app_source
+            .find("ViewMode::D2 =>")
+            .expect("2D canvas branch");
+        let two_dimensional_end = app_source[two_dimensional_start..]
+            .find("ViewMode::D3 =>")
+            .map(|offset| two_dimensional_start + offset)
+            .expect("3D canvas branch follows 2D");
+        let two_dimensional = &app_source[two_dimensional_start..two_dimensional_end];
+        assert!(two_dimensional.contains("let canvas_resize_preview ="));
+        let grid_draw = two_dimensional
+            .find("self.draw_grid(&painter, canvas_rect);")
+            .expect("grid remains visible during resize preview");
+        let axes_draw = two_dimensional
+            .find("self.draw_axes(")
+            .expect("2D axes receive the resize-preview policy");
+        assert!(grid_draw < axes_draw);
+
+        let render_source = include_str!("render_2d.rs");
+        let axes_start = render_source
+            .find("pub(crate) fn draw_axes")
+            .expect("2D axis renderer");
+        let axes_end = render_source[axes_start..]
+            .find("pub(crate) fn draw_trig_canvas_overlay")
+            .map(|offset| axes_start + offset)
+            .expect("next 2D renderer method");
+        let axes = &render_source[axes_start..axes_end];
+        assert!(axes.contains("show_numeric_ticks: bool"));
+        assert!(
+            axes.contains("locale: grafito_ui::i18n::Locale"),
+            "draw_axes recibe el locale vivo para etiquetas localizadas"
+        );
+        let x_axis = axes.find("let x_axis_a").expect("X axis is painted");
+        let y_axis = axes.find("let y_axis_a").expect("Y axis is painted");
+        let numeric_guard = axes
+            .find("if !show_numeric_ticks {")
+            .expect("numeric decoration guard");
+        let numeric_ticks = axes
+            .find("// Tick marks and labels")
+            .expect("numeric decoration follows the guard");
+        assert!(x_axis < numeric_guard);
+        assert!(y_axis < numeric_guard);
+        assert!(axes[x_axis..y_axis].contains("painter.line_segment("));
+        assert!(axes[y_axis..numeric_guard].contains("painter.line_segment("));
+        assert!(numeric_guard < numeric_ticks);
+        assert!(axes[numeric_guard..numeric_ticks].contains("return;"));
+    }
+
+    #[test]
+    fn construction_log_caps_at_500_keeping_chronological_order() {
+        let mut app = dummy_grafito_app();
+        for i in 0..MAX_CONSTRUCTION_LOG + 1 {
+            app.record_construction_step(&format!("act{i}"), vec![], &format!("out{i}"));
+        }
+        assert_eq!(app.construction_log.len(), MAX_CONSTRUCTION_LOG);
+        // El más antiguo (act0) fue drenado; el primero ahora es act1
+        assert_eq!(app.construction_log[0].action, "act1");
+        assert_eq!(
+            app.construction_log[MAX_CONSTRUCTION_LOG - 1].action,
+            format!("act{}", MAX_CONSTRUCTION_LOG)
+        );
+        // Agregar otro mantiene cota y orden
+        app.record_construction_step("final", vec![], "F");
+        assert_eq!(app.construction_log.len(), MAX_CONSTRUCTION_LOG);
+        assert_eq!(app.construction_log[0].action, "act2");
+        assert_eq!(
+            app.construction_log[MAX_CONSTRUCTION_LOG - 1].action,
+            "final"
+        );
+    }
+
+    #[test]
+    fn construction_log_constant_is_500() {
+        assert_eq!(MAX_CONSTRUCTION_LOG, 500);
+    }
+
+    #[test]
+    fn welcome_carousel_copy_covers_all_pages_and_locales() {
+        use grafito_ui::i18n::Locale;
+        for locale in [
+            Locale::Es,
+            Locale::En,
+            Locale::Pt,
+            Locale::It,
+            Locale::Fr,
+            Locale::De,
+        ] {
+            for page in 0..WELCOME_PAGES {
+                let (headline, sub) = welcome_page_copy(page, locale);
+                assert!(!headline.trim().is_empty(), "page {page} headline vacío");
+                assert!(!sub.trim().is_empty(), "page {page} sub vacío");
+            }
+            // Fuera de rango satura a la última página (sin pánico).
+            let (last_headline, _) = welcome_page_copy(999, locale);
+            let (expected, _) = welcome_page_copy(WELCOME_PAGES - 1, locale);
+            assert_eq!(last_headline, expected);
+        }
+    }
+
+    #[test]
+    fn welcome_skip_label_es_spanish_y_no_vacio() {
+        use grafito_ui::i18n::Locale;
+        for locale in [
+            Locale::Es,
+            Locale::En,
+            Locale::Pt,
+            Locale::It,
+            Locale::Fr,
+            Locale::De,
+        ] {
+            assert!(!welcome_skip_label(locale).trim().is_empty());
+        }
+        assert_eq!(welcome_skip_label(Locale::Es), "Omitir");
+        assert_eq!(welcome_skip_label(Locale::En), "Skip");
+    }
+
+    #[test]
+    fn welcome_liviano_es_una_sola_pantalla() {
+        // Onboarding liviano: 1 pantalla (qué es Grafito + Mili + 2
+        // botones + checkbox). Sin carrusel ni progreso.
+        assert_eq!(WELCOME_PAGES, 1, "el pin total es 1 pantalla");
+    }
+
+    #[test]
+    fn onboarding_probar_ahora_siembra_un_objeto_y_abre_a_mili() {
+        // "Probar ahora" siembra `y = x^2` por el mismo camino que
+        // tipear + Enter (1 objeto real, entrada limpia, como el botón
+        // del vacío de álgebra) y abre el asistente con el saludo de
+        // Mili. Sin egui: lógica pura cabezal (el cierre lo decide el
+        // llamador vía `close_onboarding_from_button`).
+        let mut app = dummy_grafito_app();
+        assert_eq!(app.document.object_count(), 0);
+        app.show_onboarding = true;
+        app.assistant_visible = false;
+        app.onboarding_try_example(0.0);
+        assert_eq!(
+            app.document.object_count(),
+            1,
+            "el ejemplo del onboarding crea 1 objeto"
+        );
+        assert!(app.input_text.is_empty(), "la entrada se limpia al crear");
+        assert!(app.assistant_visible, "el asistente se abre");
+        assert_eq!(
+            app.assistant.conversation.len(),
+            1,
+            "Mili saluda una vez en el transcript vacío"
+        );
+        let saludo = app.assistant.conversation.last().expect("saludo");
+        assert_eq!(
+            saludo.role,
+            grafito_assistant_types::ConversationRole::Assistant
+        );
+        assert_eq!(
+            saludo.content,
+            grafito_ui::i18n::t("assistant.greeting.fallback", app.config_locale()),
+            "el saludo es el fallback localizado de Mili"
+        );
+        // El cierre con el checkbox sin marcar solo oculta en sesión.
+        app.close_onboarding_from_button(OnboardingChoice::TryExample);
+        assert!(!app.show_onboarding, "Probar ahora cierra el onboarding");
+    }
+
+    #[test]
+    fn onboarding_skip_deja_lienzo_vacio() {
+        // Skip/Esc = "Empezar vacío": sin ejemplo, sin persistir nada
+        // (igual que hoy). Sin egui: el documento sigue en 0 objetos y
+        // el transcript de Mili queda intacto.
+        for choice in [OnboardingChoice::Escape, OnboardingChoice::DismissX] {
+            let mut app = dummy_grafito_app();
+            app.show_onboarding = true;
+            app.apply_onboarding_choice(choice);
+            assert!(!app.show_onboarding, "{choice:?} cierra el onboarding");
+            assert_eq!(app.document.object_count(), 0, "{choice:?} no siembra nada");
+            assert!(
+                app.assistant.conversation.is_empty(),
+                "{choice:?} no abre conversación"
+            );
+        }
+    }
+
+    #[test]
+    fn b_a104_center_sin_pestanas_tras_eliminacion() {
+        // Pestañas eliminadas 2026-10-06 (directiva usuario): el centro es
+        // solo canvas. Este test blinda la ausencia del cableado viejo.
+        let app_source = include_str!("app.rs");
+        // Concat a propósito: `include_str!` incluye este test, el
+        // literal completo se auto-matchearía; por fragmentos no.
+        for pin in [
+            ["draw_center", "_tabs"].concat(),
+            ["paint_center", "_tabs"].concat(),
+            ["CenterTab", "Action"].concat(),
+            ["center", "_tabs"].concat(),
+            ["center_close_error", "_for"].concat(),
+        ] {
+            assert!(
+                !app_source.contains(pin.as_str()),
+                "resto de pestañas en app.rs"
+            );
+        }
+        let ui_source = include_str!("ui.rs");
+        assert!(
+            !ui_source.contains("center.menu_reopen"),
+            "resto de menú Reabrir en ui.rs"
+        );
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn dummy_grafito_app() -> GrafitoApp {
+    dummy_grafito_app_with_perspective(Perspective::Geometry2D)
+}
+
+#[cfg(test)]
+pub(crate) fn dummy_grafito_app_with_perspective(perspective: Perspective) -> GrafitoApp {
+    let document = initial_document();
+    let current_view = perspective.view_mode();
+    let camera = grafito_geometry::Camera3D::new(1280.0 / 720.0);
+    let snapshot_version = document.version;
+    let snapshot_render_quality = document.render_quality;
+    let document_snapshot = std::sync::Arc::new(document.clone());
+    GrafitoApp {
+        document,
+        current_tool: grafito_ui::Tool::default(),
+        previous_tool: grafito_ui::Tool::default(),
+        current_view,
+        perspective,
+        camera,
+        show_grid: true,
+        snap_to_grid: true,
+        snap_config: crate::snap::SnapConfig::default(),
+        complex_contour: crate::complex_contour::ComplexContourState::default(),
+        exam_mode: false,
+        exam_exit_confirm: false,
+        dark_mode: false,
+        pending_points: Vec::new(),
+        pending_points_3d: Vec::new(),
+        last_mouse_pos: None,
+        canvas_origin: None,
+        canvas_drag_start: None,
+        canvas_is_panning: false,
+        point_drag_has_mutated: false,
+        eraser_stroke_has_mutated: false,
+        select_drag_object: None,
+        point_drag_error_reported: false,
+        selected_object: None,
+        indicate: None,
+        preview_object: None,
+        input_text: String::new(),
+        command_input_focus_requested: false,
+        cas_result: String::new(),
+        keyboard_tab: 0,
+        keyboard_visible: false,
+        keyboard_visible_explicit: false,
+        keyboard_expanded: false,
+        table_func_idx: 0,
+        table_x_min: "-5".to_string(),
+        table_x_max: "5".to_string(),
+        table_step: "1.0".to_string(),
+        cas_history: VecDeque::new(),
+        sidebar_tab: 0,
+        recent_files: VecDeque::new(),
+        document_lifecycle: DocumentLifecycle::new(&document_snapshot),
+        deferred_file_actions: DeferredFileActions::default(),
+        startup_instant: Instant::now(),
+        startup_first_frame_logged: false,
+        mora_texture: None,
+        mora_texture_load_attempted: false,
+        plugin_registry: None,
+        pending_plugins_job: None,
+        plugins_loaded: false,
+        shot_viewport_resize: false,
+        assistant_blocks_cache: grafito_ui::assistant::AssistantBlocksCache::default(),
+        whiteboard_open: false,
+        whiteboard: crate::whiteboard_ui::WhiteboardSession::default(),
+        whiteboard_book: crate::whiteboard_ui::WhiteboardBook::default(),
+        whiteboard_left_pinned: false,
+        show_whiteboard_assistant: true,
+        profile: grafito_profile::StudentProfile::default(),
+        undo_stack: VecDeque::new(),
+        redo_stack: VecDeque::new(),
+        undo_total_bytes: 0,
+        frame_budget_skipped: 0,
+        welcome_page: 0,
+        show_onboarding: false,
+        welcome_dont_show_again: false,
+        pending_save_job: None,
+        pending_open_job: None,
+        startup_pending_doc: None,
+        pending_export_job: None,
+        last_export_dir: None,
+        pending_ggb_import_job: None,
+        pending_ggb_export_job: None,
+        pending_import_job: None,
+        pending_text_job: None,
+        pending_clipboard_job: None,
+        pending_chained_action: None,
+        implicit_surface_slot: crate::implicit_surface_compute::ImplicitSurfaceSlot::new(),
+        implicit_slot_key: None,
+        implicit_slot_version: None,
+        attractor_cache: std::collections::HashMap::new(),
+        fill_textures: std::sync::RwLock::new(crate::render_2d::FillTextureCacheStore::default()),
+        active_color_picker: None,
+        color_favorites: [
+            grafito_geometry::Color::new(0.9, 0.1, 0.1, 1.0),
+            grafito_geometry::Color::new(0.1, 0.6, 0.1, 1.0),
+            grafito_geometry::Color::new(0.1, 0.3, 0.9, 1.0),
+            grafito_geometry::Color::new(0.9, 0.6, 0.1, 1.0),
+            grafito_geometry::Color::new(0.5, 0.1, 0.9, 1.0),
+        ],
+        tool_ghost: None,
+        tool_state: crate::tool_dispatcher::ToolState::default(),
+        gpu_renderer: None,
+        gpu_scene_readiness: None,
+        transient_render_state: TransientRenderState::default(),
+        mapping_anim_cache: None,
+        algebra_expr_cache: std::collections::HashMap::new(),
+        hover_pick_cache: None,
+        multidimensional_motion_enabled: true,
+        explicit_spin_speed_dps: None,
+        on_update_running: false,
+        multidimensional_motion_speed: DEFAULT_MULTIDIMENSIONAL_MOTION_SPEED,
+        view3d: crate::canvas::View3D::default(),
+        camera_travelling: None,
+        use_gpu: false,
+        last_interaction_time: Instant::now(),
+        is_view_changing: false,
+        last_canvas_resize_at: None,
+        pending_action: PendingAction::None,
+        toasts: grafito_ui::toast::ToastManager::default(),
+        hovered_analysis: None,
+        hover_candidate_pos: None,
+        hover_candidate_time: 0.0,
+        hover_cached_analysis: None,
+        document_snapshot,
+        snapshot_version,
+        snapshot_render_quality,
+        command_palette: grafito_ui::command_palette::CommandPaletteState::default(),
+        custom_tools: grafito_command::ggbscript::CustomToolStore::new(),
+        custom_tools_revision: 0,
+        show_custom_tool_dialog: false,
+        custom_tool_name: String::new(),
+        assistant: grafito_ui::assistant::AssistantPanelState::default(),
+        steps_tts: None,
+        steps_tts_available_cached: None,
+        stt_recording: None,
+        stt_transcribing: None,
+        stt_available_cached: None,
+        assistant_runtime: crate::assistant::AssistantRuntime::default(),
+        right_drawer_open: true,
+        workspace_dock_tab: crate::WorkspaceDockTab::Inspector,
+        compact_geometry_utility_open: false,
+        left_drawer_open: false,
+        compact_drawer_open: false,
+        nivel0_hidden_announced: false,
+        drawer_blocked_announced: false,
+        assistant_visible: true,
+        mobile_menu_open: false,
+        mobile_menu_page: crate::ui::MobileMenuPage::Root,
+        ui_time: 0.0,
+        construction_log: Vec::new(),
+        show_construction_protocol: DEFAULT_CONSTRUCTION_PROTOCOL_VISIBLE,
+        statistics_data: Vec::new(),
+        statistics_input_buf: String::new(),
+        statistics_input_error: None,
+        autocomplete: InputAutocomplete::default(),
+        show_about: false,
+        show_colab_window: false,
+        colab: crate::colab_link::ColabLink::default(),
+        colab_panel: crate::colab_panel::ColabPanelState::default(),
+        show_cheat_sheet: false,
+        show_trig_animation: false,
+        trig_angle: 0.0,
+        trig_animating: false,
+        trig_speed: 0.5,
+        trig_function: 0,
+        trig_view_mode: TrigViewMode::Didactic,
+        trig_graph_cache: std::sync::RwLock::new(None),
+        show_mascot_config: false,
+        avatar_draft: grafito_profile::AvatarConfig::default(),
+        config_name_error: None,
+        teaching_ui: crate::teaching_ui::TeachingUiState::default(),
+        celebration: crate::celebration::CelebrationState::default(),
+        repaint_budget: RepaintBudget::default(),
+        autosave: AutosaveDebouncer::new(),
+        autosave_last_version: 0,
+        // A8 recovery (test helper): sin oferta pendiente al crear dummy.
+        pending_recovery_job: None,
+        recovery_offer: None,
+        recovery_corrupt: None,
+        recovery_checked_path: None,
+        advanced_red_opt_in: false,
+        locale: AppLocale::Es,
+        reduced_motion: false,
+        classroom: crate::classroom::ClassroomPanel::new(),
+    }
+}
+
+// La animación vive dentro del turno del chat (transcript con `AssistantMedia`,
+// ver `assistant.rs::run_assistant_animation_with` + `sync_assistant_for_frame`):
+// sin ventana compañera. El reproductor del transcript
+// (`grafito-ui/src/assistant.rs::set_media`, `draw_media_card`) es el único
+// destino, con scrub, velocidad y botón Exportar GIF (`GifExportJob`,
+// `export_assistant_media`, `poll_gif_export_job`).
+
+#[cfg(test)]
+mod indicate_integration_tests {
+    use super::*;
+
+    #[test]
+    fn indica_dispara_y_expira_solo_a_los_1300_ms() {
+        let mut app = dummy_grafito_app();
+        let id = app
+            .document
+            .try_add_point(Point2::new(1.0, 2.0))
+            .expect("punto válido");
+        app.ui_time = 0.0;
+        assert!(app.trigger_indicate(id).is_ok());
+        assert_eq!(app.indicate.map(|hl| hl.target()), Some(id));
+        // Sigue latiendo antes del TTL.
+        assert!(app.tick_indicate(1199.0));
+        assert!(app.indicate.is_some());
+        // A los 1300 ms expiró solo.
+        assert!(!app.tick_indicate(1300.0));
+        assert!(app.indicate.is_none());
+    }
+
+    #[test]
+    fn indica_id_inexistente_es_err_honesto() {
+        let mut app = dummy_grafito_app();
+        let fantasma = ObjectId::new();
+        assert!(app.trigger_indicate(fantasma).is_err());
+        assert!(app.indicate.is_none());
+    }
+
+    #[test]
+    fn indica_tiempo_no_finito_es_err_honesto() {
+        let mut app = dummy_grafito_app();
+        let id = app
+            .document
+            .try_add_point(Point2::new(0.0, 0.0))
+            .expect("punto válido");
+        app.ui_time = f64::NAN;
+        assert!(app.trigger_indicate(id).is_err());
+        assert!(app.indicate.is_none());
+    }
+
+    #[test]
+    fn indica_expira_si_el_objeto_desaparece() {
+        let mut app = dummy_grafito_app();
+        let id = app
+            .document
+            .try_add_point(Point2::new(3.0, 4.0))
+            .expect("punto válido");
+        app.ui_time = 0.0;
+        assert!(app.trigger_indicate(id).is_ok());
+        app.document.remove_object(id);
+        assert!(!app.tick_indicate(100.0));
+        assert!(app.indicate.is_none());
+    }
+}
+#[cfg(test)]
+mod coverage_sweep_app_pure {
+    use super::*;
+    #[test]
+    fn barrido_ctrl_y_y_gpu_flags() {
+        assert!(matches!(ctrl_y_shortcut(true), CtrlYShortcut::YIntercept));
+        assert!(matches!(ctrl_y_shortcut(false), CtrlYShortcut::Redo));
+        assert!(should_use_gpu_3d(true, true, false));
+        assert!(!should_use_gpu_3d(true, true, true));
+        assert!(!should_use_gpu_3d(false, true, false));
+        assert!(!should_prepare_gpu_3d(
+            false,
+            true,
+            false,
+            false,
+            false,
+            crate::canvas::Scene3DReadiness::GpuReady
+        ));
+        assert!(should_repaint_3d_warmup(
+            crate::canvas::Scene3DReadiness::Pending
+        ));
+        assert!(!should_repaint_3d_warmup(
+            crate::canvas::Scene3DReadiness::GpuReady
+        ));
+        assert!(!should_repaint_3d_warmup(
+            crate::canvas::Scene3DReadiness::CpuOnly
+        ));
+        assert!(should_animate_multidimensional_scene(
+            ViewMode::D3,
+            true,
+            true
+        ));
+        assert!(!should_animate_multidimensional_scene(
+            ViewMode::D2,
+            true,
+            true
+        ));
+        assert_eq!(typed_four_d_motion_phase(1.5), Some(1.5));
+        assert_eq!(typed_four_d_motion_phase(f64::NAN), None);
+    }
+    #[test]
+    fn barrido_motion_speed_y_toggles() {
+        assert!(
+            (normalize_multidimensional_motion_speed(2.0) - 2.0).abs() < 1e-6
+                || normalize_multidimensional_motion_speed(2.0)
+                    <= MAX_MULTIDIMENSIONAL_MOTION_SPEED
+        );
+        assert_eq!(
+            normalize_multidimensional_motion_speed(f64::NAN as f32),
+            DEFAULT_MULTIDIMENSIONAL_MOTION_SPEED
+        );
+        let mut on = true;
+        assert!(pause_default_multidimensional_motion(&mut on));
+        assert!(!on);
+        let mut off = false;
+        assert!(!pause_default_multidimensional_motion(&mut off));
+        let mut m = false;
+        assert!(toggle_default_multidimensional_motion(&mut m));
+        assert!(m);
+        assert!(!sidebar_uses_cas_worksheet(usize::MAX) || sidebar_uses_cas_worksheet(usize::MAX));
+        let mut s = String::from("texto");
+        assert!(clear_submitted_input_on_success(
+            &mut s,
+            &grafito_command::commands::CommandOutcome::Ok
+        ));
+        assert!(s.is_empty());
+        let mut s = String::from("texto");
+        assert!(!clear_submitted_input_on_success(
+            &mut s,
+            &grafito_command::commands::CommandOutcome::Error("mal".to_string())
+        ));
+        assert_eq!(s, "texto");
+    }
+}

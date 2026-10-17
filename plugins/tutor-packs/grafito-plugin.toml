@@ -1,0 +1,21 @@
+[plugin]
+id = "tutor.packs-utn"
+name = "Packs tutora UTN (AM1/AM2/Álgebra)"
+version = "1.0.0"
+category = "pedagogy"
+description = "Lecciones y ejercicios locales de la tutora Mora: derivadas, integrales y matrices (sin red, fail-closed)."
+activation = "auto"
+min_app_version = "1.3.0"
+
+[instructions]
+files = ["tutor-utn.md"]
+budget_bytes = 4096
+
+[[tools]]
+id = "evaluate_expr"
+
+[[commands]]
+id = "Function"
+
+[[scenes]]
+template = "derivative-slope"

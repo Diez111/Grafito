@@ -1,0 +1,206 @@
+use std::env;
+use std::fs;
+use std::io;
+use std::path::Path;
+
+const WINDOWS_MANIFEST: &str = r#"<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity version="1.0.0.0" processorArchitecture="*" name="Grafito.Grafito" type="win32" />
+  <description>Grafito</description>
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false" />
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <supportedOS Id="{35138b9a-5d96-4fbd-8e2d-a2440225f93a}" />
+      <supportedOS Id="{4a2f28e3-53b9-4441-ba9c-d69d4a4a6e38}" />
+      <supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}" />
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}" />
+    </application>
+  </compatibility>
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2,PerMonitor</dpiAwareness>
+    </windowsSettings>
+  </application>
+</assembly>
+"#;
+
+fn main() -> io::Result<()> {
+    let icon_source =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/grafito-icon-256x256.png");
+    println!("cargo:rerun-if-changed={}", icon_source.display());
+
+    // Hash del commit para "Acerca de" (prueba de versión visible).
+    // `HEAD` solo cambia al saltar de rama; el ref real (`refs/heads/...`)
+    // cambia por commit: se emiten ambos para no servir un hash rancio.
+    println!("cargo:rerun-if-changed=../../.git/HEAD");
+    {
+        let git_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.git");
+        let head_path = git_dir.join("HEAD");
+        if let Ok(head) = fs::read_to_string(&head_path) {
+            let head = head.trim();
+            if let Some(ref_path) = head.strip_prefix("ref: ") {
+                let ref_file = git_dir.join(ref_path);
+                println!("cargo:rerun-if-changed=../../{ref_path}");
+                let _ = ref_file;
+            }
+        }
+    }
+    let hash = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("dev-{}", env!("CARGO_PKG_VERSION")));
+    println!("cargo:rustc-env=GRAFITO_BUILD_HASH={hash}");
+    // Alias con el nombre pedido por el reporte (fecha+hash visibles): el
+    // histórico GRAFITO_BUILD_HASH se conserva porque app.rs/tests lo leen.
+    println!("cargo:rustc-env=GRAFITO_GIT_HASH={hash}");
+    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+    match build_date_yyyymmdd() {
+        Some(date) => println!("cargo:rustc-env=GRAFITO_BUILD_DATE={date}"),
+        None => println!("cargo:rustc-env=GRAFITO_BUILD_DATE=dev"),
+    }
+
+    if env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() != "windows" {
+        return Ok(());
+    }
+
+    let Some(out_dir) = env::var_os("OUT_DIR") else {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "OUT_DIR not set"));
+    };
+    let icon_path = Path::new(&out_dir).join("grafito.ico");
+    write_png_icon(&icon_source, &icon_path)?;
+
+    let icon_path = icon_path
+        .to_str()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "non-UTF-8 icon path"))?;
+    let Ok(package_version) = env::var("CARGO_PKG_VERSION") else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "CARGO_PKG_VERSION not set",
+        ));
+    };
+    let mut resource = winresource::WindowsResource::new();
+    resource
+        .set_icon(icon_path)
+        .set_manifest(WINDOWS_MANIFEST)
+        .set("ProductName", "Grafito")
+        .set(
+            "FileDescription",
+            "Grafito - interactive mathematical graphing",
+        )
+        .set("InternalName", "grafito")
+        .set("OriginalFilename", "grafito.exe")
+        .set("CompanyName", "Grafito Contributors")
+        .set(
+            "LegalCopyright",
+            "Copyright (c) 2024-2026 Grafito Contributors",
+        )
+        .set("FileVersion", &package_version)
+        .set("ProductVersion", &package_version);
+
+    if !env::var("CARGO_PKG_VERSION_PRE")
+        .unwrap_or_default()
+        .is_empty()
+    {
+        resource.set_version_info(
+            winresource::VersionInfo::FILEFLAGS,
+            winresource::VersionInfo::VS_FF_PRERELEASE,
+        );
+    }
+
+    resource.compile()
+}
+
+/// Fecha de build `YYYY-MM-DD` sin dependencias externas (MSRV 1.92).
+///
+/// Prefiere `SOURCE_DATE_EPOCH` (builds reproducibles); si no está, usa el
+/// reloj de la máquina que compila. Devuelve `None` si no hay reloj útil y
+/// el llamador emite el fallback `"dev"`.
+fn build_date_yyyymmdd() -> Option<String> {
+    let secs: u64 = match std::env::var("SOURCE_DATE_EPOCH") {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(epoch) => epoch,
+            Err(_) => return None,
+        },
+        Err(_) => match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(elapsed) => elapsed.as_secs(),
+            Err(_) => return None,
+        },
+    };
+    Some(civil_date_yyyymmdd(secs / 86_400))
+}
+
+/// Convierte días desde 1970-01-01 a `YYYY-MM-DD` (inversa de
+/// Howard Hinnant `days_from_civil`; aritmética entera, sin deps).
+fn civil_date_yyyymmdd(days_since_epoch: u64) -> String {
+    let days: i64 = days_since_epoch.min(i64::MAX as u64) as i64;
+    let z: i64 = days + 719_468;
+    let era: i64 = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe: i64 = z - era * 146_097;
+    let yoe: i64 = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut y: i64 = yoe + era * 400;
+    let doy: i64 = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp: i64 = (5 * doy + 2) / 153;
+    let d: i64 = doy - (153 * mp + 2) / 5 + 1;
+    let m: i64 = if mp < 10 { mp + 3 } else { mp - 9 };
+    y += i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+fn write_png_icon(source: &Path, destination: &Path) -> io::Result<()> {
+    let png = fs::read(source)?;
+    if png.len() < 24 || &png[..8] != b"\x89PNG\r\n\x1a\n" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Windows icon source is not a PNG",
+        ));
+    }
+
+    let Some(width_bytes): Option<[u8; 4]> = png[16..20].try_into().ok() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "validated PNG header missing width",
+        ));
+    };
+    let width = u32::from_be_bytes(width_bytes);
+    let Some(height_bytes): Option<[u8; 4]> = png[20..24].try_into().ok() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "validated PNG header missing height",
+        ));
+    };
+    let height = u32::from_be_bytes(height_bytes);
+    if width != 256 || height != 256 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Windows icon source must be 256x256",
+        ));
+    }
+
+    let png_len = u32::try_from(png.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Windows icon source is too large",
+        )
+    })?;
+    let mut ico = Vec::with_capacity(22 + png.len());
+    ico.extend_from_slice(&0_u16.to_le_bytes());
+    ico.extend_from_slice(&1_u16.to_le_bytes());
+    ico.extend_from_slice(&1_u16.to_le_bytes());
+    ico.extend_from_slice(&[0, 0, 0, 0]);
+    ico.extend_from_slice(&1_u16.to_le_bytes());
+    ico.extend_from_slice(&32_u16.to_le_bytes());
+    ico.extend_from_slice(&png_len.to_le_bytes());
+    ico.extend_from_slice(&22_u32.to_le_bytes());
+    ico.extend_from_slice(&png);
+    fs::write(destination, ico)
+}

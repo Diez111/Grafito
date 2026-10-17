@@ -1,0 +1,3109 @@
+//! Mouse, keyboard, and gesture input handling for the central canvas.
+//!
+//! Covers 2D/3D drag, pan, zoom, selection, tool clicks, and the transient
+//! tool-ghost preview that follows the pointer.
+
+use crate::{tool_dispatcher::ToolState, GrafitoApp, PendingAction};
+use egui::{PointerButton, Rect, Sense, Vec2};
+use glam::Vec2 as GlamVec2;
+use grafito_core::{
+    CircleObj, Document, FunctionObj, GeoObject, ImplicitCurveObj, LineObj, ParametricCurve2DObj,
+    PencilObj, Point3DObj, PointObj, PolarCurveObj, PolygonObj, RelationOperator, RenderQuality,
+    VectorField2DObj,
+};
+use grafito_geometry::{Point2, Point3D};
+use grafito_ui::i18n::t;
+use grafito_ui::tokens::{SPACE_SM, SPACE_XS, SPACE_XXL, TYPE_XS};
+use grafito_ui::Tool;
+use std::time::Instant;
+
+fn snap_world_to_grid(world: Point2, scale: f64) -> Point2 {
+    let pixels_per_unit = scale;
+    let target_world_step = 80.0 / pixels_per_unit.max(1e-50);
+    let magnitude = target_world_step.log10().floor();
+    let base = 10f64.powf(magnitude);
+    let factor = target_world_step / base;
+    let major_step = if factor < 2.0 {
+        1.0 * base
+    } else if factor < 5.0 {
+        2.0 * base
+    } else {
+        5.0 * base
+    };
+    Point2::new(
+        (world.x / major_step).round() * major_step,
+        (world.y / major_step).round() * major_step,
+    )
+}
+
+/// Los objetos que se construyen sobre el plano de construcción muestran una
+/// previsualización en la posición del puntero. Los politopos proyectados se
+/// crean centrados, por lo que deliberadamente no usan este fantasma.
+pub(crate) const fn uses_3d_position_ghost(tool: Tool) -> bool {
+    matches!(
+        tool,
+        Tool::Point3D
+            | Tool::Segment3D
+            | Tool::Line3D
+            | Tool::Plane3D
+            | Tool::Sphere3D
+            | Tool::Cube3D
+            | Tool::Cylinder3D
+            | Tool::Cone3D
+            | Tool::Torus3D
+            | Tool::MoebiusStrip
+            | Tool::Surface3D
+            | Tool::ParametricCurve3D
+            | Tool::VectorField3D
+            | Tool::HyperSurface4D
+    )
+}
+
+pub(crate) fn cancel_locus_selection(state: &mut ToolState) {
+    state.driver = None;
+}
+
+/// Long-press táctil (~500 ms, 1 dedo quieto <10 px) sobre el lienzo 2D:
+/// abre el MISMO popup que el clic derecho (sin duplicar acciones).
+/// Máquina de tiempos pura: `note_frame` arma/cancela por frame, `fire_due`
+/// dice si toca abrir, `mark_fired` consume el gesto hasta soltar.
+/// Convive con pan de 1 dedo (moverse >`LONG_PRESS_SLOP_PX` cancela y el
+/// pan sigue intacto) y con 2 dedos (el llamador pasa `down=false` cuando
+/// hay multitouch, lo que resetea). Sin I/O.
+pub(crate) const LONG_PRESS_HOLD_SECS: f64 = 0.5;
+pub(crate) const LONG_PRESS_SLOP_PX: f32 = 10.0;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LongPressTracker {
+    start_time: Option<f64>,
+    start_pos: Option<egui::Pos2>,
+    fired: bool,
+    cancelled: bool,
+}
+
+impl LongPressTracker {
+    /// Avanza la máquina un frame. `down=false` (soltado, multitouch,
+    /// herramienta no-Select…) resetea al reposo.
+    pub(crate) fn note_frame(&mut self, down: bool, now: f64, pos: Option<egui::Pos2>) {
+        if !down || !now.is_finite() {
+            *self = Self::default();
+            return;
+        }
+        let Some(p) = pos else { return };
+        if !p.is_finite() {
+            return;
+        }
+        match (self.start_time, self.start_pos) {
+            (Some(_), Some(p0)) => {
+                if p0.distance(p) > LONG_PRESS_SLOP_PX {
+                    self.cancelled = true;
+                }
+            }
+            _ => {
+                self.start_time = Some(now);
+                self.start_pos = Some(p);
+                self.fired = false;
+                self.cancelled = false;
+            }
+        }
+    }
+
+    /// `true` si el dedo lleva quieto al menos el hold sin haber disparado
+    /// ni cancelado. Puro.
+    pub(crate) fn fire_due(&self, now: f64) -> bool {
+        if self.fired || self.cancelled {
+            return false;
+        }
+        match self.start_time {
+            Some(t0) => now - t0 >= LONG_PRESS_HOLD_SECS,
+            None => false,
+        }
+    }
+
+    /// Consume el gesto: no re-dispara hasta el próximo apoyo.
+    pub(crate) fn mark_fired(&mut self) {
+        self.fired = true;
+    }
+
+    /// `true` si ya disparó (el llamador suprime pan/click de ese apoyo).
+    pub(crate) fn menu_open(&self) -> bool {
+        self.fired
+    }
+
+    /// `true` mientras arma el hold (el llamador pide repintado para que el
+    /// temporizador avance sin movimiento). Puro.
+    pub(crate) fn awaiting(&self, now: f64) -> bool {
+        self.start_time.is_some() && !self.fired && !self.cancelled && !self.fire_due(now)
+    }
+}
+
+/// Clave temporal (memoria egui) del long-press del lienzo 2D.
+const CANVAS_LONG_PRESS_KEY: &str = "canvas_long_press";
+
+pub(crate) fn canvas_local_pointer(canvas_rect: Rect, pointer: egui::Pos2) -> Option<Vec2> {
+    let size = canvas_rect.size();
+    if !pointer.x.is_finite()
+        || !pointer.y.is_finite()
+        || !size.is_finite()
+        || size.x <= 0.0
+        || size.y <= 0.0
+        || !canvas_rect.contains(pointer)
+    {
+        return None;
+    }
+    let local = pointer - canvas_rect.min;
+    local.is_finite().then_some(local)
+}
+
+impl GrafitoApp {
+    /// Dispara guiones de click (P3b): botón de acción primero, mapa
+    /// `OnClick` después. Presupuesto fresco por click; si el documento
+    /// mutó se empuja undo y se marca autosave (igual que un comando).
+    fn fire_click_scripts(&mut self, id: grafito_core::ObjectId, time: f64) {
+        use grafito_command::commands::CommandOutcome;
+        let label = match self.document.get_object(id) {
+            Some(object) => object.label().to_string(),
+            None => return,
+        };
+        if label.is_empty() {
+            return;
+        }
+        // ¿Es botón de acción? Su guion tiene prioridad.
+        let is_button = self
+            .document
+            .get_object(id)
+            .and_then(grafito_command::ggbscript::action_view_of)
+            .is_some_and(|view| {
+                matches!(view.kind, grafito_command::ggbscript::ActionKind::Button)
+            });
+        let outcome = if is_button {
+            match grafito_command::ggbscript::run_button_script(&mut self.document, &label) {
+                Ok(n) => CommandOutcome::Message(format!("Botón {label}: {n} pasos")),
+                Err(error) => CommandOutcome::Error(error),
+            }
+        } else if self
+            .document
+            .object_scripts
+            .get(&label)
+            .and_then(|scripts| scripts.on_click.clone())
+            .is_some()
+        {
+            match grafito_command::ggbscript::run_click_script(&mut self.document, &label) {
+                Ok(n) => CommandOutcome::Message(format!("OnClick[{label}]: {n} pasos")),
+                Err(error) => CommandOutcome::Error(error),
+            }
+        } else {
+            return;
+        };
+        let before = self.document.clone();
+        let mutated = crate::lifecycle::command_mutated_document(&outcome, &before, &self.document);
+        crate::app::save_command_snapshot_if_mutated(
+            &outcome,
+            before,
+            &self.document,
+            &mut self.undo_stack,
+            &mut self.redo_stack,
+        );
+        if mutated {
+            self.mark_autosave_dirty();
+        }
+        self.handle_command_outcome(outcome, time, "click");
+    }
+
+    fn handle_canvas_primary_click(&mut self, world: Point2, time: f64) {
+        if !matches!(self.pending_action, PendingAction::None) {
+            let tolerance = 10.0 / self.document.view().scale;
+            if let Some(id) = self.document.pick_object(world, tolerance) {
+                self.document.clear_selection();
+                self.document.select(id);
+                self.selected_object = Some(id);
+                self.handle_pending_object_click(id, time);
+            }
+            return;
+        }
+
+        match self.current_tool {
+            Tool::Select => {
+                let tolerance = 10.0 / self.document.view().scale;
+                if let Some(id) = self.document.pick_object(world, tolerance) {
+                    self.document.clear_selection();
+                    self.document.select(id);
+                    self.selected_object = Some(id);
+                    // P3b: los clicks disparan guiones (botón de acción u
+                    // OnClick guardado) con presupuesto fresco y undo honesto.
+                    self.fire_click_scripts(id, time);
+                } else {
+                    self.document.clear_selection();
+                    self.selected_object = None;
+                }
+            }
+            Tool::Text => {
+                // Ola 1.6: un clic coloca un texto editable en el mundo; se
+                // renombra por menú contextual y se edita con `Text[...]`.
+                self.insert_object_from_tool(
+                    GeoObject::Text(grafito_core::TextObj::new("Texto", world)),
+                    "Text",
+                    time,
+                );
+            }
+            Tool::Pencil => {
+                // El Pencil se construye en `response.drag_stopped`, no con un
+                // clic simple. Aquí no hacemos nada.
+            }
+            Tool::Eraser => {
+                // Clic simple: borrar el objeto bajo el cursor (si hay).
+                let tolerance = 10.0 / self.document.view().scale;
+                if let Some(id) = self.document.pick_object(world, tolerance) {
+                    let mut stroke_has_mutated = false;
+                    if crate::app::erase_object_for_stroke(
+                        &mut self.document,
+                        id,
+                        &mut stroke_has_mutated,
+                        &mut self.undo_stack,
+                        &mut self.redo_stack,
+                    ) && self.selected_object == Some(id)
+                    {
+                        self.selected_object = None;
+                    }
+                }
+            }
+            Tool::Point => {
+                self.insert_object_from_tool(GeoObject::Point(PointObj::new(world)), "Point", time);
+                self.tool_ghost = None;
+            }
+            Tool::Line => {
+                self.tool_state.pending.push(world);
+                if self.tool_state.pending.len() == 2 {
+                    let pts = self.tool_state.pending.clone();
+                    // W-B: clics sobre puntos etiquetados → recta paramétrica
+                    // viva (`Line[A, B]`, sigue al arrastre); si no, objeto
+                    // libre congelado como antes.
+                    let first = crate::tool_dispatcher::point_label_at(&mut self.document, pts[0]);
+                    let second = crate::tool_dispatcher::point_label_at(&mut self.document, pts[1]);
+                    if let (Some(a), Some(b)) = (first, second) {
+                        self.execute_command_and_record(&format!("Line[{a}, {b}]"), time);
+                    } else {
+                        self.insert_object_from_tool(
+                            GeoObject::Line(LineObj::new(pts[0], pts[1])),
+                            "Line",
+                            time,
+                        );
+                    }
+                    self.tool_state.pending.clear();
+                    self.tool_ghost = None;
+                }
+            }
+            Tool::Circle => {
+                self.tool_state.pending.push(world);
+                if self.tool_state.pending.len() == 2 {
+                    let pts = self.tool_state.pending.clone();
+                    let center = pts[0];
+                    let edge = pts[1];
+                    // W-B: centro+borde etiquetados → círculo paramétrico vivo
+                    // (`Circle[A, B]`); si no, libre congelado como antes.
+                    let first = crate::tool_dispatcher::point_label_at(&mut self.document, center);
+                    let second = crate::tool_dispatcher::point_label_at(&mut self.document, edge);
+                    if let (Some(a), Some(b)) = (first, second) {
+                        self.execute_command_and_record(&format!("Circle[{a}, {b}]"), time);
+                    } else {
+                        let radius = center.distance(&edge);
+                        self.insert_object_from_tool(
+                            GeoObject::Circle(CircleObj::new(center, radius)),
+                            "Circle",
+                            time,
+                        );
+                    }
+                    self.tool_state.pending.clear();
+                    self.tool_ghost = None;
+                }
+            }
+            Tool::Polygon => {
+                self.tool_state.pending.push(world);
+            }
+            Tool::Function => {
+                self.execute_command_and_record("y = x^2", time);
+                self.current_tool = Tool::Select;
+            }
+            Tool::Point3D => {
+                let p3 = Point3D::new(world.x, world.y, 0.0);
+                self.insert_object_from_tool(
+                    GeoObject::Point3D(grafito_core::Point3DObj::new(p3)),
+                    "Point3D",
+                    time,
+                );
+                self.tool_ghost = None;
+            }
+            Tool::Sphere3D => {
+                let p3 = Point3D::new(world.x, world.y, 0.0);
+                self.pending_points_3d.push(p3);
+                if self.pending_points_3d.len() == 2 {
+                    let center = self.pending_points_3d[0];
+                    let edge = self.pending_points_3d[1];
+                    let radius = center.distance(&edge);
+                    self.insert_object_from_tool(
+                        GeoObject::Sphere3D(grafito_core::Sphere3DObj::new(center, radius)),
+                        "Sphere3D",
+                        time,
+                    );
+                    self.pending_points_3d.clear();
+                    self.tool_ghost = None;
+                }
+            }
+            Tool::Cube3D => {
+                let p3 = Point3D::new(world.x, world.y, 0.0);
+                self.pending_points_3d.push(p3);
+                if self.pending_points_3d.len() == 2 {
+                    let p1 = self.pending_points_3d[0];
+                    let p2 = self.pending_points_3d[1];
+                    let size = p1.distance(&p2);
+                    self.insert_object_from_tool(
+                        GeoObject::Cube3D(grafito_core::Cube3DObj::new(p1, size)),
+                        "Cube3D",
+                        time,
+                    );
+                    self.pending_points_3d.clear();
+                    self.tool_ghost = None;
+                }
+            }
+            Tool::Tesseract4D | Tool::Hypercube5D => {
+                // Los politopos tipados solo se crean desde `handle_3d_click`.
+                self.tool_ghost = None;
+            }
+            Tool::Attractor => {
+                self.execute_command_and_record("Lorenz[]", time);
+                self.selected_object = None;
+                self.current_tool = Tool::Select;
+            }
+            Tool::Fractal => {
+                self.execute_command_and_record("Mandelbrot[]", time);
+                self.selected_object = None;
+                self.current_tool = Tool::Select;
+            }
+            Tool::Histogram => {
+                self.execute_command_and_record("Histogram[{1,2,3,4,5,6,4,3,2,5,3,4,3}, 5]", time);
+                self.selected_object = None;
+                self.current_tool = Tool::Select;
+            }
+            Tool::ScatterPlot => {
+                self.execute_command_and_record("ScatterPlot[{1,2,3,4,5}, {2,3,5,7,11}]", time);
+                self.selected_object = None;
+                self.current_tool = Tool::Select;
+            }
+            Tool::Tangent => {
+                self.tool_state.pending.push(world);
+                if self.tool_state.pending.len() == 2 {
+                    let p1 = self.tool_state.pending[0];
+                    let p2 = self.tool_state.pending[1];
+                    let cmd = format!(
+                        "Tangent[({:.2}, {:.2}), 1, ({:.2}, {:.2})]",
+                        p1.x, p1.y, p2.x, p2.y
+                    );
+                    self.execute_command_and_record(&cmd, time);
+                    self.tool_state.pending.clear();
+                    self.tool_ghost = None;
+                    self.current_tool = Tool::Select;
+                }
+            }
+            Tool::Perpendicular => {
+                self.tool_state.pending.push(world);
+                if self.tool_state.pending.len() == 2 {
+                    let p1 = self.tool_state.pending[0];
+                    let p2 = self.tool_state.pending[1];
+                    // GeoGebra: perpendicular = punto + recta existentes por etiqueta.
+                    // Solo si no hay ese par, mediatriz honesta de dos puntos libres.
+                    let tol = 10.0 / self.document.view().scale;
+                    let classify = |obj: &GeoObject| {
+                        (
+                            obj.label().to_owned(),
+                            matches!(obj, GeoObject::Point(_)),
+                            matches!(obj, GeoObject::Line(_)),
+                        )
+                    };
+                    let r1 = self
+                        .document
+                        .pick_object(p1, tol)
+                        .and_then(|id| self.document.get_object(id).map(classify));
+                    let r2 = self
+                        .document
+                        .pick_object(p2, tol)
+                        .and_then(|id| self.document.get_object(id).map(classify));
+                    let cmd = perpendicular_command(r1, r2, p1, p2);
+                    self.execute_command_and_record(&cmd, time);
+                    self.tool_state.pending.clear();
+                    self.tool_ghost = None;
+                    self.current_tool = Tool::Select;
+                }
+            }
+            Tool::DomainColoring => {
+                self.execute_command_and_record("DomainColoring[z^2 + 1, -3, 3, -3, 3, 200]", time);
+                self.selected_object = None;
+                self.current_tool = Tool::Select;
+            }
+            Tool::HeatMap => {
+                self.execute_command_and_record("HeatMap[x^2 + y^2, -5, 5, -5, 5, 150]", time);
+                self.selected_object = None;
+                self.current_tool = Tool::Select;
+            }
+            Tool::ComplexGrid => {
+                self.execute_command_and_record("ComplexGrid[sin(z), -3, 3, -3, 3]", time);
+                self.selected_object = None;
+                self.current_tool = Tool::Select;
+            }
+            Tool::Locus
+            | Tool::Midpoint
+            | Tool::Slider
+            | Tool::Button
+            | Tool::Parallel
+            | Tool::Arc
+            | Tool::Sector
+            | Tool::Distance
+            | Tool::Angle
+            | Tool::Area
+            | Tool::Slope
+            | Tool::Image
+            | Tool::Segment
+            | Tool::Ray
+            | Tool::Vector
+            | Tool::Root
+            | Tool::Extremum
+            | Tool::Inflection
+            | Tool::YIntercept
+            | Tool::XIntercept
+            | Tool::Analyze
+            | Tool::Intersect
+            | Tool::RegularPolygon
+            | Tool::ParametricCurve2D
+            | Tool::PolarCurve
+            | Tool::ImplicitCurve
+            | Tool::VectorField2D => {
+                let tool_name = self.current_tool.name();
+                let mut state = self.tool_state.clone();
+                let before = self.document.clone();
+                let mut staged = self.document.detached_clone_for_staging();
+                let result = crate::tool_dispatcher::dispatch_tool(
+                    self.current_tool,
+                    &mut state,
+                    &mut staged,
+                    world,
+                );
+                let outcome = state.last_outcome.take();
+                let inserted = result
+                    .objects
+                    .into_iter()
+                    .map(|object| staged.try_add_object(object))
+                    .collect::<Result<Vec<_>, _>>();
+                self.tool_state = state;
+                if result.reset_tool {
+                    self.current_tool = Tool::Select;
+                }
+                if let Some(msg) = result.message {
+                    self.cas_result = msg;
+                }
+                let command_failed = matches!(
+                    outcome.as_ref(),
+                    Some(grafito_command::commands::CommandOutcome::Error(_))
+                );
+                let insertion_error = match inserted {
+                    Ok(ids) => {
+                        if !command_failed
+                            && crate::app::documents_semantically_differ(&before, &staged)
+                        {
+                            staged.version = before.version.wrapping_add(1);
+                            self.document = staged;
+                            self.save_snapshot(before);
+                            let outputs = ids
+                                .iter()
+                                .filter_map(|id| {
+                                    self.document
+                                        .get_object(*id)
+                                        .map(|object| object.label().to_string())
+                                })
+                                .collect::<Vec<_>>();
+                            for output in outputs {
+                                self.record_construction_step(tool_name, Vec::new(), &output);
+                            }
+                        }
+                        None
+                    }
+                    Err(error) => Some(error),
+                };
+                if let Some(outcome) = outcome {
+                    self.handle_command_outcome(outcome, time, tool_name);
+                }
+                if let Some(error) = insertion_error {
+                    self.handle_command_outcome(
+                        grafito_command::commands::CommandOutcome::Error(error),
+                        time,
+                        tool_name,
+                    );
+                }
+            }
+            Tool::Coincident
+            | Tool::DistanceConstraint
+            | Tool::AngleConstraint
+            | Tool::Horizontal
+            | Tool::Vertical
+            | Tool::EqualLength
+            | Tool::Symmetry
+            | Tool::EllipseByFoci
+            | Tool::ParabolaByFocusDirectrix
+            | Tool::HyperbolaByFoci
+            | Tool::ConicByFivePoints
+            | Tool::PolygonUnion
+            | Tool::PolygonIntersection
+            | Tool::PolygonDifference
+            | Tool::PolygonXor => {
+                // These tools are driven by the pending_action state machine in app.rs.
+            }
+            _ => {}
+        }
+    }
+
+    fn update_tool_ghost(&mut self, world: Point2, painter: &egui::Painter, canvas_rect: Rect) {
+        self.tool_ghost = None;
+        let pts = &self.tool_state.pending;
+        match self.current_tool {
+            Tool::Point | Tool::Point3D => {
+                self.tool_ghost = Some(GeoObject::Point(PointObj::new(world)));
+            }
+            Tool::Line | Tool::Distance | Tool::Perpendicular | Tool::Midpoint => {
+                if let Some(first) = pts.first() {
+                    self.tool_ghost = Some(GeoObject::Line(LineObj::new(*first, world)));
+                }
+            }
+            Tool::Segment => {
+                if let Some(first) = pts.first() {
+                    self.tool_ghost = Some(GeoObject::Line(grafito_core::LineObj::new_with_kind(
+                        *first,
+                        world,
+                        grafito_core::LineKind::Segment,
+                    )));
+                }
+            }
+            Tool::Ray => {
+                if let Some(first) = pts.first() {
+                    self.tool_ghost = Some(GeoObject::Line(grafito_core::LineObj::new_with_kind(
+                        *first,
+                        world,
+                        grafito_core::LineKind::Ray,
+                    )));
+                }
+            }
+            Tool::Vector => {
+                if let Some(first) = pts.first() {
+                    self.tool_ghost = Some(GeoObject::Line(
+                        grafito_core::LineObj::new_with_kind(
+                            *first,
+                            world,
+                            grafito_core::LineKind::Segment,
+                        )
+                        .with_label("v"),
+                    ));
+                }
+            }
+            Tool::Circle | Tool::Tangent => {
+                if let Some(center) = pts.first() {
+                    let radius = center.distance(&world);
+                    self.tool_ghost = Some(GeoObject::Circle(CircleObj::new(*center, radius)));
+                }
+            }
+            Tool::Polygon => {
+                if let Some(last) = pts.last() {
+                    self.tool_ghost = Some(GeoObject::Line(LineObj::new(*last, world)));
+                }
+            }
+            Tool::RegularPolygon => {
+                if let Some(center) = pts.first() {
+                    let radius = center.distance(&world);
+                    let start_angle = (world.y - center.y).atan2(world.x - center.x);
+                    // n paramétrico (variable `n` > memoria sesión > 5), igual que el commit.
+                    let n = crate::tool_dispatcher::resolve_polygon_sides(
+                        &self.tool_state,
+                        &self.document,
+                    );
+                    let verts: Vec<Point2> = (0..n)
+                        .map(|i| {
+                            let angle = start_angle + i as f64 / n as f64 * std::f64::consts::TAU;
+                            Point2::new(
+                                center.x + radius * angle.cos(),
+                                center.y + radius * angle.sin(),
+                            )
+                        })
+                        .collect();
+                    self.tool_ghost = Some(GeoObject::Polygon(PolygonObj::new(verts)));
+                }
+            }
+            Tool::Sphere3D => {
+                if let Some(center) = self.pending_points_3d.first() {
+                    let c2 = Point2::new(center.x, center.y);
+                    let radius = c2.distance(&world);
+                    self.tool_ghost = Some(GeoObject::Circle(CircleObj::new(c2, radius)));
+                    // Draw 2D circle as ghost proxy
+                }
+            }
+            Tool::Cube3D => {
+                self.tool_ghost = Some(GeoObject::Point(PointObj::new(world)));
+            }
+            Tool::Tesseract4D | Tool::Hypercube5D => {
+                // La creación no depende de una posición 2D.
+            }
+            Tool::Angle if pts.len() == 1 => {
+                self.tool_ghost = Some(GeoObject::Line(LineObj::new(pts[0], world)));
+            }
+            Tool::Angle if pts.len() == 2 => {
+                // Show the two lines of the angle
+                self.tool_ghost = Some(GeoObject::Line(LineObj::new(pts[1], world)));
+            }
+            Tool::Area
+            | Tool::Slope
+            | Tool::Root
+            | Tool::Extremum
+            | Tool::Inflection
+            | Tool::YIntercept
+            | Tool::Analyze => {
+                // These tools highlight hovered items via hovered_analysis.
+            }
+            Tool::Slider => {
+                let bar = LineObj::new(
+                    Point2::new(world.x - 1.5, world.y),
+                    Point2::new(world.x + 1.5, world.y),
+                );
+                self.tool_ghost = Some(GeoObject::Line(bar));
+            }
+            Tool::Function => {
+                self.tool_ghost = Some(GeoObject::Function(FunctionObj::new("x^2")));
+            }
+            Tool::ParametricCurve2D => {
+                self.tool_ghost = Some(GeoObject::ParametricCurve2D(ParametricCurve2DObj::new(
+                    "cos(t)",
+                    "sin(t)",
+                    0.0,
+                    std::f64::consts::TAU,
+                )));
+            }
+            Tool::PolarCurve => {
+                self.tool_ghost = Some(GeoObject::PolarCurve(PolarCurveObj::new(
+                    "1 - cos(t)",
+                    0.0,
+                    std::f64::consts::TAU,
+                )));
+            }
+            Tool::ImplicitCurve => {
+                self.tool_ghost = Some(GeoObject::ImplicitCurve(ImplicitCurveObj::new(
+                    "x^2 + y^2",
+                    "4",
+                    RelationOperator::Eq,
+                )));
+            }
+            Tool::VectorField2D => {
+                self.tool_ghost = Some(GeoObject::VectorField2D(VectorField2DObj::new("x", "y")));
+            }
+            Tool::Locus => {
+                if let Some(driver) = self.tool_state.driver {
+                    if let Some(GeoObject::Point(point)) = self.document.get_object(driver) {
+                        self.tool_ghost =
+                            Some(GeoObject::Line(LineObj::new(point.position, world)));
+                    }
+                }
+            }
+            Tool::Eraser => {
+                // El borrador muestra un anillo de tamaño variable según la
+                // tolerancia de selección; no dibuja objetos.
+                self.tool_ghost = None;
+            }
+            _ => {}
+        }
+        // Overlay fantasma tangente/normal: no pisa el ghost propio de la
+        // herramienta activa (se dibuja solo si `tool_ghost` sigue vacío y
+        // el hover está sobre una función).
+        self.update_tangent_normal_ghost(world, painter, canvas_rect);
+    }
+
+    /// Overlay fantasma de tangente + normal al hover sobre una `Function`.
+    ///
+    /// Algoritmo (toda la matemática en `crate::snap`, pura y testeada):
+    /// - `tangent_ghost_at_hover` localiza la función bajo el cursor
+    ///   (distancia vertical ≤ 12 px) y su punto base `(x, f(x))`.
+    /// - `tangent_slope_central` aproxima f'(x) por diferencia central con
+    ///   h = 1e-6 (igual que `intersections.rs::newton`); la curvatura κ sale
+    ///   de `analysis::curvature_at` cuando no hay variables extra.
+    /// - Los segmentos se acotan a ±40 px en unidades de mundo y se pintan
+    ///   con el color de acento translúcido.
+    ///
+    /// No toca `tool_ghost`: si la herramienta activa ya tiene su propio
+    /// fantasma, no se dibuja nada. Al salir del hover no hay función cercana
+    /// y el overlay desaparece solo (se recalcula cada frame, sin estado).
+    fn update_tangent_normal_ghost(
+        &mut self,
+        world: Point2,
+        painter: &egui::Painter,
+        canvas_rect: Rect,
+    ) {
+        if self.tool_ghost.is_some() {
+            return;
+        }
+        let scale = self.document.view().scale;
+        let Some(ghost) = crate::snap::tangent_ghost_at_hover(world, &self.document, scale) else {
+            return;
+        };
+        let view = *self.document.view();
+        let to_screen = |p: Point2| -> Option<egui::Pos2> {
+            if !p.x.is_finite() || !p.y.is_finite() {
+                return None;
+            }
+            let s = view.world_to_screen(p);
+            if !s.is_finite() {
+                return None;
+            }
+            Some(canvas_rect.min + egui::Vec2::new(s.x, s.y))
+        };
+        let (Some(ta), Some(tb), Some(na), Some(nb), Some(base)) = (
+            to_screen(ghost.tangent_a),
+            to_screen(ghost.tangent_b),
+            to_screen(ghost.normal_a),
+            to_screen(ghost.normal_b),
+            to_screen(ghost.base),
+        ) else {
+            return;
+        };
+        // Se oculta al salir del hover: base fuera del lienzo → nada.
+        if !canvas_rect.contains(base) {
+            return;
+        }
+        // Acento translúcido: tangente celeste, normal naranja.
+        let tangent_color = egui::Color32::from_rgba_unmultiplied(56, 189, 248, 150);
+        let normal_color = egui::Color32::from_rgba_unmultiplied(251, 146, 60, 150);
+        painter.line_segment([ta, tb], egui::Stroke::new(1.5, tangent_color));
+        painter.line_segment([na, nb], egui::Stroke::new(1.5, normal_color));
+        painter.circle_filled(base, 2.5, tangent_color);
+        // Etiqueta en español con pendiente y curvatura (se reconstruye cada
+        // frame desde el hover base, así que el sufijo no se acumula; al salir
+        // del hover el fantasma es `None` y la etiqueta vuelve a la base).
+        if let Some(hover) = self.hovered_analysis.as_mut() {
+            if !hover.label.contains("tangente") {
+                hover.label = match ghost.curvature {
+                    Some(k) => {
+                        format!(
+                            "{} · tangente f'≈{:.3}, κ≈{:.3}",
+                            hover.label, ghost.slope, k
+                        )
+                    }
+                    None => format!("{} · tangente f'≈{:.3}", hover.label, ghost.slope),
+                };
+            }
+        }
+    }
+
+    /// Regla de gestos S3: 2 dedos navegan, 1 dedo construye.
+    ///
+    /// Con multitouch activo no nace ningún trazo ni selección nuevos: el
+    /// pinch-zoom vive en su propia rama (`zoom_delta`). Función pura y
+    /// pineada. Límite honesto: un segundo dedo que cae sobre un trazo ya
+    /// en curso no lo cancela (S3b); solo evita nacimientos fantasma.
+    pub(crate) fn gesture_starts_stroke(multi_touch_active: bool) -> bool {
+        !multi_touch_active
+    }
+
+    pub(crate) fn handle_canvas_input(&mut self, ui: &mut egui::Ui, canvas_rect: Rect) {
+        #[cfg(feature = "profile")]
+        puffin::profile_scope!("input_canvas");
+
+        const CLICK_THRESHOLD: f32 = 3.0;
+
+        // Sliders sobre el lienzo: prioridad sobre pan / arrastre / selección.
+        // Si el gesto cae sobre un slider, el resto del input se suprime.
+        if self.handle_canvas_sliders(ui, canvas_rect) {
+            if let Some(pos) = ui.input(|i| i.pointer.latest_pos().or(i.pointer.hover_pos())) {
+                self.last_mouse_pos = Some(pos);
+            }
+            return;
+        }
+
+        // `Sense::click_and_drag()` ya trae `focusable: true` en egui 0.29, así que
+        // el lienzo sí entraba en el orden de tabulación. Lo que faltaba era el
+        // nombre accesible: sin `widget_info` el lienzo se anunciaba como un
+        // nodo sin etiqueta, y el estado "hay un objeto seleccionado" — que es
+        // lo que anuncia qué van a afectar Supr, el Inspector y las flechas —
+        // no se comunicaba de ninguna forma (WCAG 4.1.2).
+        // B-A175: nombre accesible en el idioma activo (antes 2 literales ES).
+        let canvas_locale = self.config_locale();
+        let response = ui.interact(canvas_rect, ui.id().with("canvas"), Sense::click_and_drag());
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Other,
+                true,
+                if self.selected_object.is_some() {
+                    t("ctx.canvas_with_selection", canvas_locale)
+                } else {
+                    t("ctx.canvas_empty", canvas_locale)
+                },
+            )
+        });
+
+        let space_pressed = ui.input(|i| i.key_down(egui::Key::Space));
+        let pointer = ui.input(|i| i.pointer.clone());
+        // S3: 2 dedos navegan (pinch-zoom en su rama); 1 dedo construye.
+        let navigating = ui.input(|i| i.multi_touch().is_some());
+
+        // Current pointer position: prefer interaction point during drag, then hover, then global
+        let current_pos = response
+            .interact_pointer_pos()
+            .or(response.hover_pos())
+            .or(pointer.latest_pos());
+        let pointer_in_canvas = current_pos
+            .map(|p| canvas_rect.contains(p))
+            .unwrap_or(false);
+
+        // ── Long-press táctil: arma la máquina de tiempos (1 dedo quieto
+        // en Select; 2 dedos / Space / otra herramienta resetean). El
+        // disparo va abajo, junto a los clics, donde hay `world_at_pointer`.
+        let long_press_key = egui::Id::new(CANVAS_LONG_PRESS_KEY);
+        let mut long_press: LongPressTracker = ui
+            .ctx()
+            .memory(|mem| mem.data.get_temp(long_press_key).unwrap_or_default());
+        let now_secs = ui.ctx().input(|i| i.time);
+        // P0 long-press: el release resetea el tracker (`note_frame(false)`)
+        // en ESTE frame, y `clicked_by(Primary)` también es de este frame.
+        // Sin esta captura, el click de soltado tras un long-press se
+        // colaría como tap (re-pick + scripts). Se captura ANTES del reset.
+        let long_press_was_fired = long_press.menu_open();
+        long_press.note_frame(
+            pointer.button_down(PointerButton::Primary)
+                && pointer_in_canvas
+                && !space_pressed
+                && !navigating
+                && self.current_tool == Tool::Select,
+            now_secs,
+            current_pos,
+        );
+        ui.ctx()
+            .memory_mut(|mem| mem.data.insert_temp(long_press_key, long_press));
+        // Menú ya abierto por este apoyo (frame anterior): el pan primario
+        // no mueve la vista detrás del popup.
+        let long_press_menu_open = long_press.menu_open();
+        if long_press.awaiting(now_secs) {
+            // Sin movimiento egui no repinta: pedir frame para que el hold
+            // de ~500 ms avance y dispare a tiempo.
+            ui.ctx().request_repaint();
+        }
+
+        // El trazo de contorno muere si la herramienta cambió (Esc, panel, …):
+        // nunca queda un lazo a medio dibujar colgado del estado.
+        if self.current_tool != Tool::ComplexContour && self.complex_contour.live.is_some() {
+            self.complex_contour.live = None;
+            self.complex_contour.snap_marker = None;
+        }
+
+        // ── Drag lifecycle: start / distance / stop ──────────────────────────
+        // S3: navegando con 2 dedos no nace trazo ni selección (el pinch
+        // sigue vivo en su rama `zoom_delta`).
+        if response.drag_started() && Self::gesture_starts_stroke(navigating) {
+            #[cfg(feature = "profile")]
+            puffin::profile_scope!("input_drag_start");
+            self.canvas_drag_start = current_pos;
+            self.canvas_is_panning = false;
+            self.point_drag_has_mutated = false;
+            self.eraser_stroke_has_mutated = false;
+            if self.current_tool == Tool::Eraser {
+                self.tool_state.last_erased = None;
+            }
+            self.point_drag_error_reported = false;
+            self.select_drag_object = None;
+            self.is_view_changing = true;
+            self.last_interaction_time = Instant::now();
+            self.document.render_quality = RenderQuality::Preview;
+
+            if self.current_tool == Tool::Select
+                && response.drag_started_by(PointerButton::Primary)
+                && !space_pressed
+            {
+                if let Some(pos) = current_pos {
+                    let local = pos - canvas_rect.min;
+                    let world = self
+                        .document
+                        .view()
+                        .screen_to_world(GlamVec2::new(local.x, local.y));
+                    let tolerance = 10.0 / self.document.view().scale;
+                    self.select_drag_object = crate::app::captured_select_drag_object(
+                        &mut self.document,
+                        world,
+                        tolerance,
+                    );
+                    if let Some(id) = self.select_drag_object {
+                        self.document.clear_selection();
+                        self.document.select(id);
+                        self.selected_object = Some(id);
+                        // El gesto puede mutar el objeto con el draft del
+                        // Inspector abierto: rebasea (`editing = false`) para
+                        // que el panel re-sincronice y jamás aplique sobre
+                        // rancio (gana-último-escritor).
+                        ui.ctx().memory_mut(|mem| {
+                            let key = egui::Id::new(("inspector_equation", id));
+                            if let Some(mut eq) = mem
+                                .data
+                                .get_temp::<crate::inspector_edit::InspectorEditState>(key)
+                            {
+                                if eq.editing {
+                                    eq.editing = false;
+                                    mem.data.insert_temp(key, eq);
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+
+            // Inicio de Pencil: crear el PencilObj directamente en el
+            // documento con el primer punto. De este modo el usuario ve
+            // el trazo en tiempo real sin "ghost": cada tick del drag
+            // añade un punto al PencilObj existente. Sin Space (que panea).
+            // Solo creamos si no hay ya un PencilObj en curso (caso
+            // touch/stylus que ya creó uno con `button_down`).
+            if self.current_tool == Tool::Pencil
+                && response.drag_started_by(PointerButton::Primary)
+                && !space_pressed
+                && self.tool_state.drawing_pencil.is_none()
+            {
+                if let Some(pos) = current_pos {
+                    let local = pos - canvas_rect.min;
+                    let world = self
+                        .document
+                        .view()
+                        .screen_to_world(GlamVec2::new(local.x, local.y));
+                    let mut pencil = PencilObj::new(vec![world]);
+                    pencil.color = self.color_favorites[0];
+                    pencil.width = 2.0;
+                    let id = self.insert_object_from_tool(
+                        GeoObject::Pencil(pencil),
+                        "Pencil",
+                        ui.ctx().input(|input| input.time),
+                    );
+                    self.tool_state.drawing_pencil = id;
+                }
+            }
+        }
+
+        // Inicio del contorno complejo: mismo ciclo de drag que el lápiz, pero
+        // el trazo vive en el estado del contorno (overlay + valor en vivo) y
+        // recién se persiste al soltar.
+        if self.current_tool == Tool::ComplexContour
+            && response.drag_started_by(PointerButton::Primary)
+            && !space_pressed
+        {
+            if let Some(pos) = current_pos {
+                let shift = ui.input(|i| i.modifiers.shift);
+                self.begin_complex_contour_at(pos, canvas_rect, shift);
+            }
+        }
+
+        // ── Compatibilidad con tabletas gráficas (stylus) ────────────────
+        // Las tabletas y pantallas táctiles emiten presión desde el primer
+        // frame, sin movimiento significativo, por lo que egui no marca
+        // `drag_started`/`dragged_by` con la suficiente rapidez. Para que
+        // el Pencil funcione con stylus, detectamos el botón presionado
+        // directamente con `pointer.button_down(...)` y creamos el
+        // PencilObj en el frame actual. Space anula el comportamiento
+        // (pan universal). Solo Primary, Secondary y Middle disparan el
+        // Pencil para que la goma lateral del stylus (Secondary) también
+        // dibuje.
+        if !space_pressed
+            && pointer_in_canvas
+            && (pointer.button_down(PointerButton::Primary)
+                || pointer.button_down(PointerButton::Secondary)
+                || pointer.button_down(PointerButton::Middle))
+            && self.tool_state.drawing_pencil.is_none()
+            && self.current_tool == Tool::Pencil
+        {
+            if let Some(pos) = current_pos {
+                let local = pos - canvas_rect.min;
+                let world = self
+                    .document
+                    .view()
+                    .screen_to_world(GlamVec2::new(local.x, local.y));
+                let mut pencil = PencilObj::new(vec![world]);
+                pencil.color = self.color_favorites[0];
+                pencil.width = 2.0;
+                let id = self.insert_object_from_tool(
+                    GeoObject::Pencil(pencil),
+                    "Pencil",
+                    ui.ctx().input(|input| input.time),
+                );
+                self.tool_state.drawing_pencil = id;
+                self.is_view_changing = true;
+            }
+        }
+
+        // Stylus: el contorno también arranca con `button_down` directo.
+        if !space_pressed
+            && pointer_in_canvas
+            && (pointer.button_down(PointerButton::Primary)
+                || pointer.button_down(PointerButton::Secondary)
+                || pointer.button_down(PointerButton::Middle))
+            && self.current_tool == Tool::ComplexContour
+            && self.complex_contour.live.is_none()
+        {
+            if let Some(pos) = current_pos {
+                let shift = ui.input(|i| i.modifiers.shift);
+                self.begin_complex_contour_at(pos, canvas_rect, shift);
+                self.is_view_changing = true;
+            }
+        }
+
+        let drag_distance = self
+            .canvas_drag_start
+            .and_then(|s| current_pos.map(|p| (p - s).length()))
+            .unwrap_or(0.0);
+        let became_drag = drag_distance > CLICK_THRESHOLD;
+        if became_drag {
+            self.canvas_is_panning = true;
+        }
+
+        // Compute world position at pointer for tools / hover
+        let world_at_pointer = current_pos.map(|pos| {
+            let local = pos - canvas_rect.min;
+            self.document
+                .view()
+                .screen_to_world(GlamVec2::new(local.x, local.y))
+        });
+
+        // ── Determine panning ────────────────────────────────────────────────
+        let mut panning = false;
+        let mut pan_delta = Vec2::ZERO;
+
+        // Right-click is reserved for polygon closing / cancel when a polygon is in progress.
+        // Si la herramienta es Pencil o Eraser, **bloqueamos el pan con
+        // Middle/Secondary** porque el botón lateral del stylus suele
+        // emitir Secondary y queremos que sirva para borrar/dibujar, no
+        // para mover la vista. Con Space+Primary sigue siendo pan.
+        let drawing_tool = matches!(self.current_tool, Tool::Pencil | Tool::Eraser);
+        let can_pan_with_right =
+            self.current_tool != Tool::Polygon || self.tool_state.pending.is_empty();
+        let pan_button_pressed = !drawing_tool
+            && pointer_in_canvas
+            && (pointer.button_down(PointerButton::Middle)
+                || (pointer.button_down(PointerButton::Secondary) && can_pan_with_right));
+
+        // 1. Space + primary drag: universal pan
+        if space_pressed && response.dragged_by(PointerButton::Primary) {
+            panning = true;
+            pan_delta = response.drag_delta();
+        }
+        // 2. Middle/right button drag: universal pan (direct pointer reading).
+        //    Bloqueado durante Pencil/Eraser (ver `pan_button_pressed`).
+        else if pan_button_pressed {
+            let delta = pointer.delta();
+            if delta != Vec2::ZERO {
+                panning = true;
+                pan_delta = delta;
+            }
+        }
+        // 3. Primary drag: pan unless we are moving a free point in Select mode
+        //    o dibujando con Pencil/Eraser (donde el arrastre primario es
+        //    para acumular puntos del trazo o borrar, no para mover la
+        //    vista). Con el menú de long-press abierto el pan primario
+        //    tampoco mueve (no panea detrás del popup).
+        else if response.dragged_by(PointerButton::Primary) {
+            let moving_point = self.current_tool == Tool::Select
+                && self
+                    .select_drag_object
+                    .map(|id| crate::app::is_free_point(&self.document, id))
+                    .unwrap_or(false);
+            let drawing = drawing_tool;
+            if !moving_point && !drawing && !long_press_menu_open {
+                panning = true;
+                pan_delta = response.drag_delta();
+            }
+        }
+
+        // Apply pan
+        if panning && pan_delta != Vec2::ZERO {
+            #[cfg(feature = "profile")]
+            puffin::profile_scope!("input_pan");
+            self.is_view_changing = true;
+            self.last_interaction_time = Instant::now();
+            self.document.render_quality = RenderQuality::Preview;
+            self.document
+                .view_mut()
+                .pan(GlamVec2::new(pan_delta.x, pan_delta.y));
+        }
+
+        // ── Pencil: añadir puntos al PencilObj vivo durante el drag ───────
+        // Pencil no usa pan durante el arrastre. Modificamos el PencilObj
+        // directamente en el documento para que se vea en tiempo real.
+        // Aceptamos Primary, Secondary y Middle como botones de dibujo
+        // para máxima compatibilidad con stylus (botón lateral del
+        // lápiz óptico).
+        if !panning
+            && self.current_tool == Tool::Pencil
+            && (pointer.button_down(PointerButton::Primary)
+                || pointer.button_down(PointerButton::Secondary)
+                || pointer.button_down(PointerButton::Middle))
+        {
+            if let (Some(pencil_id), Some(pos)) = (self.tool_state.drawing_pencil, current_pos) {
+                let local = pos - canvas_rect.min;
+                let world = self
+                    .document
+                    .view()
+                    .screen_to_world(GlamVec2::new(local.x, local.y));
+                // Throttling: solo añadimos un punto si está al menos a
+                // `min_step` unidades del último (en coords del mundo).
+                let min_step = 0.01 / self.document.view().scale.max(1e-3);
+                if let Some(GeoObject::Pencil(p)) = self.document.get_object_mut_touch(pencil_id) {
+                    let should_push = p
+                        .points
+                        .last()
+                        .map(|last| last.distance(&world) >= min_step)
+                        .unwrap_or(true);
+                    if should_push {
+                        p.push(world);
+                    }
+                }
+                // Forzamos repintado para que el PencilObj actualizado se vea.
+                self.is_view_changing = true;
+            }
+        }
+
+        // ── Contorno complejo: capturar muestras durante el drag ──────────
+        if !panning
+            && self.current_tool == Tool::ComplexContour
+            && (pointer.button_down(PointerButton::Primary)
+                || pointer.button_down(PointerButton::Secondary)
+                || pointer.button_down(PointerButton::Middle))
+        {
+            if let Some(pos) = current_pos {
+                let shift = ui.input(|i| i.modifiers.shift);
+                self.extend_complex_contour_at(pos, canvas_rect, shift);
+                self.is_view_changing = true;
+            }
+        }
+
+        // ── Eraser: borrar el objeto bajo el cursor durante el arrastre ─────
+        // Igual que Pencil, no debe paneo con arrastre primario. Borra cada
+        // objeto que esté dentro de la tolerancia en cada tick del drag.
+        // Aceptamos cualquier botón de dibujo (compatibilidad con stylus).
+        if !panning
+            && self.current_tool == Tool::Eraser
+            && (pointer.button_down(PointerButton::Primary)
+                || pointer.button_down(PointerButton::Secondary)
+                || pointer.button_down(PointerButton::Middle))
+        {
+            if let Some(pos) = current_pos {
+                let local = pos - canvas_rect.min;
+                let world = self
+                    .document
+                    .view()
+                    .screen_to_world(GlamVec2::new(local.x, local.y));
+                let tolerance = 10.0 / self.document.view().scale;
+                if let Some(id) = self.document.pick_object(world, tolerance) {
+                    if self.tool_state.last_erased != Some(id)
+                        && crate::app::erase_object_for_stroke(
+                            &mut self.document,
+                            id,
+                            &mut self.eraser_stroke_has_mutated,
+                            &mut self.undo_stack,
+                            &mut self.redo_stack,
+                        )
+                    {
+                        if self.selected_object == Some(id) {
+                            self.selected_object = None;
+                        }
+                        self.tool_state.last_erased = Some(id);
+                    }
+                }
+                self.is_view_changing = true;
+            }
+        }
+
+        // ── Move free point in Select mode (primary drag, not panning) ───────
+        if !panning
+            && self.current_tool == Tool::Select
+            && response.dragged_by(PointerButton::Primary)
+        {
+            if let (Some(sel_id), Some(pos)) = (self.select_drag_object, current_pos) {
+                // Frente P4: `SetFixed` bloquea el arrastre (una sola línea de gate, sin cambiar firmas).
+                if self.document.is_free_object(&sel_id)
+                    && !grafito_command::ggbscript::is_locked(
+                        &self.document.display_flags,
+                        self.document
+                            .get_object(sel_id)
+                            .map(|o| o.label())
+                            .unwrap_or_default(),
+                    )
+                {
+                    let local = pos - canvas_rect.min;
+                    let mut world = self
+                        .document
+                        .view()
+                        .screen_to_world(GlamVec2::new(local.x, local.y));
+                    if self.snap_to_grid {
+                        world = snap_world_to_grid(world, self.document.view().scale);
+                    }
+                    let before = crate::app::capture_point_drag_snapshot(
+                        &self.document,
+                        sel_id,
+                        world,
+                        self.point_drag_has_mutated,
+                    );
+                    let version_before = self.document.version;
+                    match self.document.try_move_point_and_re_evaluate(sel_id, world) {
+                        Ok(true) => {
+                            if let Some(before) = before {
+                                self.save_snapshot(before);
+                            }
+                            self.point_drag_has_mutated = true;
+                            crate::app::refresh_direct_document_change(
+                                &mut self.document,
+                                version_before,
+                            );
+                        }
+                        Ok(false) => {}
+                        Err(error) if !self.point_drag_error_reported => {
+                            self.point_drag_error_reported = true;
+                            self.handle_command_outcome(
+                                grafito_command::commands::CommandOutcome::Error(error),
+                                ui.ctx().input(|input| input.time),
+                                "Mover punto",
+                            );
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
+        }
+
+        // ── Cursor feedback ──────────────────────────────────────────────────
+        // Flag de hover sobre slider (lo publica `handle_canvas_sliders` en
+        // memoria temporal egui para no añadir campos a `GrafitoApp`).
+        let slider_hovered = ui.ctx().memory(|mem| {
+            mem.data
+                .get_temp::<bool>(egui::Id::new(CANVAS_SLIDER_HOVER_KEY))
+                .unwrap_or(false)
+        });
+        if panning {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        } else if (space_pressed && pointer_in_canvas) || slider_hovered {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+        } else if self.current_tool == Tool::Select && response.hover_pos().is_some() {
+            if let Some(world) = world_at_pointer {
+                let tolerance = 10.0 / self.document.view().scale;
+                // El pick (hash O(V) + scan de candidatos) corría cada frame
+                // con el cursor quieto. Con posición/tolerancia/versión
+                // quietas se reutiliza: el mouse parado no re-pickea.
+                let key = (
+                    (world.x.to_bits(), world.y.to_bits()),
+                    self.document.version,
+                    tolerance.to_bits(),
+                );
+                let hit = match self.hover_pick_cache {
+                    Some((k, r)) if k == key => r,
+                    _ => {
+                        let r = self.document.pick_object(world, tolerance);
+                        self.hover_pick_cache = Some((key, r));
+                        r
+                    }
+                };
+                if hit.is_some() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                }
+            }
+        } else {
+            ui.ctx().set_cursor_icon(self.current_tool.cursor_icon());
+        }
+
+        // ── Hover Analytics (Dynamic Inspector) ───────────────────────────────
+        if !panning
+            && !self.is_view_changing
+            && response.hover_pos().is_some()
+            && !response.dragged()
+            && self.current_view != crate::ViewMode::D3
+        {
+            if let Some(world) = world_at_pointer {
+                let pixel_tolerance = 15.0 / self.document.view().scale;
+
+                // A very short debounce (30ms) ensures 30fps for analysis while the app runs at 60fps+.
+                // Or we can just run it if the mouse stopped moving.
+                // Let's implement a spatial + temporal debounce
+                let dist_moved = if let Some(last) = self.hover_candidate_pos {
+                    world.distance(&last) * self.document.view().scale // pixels
+                } else {
+                    100.0
+                };
+
+                if dist_moved > 5.0 {
+                    self.hover_candidate_pos = Some(world);
+                    self.hover_candidate_time = 0.0;
+                    // Reset hovered_analysis so we don't show old ghosts while moving fast
+                    self.hovered_analysis = None;
+                } else {
+                    // Debounce temporal (~30fps): el cursor quieto no debe
+                    // re-correr el análisis (snap + picks) en cada frame.
+                    let now = ui.ctx().input(|input| input.time);
+                    if now - self.hover_candidate_time >= HOVER_ANALYSIS_INTERVAL_SECS {
+                        self.hover_candidate_time = now;
+                        self.update_hover_analysis(world, pixel_tolerance);
+                    }
+                }
+            }
+        } else {
+            self.hovered_analysis = None;
+            self.hover_candidate_pos = None;
+            self.hover_cached_analysis = None;
+        }
+
+        // ── Clicks (ignore if this was a pan gesture) ────────────────────────
+        let is_click = !self.canvas_is_panning && drag_distance <= CLICK_THRESHOLD;
+
+        // ── Long-press táctil (~500 ms, 1 dedo quieto <10 px): abre el MISMO
+        // popup que el clic derecho (reusa `draw_object_context_menu`, sin
+        // duplicar acciones). Solo con 1 dedo quieto: moverse cancela (el
+        // pan sigue intacto) y 2 dedos resetean arriba (`navigating`).
+        if long_press.fire_due(now_secs) {
+            if let Some(world) = world_at_pointer {
+                let tolerance = 10.0 / self.document.view().scale;
+                if let Some(id) = self.document.pick_object(world, tolerance) {
+                    self.document.clear_selection();
+                    self.document.select(id);
+                    self.selected_object = Some(id);
+                    response.context_menu(|ui| {
+                        self.draw_object_context_menu(ui, id);
+                    });
+                }
+            }
+            // Se consuma haya o no objeto: no re-dispara ni re-pickea cada
+            // frame hasta soltar, y el click de soltado se suprime abajo.
+            long_press.mark_fired();
+            ui.ctx()
+                .memory_mut(|mem| mem.data.insert_temp(long_press_key, long_press));
+        }
+        // Suprime también el click del frame-release: el tracker ya se
+        // reseteó arriba (`was_fired`), pero el `clicked_by` es de este frame.
+        let long_press_suppress_click = long_press.menu_open() || long_press_was_fired;
+
+        // S3: el tap que cierra un pinch no crea objetos.
+        if response.clicked_by(PointerButton::Primary)
+            && is_click
+            && !long_press_suppress_click
+            && Self::gesture_starts_stroke(navigating)
+        {
+            #[cfg(feature = "profile")]
+            puffin::profile_scope!("input_click");
+            if let Some(mut world) = world_at_pointer {
+                // Ensure instant snap calculation on click to avoid missing snaps due to hover debounce
+                use grafito_geometry::analysis::AnalysisFeature;
+                let tool_filter = match self.current_tool {
+                    grafito_ui::Tool::Root => {
+                        Some(vec![AnalysisFeature::Root, AnalysisFeature::XIntercept])
+                    }
+                    grafito_ui::Tool::Extremum => Some(vec![
+                        AnalysisFeature::LocalMaximum,
+                        AnalysisFeature::LocalMinimum,
+                    ]),
+                    grafito_ui::Tool::Inflection => Some(vec![AnalysisFeature::Inflection]),
+                    grafito_ui::Tool::YIntercept => Some(vec![AnalysisFeature::YIntercept]),
+                    grafito_ui::Tool::XIntercept => Some(vec![AnalysisFeature::XIntercept]),
+                    _ => None,
+                };
+                let snap = crate::snap::snap_point(
+                    world,
+                    &self.document,
+                    self.document.view().scale,
+                    &self.snap_config,
+                    crate::snap::SnapOverrides::default(),
+                    tool_filter,
+                );
+
+                if snap.kind != crate::snap::SnapKind::Free {
+                    world = snap.point;
+                } else if self.snap_to_grid {
+                    world = snap_world_to_grid(world, self.document.view().scale);
+                }
+                self.handle_canvas_primary_click(world, ui.ctx().input(|i| i.time));
+            }
+        }
+
+        // Right-click: close polygon / cancel pending point (only if not a pan)
+        if response.clicked_by(PointerButton::Secondary) && is_click {
+            if !matches!(self.pending_action, PendingAction::None) {
+                self.clear_pending_action();
+                self.current_tool = Tool::Select;
+                return;
+            }
+            if self.current_tool == Tool::Locus && self.tool_state.driver.is_some() {
+                cancel_locus_selection(&mut self.tool_state);
+                self.tool_ghost = None;
+            } else if self.current_tool == Tool::Polygon && self.tool_state.pending.len() >= 3 {
+                let vertices = self.tool_state.pending.clone();
+                self.insert_object_from_tool(
+                    GeoObject::Polygon(PolygonObj::new(vertices)),
+                    "Polygon",
+                    ui.ctx().input(|input| input.time),
+                );
+                self.tool_state.pending.clear();
+                self.tool_ghost = None;
+            } else if !self.tool_state.pending.is_empty() {
+                // Cancel single pending point (Line/Circle first point)
+                self.tool_state.pending.clear();
+                self.tool_ghost = None;
+            } else {
+                // Ola 1.2: clic derecho sin pendiente sobre un objeto abre el
+                // menú contextual (GeoGebra). Selecciona sin disparar OnClick.
+                if let Some(world) = world_at_pointer {
+                    let tolerance = 10.0 / self.document.view().scale;
+                    if let Some(id) = self.document.pick_object(world, tolerance) {
+                        self.document.clear_selection();
+                        self.document.select(id);
+                        self.selected_object = Some(id);
+                        response.context_menu(|ui| {
+                            self.draw_object_context_menu(ui, id);
+                        });
+                    }
+                }
+            }
+        }
+
+        // ── Zoom with scroll wheel ───────────────────────────────────────────
+        if response.hovered() {
+            let scroll = ui.input(|i| i.smooth_scroll_delta);
+            if scroll.y != 0.0 {
+                #[cfg(feature = "profile")]
+                puffin::profile_scope!("input_zoom");
+                let factor = if scroll.y > 0.0 {
+                    1.0 + scroll.y.abs() * 0.001
+                } else {
+                    1.0 / (1.0 + scroll.y.abs() * 0.001)
+                };
+                if let Some(pos) = response.hover_pos() {
+                    let local = pos - canvas_rect.min;
+                    self.zoom_stepped_view(factor, GlamVec2::new(local.x, local.y));
+                }
+            }
+            // ── Ola 0.6: pinch-zoom táctil (zoom_delta de egui; la rueda
+            // física sigue arriba). Sin hover no hay centro: usa el canvas.
+            let pinch = ui.input(|i| i.zoom_delta());
+            if (pinch - 1.0).abs() > f32::EPSILON {
+                let center = response
+                    .hover_pos()
+                    .map(|pos| pos - canvas_rect.min)
+                    .unwrap_or(egui::Vec2::new(
+                        canvas_rect.width() / 2.0,
+                        canvas_rect.height() / 2.0,
+                    ));
+                self.zoom_stepped_view(pinch, GlamVec2::new(center.x, center.y));
+            }
+        }
+
+        // ── Tool ghost preview ───────────────────────────────────────────────
+        if let Some(mut world) = world_at_pointer {
+            if let Some(hover) = &self.hovered_analysis {
+                if hover.is_snap {
+                    world = hover.point;
+                } else if self.snap_to_grid {
+                    world = snap_world_to_grid(world, self.document.view().scale);
+                }
+            } else if self.snap_to_grid {
+                world = snap_world_to_grid(world, self.document.view().scale);
+            }
+            // El overlay tangente/normal pinta con acento translúcido sobre
+            // el lienzo; el pintor se recorta al canvas para no invadir paneles.
+            let overlay_painter = ui.painter().with_clip_rect(canvas_rect);
+            self.update_tool_ghost(world, &overlay_painter, canvas_rect);
+
+            // Overlay del contorno vivo: trazo + imán + chip con el valor.
+            if self.current_tool == Tool::ComplexContour {
+                if let Some(live) = self.complex_contour.live.as_ref() {
+                    let theme = grafito_ui::theme::current_theme(ui.ctx());
+                    crate::complex_contour::draw_overlay(
+                        &overlay_painter,
+                        canvas_rect,
+                        self.document.view(),
+                        live,
+                        &self.complex_contour.settings,
+                        self.complex_contour.snap_marker.as_ref(),
+                        theme,
+                    );
+                }
+            }
+        }
+
+        // ── Cleanup drag state ───────────────────────────────────────────────
+        if response.drag_stopped() {
+            // Finalizar Pencil: el PencilObj ya está en el documento y
+            // actualizado en cada tick del drag. Si solo tiene 1 punto
+            // (clic simple sin arrastrar), lo eliminamos — no es un trazo
+            // válido. El undo ya se guardó al inicio del drag con
+            // `save_state`, así que un solo Ctrl+Z deshará el trazo entero.
+            if self.current_tool == Tool::Pencil {
+                if let Some(id) = self.tool_state.drawing_pencil.take() {
+                    let too_short = self
+                        .document
+                        .get_object(id)
+                        .map(|obj| {
+                            if let GeoObject::Pencil(p) = obj {
+                                p.points.len() < 2
+                            } else {
+                                true
+                            }
+                        })
+                        .unwrap_or(true);
+                    if too_short {
+                        self.document.remove_object(id);
+                    }
+                }
+            }
+            if self.current_tool == Tool::ComplexContour {
+                self.finish_complex_contour();
+                self.complex_contour.snap_marker = None;
+            }
+            self.canvas_is_panning = false;
+            self.canvas_drag_start = None;
+            self.point_drag_has_mutated = false;
+            self.select_drag_object = None;
+            self.point_drag_error_reported = false;
+            self.eraser_stroke_has_mutated = false;
+        }
+
+        // ── Finalizar Pencil/Eraser cuando se suelta el botón (caso touch
+        // y stylus): si ninguno de los botones de dibujo está presionado,
+        // terminamos el trazo del mismo modo que `drag_stopped`. Esto
+        // cubre el caso en que el driver de la tableta emite `button_down`
+        // durante varios frames sin notificar `drag_stopped`.
+        let any_draw_button = pointer.button_down(PointerButton::Primary)
+            || pointer.button_down(PointerButton::Secondary)
+            || pointer.button_down(PointerButton::Middle);
+        if !any_draw_button {
+            if let Some(id) = self.tool_state.drawing_pencil.take() {
+                let too_short = self
+                    .document
+                    .get_object(id)
+                    .map(|obj| {
+                        if let GeoObject::Pencil(p) = obj {
+                            p.points.len() < 2
+                        } else {
+                            true
+                        }
+                    })
+                    .unwrap_or(true);
+                if too_short {
+                    self.document.remove_object(id);
+                }
+            }
+            if self.current_tool == Tool::ComplexContour {
+                self.finish_complex_contour();
+                self.complex_contour.snap_marker = None;
+            }
+            // Eraser: al soltar el botón, limpiamos `last_erased` para
+            // permitir borrar el mismo objeto en un trazo posterior.
+            self.tool_state.last_erased = None;
+            self.eraser_stroke_has_mutated = false;
+        }
+
+        // Keep last known position for external consumers (status bar, etc.)
+        if let Some(pos) = current_pos {
+            self.last_mouse_pos = Some(pos);
+        }
+    }
+
+    fn update_hover_analysis(&mut self, world: Point2, pixel_tolerance: f64) {
+        use crate::snap::{snap_point, SnapOverrides};
+        use grafito_core::analyzable::evaluate_curve_at;
+
+        use grafito_geometry::analysis::AnalysisFeature;
+        let tool_filter = match self.current_tool {
+            grafito_ui::Tool::Root => {
+                Some(vec![AnalysisFeature::Root, AnalysisFeature::XIntercept])
+            }
+            grafito_ui::Tool::Extremum => Some(vec![
+                AnalysisFeature::LocalMaximum,
+                AnalysisFeature::LocalMinimum,
+            ]),
+            grafito_ui::Tool::Inflection => Some(vec![AnalysisFeature::Inflection]),
+            grafito_ui::Tool::YIntercept => Some(vec![AnalysisFeature::YIntercept]),
+            grafito_ui::Tool::XIntercept => Some(vec![AnalysisFeature::XIntercept]),
+            _ => None,
+        };
+
+        // 1) Snap jerárquico: característica > curva > objeto > eje > cuadrícula.
+        let snap = snap_point(
+            world,
+            &self.document,
+            self.document.view().scale,
+            &self.snap_config,
+            SnapOverrides::default(),
+            tool_filter,
+        );
+        match snap.kind {
+            crate::snap::SnapKind::Free => {
+                // Sin snap: medir la distancia a la curva del primer objeto bajo
+                // el cursor, si está cerca.
+                // Ola 2: se presta `&variables` una vez fuera del loop en vez
+                // de `variables.clone()` por objeto bajo el cursor (drag/hover
+                // por frame). El bloque acota el préstamo inmutable para poder
+                // asignar `hovered_analysis` después (mismo valor en ambas
+                // ramas: el `handled` original solo elegía cuándo salir).
+                let _hit_curve = {
+                    let vars = self.document.variables();
+                    let mut hit = false;
+                    for (_, obj) in self.document.objects_iter() {
+                        if !obj.is_visible() {
+                            continue;
+                        }
+                        if let Some(y_curve) = evaluate_curve_at(obj, world, vars) {
+                            let y_match = match obj {
+                                GeoObject::Function(_) => {
+                                    (y_curve - world.y).abs() <= pixel_tolerance
+                                }
+                                _ => y_curve.abs() <= pixel_tolerance,
+                            };
+                            if y_match {
+                                hit = true;
+                                break;
+                            }
+                        }
+                    }
+                    hit
+                };
+                self.hovered_analysis = Some(crate::app::HoveredAnalysis {
+                    point: world,
+                    label: format!("({:.2}, {:.2})", world.x, world.y),
+                    is_snap: false,
+                    feature: None,
+                    snap_kind: Some(snap.kind),
+                });
+            }
+            _ => {
+                let is_snap = matches!(
+                    snap.kind,
+                    crate::snap::SnapKind::Feature | crate::snap::SnapKind::Axis
+                );
+                self.hovered_analysis = Some(crate::app::HoveredAnalysis {
+                    point: snap.point,
+                    label: snap.label.clone(),
+                    is_snap,
+                    feature: snap.feature,
+                    snap_kind: Some(snap.kind),
+                });
+            }
+        }
+
+        // 2) Objetos geométricos simples: medidas al hover (longitud de
+        // segmento, radio, conteo de vértices) — solo si el snap no produjo
+        // un resultado más específico.
+        if matches!(
+            self.hovered_analysis,
+            None | Some(crate::app::HoveredAnalysis {
+                snap_kind: None | Some(crate::snap::SnapKind::Free),
+                ..
+            })
+        ) {
+            for (_, obj) in self.document.objects_iter() {
+                let label = match obj {
+                    GeoObject::Point(p) if p.position.distance(&world) <= pixel_tolerance => {
+                        Some(format!("Punto: ({:.2}, {:.2})", p.position.x, p.position.y))
+                    }
+                    GeoObject::Line(l) => {
+                        let d = point_to_line_distance(world, l.start, l.end);
+                        if d <= pixel_tolerance {
+                            let len = l.start.distance(&l.end);
+                            Some(format!("Longitud: {:.2}", len))
+                        } else {
+                            None
+                        }
+                    }
+                    GeoObject::Circle(c) => {
+                        let d = world.distance(&c.center);
+                        if (d - c.radius).abs() <= pixel_tolerance {
+                            Some(format!("Radio: {:.2}", c.radius))
+                        } else {
+                            None
+                        }
+                    }
+                    GeoObject::Polygon(poly) if poly.vertices.len() >= 3 => {
+                        if point_inside_polygon(world, &poly.vertices) {
+                            Some(format!("Vértices: {}", poly.vertices.len()))
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(text) = label {
+                    self.hovered_analysis = Some(crate::app::HoveredAnalysis {
+                        point: world,
+                        label: text,
+                        is_snap: false,
+                        feature: None,
+                        snap_kind: Some(crate::snap::SnapKind::Object),
+                    });
+                    return;
+                }
+            }
+        }
+        let _ = pixel_tolerance;
+    }
+
+    /// Ola 1.2: menú contextual 2D sobre un objeto (clic derecho, GeoGebra).
+    /// Todo pasa por comandos reales (`execute_command_and_record`): undo,
+    /// outcome y construction-log incluidos. Renombrar deja la plantilla en
+    /// la entrada y le da foco; Propiedades selecciona y abre el inspector.
+    pub(crate) fn draw_object_context_menu(
+        &mut self,
+        ui: &mut egui::Ui,
+        id: grafito_core::ObjectId,
+    ) {
+        let (label, visible) = match self.document.get_object(id) {
+            Some(object) => (object.label().to_string(), object.is_visible()),
+            None => return,
+        };
+        let time = ui.ctx().input(|input| input.time);
+        // B-A145: chrome del menú en el idioma activo (antes 6 literales ES).
+        let ctx_locale = self.config_locale();
+        if ui.button(t("ctx.rename", ctx_locale)).clicked() {
+            self.input_text = format!("Rename[{label}, ]");
+            self.command_input_focus_requested = true;
+            ui.close_menu();
+        }
+        if ui.button(t("ctx.copy", ctx_locale)).clicked() {
+            self.execute_command_and_record(&format!("CopyFreeObject[{label}]"), time);
+            ui.close_menu();
+        }
+        if visible {
+            if ui.button(t("ctx.hide", ctx_locale)).clicked() {
+                self.execute_command_and_record(&format!("Hide[{label}]"), time);
+                ui.close_menu();
+            }
+        } else if ui.button(t("ctx.show", ctx_locale)).clicked() {
+            self.execute_command_and_record(&format!("Show[{label}]"), time);
+            ui.close_menu();
+        }
+        if ui.button(t("ctx.delete", ctx_locale)).clicked() {
+            self.execute_command_and_record(&format!("Delete[{label}]"), time);
+            ui.close_menu();
+        }
+        if ui.button(t("ctx.properties", ctx_locale)).clicked() {
+            self.document.clear_selection();
+            self.document.select(id);
+            self.selected_object = Some(id);
+            self.sidebar_tab = 0;
+            self.left_drawer_open = true;
+            self.compact_drawer_open = true;
+            ui.close_menu();
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Sliders arrastrables sobre el lienzo (Piel pura)
+// ═══════════════════════════════════════════════════════════════
+//
+// El Cerebro expone cada slider como `VariableMeta { position, min, max,
+// step, visible, animating }` más su valor en `Document::variables`.
+// Este widget dibuja pista + relleno + thumb + etiqueta `nombre = valor`
+// (prefijo `▶` si anima) con el painter del overlay recortado al canvas,
+// y traduce el arrastre horizontal a `X → [min, max]` vía
+// `try_set_variable` (clamp + snap continuo por `step`).
+// Piel pura: sin I/O ni spawn; colores de `ui.visuals()` y tamaños de
+// `grafito_ui::tokens` (cero literales de tamaño/fuente).
+
+/// Ancho de la pista del slider (4 × SPACE_XXL = 160 px, sin literales).
+const CANVAS_SLIDER_TRACK_WIDTH: f32 = SPACE_XXL + SPACE_XXL + SPACE_XXL + SPACE_XXL;
+
+/// Intervalo mínimo entre análisis de hover con el cursor quieto (~30fps).
+const HOVER_ANALYSIS_INTERVAL_SECS: f64 = 0.05;
+/// Clave temporal (memoria egui) con el flag de hover para el cursor Grab.
+const CANVAS_SLIDER_HOVER_KEY: &str = "canvas_slider_hover";
+/// Clave temporal (memoria egui) con el nombre del slider en arrastre.
+const CANVAS_SLIDER_ACTIVE_KEY: &str = "canvas_slider_active";
+/// Clave temporal con el nombre del slider enfocado por teclado.
+///
+/// El slider del lienzo se dibuja a mano sobre el canvas (no es un widget de
+/// egui), así que no tiene `Response::has_focus`: el estado de foco vive acá.
+/// Antes el anillo de «foco» se pintaba con el hover del puntero, que no es
+/// foco — informaba un estado que el teclado nunca podía alcanzar (WCAG
+/// 4.1.2) y hacía creer que el control era alcanzable.
+const CANVAS_SLIDER_FOCUSED_KEY: &str = "canvas_slider_focused";
+/// Multiplicador de la tecla modificadora (Shift) al ajustar con flechas: diez
+/// pasos por pulsación en vez de uno.
+const CANVAS_SLIDER_KEYBOARD_COARSE: f64 = 10.0;
+/// Prefijo de clave temporal (memoria egui) para el snapshot de undo.
+const CANVAS_SLIDER_UNDO_KEY: &str = "canvas_slider_undo";
+/// Guarda de dominio para `sanitize_animation_speed` (no es tamaño UI).
+const CANVAS_SLIDER_MAX_ANIMATION_SPEED: f64 = 100.0;
+/// Velocidad de repuesto cuando la persistida no es finita.
+const CANVAS_SLIDER_DEFAULT_ANIMATION_SPEED: f64 = 1.0;
+
+/// Nombres internos que nunca se dibujan como slider (espejo de la regla
+/// privada de `algebra.rs`: el lienzo no duplica variables trigonométricas
+/// sintéticas; las de spreadsheet se filtran vía `is_spreadsheet_owned_variable`).
+fn canvas_slider_is_internal_name(name: &str) -> bool {
+    name == "TrigGraph" || name == "TrigValue" || name == "trig_angle" || name.starts_with("trig_")
+}
+
+/// Sanea una velocidad de animación persistida: no-finitos → 1.0 (defecto
+/// del Cerebro), resto con clamp a ±100 para evitar recorridos desbocados
+/// por dato corrupto. Pura, sin I/O.
+pub(crate) fn sanitize_animation_speed(raw: f64) -> f64 {
+    if !raw.is_finite() {
+        return CANVAS_SLIDER_DEFAULT_ANIMATION_SPEED;
+    }
+    raw.clamp(
+        -CANVAS_SLIDER_MAX_ANIMATION_SPEED,
+        CANVAS_SLIDER_MAX_ANIMATION_SPEED,
+    )
+}
+
+/// Traduce X del puntero a valor `[min, max]` con clamp + snap continuo por
+/// `step` (redondeo al múltiplo más cercano; `step` no-finito o ≤ 0 =
+/// continuo sin snap). Rango inválido → `min` (o 0.0 si ni `min` es finito).
+/// Pura, sin I/O: la mutación real la hace `try_set_variable`.
+pub(crate) fn canvas_slider_apply_drag(
+    pointer_x: f32,
+    track_min_x: f32,
+    track_max_x: f32,
+    min: f64,
+    max: f64,
+    step: f64,
+) -> f64 {
+    if !min.is_finite() {
+        return 0.0;
+    }
+    if !max.is_finite() || min >= max {
+        return min;
+    }
+    let span_px = f64::from(track_max_x - track_min_x);
+    if !span_px.is_finite() || span_px <= 0.0 {
+        return min;
+    }
+    let ratio = f64::from(pointer_x - track_min_x) / span_px;
+    let mut value = min + ratio.clamp(0.0, 1.0) * (max - min);
+    if step.is_finite() && step > 0.0 {
+        value = min + ((value - min) / step).round() * step;
+    }
+    if !value.is_finite() {
+        return min;
+    }
+    value.clamp(min, max)
+}
+
+/// Aplica un paso de teclado al valor del slider.
+///
+/// Devuelve `None` cuando el rango o el paso son inválidos, o cuando el valor
+/// ya está en el extremo: en ese caso no hay edición que registrar y el
+/// llamador no debe tomar un snapshot de undo por pulsación al vacío.
+///
+/// `step` no finito o ≤ 0 cae al 1 % del rango, que es la granularidad que
+/// usa el resto de la app para sliders sin paso declarado.
+pub(crate) fn canvas_slider_apply_step(
+    current: f64,
+    min: f64,
+    max: f64,
+    step: f64,
+    dir: f64,
+    coarse: f64,
+) -> Option<f64> {
+    if !current.is_finite() || !min.is_finite() || !max.is_finite() || min >= max {
+        return None;
+    }
+    // Normaliza `coarse` ANTES de multiplicar: un `NaN` de entrada se
+    // convierte en 1.0 en vez de envenenar el salto (`NaN * 0.25 = NaN`, que
+    // hacía que toda pulsación fuera descartada como inválida).
+    let coarse = if coarse.is_finite() && coarse > 0.0 {
+        coarse
+    } else {
+        1.0
+    };
+    let unit = if step.is_finite() && step > 0.0 {
+        step
+    } else {
+        (max - min) / 100.0
+    };
+    let delta = unit * dir * coarse;
+    if !delta.is_finite() || delta == 0.0 || !dir.is_finite() {
+        return None;
+    }
+    let next = (current + delta).clamp(min, max);
+    // Extremo alcanzado: no hay cambio real que registrar. El criterio es
+    // geométrico y no de tolerancia — `next == current` a bits, o el clamp se
+    // comió todo el salto porque ya estábamos en el tope. (Una tolerancia
+    // relativa al paso descartaría pulsaciones legítimas cerca del extremo:
+    // desde 9.9 con paso 0.25, el salto real es 0.1.)
+    if next.to_bits() == current.to_bits() {
+        return None;
+    }
+    next.is_finite().then_some(next)
+}
+
+/// Fracción 0..=1 del valor dentro de `[min, max]` para colocar el thumb.
+/// Rango o valor inválido → 0.0. Pura, sin I/O.
+pub(crate) fn canvas_slider_value_to_t(value: f64, min: f64, max: f64) -> f32 {
+    if !value.is_finite() || !min.is_finite() || !max.is_finite() || min >= max {
+        return 0.0;
+    }
+    let ratio = (value.clamp(min, max) - min) / (max - min);
+    ratio.clamp(0.0, 1.0) as f32
+}
+
+/// Hit-test del widget: pista expandida por `tolerance` o cercanía al thumb
+/// (`thumb_radius + tolerance`). El llamador pasa `SPACE_SM` (= 8 px).
+/// Pura, sin I/O.
+pub(crate) fn canvas_slider_hit(
+    pointer: egui::Pos2,
+    track: Rect,
+    thumb_center: egui::Pos2,
+    thumb_radius: f32,
+    tolerance: f32,
+) -> bool {
+    if track.expand(tolerance).contains(pointer) {
+        return true;
+    }
+    pointer.distance(thumb_center) <= thumb_radius + tolerance
+}
+
+/// Texto del valor con el formato del panel Álgebra (entero sin decimales).
+fn canvas_slider_value_text(value: f64) -> String {
+    if value.fract() == 0.0 {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.2}")
+    }
+}
+
+/// Geometría en pantalla de un slider ya filtrado y con culling superado.
+struct CanvasSliderGeom {
+    name: String,
+    track: Rect,
+    thumb: egui::Pos2,
+    min: f64,
+    max: f64,
+    step: f64,
+}
+
+impl GrafitoApp {
+    /// Dibuja los sliders visibles sobre el lienzo y gestiona su gesto.
+    ///
+    /// Llamar al inicio de `handle_canvas_input`, antes de pan / arrastre /
+    /// selección. Retorna `true` cuando el puntero opera sobre un slider y el
+    /// resto del input (pan, creación, mover-punto, clics) debe suprimirse.
+    ///
+    /// - Dibuja pista + relleno + thumb + etiqueta `nombre = valor` (prefijo
+    ///   `▶` si anima) con painter recortado al canvas, colores de
+    ///   `ui.visuals()` y tokens `SPACE_*` / `TYPE_*`.
+    /// - Hit-test con pista expandida + thumb (`SPACE_SM` = 8 px de tolerancia).
+    /// - Drag horizontal `X → [min, max]` vía `try_set_variable`.
+    /// - Doble-clic alterna `animating` vía
+    ///   `try_replace_variable_meta_with_previous`.
+    /// - `visible = false` no se dibuja; nombres internos trig y variables
+    ///   spreadsheet se filtran; culling fuera de pantalla; orden por nombre.
+    /// - Undo: una entrada por gesto (snapshot pre-mutación en el primer
+    ///   frame con movimiento, en memoria temporal egui, sin campos nuevos).
+    pub(crate) fn handle_canvas_sliders(&mut self, ui: &mut egui::Ui, canvas_rect: Rect) -> bool {
+        #[cfg(feature = "profile")]
+        puffin::profile_scope!("input_canvas_sliders");
+
+        // Snapshot determinista (orden por nombre) de sliders dibujables.
+        let mut entries: Vec<(String, f64, grafito_core::VariableMeta)> = self
+            .document
+            .variables()
+            .iter()
+            .filter_map(|(name, value)| {
+                if canvas_slider_is_internal_name(name)
+                    || self.document.is_spreadsheet_owned_variable(name)
+                {
+                    return None;
+                }
+                let meta = self.document.variable_meta(name)?.clone();
+                if !meta.visible
+                    || !meta.min.is_finite()
+                    || !meta.max.is_finite()
+                    || meta.min >= meta.max
+                    || !value.is_finite()
+                {
+                    return None;
+                }
+                Some((name.clone(), *value, meta))
+            })
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Colores vivos del tema (copias; no retienen préstamo de `ui`).
+        let track_color = ui.visuals().widgets.inactive.bg_fill;
+        let fill_color = ui.visuals().selection.bg_fill;
+        let thumb_fill = ui.visuals().selection.bg_fill;
+        let label_color = ui.visuals().text_color();
+        // Estado de foco real del slider, leído de la memoria de egui (el widget
+        // es un `painter` puro, sin `Response`). Ver `CANVAS_SLIDER_FOCUSED_KEY`.
+        let focused_id = egui::Id::new(CANVAS_SLIDER_FOCUSED_KEY);
+        let focused: Option<String> = ui.ctx().memory(|mem| mem.data.get_temp(focused_id));
+        // El overlay se recorta al canvas para no invadir paneles.
+        let painter = ui.painter().with_clip_rect(canvas_rect);
+        let view = *self.document.view();
+        // Posición del puntero antes del loop de dibujo: el anillo de foco
+        // A11Y la necesita por slider (hoisted; se reutiliza abajo).
+        let pointer_pos = ui.input(|i| i.pointer.latest_pos().or(i.pointer.hover_pos()));
+
+        let mut geoms: Vec<CanvasSliderGeom> = Vec::new();
+        for (name, value, meta) in &entries {
+            let screen = view.world_to_screen(meta.position);
+            if !screen.x.is_finite() || !screen.y.is_finite() {
+                continue;
+            }
+            let anchor = canvas_rect.min + egui::Vec2::new(screen.x, screen.y);
+            let track_min = egui::pos2(anchor.x, anchor.y + TYPE_XS + SPACE_XS);
+            let track =
+                Rect::from_min_size(track_min, egui::vec2(CANVAS_SLIDER_TRACK_WIDTH, SPACE_XS));
+            // Culling: etiqueta + pista expandidos por el thumb.
+            if !Rect::from_min_max(anchor, track.max)
+                .expand(SPACE_SM)
+                .intersects(canvas_rect)
+            {
+                continue;
+            }
+            let ratio = canvas_slider_value_to_t(*value, meta.min, meta.max);
+            let thumb = egui::pos2(
+                track.min.x + ratio * CANVAS_SLIDER_TRACK_WIDTH,
+                track.center().y,
+            );
+            let mut label = format!("{name} = {}", canvas_slider_value_text(*value));
+            if meta.animating {
+                label = format!("▶ {label}");
+            }
+            painter.rect_filled(track, SPACE_XS, track_color);
+            let fill = Rect::from_min_max(track.min, egui::pos2(thumb.x, track.max.y));
+            if fill.width() > 0.0 {
+                painter.rect_filled(fill, SPACE_XS, fill_color);
+            }
+            painter.circle_filled(thumb, SPACE_SM, thumb_fill);
+            painter.circle_stroke(thumb, SPACE_SM, ui.visuals().widgets.active.fg_stroke);
+            // Anillo de foco (WCAG 2.4.7 / 2.4.13), atado al foco real y no al hover:
+            // el puntero encima de un slider ya se señala con el cursor `Grab`
+            // y con el relleno de la pista, así que el anillo queda reservado
+            // para el usuario de teclado.
+            if focused.as_deref() == Some(name.as_str()) {
+                let theme = grafito_ui::theme::current_theme(ui.ctx());
+                theme.paint_focus_ring(&painter, track.expand(SPACE_XS));
+            }
+            // Halo en la etiqueta: el widget vive sobre curvas y grilla.
+            grafito_ui::theme::current_theme(ui.ctx()).paint_canvas_text(
+                &painter,
+                anchor,
+                egui::Align2::LEFT_TOP,
+                &label,
+                egui::FontId::proportional(TYPE_XS),
+                label_color,
+            );
+            geoms.push(CanvasSliderGeom {
+                name: name.clone(),
+                track,
+                thumb,
+                min: meta.min,
+                max: meta.max,
+                step: meta.step,
+            });
+        }
+
+        let primary_down = ui.input(|i| i.pointer.button_down(PointerButton::Primary));
+        let primary_pressed = ui.input(|i| i.pointer.button_pressed(PointerButton::Primary));
+        let double_clicked = ui.input(|i| i.pointer.button_double_clicked(PointerButton::Primary));
+
+        let hovered: Option<String> = pointer_pos.and_then(|pos| {
+            geoms
+                .iter()
+                .find(|geom| canvas_slider_hit(pos, geom.track, geom.thumb, SPACE_SM, SPACE_SM))
+                .map(|geom| geom.name.clone())
+        });
+        ui.ctx().memory_mut(|mem| {
+            mem.data
+                .insert_temp(egui::Id::new(CANVAS_SLIDER_HOVER_KEY), hovered.is_some());
+        });
+        if hovered.is_some() && !primary_down {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+        }
+
+        let active_id = egui::Id::new(CANVAS_SLIDER_ACTIVE_KEY);
+        let active: Option<String> = ui.ctx().memory(|mem| mem.data.get_temp(active_id));
+
+        // ── Teclado sobre los sliders del lienzo (WCAG 2.1.1) ──
+        // Los sliders del lienzo se pintan a mano: sin esto no eran alcanzables
+        // ni ajustables sin puntero. `Tab` recorre los sliders en el orden en
+        // que ya se dibujan (alfabético, ver el `sort_by` de arriba); con
+        // `Ctrl` vuelve al anterior. Las flechas mueven el valor en el paso
+        // declarado de la variable y `Shift` multiplica el salto por diez.
+        if geoms.is_empty() {
+            ui.ctx()
+                .memory_mut(|mem| mem.data.remove_temp::<String>(focused_id));
+        } else {
+            // Sin `Vec<String>` intermedio: se indexa `geoms` directo (el
+            // collect + clones por frame no aportaban nada).
+            let cursor = focused
+                .as_deref()
+                .and_then(|f| geoms.iter().position(|g| g.name == f));
+
+            let (forward, backward) = ui.input(|i| {
+                (
+                    i.key_pressed(egui::Key::Tab) && !i.modifiers.shift,
+                    (i.key_pressed(egui::Key::Tab) && i.modifiers.shift)
+                        || i.key_pressed(egui::Key::ArrowLeft) && i.modifiers.alt,
+                )
+            });
+            if forward || backward {
+                let stepped = cursor
+                    .map(|idx| {
+                        if forward {
+                            idx + 1
+                        } else {
+                            idx.saturating_sub(1)
+                        }
+                    })
+                    .filter(|idx| *idx < geoms.len());
+                ui.ctx().memory_mut(|mem| {
+                    if let Some(idx) = stepped {
+                        mem.data.insert_temp(focused_id, geoms[idx].name.clone());
+                    } else {
+                        mem.data.remove_temp::<String>(focused_id);
+                    }
+                });
+            }
+
+            // Ajuste por flechas. Solo una dirección por frame: si el usuario
+            // mantiene la tecla pulsada, `key_pressed` no se repite y el
+            // ajuste continuo llega por el drag, que es el camino natural para
+            // el puntero.
+            let arrow = ui.input(|i| {
+                let dir = if i.key_pressed(egui::Key::ArrowRight)
+                    || i.key_pressed(egui::Key::ArrowUp)
+                {
+                    Some(1.0)
+                } else if i.key_pressed(egui::Key::ArrowLeft) || i.key_pressed(egui::Key::ArrowDown)
+                {
+                    Some(-1.0)
+                } else {
+                    None
+                };
+                dir.map(|dir| {
+                    (
+                        dir,
+                        if i.modifiers.shift {
+                            CANVAS_SLIDER_KEYBOARD_COARSE
+                        } else {
+                            1.0
+                        },
+                    )
+                })
+            });
+            if let (Some(name), Some((dir, coarse))) = (focused.as_deref(), arrow) {
+                if let Some(geom) = geoms.iter().find(|g| g.name == name) {
+                    let current = self.document.get_variable(name).unwrap_or(geom.min);
+                    if let Some(next) = canvas_slider_apply_step(
+                        current, geom.min, geom.max, geom.step, dir, coarse,
+                    ) {
+                        // Una pulsación es una edición, no un arrastre: cada
+                        // una toma su snapshot antes de mutar, igual que el
+                        // drag toma uno al empezar a moverse. Así `Supr` los
+                        // revierte de a uno y no todo el bloque de flechas.
+                        let undo_id = egui::Id::new((CANVAS_SLIDER_UNDO_KEY, name.to_owned()));
+                        ui.ctx().memory_mut(|mem| {
+                            mem.data.insert_temp(undo_id, self.document.clone());
+                        });
+                        if self
+                            .document
+                            .try_set_variable(name.to_owned(), next)
+                            .is_ok()
+                        {
+                            self.finish_canvas_slider_gesture(ui, name);
+                            ui.ctx().request_repaint();
+                        }
+                    }
+                }
+            }
+        }
+
+        // Doble-clic sobre el widget: alterna `animating` (cierra antes un
+        // drag en curso y reclama el gesto para que no cree objetos).
+        if double_clicked {
+            if let Some(pos) = pointer_pos {
+                if let Some(hit) = geoms
+                    .iter()
+                    .find(|geom| canvas_slider_hit(pos, geom.track, geom.thumb, SPACE_SM, SPACE_SM))
+                {
+                    self.finish_canvas_slider_gesture(ui, &hit.name);
+                    if let Some(meta) = self.document.variable_meta(&hit.name).cloned() {
+                        let mut candidate = meta;
+                        candidate.animating = !candidate.animating;
+                        candidate.animation_speed =
+                            sanitize_animation_speed(candidate.animation_speed);
+                        match self
+                            .document
+                            .try_replace_variable_meta_with_previous(&hit.name, candidate)
+                        {
+                            Ok(Some(previous)) => {
+                                self.save_snapshot(previous);
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                let time = ui.ctx().input(|input| input.time);
+                                self.handle_command_outcome(
+                                    grafito_command::commands::CommandOutcome::Error(error),
+                                    time,
+                                    "Slider",
+                                );
+                            }
+                        }
+                    }
+                    // Reclama también el release: evita un clic fantasma.
+                    ui.ctx()
+                        .memory_mut(|mem| mem.data.insert_temp(active_id, hit.name.clone()));
+                    return true;
+                }
+            }
+        }
+
+        // Gesto en curso: arrastre (con mutación) o release (confirma undo).
+        if let Some(active_name) = active {
+            if primary_down {
+                if let Some(geom) = geoms.iter().find(|geom| geom.name == active_name) {
+                    if let Some(pos) = pointer_pos {
+                        let next = canvas_slider_apply_drag(
+                            pos.x,
+                            geom.track.min.x,
+                            geom.track.max.x,
+                            geom.min,
+                            geom.max,
+                            geom.step,
+                        );
+                        let current = self.document.get_variable(&active_name).unwrap_or(next);
+                        // Comparación exacta por bits: ambos valores son
+                        // finitos y el snap es determinista; evita lint float.
+                        if next.to_bits() != current.to_bits() {
+                            // Snapshot pre-mutación solo en el primer frame
+                            // con movimiento: una entrada de undo por gesto.
+                            let undo_id =
+                                egui::Id::new((CANVAS_SLIDER_UNDO_KEY, active_name.clone()));
+                            let has_snapshot: bool = ui
+                                .ctx()
+                                .memory(|mem| mem.data.get_temp::<Document>(undo_id).is_some());
+                            if !has_snapshot {
+                                // Ola 2: este `clone()` es una vez por gesto
+                                // (no por frame) y `save_snapshot` exige un
+                                // `Document` propio al soltar; un `Arc` solo
+                                // movería la copia a `finish_canvas_slider_gesture`.
+                                let snapshot = self.document.clone();
+                                ui.ctx()
+                                    .memory_mut(|mem| mem.data.insert_temp(undo_id, snapshot));
+                            }
+                            let version_before = self.document.version;
+                            if self
+                                .document
+                                .try_set_variable(active_name.clone(), next)
+                                .is_ok()
+                            {
+                                crate::app::refresh_direct_document_change(
+                                    &mut self.document,
+                                    version_before,
+                                );
+                                self.is_view_changing = true;
+                                self.last_interaction_time = Instant::now();
+                            }
+                        }
+                    }
+                }
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                return true;
+            }
+            // Release: confirma el undo si hubo movimiento y consume el frame
+            // para que el canvas no lo lea como clic de creación.
+            self.finish_canvas_slider_gesture(ui, &active_name);
+            return true;
+        }
+
+        // Inicio de gesto: el press debe nacer sobre el widget (no se roban
+        // arrastres ajenos) y dentro del lienzo.
+        if primary_pressed {
+            if let Some(pos) = pointer_pos {
+                if canvas_rect.contains(pos) {
+                    if let Some(name) = hovered {
+                        ui.ctx()
+                            .memory_mut(|mem| mem.data.insert_temp(active_id, name));
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Confirma el gesto de un slider: si el snapshot temporal muestra un
+    /// valor distinto al actual (hubo movimiento), guarda una única entrada
+    /// de undo; siempre limpia el estado temporal egui.
+    fn finish_canvas_slider_gesture(&mut self, ui: &mut egui::Ui, name: &str) {
+        let undo_id = egui::Id::new((CANVAS_SLIDER_UNDO_KEY, name.to_owned()));
+        let snapshot: Option<Document> = ui.ctx().memory_mut(|mem| mem.data.remove_temp(undo_id));
+        ui.ctx().memory_mut(|mem| {
+            mem.data
+                .remove_temp::<String>(egui::Id::new(CANVAS_SLIDER_ACTIVE_KEY))
+        });
+        if let Some(before) = snapshot {
+            if before.get_variable(name) != self.document.get_variable(name) {
+                self.save_snapshot(before);
+            }
+        }
+    }
+}
+
+/// Comando para la herramienta Perpendicular dados dos picks del lienzo.
+///
+/// `r` = `Some((etiqueta, es_punto, es_recta))` si el clic cayó sobre un
+/// objeto existente. Con par (punto, recta) en cualquier orden emite
+/// `Perpendicular[punto, recta]` (GeoGebra); en otro caso, mediatriz honesta
+/// de dos puntos libres (única perpendicular definible sin objetos).
+pub(crate) fn perpendicular_command(
+    r1: Option<(String, bool, bool)>,
+    r2: Option<(String, bool, bool)>,
+    p1: Point2,
+    p2: Point2,
+) -> String {
+    let mut point_label: Option<String> = None;
+    let mut line_label: Option<String> = None;
+    for r in [r1, r2].into_iter().flatten() {
+        if r.1 && point_label.is_none() {
+            point_label = Some(r.0.clone());
+        }
+        if r.2 && line_label.is_none() {
+            line_label = Some(r.0);
+        }
+    }
+    match (point_label, line_label) {
+        (Some(p), Some(l)) => format!("Perpendicular[{p}, {l}]"),
+        _ => format!(
+            "PerpendicularBisector[({:.2}, {:.2}), ({:.2}, {:.2})]",
+            p1.x, p1.y, p2.x, p2.y
+        ),
+    }
+}
+
+fn point_to_line_distance(p: Point2, a: Point2, b: Point2) -> f64 {
+    let abx = b.x - a.x;
+    let aby = b.y - a.y;
+    let apx = p.x - a.x;
+    let apy = p.y - a.y;
+    let len2 = abx * abx + aby * aby;
+    if len2 == 0.0 {
+        return (apx * apx + apy * apy).sqrt();
+    }
+    let t = ((apx * abx + apy * aby) / len2).clamp(0.0, 1.0);
+    let closest_x = a.x + t * abx;
+    let closest_y = a.y + t * aby;
+    let dx = p.x - closest_x;
+    let dy = p.y - closest_y;
+    (dx * dx + dy * dy).sqrt()
+}
+
+fn point_inside_polygon(p: Point2, vertices: &[Point2]) -> bool {
+    let mut inside = false;
+    let mut j = vertices.len() - 1;
+    for i in 0..vertices.len() {
+        let pi = vertices[i];
+        let pj = vertices[j];
+        if ((pi.y > p.y) != (pj.y > p.y))
+            && (p.x < (pj.x - pi.x) * (p.y - pi.y) / (pj.y - pi.y) + pi.x)
+        {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
+impl GrafitoApp {
+    pub(crate) fn handle_canvas_3d_input(
+        &mut self,
+        ui: &mut egui::Ui,
+        canvas_rect: egui::Rect,
+        typed_four_d_phase: Option<f64>,
+    ) {
+        #[cfg(feature = "profile")]
+        puffin::profile_scope!("input_canvas_3d");
+
+        let w = canvas_rect.width();
+        let h = canvas_rect.height();
+        self.camera.aspect = w / h.max(1.0);
+
+        let ctx_resp = ui.interact(
+            canvas_rect,
+            ui.id().with("ctx3d"),
+            egui::Sense::click_and_drag(),
+        );
+        if ctx_resp.clicked_by(egui::PointerButton::Secondary) {
+            // B-A174: chrome del menú 3D en el idioma activo (antes 2 literales ES).
+            let ctx_locale = self.config_locale();
+            ctx_resp.context_menu(|ui| {
+                if ui.button(t("ctx.clear_selection", ctx_locale)).clicked() {
+                    self.delete_selected();
+                    ui.close_menu();
+                }
+                if ui.button(t("ctx.reset_view", ctx_locale)).clicked() {
+                    crate::app::reset_3d_view_and_pause_motion(
+                        &mut self.camera,
+                        w,
+                        h,
+                        &mut self.multidimensional_motion_enabled,
+                    );
+                    ui.close_menu();
+                }
+            });
+        }
+
+        let response = ui.interact(
+            canvas_rect,
+            ui.id().with("canvas3d"),
+            egui::Sense::click_and_drag(),
+        );
+
+        let space_pressed = ui.input(|i| i.key_down(egui::Key::Space));
+        let pointer = ui.input(|i| i.pointer.clone());
+        let current_pos = response
+            .interact_pointer_pos()
+            .or(response.hover_pos())
+            .or(pointer.latest_pos());
+        let pointer_in_canvas = current_pos
+            .map(|p| canvas_rect.contains(p))
+            .unwrap_or(false);
+
+        if response.drag_started() {
+            self.canvas_drag_start = current_pos;
+            self.canvas_is_panning = false;
+            self.is_view_changing = true;
+            self.last_interaction_time = Instant::now();
+            self.document.render_quality = RenderQuality::Preview;
+        }
+
+        let drag_distance = self
+            .canvas_drag_start
+            .and_then(|s| current_pos.map(|p| (p - s).length()))
+            .unwrap_or(0.0);
+        if drag_distance > 3.0 {
+            self.canvas_is_panning = true;
+        }
+
+        // ── S6 táctil: rama ANTES de orbit/pan. `multi_touch()` solo existe
+        // con ≥2 dedos (egui 0.29); con 1 dedo el touch emula el primario y
+        // se detecta por `any_touches()` + drag primario: solo cuando el drag
+        // nació de touch se orbita con 1 dedo, el mouse sigue intacto abajo.
+        let touch_state = ui.input(|i| (i.multi_touch(), i.any_touches(), i.zoom_delta()));
+        let (touch_multi, touch_any, touch_zoom) = touch_state;
+        let touch_action = if let Some(multi) = touch_multi {
+            grafito_geometry::touch_to_3d_action(
+                multi.num_touches as u32,
+                (multi.translation_delta.x, multi.translation_delta.y),
+                multi.zoom_delta,
+            )
+        } else if touch_any && response.dragged_by(egui::PointerButton::Primary) {
+            let delta = response.drag_delta();
+            grafito_geometry::touch_to_3d_action(1, (delta.x, delta.y), touch_zoom)
+        } else {
+            None
+        };
+        if let Some(action) = touch_action {
+            #[cfg(feature = "profile")]
+            puffin::profile_scope!("input_touch_3d");
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            self.pause_multidimensional_motion();
+            // La órbita táctil también sale del plano ortográfico, como la
+            // del botón derecho (trampa planta-vs-2D).
+            if matches!(action, grafito_geometry::Touch3DAction::Orbit { .. })
+                && self.view3d.is_orthographic()
+            {
+                let prev = self.view3d.name();
+                self.view3d = crate::canvas::View3D::Perspective;
+                self.notify(
+                    format!("Vista en perspectiva (venías de {prev})"),
+                    grafito_ui::toast::ToastKind::Info,
+                );
+            }
+            self.is_view_changing = true;
+            self.last_interaction_time = Instant::now();
+            self.document.render_quality = RenderQuality::Preview;
+            action.apply(&mut self.camera);
+        // Orbit with right drag. En vistas ortográficas (alzado/planta/perfil)
+        // la cámara no se mueve: el primer intento de orbitar vuelve a
+        // perspectiva en vez de dejar la vista clavada en un plano que
+        // parece 2D (trampa planta-vs-2D). Es `else if`: con gesto táctil el
+        // mouse no re-aplica el mismo drag (órbita + pan a la vez).
+        } else if response.dragged_by(egui::PointerButton::Secondary) {
+            #[cfg(feature = "profile")]
+            puffin::profile_scope!("input_orbit");
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            self.pause_multidimensional_motion();
+            if self.view3d.is_orthographic() {
+                let prev = self.view3d.name();
+                self.view3d = crate::canvas::View3D::Perspective;
+                self.notify(
+                    format!("Vista en perspectiva (venías de {prev})"),
+                    grafito_ui::toast::ToastKind::Info,
+                );
+            }
+            let delta = response.drag_delta();
+            self.camera.orbit(delta.x * 0.005, delta.y * 0.005);
+        }
+        // Pan with Space + primary, middle button, or primary drag in any tool
+        else if (space_pressed && response.dragged_by(egui::PointerButton::Primary))
+            || (pointer_in_canvas && pointer.button_down(egui::PointerButton::Middle))
+            || response.dragged_by(egui::PointerButton::Primary)
+        {
+            #[cfg(feature = "profile")]
+            puffin::profile_scope!("input_pan");
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            let delta = if pointer.button_down(egui::PointerButton::Middle) {
+                pointer.delta()
+            } else {
+                response.drag_delta()
+            };
+            if delta != egui::Vec2::ZERO {
+                self.pause_multidimensional_motion();
+                self.is_view_changing = true;
+                self.last_interaction_time = Instant::now();
+                self.document.render_quality = RenderQuality::Preview;
+                self.camera.pan(delta.x, delta.y);
+            }
+        } else if space_pressed && pointer_in_canvas {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+        }
+
+        if response.hovered() {
+            let sc = ui.input(|i| i.smooth_scroll_delta);
+            // Filtra scroll NaN/Inf y limita delta para no saltar de 0.01 a 50k en un frame.
+            if sc.y.is_finite() && sc.y.abs() > f32::EPSILON && sc.y.abs() < 1e4 {
+                #[cfg(feature = "profile")]
+                puffin::profile_scope!("input_zoom");
+                self.pause_multidimensional_motion();
+                self.is_view_changing = true;
+                self.last_interaction_time = Instant::now();
+                self.document.render_quality = RenderQuality::Preview;
+                let factor = (1.0 + sc.y * 0.005).clamp(0.8, 1.25);
+                self.camera.zoom(factor);
+            }
+        }
+
+        // Tool ghost for 3D mode
+        self.tool_ghost = None;
+        if uses_3d_position_ghost(self.current_tool) {
+            if let Some(local) = current_pos.and_then(|pos| canvas_local_pointer(canvas_rect, pos))
+            {
+                if let Some(ghost_pos) = crate::render_3d::construction_point_from_canvas(
+                    &self.camera,
+                    local,
+                    canvas_rect.size(),
+                ) {
+                    self.tool_ghost = Some(GeoObject::Point3D(Point3DObj::new(ghost_pos)));
+                }
+            }
+        }
+
+        if let Some(pos) = current_pos {
+            self.last_mouse_pos = Some(pos);
+        }
+
+        if response.drag_stopped() {
+            self.canvas_is_panning = false;
+            self.canvas_drag_start = None;
+        }
+
+        // 3D object placement: only on real clicks, not drags
+        let is_click = !self.canvas_is_panning && drag_distance <= 3.0;
+        if response.clicked_by(egui::PointerButton::Primary) && is_click {
+            if let Some(local) = current_pos.and_then(|pos| canvas_local_pointer(canvas_rect, pos))
+            {
+                if self.current_tool == Tool::Select {
+                    // Selección por vista: perspectiva orbita, ortográficas
+                    // pickean por rayo exacto (`render_3d::pick_ortho_object`).
+                    crate::canvas::select_3d_object_for_view(
+                        &mut self.document,
+                        &mut self.selected_object,
+                        self.view3d,
+                        &self.camera,
+                        local,
+                        canvas_rect.size(),
+                        typed_four_d_phase,
+                    );
+                } else {
+                    self.handle_3d_click(ui, local, canvas_rect.size());
+                    self.tool_ghost = None;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod perpendicular_command_tests {
+    use super::*;
+    use grafito_geometry::Point2;
+
+    fn pt(x: f64, y: f64) -> Point2 {
+        Point2::new(x, y)
+    }
+
+    #[test]
+    fn point_line_pair_in_any_order_emits_perpendicular() {
+        let p = |s: &str| Some((s.to_owned(), true, false));
+        let l = |s: &str| Some((s.to_owned(), false, true));
+        assert_eq!(
+            perpendicular_command(p("A"), l("r"), pt(0.0, 0.0), pt(1.0, 1.0)),
+            "Perpendicular[A, r]"
+        );
+        assert_eq!(
+            perpendicular_command(l("r"), p("A"), pt(0.0, 0.0), pt(1.0, 1.0)),
+            "Perpendicular[A, r]"
+        );
+    }
+
+    #[test]
+    fn missing_pair_falls_back_to_honest_bisector() {
+        let p = |s: &str| Some((s.to_owned(), true, false));
+        let (p1, p2) = (pt(0.0, 0.0), pt(2.0, 0.0));
+        assert_eq!(
+            perpendicular_command(None, None, p1, p2),
+            "PerpendicularBisector[(0.00, 0.00), (2.00, 0.00)]"
+        );
+        assert!(perpendicular_command(p("A"), p("B"), p1, p2).starts_with("PerpendicularBisector"));
+        assert!(perpendicular_command(None, p("A"), p1, p2).starts_with("PerpendicularBisector"));
+    }
+}
+
+#[cfg(test)]
+mod canvas_slider_widget_tests {
+    use super::{
+        canvas_slider_apply_drag, canvas_slider_apply_step, canvas_slider_hit,
+        canvas_slider_is_internal_name, canvas_slider_value_to_t, sanitize_animation_speed,
+        GrafitoApp,
+    };
+
+    #[test]
+    fn gestos_dos_dedos_navegan_un_dedo_construye() {
+        // S3: con multitouch no nace trazo; con 1 dedo sí.
+        assert!(GrafitoApp::gesture_starts_stroke(false));
+        assert!(!GrafitoApp::gesture_starts_stroke(true));
+    }
+
+    fn approx_eq(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    #[test]
+    fn drag_maps_track_edges_and_center_without_step() {
+        // Sin paso (step <= 0): continuo puro.
+        assert!(approx_eq(
+            canvas_slider_apply_drag(0.0, 0.0, 160.0, -5.0, 5.0, 0.0),
+            -5.0
+        ));
+        assert!(approx_eq(
+            canvas_slider_apply_drag(160.0, 0.0, 160.0, -5.0, 5.0, 0.0),
+            5.0
+        ));
+        assert!(approx_eq(
+            canvas_slider_apply_drag(80.0, 0.0, 160.0, -5.0, 5.0, 0.0),
+            0.0
+        ));
+    }
+
+    #[test]
+    fn drag_clamps_outside_and_snaps_to_step() {
+        // Fuera de pista: clamp a extremos.
+        assert!(approx_eq(
+            canvas_slider_apply_drag(-40.0, 0.0, 100.0, 0.0, 10.0, 0.0),
+            0.0
+        ));
+        assert!(approx_eq(
+            canvas_slider_apply_drag(400.0, 0.0, 100.0, 0.0, 10.0, 0.0),
+            10.0
+        ));
+        // 33 % de [0, 10] = 3.3 → snap a múltiplo de 2 = 4.0.
+        assert!(approx_eq(
+            canvas_slider_apply_drag(33.0, 0.0, 100.0, 0.0, 10.0, 2.0),
+            4.0
+        ));
+        // Paso no-finito o <= 0 = continuo sin snap.
+        assert!(approx_eq(
+            canvas_slider_apply_drag(33.0, 0.0, 100.0, 0.0, 10.0, f64::NAN),
+            3.3
+        ));
+    }
+
+    // ── Teclado (WCAG 2.1.1) ──
+
+    #[test]
+    fn keyboard_step_moves_by_the_declared_step() {
+        // Paso 0.25, sin Shift: un paso por pulsación.
+        assert!(approx_eq(
+            canvas_slider_apply_step(1.0, 0.0, 10.0, 0.25, 1.0, 1.0).unwrap(),
+            1.25
+        ));
+        assert!(approx_eq(
+            canvas_slider_apply_step(1.0, 0.0, 10.0, 0.25, -1.0, 1.0).unwrap(),
+            0.75
+        ));
+    }
+
+    #[test]
+    fn keyboard_shift_multiplies_the_step_by_ten() {
+        let coarse = canvas_slider_apply_step(1.0, 0.0, 10.0, 0.25, 1.0, 10.0).unwrap();
+        assert!(approx_eq(coarse, 3.5), "0.25 * 10 = 2.5 de salto");
+    }
+
+    #[test]
+    fn keyboard_step_clamps_at_the_range_ends() {
+        assert!(approx_eq(
+            canvas_slider_apply_step(9.9, 0.0, 10.0, 0.25, 1.0, 1.0).unwrap(),
+            10.0
+        ));
+        assert!(approx_eq(
+            canvas_slider_apply_step(0.1, 0.0, 10.0, 0.25, -1.0, 1.0).unwrap(),
+            0.0
+        ));
+    }
+
+    #[test]
+    fn keyboard_step_returns_none_when_there_is_nothing_to_edit() {
+        // Ya en el extremo: sin edición, el llamador no toma snapshot de undo.
+        assert_eq!(
+            canvas_slider_apply_step(10.0, 0.0, 10.0, 0.25, 1.0, 1.0),
+            None
+        );
+        assert_eq!(
+            canvas_slider_apply_step(0.0, 0.0, 10.0, 0.25, -1.0, 1.0),
+            None
+        );
+        // Rango o valor degenerados.
+        assert_eq!(canvas_slider_apply_step(1.0, 5.0, 5.0, 0.1, 1.0, 1.0), None);
+        assert_eq!(
+            canvas_slider_apply_step(1.0, 10.0, 0.0, 0.1, 1.0, 1.0),
+            None
+        );
+        assert_eq!(
+            canvas_slider_apply_step(f64::NAN, 0.0, 10.0, 0.1, 1.0, 1.0),
+            None
+        );
+        assert_eq!(
+            canvas_slider_apply_step(1.0, f64::NAN, 10.0, 0.1, 1.0, 1.0),
+            None
+        );
+        assert_eq!(
+            canvas_slider_apply_step(1.0, 0.0, 10.0, 0.1, f64::NAN, 1.0),
+            None
+        );
+    }
+
+    #[test]
+    fn keyboard_step_without_declared_step_falls_back_to_one_percent() {
+        // step <= 0 → 1 % del rango, la granularidad que usa el resto de la app.
+        assert!(approx_eq(
+            canvas_slider_apply_step(0.0, 0.0, 100.0, 0.0, 1.0, 1.0).unwrap(),
+            1.0
+        ));
+        // Hacia abajo desde el medio: 1 % del rango hacia la izquierda.
+        assert!(approx_eq(
+            canvas_slider_apply_step(50.0, 0.0, 100.0, f64::NAN, -1.0, 1.0).unwrap(),
+            49.0
+        ));
+        // `coarse` no finito o ≤ 0 se normaliza a 1.0 en vez de envenenar el
+        // salto: un NaN acá no puede llegar desde el teclado, pero el helper
+        // es público dentro del crate y no debe propagarlo.
+        assert!(approx_eq(
+            canvas_slider_apply_step(1.0, 0.0, 100.0, 0.1, 1.0, f64::NAN).unwrap(),
+            1.1
+        ));
+        assert!(approx_eq(
+            canvas_slider_apply_step(1.0, 0.0, 100.0, 0.1, 1.0, 0.0).unwrap(),
+            1.1
+        ));
+    }
+
+    #[test]
+    fn drag_rejects_degenerate_ranges_without_panic() {
+        assert!(approx_eq(
+            canvas_slider_apply_drag(50.0, 0.0, 100.0, 5.0, 5.0, 0.1),
+            5.0
+        ));
+        assert!(approx_eq(
+            canvas_slider_apply_drag(50.0, 0.0, 100.0, 7.0, -7.0, 0.1),
+            7.0
+        ));
+        assert!(approx_eq(
+            canvas_slider_apply_drag(50.0, 0.0, 100.0, f64::NAN, 5.0, 0.1),
+            0.0
+        ));
+        // Pista de ancho cero: no hay mapeo, conserva el mínimo.
+        assert!(approx_eq(
+            canvas_slider_apply_drag(50.0, 80.0, 80.0, -5.0, 5.0, 0.1),
+            -5.0
+        ));
+    }
+
+    #[test]
+    fn sanitize_speed_keeps_finite_and_repairs_the_rest() {
+        assert!(approx_eq(sanitize_animation_speed(2.5), 2.5));
+        assert!(approx_eq(sanitize_animation_speed(0.0), 0.0));
+        assert!(approx_eq(sanitize_animation_speed(-3.0), -3.0));
+        assert!(approx_eq(sanitize_animation_speed(250.0), 100.0));
+        assert!(approx_eq(sanitize_animation_speed(-250.0), -100.0));
+        assert!(approx_eq(sanitize_animation_speed(f64::NAN), 1.0));
+        assert!(approx_eq(sanitize_animation_speed(f64::INFINITY), 1.0));
+    }
+
+    #[test]
+    fn value_to_t_covers_range_and_clamps() {
+        assert!((canvas_slider_value_to_t(0.0, -5.0, 5.0) - 0.5).abs() < 1e-6);
+        assert!((canvas_slider_value_to_t(5.0, -5.0, 5.0) - 1.0).abs() < 1e-6);
+        assert!((canvas_slider_value_to_t(-5.0, -5.0, 5.0) - 0.0).abs() < 1e-6);
+        assert!((canvas_slider_value_to_t(99.0, -5.0, 5.0) - 1.0).abs() < 1e-6);
+        assert!((canvas_slider_value_to_t(f64::NAN, -5.0, 5.0) - 0.0).abs() < 1e-6);
+        assert!((canvas_slider_value_to_t(1.0, 5.0, 5.0) - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn hit_covers_expanded_track_and_thumb_with_8px_tolerance() {
+        use egui::{pos2, Rect, Vec2};
+        let track = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(160.0, 4.0));
+        let thumb = pos2(80.0, 2.0);
+        // Sobre pista y thumb.
+        assert!(canvas_slider_hit(pos2(80.0, 2.0), track, thumb, 8.0, 8.0));
+        // Borde expandido: 5 px más allá del final sigue dentro (160 + 8).
+        assert!(canvas_slider_hit(pos2(165.0, 2.0), track, thumb, 8.0, 8.0));
+        // 15 px bajo el thumb: fuera de pista expandida pero dentro del
+        // radio del thumb (8 + 8 = 16).
+        assert!(canvas_slider_hit(pos2(80.0, 17.0), track, thumb, 8.0, 8.0));
+        // Lejos de ambos: sin hit.
+        assert!(!canvas_slider_hit(
+            pos2(200.0, 60.0),
+            track,
+            thumb,
+            8.0,
+            8.0
+        ));
+    }
+
+    #[test]
+    fn internal_trig_names_are_filtered_but_user_names_pass() {
+        assert!(canvas_slider_is_internal_name("trig_angle"));
+        assert!(canvas_slider_is_internal_name("trig_aux_1"));
+        assert!(canvas_slider_is_internal_name("TrigGraph"));
+        assert!(canvas_slider_is_internal_name("TrigValue"));
+        assert!(!canvas_slider_is_internal_name("alpha"));
+        assert!(!canvas_slider_is_internal_name("v0"));
+        assert!(!canvas_slider_is_internal_name("trigger"));
+    }
+}
+#[cfg(test)]
+mod coverage_sweep_input_pure {
+    use super::*;
+    #[test]
+    fn barrido_sliders_y_velocidad() {
+        assert!(sanitize_animation_speed(2.0).abs() <= CANVAS_SLIDER_MAX_ANIMATION_SPEED);
+        assert_eq!(
+            sanitize_animation_speed(f64::NAN),
+            CANVAS_SLIDER_DEFAULT_ANIMATION_SPEED
+        );
+        assert!((canvas_slider_apply_drag(50.0, 0.0, 100.0, 0.0, 10.0, 0.0) - 5.0).abs() < 1e-9);
+        assert_eq!(
+            canvas_slider_apply_drag(50.0, 0.0, 100.0, f64::NAN, 10.0, 0.0),
+            0.0
+        );
+        assert_eq!(canvas_slider_value_to_t(5.0, 0.0, 10.0), 0.5);
+        assert_eq!(canvas_slider_value_to_t(99.0, 10.0, 0.0), 0.0);
+        let track =
+            egui::Rect::from_min_size(egui::Pos2::new(0.0, 0.0), egui::Vec2::new(100.0, 10.0));
+        assert!(canvas_slider_hit(
+            egui::Pos2::new(50.0, 5.0),
+            track,
+            egui::Pos2::new(50.0, 5.0),
+            6.0,
+            8.0
+        ));
+        assert!(!canvas_slider_hit(
+            egui::Pos2::new(500.0, 500.0),
+            track,
+            egui::Pos2::new(50.0, 5.0),
+            6.0,
+            8.0
+        ));
+    }
+    #[test]
+    fn barrido_perpendicular_y_puntero() {
+        let cmd = perpendicular_command(
+            Some(("P".to_string(), true, false)),
+            Some(("r".to_string(), false, true)),
+            Point2::new(0.0, 0.0),
+            Point2::new(1.0, 1.0),
+        );
+        assert_eq!(cmd, "Perpendicular[P, r]");
+        let cmd = perpendicular_command(None, None, Point2::new(0.0, 0.0), Point2::new(1.0, 0.0));
+        assert!(cmd.starts_with("PerpendicularBisector["), "{cmd}");
+        let rect =
+            egui::Rect::from_min_size(egui::Pos2::new(0.0, 0.0), egui::Vec2::new(200.0, 200.0));
+        assert!(canvas_local_pointer(rect, egui::Pos2::new(10.0, 10.0)).is_some());
+        assert!(canvas_local_pointer(rect, egui::Pos2::new(500.0, 500.0)).is_none());
+    }
+}
+
+/// Contorno complejo: arranque, captura y guías del trazo dibujado a mano.
+impl GrafitoApp {
+    /// Punto de mundo del puntero dentro del canvas.
+    fn contour_world_at(&self, pos: egui::Pos2, canvas_rect: Rect) -> Point2 {
+        let local = pos - canvas_rect.min;
+        let world = self
+            .document
+            .view()
+            .screen_to_world(GlamVec2::new(local.x, local.y));
+        Point2::new(world.x, world.y)
+    }
+
+    /// Imán liviano (objetos/ejes/cuadrícula) para las muestras del contorno.
+    /// Shift lo libera; con el imán apagado devuelve el punto crudo.
+    fn contour_snap(
+        &self,
+        world: Point2,
+        shift: bool,
+    ) -> (Point2, Option<crate::snap::SnapResult>) {
+        if !self.complex_contour.settings.snap {
+            return (world, None);
+        }
+        let result = crate::snap::snap_point_light(
+            world,
+            &self.document,
+            self.document.view().scale,
+            &self.snap_config,
+            shift,
+        );
+        let point = result.point;
+        (point, Some(result))
+    }
+
+    /// Arranca el trazo vivo del contorno (libre o círculo) con imán.
+    pub(crate) fn begin_complex_contour_at(
+        &mut self,
+        pos: egui::Pos2,
+        canvas_rect: Rect,
+        shift: bool,
+    ) {
+        if self.complex_contour.live.is_some() {
+            return;
+        }
+        let world = self.contour_world_at(pos, canvas_rect);
+        let (point, marker) = self.contour_snap(world, shift);
+        self.complex_contour.snap_marker = marker;
+        let settings = self.complex_contour.settings.clone();
+        let result = match settings.mode {
+            crate::complex_contour::ComplexContourMode::Freehand => {
+                crate::complex_contour::start_freehand(&self.document, point, &settings)
+            }
+            crate::complex_contour::ComplexContourMode::Circle => {
+                crate::complex_contour::start_circle(&self.document, point, &settings)
+            }
+        };
+        match result {
+            Ok(live) => {
+                self.complex_contour.live = Some(live);
+                self.last_interaction_time = Instant::now();
+            }
+            Err(error) => {
+                self.complex_contour.live = None;
+                self.notify(error, grafito_ui::toast::ToastKind::Error);
+            }
+        }
+    }
+
+    /// Captura una muestra del trazo vivo (aplica imán y cierre automático).
+    pub(crate) fn extend_complex_contour_at(
+        &mut self,
+        pos: egui::Pos2,
+        canvas_rect: Rect,
+        shift: bool,
+    ) {
+        let world = self.contour_world_at(pos, canvas_rect);
+        let view_scale = self.document.view().scale;
+        let settings = self.complex_contour.settings.clone();
+        let (mut point, marker) = self.contour_snap(world, shift);
+        self.complex_contour.snap_marker = marker;
+
+        if settings.mode == crate::complex_contour::ComplexContourMode::Circle {
+            self.complex_contour.capture_circle(point);
+            return;
+        }
+
+        // Imán de cierre: si el trazo vuelve cerca del inicio, clava el primer
+        // punto (lazo limpio para ∮); pisa al imán de objetos.
+        if settings.auto_close {
+            let live = self.complex_contour.live.as_ref();
+            if let Some(first) = live.and_then(|live| live.points().first().copied()) {
+                let long_enough = live.map(|live| live.points().len() >= 3).unwrap_or(false);
+                if long_enough && crate::complex_contour::should_close(first, point, view_scale) {
+                    point = first;
+                    self.complex_contour.snap_marker = None;
+                }
+            }
+        }
+        self.complex_contour.capture_freehand(point, view_scale);
+    }
+}
+
+#[cfg(test)]
+mod long_press_tracker_tests {
+    use super::{LongPressTracker, LONG_PRESS_HOLD_SECS, LONG_PRESS_SLOP_PX};
+
+    fn pos(x: f32, y: f32) -> Option<egui::Pos2> {
+        Some(egui::pos2(x, y))
+    }
+
+    #[test]
+    fn hold_quieto_dispara_a_los_500ms() {
+        let mut t = LongPressTracker::default();
+        t.note_frame(true, 10.0, pos(100.0, 100.0));
+        assert!(!t.fire_due(10.0));
+        assert!(t.awaiting(10.0));
+        // Justo antes del hold: aún no.
+        t.note_frame(true, 10.0 + LONG_PRESS_HOLD_SECS - 0.01, pos(100.0, 100.0));
+        assert!(!t.fire_due(10.0 + LONG_PRESS_HOLD_SECS - 0.01));
+        // Hold cumplido: dispara.
+        t.note_frame(true, 10.0 + LONG_PRESS_HOLD_SECS, pos(100.0, 100.0));
+        assert!(t.fire_due(10.0 + LONG_PRESS_HOLD_SECS));
+        // Se consume: no re-dispara hasta soltar y re-apoyar.
+        t.mark_fired();
+        assert!(t.menu_open());
+        assert!(!t.fire_due(11.0));
+        assert!(!t.awaiting(11.0));
+        // Soltar resetea: el próximo apoyo arma de nuevo.
+        t.note_frame(false, 12.0, None);
+        assert!(!t.menu_open());
+        t.note_frame(true, 12.0, pos(100.0, 100.0));
+        assert!(!t.fire_due(12.0));
+    }
+
+    #[test]
+    fn moverse_mas_de_10px_cancela_y_no_dispara() {
+        let mut t = LongPressTracker::default();
+        t.note_frame(true, 0.0, pos(50.0, 50.0));
+        // Drift dentro del slop: sigue armando.
+        t.note_frame(true, 0.2, pos(50.0 + LONG_PRESS_SLOP_PX - 1.0, 50.0));
+        assert!(!t.fire_due(0.2));
+        // Salida del slop: cancela (el pan de 1 dedo sigue intacto).
+        t.note_frame(true, 0.3, pos(50.0 + LONG_PRESS_SLOP_PX + 1.0, 50.0));
+        assert!(!t.fire_due(1.0));
+        assert!(!t.awaiting(1.0));
+        // Volver al origen no re-arma: hasta soltar, muerto.
+        t.note_frame(true, 1.5, pos(50.0, 50.0));
+        assert!(!t.fire_due(1.5));
+    }
+
+    #[test]
+    fn soltar_o_multitouch_resetea_sin_disparar() {
+        let mut t = LongPressTracker::default();
+        t.note_frame(true, 0.0, pos(10.0, 10.0));
+        // Multitouch (2 dedos navegan): el llamador pasa down=false.
+        t.note_frame(false, 0.3, pos(10.0, 10.0));
+        assert!(!t.fire_due(1.0));
+        // Tap corto (<500 ms) y soltar: sin menú, sin click suprimido.
+        t.note_frame(true, 2.0, pos(10.0, 10.0));
+        t.note_frame(false, 2.2, pos(10.0, 10.0));
+        assert!(!t.menu_open());
+        assert!(!t.fire_due(3.0));
+    }
+}

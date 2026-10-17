@@ -1,0 +1,7042 @@
+use egui::{Color32, Pos2, Rect, Stroke, Vec2};
+use glam::{DVec3, Vec3};
+use grafito_core::{
+    ChangeSet, Cone3DObj, Cube3DObj, Cylinder3DObj, Document, GeoObject, ImplicitSurface3DObj,
+    InfiniteCone3DObj, InfiniteCylinder3DObj, Line3DObj, MoebiusStripObj, ObjectId,
+    ParametricCurve3DObj, Plane3DObj, Platonic3DObj, Point3DObj, PointStyle, Prism3DObj,
+    Pyramid3DObj, RegularPolychoron4DObj, RegularPolytopeNDObj, Segment3DObj, Sphere3DObj,
+    Surface3DObj, Tetrahedron3DObj, Torus3DObj, VectorField3DObj,
+};
+use grafito_geometry::{
+    curve_3d_segment_is_continuous, ray_mesh_hit, Aabb3D, Camera3D, Point3D, PolyhedronNet, Ray3D,
+    RegularPolychoron, RegularPolytopeFamily, GB_GEOM_EPS,
+};
+use grafito_render::depth_3d::{
+    project_regular_polychoron, project_regular_polytope_nd, ProjectedRegularPolytope,
+};
+use grafito_ui::Tool;
+
+use crate::{to_color32, GrafitoApp};
+
+/// Tope del memo de centros paramétricos 3D.
+const PARAM_CENTER_CACHE_CAP: usize = 64;
+/// Cota de órbitas de atractores en memoria (cada una es densa).
+/// Al llenar se expulsa una ajena a la vigente (ver call-site).
+const ATTRACTOR_CACHE_MAX_ENTRIES: usize = 16;
+// F14.4.3: construcción `const` sin `unsafe` (cap literal > 0).
+const PARAM_CENTER_CACHE_SIZE: std::num::NonZeroUsize =
+    match std::num::NonZeroUsize::new(PARAM_CENTER_CACHE_CAP) {
+        Some(v) => v,
+        None => panic!("PARAM_CENTER_CACHE_CAP must be nonzero"),
+    };
+
+thread_local! {
+    /// Centros de superficies/curvas paramétricas por (objeto, versión).
+    static PARAM_CENTERS: std::cell::RefCell<lru::LruCache<(ObjectId, u64), Vec3>> =
+        std::cell::RefCell::new(lru::LruCache::new(PARAM_CENTER_CACHE_SIZE));
+}
+
+/// Centro memoizado: el cálculo evalúa el AST 3 veces (parse completo en
+/// cada una vía `prepare_function_ast`, sin caché) y corría por frame por
+/// superficie/curva aunque nada cambie. La versión cubre ediciones de
+/// expresión y cambios de variables (ambos con commit).
+fn cached_parametric_center(
+    obj_id: ObjectId,
+    version: u64,
+    compute: impl FnOnce() -> Vec3,
+) -> Vec3 {
+    if let Some(hit) = PARAM_CENTERS.with(|c| c.borrow_mut().get(&(obj_id, version)).copied()) {
+        return hit;
+    }
+    let center = compute();
+    PARAM_CENTERS.with(|c| {
+        c.borrow_mut().put((obj_id, version), center);
+    });
+    center
+}
+
+/// La superficie 4D histórica no entra en el `WorldMesh` y conserva su
+/// proyección CPU cuando el callback GPU está activo.
+pub(crate) fn requires_cpu_3d_overlay(object: &GeoObject) -> bool {
+    matches!(object, GeoObject::HyperSurface4D(_))
+}
+
+pub(crate) fn should_draw_cpu_3d_geometry(object: &GeoObject, overlay_only: bool) -> bool {
+    !overlay_only || requires_cpu_3d_overlay(object)
+}
+
+/// Indica si un objeto tipado debe adquirir una proyección CPU en este frame.
+///
+/// Cuando el callback GPU ya compone su geometría, una proyección solo se necesita
+/// para posicionar una etiqueta CPU; los objetos sin etiqueta no tocan la cache.
+pub(crate) fn typed_cpu_projection_is_needed(object: &GeoObject, overlay_only: bool) -> bool {
+    match object {
+        GeoObject::RegularPolychoron4D(polychoron) => !overlay_only || !polychoron.label.is_empty(),
+        GeoObject::RegularPolytopeND(polytope) => !overlay_only || !polytope.label.is_empty(),
+        _ => false,
+    }
+}
+
+/// Limita una fase transitoria a las proyecciones tipadas que realmente viven en R4.
+/// La aplicación conserva la fase al pausar para mantener la proyección visible inmóvil.
+pub(crate) fn typed_four_d_phase_for_object(
+    object: &GeoObject,
+    transient_phase: Option<f64>,
+) -> Option<f64> {
+    let phase = transient_phase.filter(|phase| phase.is_finite())?;
+    match object {
+        GeoObject::RegularPolychoron4D(_) => Some(phase),
+        GeoObject::RegularPolytopeND(polytope) if polytope.dimension == 4 => Some(phase),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Cpu3dRenderOptions {
+    pub(crate) overlay_only: bool,
+    pub(crate) motion_preview: bool,
+    pub(crate) typed_four_d_phase: Option<f64>,
+}
+
+fn camera_view_depth(camera: &Camera3D, point: Vec3) -> f32 {
+    -(camera.view_matrix() * point.extend(1.0)).z
+}
+
+const PICK_RADIUS_PIXELS: f64 = 8.0;
+const DEFAULT_CREATION_RADIUS_PIXELS: f64 = 40.0;
+const PLANE_RENDER_EXTENT: f64 = 8.0;
+const LINE_RENDER_HALF_EXTENT: f64 = 40.0;
+/// Semiextensión del viewport para objetos infinitos (cono/cilindro): el
+/// dibujo y el picking grueso clipan honesto a ±50 alrededor del
+/// ápice/punto base. Documentado acá para que `canvas.rs` (dueño del
+/// viewport) lo reuse sin magia duplicada.
+pub(crate) const INFINITE_OBJECT_VIEWPORT_CLIP: f64 = 50.0;
+const FALLBACK_CURVE_SAMPLES: usize = 500;
+const FALLBACK_ATTRACTOR_STEPS: usize = 4_096;
+const MOTION_PREVIEW_MAX_3D_SAMPLES: usize = 1_024;
+pub(crate) const MAX_MOTION_PREVIEW_POLYTOPE_EDGES: usize = 1_024;
+
+fn motion_preview_sample_stride(sample_count: usize, motion_preview: bool) -> usize {
+    if !motion_preview || sample_count <= MOTION_PREVIEW_MAX_3D_SAMPLES {
+        return 1;
+    }
+    sample_count.div_ceil(MOTION_PREVIEW_MAX_3D_SAMPLES)
+}
+
+fn motion_preview_surface_resolution(resolution: usize, motion_preview: bool) -> usize {
+    if motion_preview {
+        resolution.min(16)
+    } else {
+        resolution
+    }
+}
+
+pub(crate) fn motion_preview_polytope_edge_stride(
+    edge_count: usize,
+    motion_preview: bool,
+) -> usize {
+    if !motion_preview || edge_count <= MAX_MOTION_PREVIEW_POLYTOPE_EDGES {
+        return 1;
+    }
+    edge_count.div_ceil(MAX_MOTION_PREVIEW_POLYTOPE_EDGES)
+}
+
+fn effective_four_d_angles(base_angles: &[f64], phase: f64) -> [f64; 3] {
+    let base = [
+        base_angles.first().copied().unwrap_or(0.3),
+        base_angles.get(1).copied().unwrap_or(0.5),
+        base_angles.get(2).copied().unwrap_or(0.7),
+    ];
+    if !phase.is_finite() {
+        return base;
+    }
+    [
+        base[0] + phase,
+        base[1] + phase * 2.0,
+        base[2] + phase * 3.0,
+    ]
+}
+
+/// Compone una fase transitoria únicamente sobre las seis rotaciones tipadas
+/// de R4. Los multiplicadores enteros conservan continuidad al envolver en TAU.
+pub(crate) fn effective_typed_four_d_angles(base_angles: [f64; 6], phase: Option<f64>) -> [f64; 6] {
+    let Some(phase) = phase.filter(|phase| phase.is_finite()) else {
+        return base_angles;
+    };
+
+    let mut effective = base_angles;
+    for (index, angle) in effective.iter_mut().enumerate() {
+        let offset = phase * (index + 1) as f64;
+        let next = *angle + offset;
+        if !next.is_finite() {
+            return base_angles;
+        }
+        *angle = next;
+    }
+    effective
+}
+
+fn color_is_renderable(color: grafito_geometry::Color) -> bool {
+    color
+        .to_array()
+        .iter()
+        .all(|component| component.is_finite())
+}
+
+fn regular_polychoron_is_renderable(object: &RegularPolychoron4DObj) -> bool {
+    object.scale.is_finite()
+        && object.scale > 0.0
+        && object.rotation_angles.iter().all(|angle| angle.is_finite())
+        && object.width.is_finite()
+        && object.width > 0.0
+        && color_is_renderable(object.color)
+        && object.fill_color.is_none_or(color_is_renderable)
+}
+
+fn regular_polytope_is_renderable(object: &RegularPolytopeNDObj) -> bool {
+    let Some(expected_rotation_count) =
+        RegularPolytopeNDObj::expected_rotation_angle_count(object.dimension)
+    else {
+        return false;
+    };
+
+    object.scale.is_finite()
+        && object.scale > 0.0
+        && object.rotation_angles.len() == expected_rotation_count
+        && object.rotation_angles.iter().all(|angle| angle.is_finite())
+        && object.width.is_finite()
+        && object.width > 0.0
+        && color_is_renderable(object.color)
+        && object.fill_color.is_none_or(color_is_renderable)
+}
+
+pub(crate) fn project_regular_polychoron_cpu(
+    object: &RegularPolychoron4DObj,
+    transient_phase: Option<f64>,
+) -> Option<ProjectedRegularPolytope> {
+    if !regular_polychoron_is_renderable(object) {
+        return None;
+    }
+    let angles = effective_typed_four_d_angles(object.rotation_angles, transient_phase);
+    project_regular_polychoron(object, angles)
+}
+
+pub(crate) fn project_regular_polytope_nd_cpu(
+    object: &RegularPolytopeNDObj,
+    transient_phase: Option<f64>,
+) -> Option<ProjectedRegularPolytope> {
+    if !regular_polytope_is_renderable(object) {
+        return None;
+    }
+    if object.dimension == 4 {
+        let base_angles: [f64; 6] = object.rotation_angles.as_slice().try_into().ok()?;
+        let angles = effective_typed_four_d_angles(base_angles, transient_phase);
+        project_regular_polytope_nd(object, &angles)
+    } else {
+        project_regular_polytope_nd(object, &object.rotation_angles)
+    }
+}
+
+pub(crate) fn should_draw_polychoron_faces(has_fill: bool, motion_preview: bool) -> bool {
+    has_fill && !motion_preview
+}
+
+#[allow(dead_code)] // Seam legacy: tests + compat; el dibujo usa `_for_view`.
+pub(crate) fn projected_polychoron_faces(
+    camera: &Camera3D,
+    geometry: &ProjectedRegularPolytope,
+    screen_w: f32,
+    screen_h: f32,
+) -> Vec<(f32, [(f32, f32); 3])> {
+    let projector =
+        View3dProjector::for_canvas(OrthoProjection::Perspective, camera, screen_w, screen_h);
+    projected_polychoron_faces_for_view(&projector, geometry)
+}
+
+/// Caras triangulares ordenadas por profundidad según la vista del canvas
+/// (perspectiva u ortográfica). Fuente única del dibujo con relleno.
+pub(crate) fn projected_polychoron_faces_for_view(
+    projector: &View3dProjector,
+    geometry: &ProjectedRegularPolytope,
+) -> Vec<(f32, [(f32, f32); 3])> {
+    let mut triangles = Vec::new();
+    for face in geometry.faces() {
+        let Some(&first) = face.first() else {
+            continue;
+        };
+        for index in 1..face.len().saturating_sub(1) {
+            let Some((&second, &third)) = face.get(index).zip(face.get(index + 1)) else {
+                continue;
+            };
+            let Some((a, b, c)) = geometry
+                .vertices()
+                .get(first)
+                .zip(geometry.vertices().get(second))
+                .zip(geometry.vertices().get(third))
+                .map(|((a, b), c)| (*a, *b, *c))
+            else {
+                continue;
+            };
+            let (Some(a2), Some(b2), Some(c2)) = (
+                projector.project_point(&a),
+                projector.project_point(&b),
+                projector.project_point(&c),
+            ) else {
+                continue;
+            };
+            let depth = (projector.view_depth(a.to_vec3())
+                + projector.view_depth(b.to_vec3())
+                + projector.view_depth(c.to_vec3()))
+                / 3.0;
+            if depth.is_finite() {
+                triangles.push((depth, [a2, b2, c2]));
+            }
+        }
+    }
+    triangles.sort_by(|left, right| right.0.total_cmp(&left.0));
+    triangles
+}
+
+fn projected_polytope_center(geometry: &ProjectedRegularPolytope) -> Option<Vec3> {
+    let count = geometry.vertices().len() as f64;
+    if count <= 0.0 || !count.is_finite() {
+        return None;
+    }
+    let sum = geometry
+        .vertices()
+        .iter()
+        .fold(DVec3::ZERO, |sum, point| sum + point.to_dvec3());
+    if !sum.is_finite() {
+        return None;
+    }
+    let center = Point3D::from_dvec3(sum / count);
+    grafito_render::depth_3d::point_is_renderable(center).then_some(center.to_vec3())
+}
+
+/// Intersects a canvas-local pointer ray with the camera-facing plane through
+/// `camera.target`. The plane basis remains available from `Camera3D` for
+/// future axis-constrained dragging.
+pub(crate) fn construction_point_from_canvas(
+    camera: &Camera3D,
+    local_pointer: Vec2,
+    canvas_size: Vec2,
+) -> Option<Point3D> {
+    if !local_pointer.is_finite() || !canvas_size.is_finite() {
+        return None;
+    }
+    let ray = camera.screen_ray(
+        local_pointer.x,
+        local_pointer.y,
+        canvas_size.x,
+        canvas_size.y,
+    )?;
+    camera.construction_plane()?.intersect_ray(&ray)
+}
+
+fn world_pick_radius(
+    camera: &Camera3D,
+    ray: &Ray3D,
+    distance: f64,
+    canvas_height: f32,
+    pixel_radius: f64,
+) -> Option<f64> {
+    if !canvas_height.is_finite()
+        || canvas_height <= 0.0
+        || !pixel_radius.is_finite()
+        || pixel_radius <= 0.0
+    {
+        return None;
+    }
+    let point = ray.point_at(distance)?.to_vec3();
+    if !point.is_finite() {
+        return None;
+    }
+    let depth = camera_view_depth(camera, point) as f64;
+    let half_fov = (camera.fov as f64).to_radians() * 0.5;
+    let radius = 2.0 * depth * half_fov.tan() * pixel_radius / canvas_height as f64;
+    (depth >= camera.near as f64
+        && depth <= camera.far as f64
+        && radius.is_finite()
+        && radius > 0.0)
+        .then_some(radius)
+}
+
+fn segment_overlaps_visible_depth(camera: &Camera3D, a: Point3D, b: Point3D) -> bool {
+    let a = a.to_vec3();
+    let b = b.to_vec3();
+    if !a.is_finite() || !b.is_finite() {
+        return false;
+    }
+    let a_depth = camera_view_depth(camera, a);
+    let b_depth = camera_view_depth(camera, b);
+    a_depth.is_finite()
+        && b_depth.is_finite()
+        && a_depth.max(b_depth) >= camera.near
+        && a_depth.min(b_depth) <= camera.far
+}
+
+fn proximity_hit(
+    camera: &Camera3D,
+    ray: &Ray3D,
+    a: Point3D,
+    b: Point3D,
+    canvas_height: f32,
+    pixel_radius: f64,
+) -> Option<f64> {
+    if !segment_overlaps_visible_depth(camera, a, b) {
+        return None;
+    }
+    let proximity = ray.closest_to_segment(a, b)?;
+    let tolerance = world_pick_radius(
+        camera,
+        ray,
+        proximity.distance_along_ray,
+        canvas_height,
+        pixel_radius,
+    )?;
+    (proximity.separation <= tolerance).then_some(proximity.distance_along_ray)
+}
+
+fn center_extent_bounds(center: Point3D, extent: f64) -> Option<Aabb3D> {
+    if !center.is_finite() || !extent.is_finite() || extent < 0.0 {
+        return None;
+    }
+    let center = center.to_dvec3();
+    let extent = DVec3::splat(extent);
+    Aabb3D::new(
+        Point3D::from_dvec3(center - extent),
+        Point3D::from_dvec3(center + extent),
+    )
+}
+
+fn endpoints_radius_bounds(a: Point3D, b: Point3D, radius: f64) -> Option<Aabb3D> {
+    if !a.is_finite() || !b.is_finite() || !radius.is_finite() || radius < 0.0 {
+        return None;
+    }
+    let min = a.to_dvec3().min(b.to_dvec3()) - DVec3::splat(radius);
+    let max = a.to_dvec3().max(b.to_dvec3()) + DVec3::splat(radius);
+    Aabb3D::new(Point3D::from_dvec3(min), Point3D::from_dvec3(max))
+}
+
+fn surface_bounds(
+    surface: &Surface3DObj,
+    variables: &std::collections::BTreeMap<String, f64>,
+) -> Option<Aabb3D> {
+    if let Ok(grid) = surface.cached_grid.try_read() {
+        if let Some(bounds) = Aabb3D::from_points(grid.iter().flatten().copied()) {
+            return Some(bounds);
+        }
+    }
+    Aabb3D::from_points(
+        grafito_core::parametric_sampling::evaluate_surface_3d(
+            surface,
+            surface.mesh_res.clamp(8, 50),
+            variables,
+        )
+        .into_iter()
+        .flatten(),
+    )
+}
+
+fn curve_bounds(
+    curve: &ParametricCurve3DObj,
+    variables: &std::collections::BTreeMap<String, f64>,
+) -> Option<Aabb3D> {
+    if let Ok(samples) = curve.cached_samples.try_read() {
+        if let Some(bounds) =
+            Aabb3D::from_points(samples.iter().map(|&(x, y, z)| Point3D::new(x, y, z)))
+        {
+            return Some(bounds);
+        }
+    }
+    Aabb3D::from_points(
+        grafito_core::parametric_sampling::evaluate_parametric_curve_3d(
+            curve,
+            FALLBACK_CURVE_SAMPLES,
+            variables,
+        )
+        .into_iter()
+        .map(|(x, y, z)| Point3D::new(x, y, z)),
+    )
+}
+
+fn fallback_bounds_hit(
+    bounds: Aabb3D,
+    camera: &Camera3D,
+    ray: &Ray3D,
+    canvas_height: f32,
+) -> Option<f64> {
+    let mut min_depth = f32::INFINITY;
+    let mut max_depth = f32::NEG_INFINITY;
+    for x in [bounds.min.x, bounds.max.x] {
+        for y in [bounds.min.y, bounds.max.y] {
+            for z in [bounds.min.z, bounds.max.z] {
+                let point = Point3D::new(x, y, z).to_vec3();
+                if !point.is_finite() {
+                    return None;
+                }
+                let depth = camera_view_depth(camera, point);
+                if !depth.is_finite() {
+                    return None;
+                }
+                min_depth = min_depth.min(depth);
+                max_depth = max_depth.max(depth);
+            }
+        }
+    }
+    if max_depth < camera.near || min_depth > camera.far {
+        return None;
+    }
+
+    let min = bounds.min.to_dvec3();
+    let max = bounds.max.to_dvec3();
+    let center = min + (max - min) * 0.5;
+    if !center.is_finite() {
+        return None;
+    }
+    let center_distance = (center - ray.origin.to_dvec3())
+        .dot(ray.direction.to_dvec3())
+        .clamp(ray.min_distance, ray.max_distance);
+    let padding = world_pick_radius(
+        camera,
+        ray,
+        center_distance,
+        canvas_height,
+        PICK_RADIUS_PIXELS,
+    )?;
+    let padding = DVec3::splat(padding.max(1.0e-9));
+    let padded = Aabb3D::new(
+        Point3D::from_dvec3(min - padding),
+        Point3D::from_dvec3(max + padding),
+    )?;
+    ray.intersect_aabb(padded)
+}
+
+fn fallback_object_bounds(
+    object: &GeoObject,
+    variables: &std::collections::BTreeMap<String, f64>,
+) -> Option<Aabb3D> {
+    fallback_object_bounds_with_typed_four_d_phase(object, variables, None)
+}
+
+/// Obtiene los límites CPU de selección con la misma fase tipada que la proyección dibujada.
+pub(crate) fn fallback_object_bounds_with_typed_four_d_phase(
+    object: &GeoObject,
+    variables: &std::collections::BTreeMap<String, f64>,
+    typed_four_d_phase: Option<f64>,
+) -> Option<Aabb3D> {
+    match object {
+        GeoObject::Pyramid3D(pyramid) => {
+            let geometry = grafito_geometry::Pyramid3D::new(
+                pyramid.base_center,
+                pyramid.apex,
+                pyramid.base_size,
+            );
+            Aabb3D::from_points(
+                geometry
+                    .base_vertices()
+                    .into_iter()
+                    .chain(std::iter::once(pyramid.apex)),
+            )
+        }
+        GeoObject::Tetrahedron3D(tetrahedron) => Aabb3D::from_points(
+            grafito_geometry::Tetrahedron3D::new(tetrahedron.center, tetrahedron.edge_length)
+                .vertices(),
+        ),
+        GeoObject::Platonic3D(p) => {
+            grafito_geometry::platonic_mesh(p.kind.to_geometry_solid(), p.edge_length)
+                .ok()
+                .and_then(|mesh| {
+                    let verts: Vec<Point3D> = mesh
+                        .vertices()
+                        .iter()
+                        .map(|v| Point3D::new(v.x + p.center.x, v.y + p.center.y, v.z + p.center.z))
+                        .collect();
+                    Aabb3D::from_points(verts)
+                })
+        }
+        GeoObject::InfiniteCone3D(c) => {
+            // Clip honesto ±`INFINITE_OBJECT_VIEWPORT_CLIP` alrededor del ápice.
+            center_extent_bounds(c.apex, INFINITE_OBJECT_VIEWPORT_CLIP)
+        }
+        GeoObject::InfiniteCylinder3D(c) => {
+            center_extent_bounds(c.base_point, INFINITE_OBJECT_VIEWPORT_CLIP)
+        }
+        GeoObject::Cone3D(cone) => {
+            endpoints_radius_bounds(cone.base_center, cone.apex, cone.radius)
+        }
+        GeoObject::Cylinder3D(cylinder) => {
+            endpoints_radius_bounds(cylinder.base_center, cylinder.top_center, cylinder.radius)
+        }
+        GeoObject::Torus3D(torus) => {
+            center_extent_bounds(torus.center, torus.r_major.abs() + torus.r_minor.abs())
+        }
+        GeoObject::MoebiusStrip(strip) => {
+            center_extent_bounds(strip.center, strip.radius.abs() + strip.width_r.abs() * 0.5)
+        }
+        GeoObject::Surface3D(surface) => surface_bounds(surface, variables),
+        GeoObject::ParametricCurve3D(curve) => curve_bounds(curve, variables),
+        GeoObject::Attractor3D(attractor) => {
+            let steps = attractor.steps.min(FALLBACK_ATTRACTOR_STEPS);
+            let skip = attractor.skip.min(steps.saturating_sub(1));
+            let points = grafito_geometry::attractors::integrate_attractor(
+                &attractor.model(),
+                attractor.x0,
+                attractor.y0,
+                attractor.z0,
+                attractor.dt,
+                steps,
+                skip,
+            )
+            .into_iter()
+            .map(|point| Point3D::new(point.x * 0.2, point.y * 0.2, point.z * 0.2));
+            Aabb3D::from_points(points)
+        }
+        GeoObject::RegularPolychoron4D(polychoron) => project_regular_polychoron_cpu(
+            polychoron,
+            typed_four_d_phase_for_object(object, typed_four_d_phase),
+        )
+        .and_then(|geometry| Aabb3D::from_points(geometry.vertices().iter().copied())),
+        GeoObject::RegularPolytopeND(polytope) => project_regular_polytope_nd_cpu(
+            polytope,
+            typed_four_d_phase_for_object(object, typed_four_d_phase),
+        )
+        .and_then(|geometry| Aabb3D::from_points(geometry.vertices().iter().copied())),
+        GeoObject::HyperSurface4D(surface) => {
+            let extent = surface.params.first().copied().unwrap_or(3.0).abs() * 2.0;
+            center_extent_bounds(Point3D::new(0.0, 0.0, 0.0), extent)
+        }
+        GeoObject::VectorField3D(field) => Aabb3D::new(
+            Point3D::new(field.x_min, field.y_min, field.z_min),
+            Point3D::new(field.x_max, field.y_max, field.z_max),
+        ),
+        GeoObject::Prism3D(prism) => {
+            let base = grafito_render::prism_base_vertices(prism);
+            let top = grafito_render::prism_top_vertices(prism);
+            Aabb3D::from_points(base.iter().copied().chain(top))
+        }
+        GeoObject::Quadric3D(quadric) => {
+            // A4: malla exacta A2 — jamás un elipsoide falso. El elipsoide
+            // alineado a ejes mantiene el camino legacy; el resto usa sus
+            // polilíneas exactas cacheadas (`cached_quadric_wire_points` en
+            // depth_3d, NO matemática por frame en UI); degenerada sin
+            // superficie → `None` honesto (sin caja ni picking falso).
+            // W-A: la UI solo itera el `Arc` del cache.
+            if let Some(ellipsoid) = grafito_render::quadric_ellipsoid_params(quadric) {
+                let center = ellipsoid.center.to_dvec3();
+                let radii = DVec3::new(
+                    ellipsoid.radii.x as f64,
+                    ellipsoid.radii.y as f64,
+                    ellipsoid.radii.z as f64,
+                );
+                Aabb3D::new(
+                    Point3D::from_dvec3(center - radii),
+                    Point3D::from_dvec3(center + radii),
+                )
+            } else {
+                let coeffs = [
+                    quadric.a, quadric.b, quadric.c, quadric.d, quadric.e, quadric.f, quadric.g,
+                    quadric.h, quadric.i, quadric.j,
+                ];
+                let lines = match grafito_render::depth_3d::cached_quadric_wire_points(coeffs) {
+                    Ok(lines) => lines,
+                    Err(_) => return None,
+                };
+                Aabb3D::from_points(lines.iter().flatten().copied())
+            }
+        }
+        GeoObject::ImplicitSurface3D(surface) => Aabb3D::new(
+            Point3D::new(surface.x_min, surface.y_min, surface.z_min),
+            Point3D::new(surface.x_max, surface.y_max, surface.z_max),
+        ),
+        _ => None,
+    }
+}
+
+/// Eje unitario de un objeto infinito como el dibujo (`direction − origen`).
+/// `None` si algún punto no es finito o el eje degenera (longitud ~0).
+fn infinite_object_axis(origin: Point3D, direction: Point3D) -> Option<DVec3> {
+    if !origin.is_finite() || !direction.is_finite() {
+        return None;
+    }
+    let axis = direction.to_dvec3() - origin.to_dvec3();
+    if !axis.is_finite() || axis.length_squared() <= 1.0e-24 {
+        return None;
+    }
+    let unit = axis.normalize();
+    unit.is_finite().then_some(unit)
+}
+
+/// Raíces ordenadas de `a·t²+b·t+c=0` (lineal si `a ~ 0`). Vacío si no hay
+/// raíces reales o la aritmética no es finita. Sin alloc: máximo 2.
+fn quadratic_roots(a: f64, b: f64, c: f64) -> [Option<f64>; 2] {
+    if !a.is_finite() || !b.is_finite() || !c.is_finite() {
+        return [None, None];
+    }
+    if a.abs() <= 1.0e-12 {
+        if b.abs() <= 1.0e-12 {
+            return [None, None];
+        }
+        let root = -c / b;
+        return [root.is_finite().then_some(root), None];
+    }
+    let disc = b * b - 4.0 * a * c;
+    if !disc.is_finite() || disc < 0.0 {
+        return [None, None];
+    }
+    let sqrt_disc = disc.sqrt();
+    let (first, second) = ((-b - sqrt_disc) / (2.0 * a), (-b + sqrt_disc) / (2.0 * a));
+    if !first.is_finite() || !second.is_finite() {
+        return [None, None];
+    }
+    if first <= second {
+        [Some(first), Some(second)]
+    } else {
+        [Some(second), Some(first)]
+    }
+}
+
+/// Primera raíz visible cuya coordenada axial cae en el clip ±`CLIP`.
+/// El clip se mide sobre el eje desde `apex_or_base`, igual que el dibujo.
+fn first_root_in_clip(
+    ray: &Ray3D,
+    roots: [Option<f64>; 2],
+    axial_at: impl Fn(f64) -> Option<f64>,
+) -> Option<f64> {
+    for root in roots.into_iter().flatten() {
+        if root < ray.min_distance || root > ray.max_distance {
+            continue;
+        }
+        let axial = axial_at(root)?;
+        if axial.is_finite() && axial.abs() <= INFINITE_OBJECT_VIEWPORT_CLIP {
+            return Some(root);
+        }
+    }
+    None
+}
+
+/// Intersección rayo-cono infinito (doble manto, como el dibujo que traza
+/// ambas ramas): `(x·u)² − cos²α·(x·x) = 0` con `x = w + t·d`.
+/// `None` si el eje/ángulo degenera, el rayo falla el manto o todo cruce
+/// cae fuera del clip ±50.
+fn infinite_cone_ray_hit(cone: &InfiniteCone3DObj, ray: &Ray3D) -> Option<f64> {
+    if !cone.apex.is_finite() || !cone.direction.is_finite() {
+        return None;
+    }
+    let axis = infinite_object_axis(cone.apex, cone.direction)?;
+    let half = cone.half_angle_rad;
+    if !half.is_finite() || half <= 0.0 || half >= std::f64::consts::FRAC_PI_2 {
+        return None;
+    }
+    let cos2 = half.cos().powi(2);
+    if !cos2.is_finite() || cos2 <= 0.0 || cos2 >= 1.0 {
+        return None;
+    }
+    let origin = ray.origin.to_dvec3();
+    let dir = ray.direction.to_dvec3();
+    if !origin.is_finite() || !dir.is_finite() {
+        return None;
+    }
+    let apex = cone.apex.to_dvec3();
+    let dir2 = dir.length_squared();
+    let w = origin - apex;
+    let dv = dir.dot(axis);
+    let wv = w.dot(axis);
+    let wd = w.dot(dir);
+    let ww = w.dot(w);
+    if !dir2.is_finite()
+        || !dv.is_finite()
+        || !wv.is_finite()
+        || !wd.is_finite()
+        || !ww.is_finite()
+        || dir2 <= 1.0e-24
+    {
+        return None;
+    }
+    let roots = quadratic_roots(
+        dv * dv - cos2 * dir2,
+        2.0 * (wv * dv - cos2 * wd),
+        wv * wv - cos2 * ww,
+    );
+    first_root_in_clip(ray, roots, |t| {
+        let hit = origin + dir * t;
+        hit.is_finite().then(|| (hit - apex).dot(axis))
+    })
+}
+
+/// Intersección rayo-cilindro infinito de radio `r` sobre el eje por
+/// `base_point`. `None` si el eje/radio degenera, el rayo falla el manto o
+/// todo cruce cae fuera del clip ±50. El rayo paralelo al eje nunca cruza
+/// el manto (`None` honesto, incluso desde adentro).
+fn infinite_cylinder_ray_hit(cylinder: &InfiniteCylinder3DObj, ray: &Ray3D) -> Option<f64> {
+    if !cylinder.base_point.is_finite() || !cylinder.direction.is_finite() {
+        return None;
+    }
+    let radius = cylinder.radius;
+    if !radius.is_finite() || radius <= 0.0 {
+        return None;
+    }
+    let axis = infinite_object_axis(cylinder.base_point, cylinder.direction)?;
+    let origin = ray.origin.to_dvec3();
+    let dir = ray.direction.to_dvec3();
+    if !origin.is_finite() || !dir.is_finite() {
+        return None;
+    }
+    let base = cylinder.base_point.to_dvec3();
+    let dir2 = dir.length_squared();
+    let w = origin - base;
+    let dv = dir.dot(axis);
+    let wv = w.dot(axis);
+    let wd = w.dot(dir);
+    let ww = w.dot(w);
+    if !dir2.is_finite()
+        || !dv.is_finite()
+        || !wv.is_finite()
+        || !wd.is_finite()
+        || !ww.is_finite()
+        || dir2 <= 1.0e-24
+    {
+        return None;
+    }
+    let roots = quadratic_roots(
+        dir2 - dv * dv,
+        2.0 * (wd - wv * dv),
+        ww - wv * wv - radius * radius,
+    );
+    first_root_in_clip(ray, roots, |t| {
+        let hit = origin + dir * t;
+        hit.is_finite().then(|| (hit - base).dot(axis))
+    })
+}
+
+fn object_ray_hit(
+    object: &GeoObject,
+    variables: &std::collections::BTreeMap<String, f64>,
+    camera: &Camera3D,
+    ray: &Ray3D,
+    canvas_height: f32,
+    typed_four_d_phase: Option<f64>,
+) -> Option<PickHit> {
+    match object {
+        GeoObject::Point3D(point) => proximity_hit(
+            camera,
+            ray,
+            point.position,
+            point.position,
+            canvas_height,
+            PICK_RADIUS_PIXELS.max(point.size.min(5.0) as f64),
+        )
+        .map(PickHit::exact),
+        GeoObject::Segment3D(segment) => proximity_hit(
+            camera,
+            ray,
+            segment.a,
+            segment.b,
+            canvas_height,
+            PICK_RADIUS_PIXELS.max(segment.width as f64 * 0.5 + 4.0),
+        )
+        .map(PickHit::exact),
+        GeoObject::Line3D(line) => {
+            let direction = line.direction.to_dvec3();
+            let length = direction.length();
+            if !length.is_finite() || length <= 1.0e-12 || !line.point.is_finite() {
+                return None;
+            }
+            let extent = direction / length * LINE_RENDER_HALF_EXTENT;
+            proximity_hit(
+                camera,
+                ray,
+                Point3D::from_dvec3(line.point.to_dvec3() - extent),
+                Point3D::from_dvec3(line.point.to_dvec3() + extent),
+                canvas_height,
+                PICK_RADIUS_PIXELS.max(line.width as f64 * 0.5 + 4.0),
+            )
+            .map(PickHit::exact)
+        }
+        GeoObject::Sphere3D(sphere) => ray
+            .intersect_sphere(sphere.center, sphere.radius)
+            .map(PickHit::exact),
+        GeoObject::InfiniteCone3D(c) => {
+            infinite_cone_ray_hit(c, ray)
+                .map(PickHit::exact)
+                .or_else(|| {
+                    coarse_object_hit(
+                        object,
+                        variables,
+                        camera,
+                        ray,
+                        canvas_height,
+                        typed_four_d_phase,
+                    )
+                })
+        }
+        GeoObject::InfiniteCylinder3D(c) => infinite_cylinder_ray_hit(c, ray)
+            .map(PickHit::exact)
+            .or_else(|| {
+                coarse_object_hit(
+                    object,
+                    variables,
+                    camera,
+                    ray,
+                    canvas_height,
+                    typed_four_d_phase,
+                )
+            }),
+        GeoObject::Plane3D(plane) => plane_ray_hit_distance(plane, ray).map(PickHit::exact),
+        // G-B: picking exacto contra malla con tolerancia GB_GEOM_EPS; si la
+        // malla no aplica o el rayo la falla, cae al grueso conservador.
+        GeoObject::Cube3D(_)
+        | GeoObject::Platonic3D(_)
+        | GeoObject::Pyramid3D(_)
+        | GeoObject::Tetrahedron3D(_)
+        | GeoObject::Prism3D(_)
+        | GeoObject::Cone3D(_)
+        | GeoObject::Cylinder3D(_)
+        | GeoObject::Torus3D(_)
+        | GeoObject::MoebiusStrip(_)
+        | GeoObject::ImplicitSurface3D(_) => mesh_or_coarse_hit(
+            object,
+            variables,
+            camera,
+            ray,
+            canvas_height,
+            typed_four_d_phase,
+        ),
+        _ => coarse_object_hit(
+            object,
+            variables,
+            camera,
+            ray,
+            canvas_height,
+            typed_four_d_phase,
+        ),
+    }
+}
+
+/// Picking grueso histórico por caja envolvente (conservador, nunca falla de más).
+fn coarse_object_hit(
+    object: &GeoObject,
+    variables: &std::collections::BTreeMap<String, f64>,
+    camera: &Camera3D,
+    ray: &Ray3D,
+    canvas_height: f32,
+    typed_four_d_phase: Option<f64>,
+) -> Option<PickHit> {
+    let bounds = match typed_four_d_phase {
+        Some(phase) => {
+            fallback_object_bounds_with_typed_four_d_phase(object, variables, Some(phase))
+        }
+        None => fallback_object_bounds(object, variables),
+    };
+    bounds
+        .and_then(|bounds| fallback_bounds_hit(bounds, camera, ray, canvas_height))
+        .map(PickHit::coarse)
+}
+
+/// Intenta picking exacto contra la malla y cae al grueso conservador.
+///
+/// El exacto gana por confianza (`PickConfidence::ExactGeometry`); si el rayo
+/// no toca la malla pero sí la caja, se conserva el grueso para no perder
+/// selección histórica por proximidad.
+fn mesh_or_coarse_hit(
+    object: &GeoObject,
+    variables: &std::collections::BTreeMap<String, f64>,
+    camera: &Camera3D,
+    ray: &Ray3D,
+    canvas_height: f32,
+    typed_four_d_phase: Option<f64>,
+) -> Option<PickHit> {
+    if let Some((vertices, triangles)) = object_pick_mesh(object, variables) {
+        if let Some(distance) = ray_mesh_hit(ray, &vertices, &triangles, GB_GEOM_EPS) {
+            return Some(PickHit::exact(distance));
+        }
+    }
+    coarse_object_hit(
+        object,
+        variables,
+        camera,
+        ray,
+        canvas_height,
+        typed_four_d_phase,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PickConfidence {
+    CoarseBounds,
+    ExactGeometry,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PickHit {
+    distance: f64,
+    confidence: PickConfidence,
+}
+
+impl PickHit {
+    fn exact(distance: f64) -> Self {
+        Self {
+            distance,
+            confidence: PickConfidence::ExactGeometry,
+        }
+    }
+
+    fn coarse(distance: f64) -> Self {
+        Self {
+            distance,
+            confidence: PickConfidence::CoarseBounds,
+        }
+    }
+}
+
+/// Picks the highest-confidence visible 3D hit under a canvas-local pointer.
+/// Exact hits outrank coarse bounds; distance and stable `ObjectId` break ties.
+pub(crate) fn pick_3d_object(
+    document: &Document,
+    camera: &Camera3D,
+    local_pointer: Vec2,
+    canvas_size: Vec2,
+) -> Option<ObjectId> {
+    pick_3d_object_with_typed_four_d_phase(document, camera, local_pointer, canvas_size, None)
+}
+
+/// Picks using the phase snapshot captured for the current 3D frame.
+pub(crate) fn pick_3d_object_with_typed_four_d_phase(
+    document: &Document,
+    camera: &Camera3D,
+    local_pointer: Vec2,
+    canvas_size: Vec2,
+    typed_four_d_phase: Option<f64>,
+) -> Option<ObjectId> {
+    if !local_pointer.is_finite() || !canvas_size.is_finite() {
+        return None;
+    }
+    let ray = camera.screen_ray(
+        local_pointer.x,
+        local_pointer.y,
+        canvas_size.x,
+        canvas_size.y,
+    )?;
+    let mut best: Option<(PickHit, ObjectId)> = None;
+    for (id, object) in document.objects_iter() {
+        if !object.is_visible() || !object.is_3d() {
+            continue;
+        }
+        let Some(hit) = object_ray_hit(
+            object,
+            &document.variables,
+            camera,
+            &ray,
+            canvas_size.y,
+            typed_four_d_phase,
+        ) else {
+            continue;
+        };
+        if !hit.distance.is_finite() {
+            continue;
+        }
+        let candidate = (hit, *id);
+        if best
+            .as_ref()
+            .map(|current| {
+                candidate.0.confidence > current.0.confidence
+                    || (candidate.0.confidence == current.0.confidence
+                        && (candidate.0.distance.total_cmp(&current.0.distance).is_lt()
+                            || (candidate.0.distance.total_cmp(&current.0.distance).is_eq()
+                                && candidate.1 < current.1)))
+            })
+            .unwrap_or(true)
+        {
+            best = Some(candidate);
+        }
+    }
+    best.map(|(_, id)| id)
+}
+
+/// Applies the same single-selection and empty-click clearing policy as 2D.
+#[allow(dead_code)] // Seam legacy: el input usa `canvas::select_3d_object_for_view`.
+pub(crate) fn select_3d_object_at_pointer(
+    document: &mut Document,
+    selected_object: &mut Option<ObjectId>,
+    camera: &Camera3D,
+    local_pointer: Vec2,
+    canvas_size: Vec2,
+) -> Option<ObjectId> {
+    select_3d_object_at_pointer_with_typed_four_d_phase(
+        document,
+        selected_object,
+        camera,
+        local_pointer,
+        canvas_size,
+        None,
+    )
+}
+
+/// Applies 3D selection using the per-frame typed-4D phase snapshot.
+#[allow(dead_code)] // Seam legacy: el input usa `canvas::select_3d_object_for_view`.
+pub(crate) fn select_3d_object_at_pointer_with_typed_four_d_phase(
+    document: &mut Document,
+    selected_object: &mut Option<ObjectId>,
+    camera: &Camera3D,
+    local_pointer: Vec2,
+    canvas_size: Vec2,
+    typed_four_d_phase: Option<f64>,
+) -> Option<ObjectId> {
+    let picked = match typed_four_d_phase {
+        Some(phase) => pick_3d_object_with_typed_four_d_phase(
+            document,
+            camera,
+            local_pointer,
+            canvas_size,
+            Some(phase),
+        ),
+        None => pick_3d_object(document, camera, local_pointer, canvas_size),
+    };
+    document.clear_selection();
+    if let Some(id) = picked {
+        document.select(id);
+    }
+    *selected_object = picked;
+    picked
+}
+
+fn project_segment(
+    camera: &Camera3D,
+    a: &Point3D,
+    b: &Point3D,
+    screen_w: f32,
+    screen_h: f32,
+) -> Option<((f32, f32), (f32, f32))> {
+    if !a.x.is_finite()
+        || !a.y.is_finite()
+        || !a.z.is_finite()
+        || !b.x.is_finite()
+        || !b.y.is_finite()
+        || !b.z.is_finite()
+        || !screen_w.is_finite()
+        || !screen_h.is_finite()
+        || screen_w <= 0.0
+        || screen_h <= 0.0
+        || !camera.near.is_finite()
+        || camera.near <= 0.0
+    {
+        return None;
+    }
+    let mvp = camera.mvp();
+    let a = a.to_vec3();
+    let b = b.to_vec3();
+    if !a.is_finite() || !b.is_finite() {
+        return None;
+    }
+    let mut clip_a = mvp * a.extend(1.0);
+    let mut clip_b = mvp * b.extend(1.0);
+    if !clip_a.is_finite() || !clip_b.is_finite() {
+        return None;
+    }
+
+    let near = camera.near;
+
+    if clip_a.w < near && clip_b.w < near {
+        return None;
+    }
+
+    if clip_a.w < near {
+        let t = (near - clip_a.w) / (clip_b.w - clip_a.w);
+        if !t.is_finite() {
+            return None;
+        }
+        clip_a = clip_a + t * (clip_b - clip_a);
+    } else if clip_b.w < near {
+        let t = (near - clip_b.w) / (clip_a.w - clip_b.w);
+        if !t.is_finite() {
+            return None;
+        }
+        clip_b = clip_b + t * (clip_a - clip_b);
+    }
+    if !clip_a.is_finite() || !clip_b.is_finite() {
+        return None;
+    }
+
+    let ndc_ax = clip_a.x / clip_a.w;
+    let ndc_ay = clip_a.y / clip_a.w;
+    let ndc_bx = clip_b.x / clip_b.w;
+    let ndc_by = clip_b.y / clip_b.w;
+    if !ndc_ax.is_finite() || !ndc_ay.is_finite() || !ndc_bx.is_finite() || !ndc_by.is_finite() {
+        return None;
+    }
+
+    if ndc_ax.abs() > 5.0 && ndc_bx.abs() > 5.0 && ndc_ax.signum() == ndc_bx.signum() {
+        return None;
+    }
+    if ndc_ay.abs() > 5.0 && ndc_by.abs() > 5.0 && ndc_ay.signum() == ndc_by.signum() {
+        return None;
+    }
+
+    let sax = (ndc_ax + 1.0) * 0.5 * screen_w;
+    let say = (1.0 - ndc_ay) * 0.5 * screen_h;
+    let sbx = (ndc_bx + 1.0) * 0.5 * screen_w;
+    let sby = (1.0 - ndc_by) * 0.5 * screen_h;
+
+    (sax.is_finite() && say.is_finite() && sbx.is_finite() && sby.is_finite())
+        .then_some(((sax, say), (sbx, sby)))
+}
+
+#[allow(dead_code)] // Seam legacy: tests + compat; el dibujo usa `_for_view`.
+pub(crate) fn projected_tetrahedron_faces(
+    camera: &Camera3D,
+    tetrahedron: &grafito_geometry::Tetrahedron3D,
+    screen_w: f32,
+    screen_h: f32,
+) -> Vec<(f32, [(f32, f32); 3])> {
+    let projector =
+        View3dProjector::for_canvas(OrthoProjection::Perspective, camera, screen_w, screen_h);
+    projected_tetrahedron_faces_for_view(&projector, tetrahedron)
+}
+
+/// Caras del tetraedro ordenadas por profundidad según la vista del canvas.
+/// Fuente única del dibujo con relleno.
+pub(crate) fn projected_tetrahedron_faces_for_view(
+    projector: &View3dProjector,
+    tetrahedron: &grafito_geometry::Tetrahedron3D,
+) -> Vec<(f32, [(f32, f32); 3])> {
+    let vertices = tetrahedron.vertices();
+    let mut faces = tetrahedron
+        .faces()
+        .into_iter()
+        .filter_map(|[a, b, c]| {
+            let (a2, b2, c2) = (
+                projector.project_point(&vertices[a])?,
+                projector.project_point(&vertices[b])?,
+                projector.project_point(&vertices[c])?,
+            );
+            let depth = (projector.view_depth(vertices[a].to_vec3())
+                + projector.view_depth(vertices[b].to_vec3())
+                + projector.view_depth(vertices[c].to_vec3()))
+                / 3.0;
+            depth.is_finite().then_some((depth, [a2, b2, c2]))
+        })
+        .collect::<Vec<_>>();
+    faces.sort_by(|left, right| right.0.total_cmp(&left.0));
+    faces
+}
+
+/// Normal de una cara triangular (producto cruz), o `None` si es degenerada.
+fn face_normal(a: Point3D, b: Point3D, c: Point3D) -> Option<Vec3> {
+    let normal = (b.to_vec3() - a.to_vec3())
+        .cross(c.to_vec3() - a.to_vec3())
+        .normalize_or_zero();
+    (normal.is_finite() && normal.length_squared() > 1.0e-12).then_some(normal)
+}
+
+/// Proyecta una cara 3D a puntos de pantalla; `None` si algún vértice queda
+/// fuera del frustum (la cara no debe dibujarse parcialmente).
+#[allow(dead_code)] // Seam legacy: compat; el dibujo usa `_for_view`.
+fn projected_face_points(
+    camera: &Camera3D,
+    points: &[Point3D],
+    screen_w: f32,
+    screen_h: f32,
+    origin: Pos2,
+) -> Option<Vec<Pos2>> {
+    let projector =
+        View3dProjector::for_canvas(OrthoProjection::Perspective, camera, screen_w, screen_h);
+    projected_face_points_for_view(&projector, points, origin)
+}
+
+/// Cara 3D a puntos de pantalla según la vista del canvas. Fuente única del
+/// dibujo de rellenos (prisma); la variante con cámara queda para compat.
+fn projected_face_points_for_view(
+    projector: &View3dProjector,
+    points: &[Point3D],
+    origin: Pos2,
+) -> Option<Vec<Pos2>> {
+    let projected: Vec<Pos2> = points
+        .iter()
+        .filter_map(|point| {
+            projector
+                .project_point(point)
+                .map(|(x, y)| origin + Vec2::new(x, y))
+        })
+        .collect();
+    (projected.len() == points.len()).then_some(projected)
+}
+
+#[allow(dead_code)] // Seam legacy: tests + compat; el dibujo usa `_for_view`.
+pub(crate) fn projected_point_position(
+    camera: &Camera3D,
+    point: Point3D,
+    canvas_size: Vec2,
+) -> Option<Vec2> {
+    let projector = View3dProjector::for_canvas(
+        OrthoProjection::Perspective,
+        camera,
+        canvas_size.x,
+        canvas_size.y,
+    );
+    projected_point_position_for_view(&projector, point)
+}
+
+/// Punto 3D a posición canvas-local según la vista. Fuente única del dibujo.
+pub(crate) fn projected_point_position_for_view(
+    projector: &View3dProjector,
+    point: Point3D,
+) -> Option<Vec2> {
+    projector
+        .project_point(&point)
+        .map(|(x, y)| Vec2::new(x, y))
+}
+
+fn plane_point_and_basis(a: f64, b: f64, c: f64, d: f64) -> Option<(Point3D, Vec3, Vec3)> {
+    if !a.is_finite() || !b.is_finite() || !c.is_finite() || !d.is_finite() {
+        return None;
+    }
+    let scale = a.abs().max(b.abs()).max(c.abs());
+    if !scale.is_finite() || scale <= 1.0e-15 {
+        return None;
+    }
+    let normal = DVec3::new(a / scale, b / scale, c / scale).normalize_or_zero();
+    if !normal.is_finite() || normal.length_squared() < 1.0e-24 {
+        return None;
+    }
+    let point = if a.abs() >= b.abs() && a.abs() >= c.abs() {
+        Point3D::new(-d / a, 0.0, 0.0)
+    } else if b.abs() >= c.abs() {
+        Point3D::new(0.0, -d / b, 0.0)
+    } else {
+        Point3D::new(0.0, 0.0, -d / c)
+    };
+    if !point.is_finite() {
+        return None;
+    }
+    let n = normal.as_vec3();
+    let seed = if n.x.abs() < 0.8 { Vec3::X } else { Vec3::Y };
+    let u = n.cross(seed).normalize_or_zero();
+    let v = n.cross(u).normalize_or_zero();
+    (u.is_finite() && v.is_finite() && u.length_squared() > 1.0e-12 && v.length_squared() > 1.0e-12)
+        .then_some((point, u, v))
+}
+
+fn offset_point(base: Point3D, u: Vec3, v: Vec3, du: f32, dv: f32) -> Point3D {
+    Point3D::new(
+        base.x + (u.x * du + v.x * dv) as f64,
+        base.y + (u.y * du + v.y * dv) as f64,
+        base.z + (u.z * du + v.z * dv) as f64,
+    )
+}
+
+fn centered_four_d_tool_default(tool: Tool) -> Option<(GeoObject, &'static str)> {
+    match tool {
+        Tool::Tesseract4D => Some((
+            GeoObject::RegularPolychoron4D(RegularPolychoron4DObj::new(
+                RegularPolychoron::Tesseract,
+            )),
+            "Tesseract4D",
+        )),
+        Tool::Hypercube5D => Some((
+            GeoObject::RegularPolytopeND(RegularPolytopeNDObj::new(
+                RegularPolytopeFamily::Hypercube,
+                5,
+            )),
+            "Hypercube5D",
+        )),
+        _ => None,
+    }
+}
+
+/// Inserta el selector tipado por defecto para una herramienta 4D y lo deja
+/// seleccionado. La construcción no consume el puntero: ambas proyecciones
+/// nacen centradas en el origen canónico.
+pub(crate) fn create_centered_four_d_tool_object(
+    current_tool: &mut Tool,
+    document: &mut Document,
+    selected_object: &mut Option<ObjectId>,
+    undo_stack: &mut std::collections::VecDeque<Document>,
+    redo_stack: &mut std::collections::VecDeque<ChangeSet>,
+) -> Result<Option<(ObjectId, &'static str)>, String> {
+    let Some((object, action)) = centered_four_d_tool_default(*current_tool) else {
+        return Ok(None);
+    };
+    let id = crate::app::commit_object_insertions(document, undo_stack, redo_stack, vec![object])?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "La inserción 4D no devolvió un identificador".to_string())?;
+
+    document.clear_selection();
+    document.select(id);
+    *selected_object = Some(id);
+    *current_tool = Tool::Select;
+    Ok(Some((id, action)))
+}
+
+impl GrafitoApp {
+    pub fn handle_3d_click(&mut self, ui: &egui::Ui, local_pointer: Vec2, canvas_size: Vec2) {
+        if matches!(self.current_tool, Tool::Tesseract4D | Tool::Hypercube5D) {
+            let tool_name = self.current_tool.name();
+            let time = ui.ctx().input(|input| input.time);
+            match create_centered_four_d_tool_object(
+                &mut self.current_tool,
+                &mut self.document,
+                &mut self.selected_object,
+                &mut self.undo_stack,
+                &mut self.redo_stack,
+            ) {
+                Ok(Some((id, action))) => {
+                    let output = self
+                        .document
+                        .get_object(id)
+                        .map(|object| object.label().to_string())
+                        .unwrap_or_default();
+                    self.record_construction_step(action, Vec::new(), &output);
+                    self.tool_ghost = None;
+                    self.reset_tool_input();
+                }
+                Ok(None) => {}
+                Err(error) => self.handle_command_outcome(
+                    grafito_command::commands::CommandOutcome::Error(error),
+                    time,
+                    tool_name,
+                ),
+            }
+            return;
+        }
+
+        // Ruta por posición según la vista: perspectiva sobre el plano de
+        // la cámara, ortográficas sobre el plano de la vista por el target.
+        let Some(c) = construction_point_for_view(
+            self.view3d.to_ortho_projection(),
+            &self.camera,
+            local_pointer,
+            canvas_size,
+        ) else {
+            return;
+        };
+        let h = canvas_size.y;
+        let approx_scale = (2.0
+            * self.camera.sanitized_distance() as f64
+            * ((self.camera.fov as f64).to_radians() * 0.5)
+                .tan()
+                .abs()
+                .max(1e-6)
+            / (h as f64).max(1.0)
+            * DEFAULT_CREATION_RADIUS_PIXELS)
+            .clamp(1.0e-6, 1e6);
+        let time = ui.ctx().input(|i| i.time);
+
+        match self.current_tool {
+            Tool::Point => {
+                self.insert_object_from_tool(
+                    GeoObject::Point3D(Point3DObj::new(c)),
+                    "Point3D",
+                    time,
+                );
+            }
+            Tool::Line => {
+                self.pending_points_3d.push(c);
+                if self.pending_points_3d.len() == 2 {
+                    let a = self.pending_points_3d[0];
+                    let b = self.pending_points_3d[1];
+                    self.insert_object_from_tool(
+                        GeoObject::Segment3D(Segment3DObj::new(a, b)),
+                        "Segment3D",
+                        time,
+                    );
+                    self.pending_points_3d.clear();
+                }
+            }
+            Tool::Circle => {
+                self.pending_points_3d.push(c);
+                if self.pending_points_3d.len() == 2 {
+                    let center = self.pending_points_3d[0];
+                    let edge = self.pending_points_3d[1];
+                    let radius = center.distance(&edge);
+                    self.insert_object_from_tool(
+                        GeoObject::Sphere3D(Sphere3DObj::new(center, radius)),
+                        "Sphere3D",
+                        time,
+                    );
+                    self.pending_points_3d.clear();
+                }
+            }
+            Tool::Polygon => {
+                // Cube via polygon tool
+                self.insert_object_from_tool(
+                    GeoObject::Cube3D(Cube3DObj::new(c, approx_scale * 2.0)),
+                    "Cube3D",
+                    time,
+                );
+            }
+            Tool::Function => {
+                self.insert_object_from_tool(
+                    GeoObject::Pyramid3D(Pyramid3DObj::new(
+                        Point3D::new(c.x, c.y - approx_scale, c.z),
+                        c,
+                        approx_scale * 2.0,
+                    )),
+                    "Pyramid3D",
+                    time,
+                );
+            }
+            Tool::Point3D => {
+                self.insert_object_from_tool(
+                    GeoObject::Point3D(Point3DObj::new(c)),
+                    "Point3D",
+                    time,
+                );
+            }
+            Tool::Segment3D => {
+                let s = approx_scale * 2.0;
+                self.insert_object_from_tool(
+                    GeoObject::Segment3D(Segment3DObj::new(
+                        Point3D::new(c.x - s, c.y, c.z),
+                        Point3D::new(c.x + s, c.y, c.z),
+                    )),
+                    "Segment3D",
+                    time,
+                );
+            }
+            Tool::Line3D => {
+                let direction = self
+                    .camera
+                    .construction_plane()
+                    .map(|plane| plane.axis_u)
+                    .unwrap_or(Point3D::new(1.0, 0.0, 0.0));
+                self.insert_object_from_tool(
+                    GeoObject::Line3D(Line3DObj::from_point_and_direction(c, direction)),
+                    "Line3D",
+                    time,
+                );
+            }
+            Tool::Plane3D => {
+                if let Some(plane) = self.camera.construction_plane() {
+                    let normal = plane.normal;
+                    let d = -(normal.x * c.x + normal.y * c.y + normal.z * c.z);
+                    self.insert_object_from_tool(
+                        GeoObject::Plane3D(Plane3DObj::from_equation(
+                            normal.x, normal.y, normal.z, d,
+                        )),
+                        "Plane3D",
+                        time,
+                    );
+                }
+            }
+            Tool::Sphere3D => {
+                self.insert_object_from_tool(
+                    GeoObject::Sphere3D(Sphere3DObj::new(c, approx_scale * 1.5)),
+                    "Sphere3D",
+                    time,
+                );
+            }
+            Tool::Cube3D => {
+                self.insert_object_from_tool(
+                    GeoObject::Cube3D(Cube3DObj::new(c, approx_scale * 2.0)),
+                    "Cube3D",
+                    time,
+                );
+            }
+            Tool::Cylinder3D => {
+                self.insert_object_from_tool(
+                    GeoObject::Cylinder3D(Cylinder3DObj::new(
+                        c,
+                        Point3D::new(c.x, c.y + approx_scale * 3.0, c.z),
+                        approx_scale,
+                    )),
+                    "Cylinder3D",
+                    time,
+                );
+            }
+            Tool::Cone3D => {
+                self.insert_object_from_tool(
+                    GeoObject::Cone3D(Cone3DObj::new(
+                        c,
+                        Point3D::new(c.x, c.y + approx_scale * 3.0, c.z),
+                        approx_scale,
+                    )),
+                    "Cone3D",
+                    time,
+                );
+            }
+            Tool::Torus3D => {
+                self.insert_object_from_tool(
+                    GeoObject::Torus3D(Torus3DObj::new(c, approx_scale * 1.5, approx_scale * 0.4)),
+                    "Torus3D",
+                    time,
+                );
+            }
+            Tool::MoebiusStrip => {
+                self.insert_object_from_tool(
+                    GeoObject::MoebiusStrip(MoebiusStripObj::new(
+                        c,
+                        approx_scale * 1.5,
+                        approx_scale * 0.4,
+                    )),
+                    "MoebiusStrip",
+                    time,
+                );
+            }
+            Tool::Surface3D => {
+                let expression = format!(
+                    "(x - ({:.12}))^2 + (y - ({:.12}))^2 + ({:.12})",
+                    c.x, c.y, c.z
+                );
+                self.insert_object_from_tool(
+                    GeoObject::Surface3D(Surface3DObj::new(
+                        expression,
+                        (c.x - 2.0, c.x + 2.0),
+                        (c.y - 2.0, c.y + 2.0),
+                    )),
+                    "Surface3D",
+                    time,
+                );
+            }
+            Tool::ParametricCurve3D => {
+                self.insert_object_from_tool(
+                    GeoObject::ParametricCurve3D(ParametricCurve3DObj::new(
+                        &format!("({:.12}) + cos(t)", c.x),
+                        &format!("({:.12}) + sin(t)", c.y),
+                        &format!("({:.12}) + t/4", c.z),
+                        0.0,
+                        12.566,
+                    )),
+                    "ParametricCurve3D",
+                    time,
+                );
+            }
+            Tool::VectorField3D => {
+                self.insert_object_from_tool(
+                    GeoObject::VectorField3D(VectorField3DObj::new("-y", "x", "z/3").with_bounds(
+                        (c.x - 3.0, c.x + 3.0),
+                        (c.y - 3.0, c.y + 3.0),
+                        (c.z - 3.0, c.z + 3.0),
+                    )),
+                    "VectorField3D",
+                    time,
+                );
+            }
+            Tool::HyperSurface4D => {
+                self.execute_command_and_record("Hypercube[]", time);
+            }
+            Tool::Attractor => {
+                self.execute_command_and_record("Lorenz[]", time);
+            }
+            Tool::Fractal => {
+                self.input_text = "Mandelbrot[]".to_string();
+            }
+            _ => {}
+        }
+    }
+
+    /// Dibuja grilla y ejes según la vista (el proyector acompaña ortográficas).
+    #[allow(clippy::too_many_arguments)] // Firma histórica + vista (8/7).
+    pub fn draw_3d_grid(
+        &self,
+        painter: &egui::Painter,
+        canvas: Rect,
+        w: f32,
+        h: f32,
+        overlay_only: bool,
+        canvas_resize_preview: bool,
+        view: OrthoProjection,
+    ) {
+        // Mismo proyector único que los objetos: la grilla y los ejes
+        // acompañan la vista ortográfica (con paneo por target).
+        let projector = View3dProjector::for_canvas(view, &self.camera, w, h);
+        let origin = canvas.min;
+
+        // Dynamic step calculation based on camera distance (sanitizado para no NaN/black)
+        let dist = self.camera.sanitized_distance();
+        let fov_rad = self.camera.fov.to_radians().clamp(0.01, 3.0);
+        let frustum_height = 2.0 * dist * (fov_rad * 0.5).tan().abs().max(1e-6);
+        let pixels_per_unit = (h / frustum_height) as f64;
+        let target_world_step = 120.0 / pixels_per_unit.max(1e-30);
+        let magnitude = target_world_step.log10().floor();
+        let base = 10f64.powf(magnitude);
+        let factor = target_world_step / base;
+
+        let major_step = if factor < 2.0 {
+            1.0 * base
+        } else if factor < 5.0 {
+            2.0 * base
+        } else {
+            5.0 * base
+        };
+        let minor_step = major_step / 5.0;
+
+        if minor_step <= 1e-9 {
+            return;
+        }
+
+        // Grilla desde el Theme vigente (nunca de un bool local que pueda
+        // desyncarse del modo real): en claro usa `grid_line` opaco a 1px
+        // como el 2D — el rgba fijo anterior quedaba subpíxel/invisible.
+        let theme = grafito_ui::theme::current_theme(painter.ctx());
+        let major_stroke = Stroke::new(1.0, theme.grid_line);
+        let minor_stroke = Stroke::new(0.5, theme.grid_minor);
+
+        // Grid range: center around camera target projection on XZ plane
+        let center_x = self.camera.target.x as f64;
+        let center_z = self.camera.target.z as f64;
+        let aspect = w / h.max(1.0);
+        let view_range = (frustum_height * aspect.max(1.0) * 1.8) as f64;
+
+        let start_x = ((center_x - view_range) / major_step).floor() * major_step;
+        let end_x = ((center_x + view_range) / major_step).ceil() * major_step;
+        let start_z = ((center_z - view_range) / major_step).floor() * major_step;
+        let end_z = ((center_z + view_range) / major_step).ceil() * major_step;
+
+        let line_count_x = ((end_x - start_x) / major_step).round() as i64;
+        let line_count_z = ((end_z - start_z) / major_step).round() as i64;
+
+        if self.show_grid && line_count_x <= 2000 && line_count_z <= 2000 {
+            // Draw grid lines parallel to Z axis (varying z, fixed x)
+            for xi in 0..=line_count_x {
+                let x = start_x + xi as f64 * major_step;
+                let stroke = major_stroke;
+                let p1 = Point3D::new(x, 0.0, start_z);
+                let p2 = Point3D::new(x, 0.0, end_z);
+                if let Some((a, b)) = projector.project_segment(&p1, &p2) {
+                    if !overlay_only {
+                        painter.line_segment(
+                            [origin + Vec2::new(a.0, a.1), origin + Vec2::new(b.0, b.1)],
+                            stroke,
+                        );
+                    }
+                }
+            }
+
+            // Draw grid lines parallel to X axis (varying x, fixed z)
+            for zi in 0..=line_count_z {
+                let z = start_z + zi as f64 * major_step;
+                let stroke = major_stroke;
+                let p1 = Point3D::new(start_x, 0.0, z);
+                let p2 = Point3D::new(end_x, 0.0, z);
+                if let Some((a, b)) = projector.project_segment(&p1, &p2) {
+                    if !overlay_only {
+                        painter.line_segment(
+                            [origin + Vec2::new(a.0, a.1), origin + Vec2::new(b.0, b.1)],
+                            stroke,
+                        );
+                    }
+                }
+            }
+            // Menores a 0.5px: solo si no saturan (≤2000 líneas por dirección).
+            // Estructuran el plano sin ruido cuando el zoom abre el paso.
+            if line_count_x <= 400 && line_count_z <= 400 {
+                for xi in 0..=line_count_x * 5 {
+                    if xi % 5 == 0 {
+                        continue;
+                    }
+                    let x = start_x + xi as f64 * minor_step;
+                    let p1 = Point3D::new(x, 0.0, start_z);
+                    let p2 = Point3D::new(x, 0.0, end_z);
+                    if let Some((a, b)) = projector.project_segment(&p1, &p2) {
+                        if !overlay_only {
+                            painter.line_segment(
+                                [origin + Vec2::new(a.0, a.1), origin + Vec2::new(b.0, b.1)],
+                                minor_stroke,
+                            );
+                        }
+                    }
+                }
+                for zi in 0..=line_count_z * 5 {
+                    if zi % 5 == 0 {
+                        continue;
+                    }
+                    let z = start_z + zi as f64 * minor_step;
+                    let p1 = Point3D::new(start_x, 0.0, z);
+                    let p2 = Point3D::new(end_x, 0.0, z);
+                    if let Some((a, b)) = projector.project_segment(&p1, &p2) {
+                        if !overlay_only {
+                            painter.line_segment(
+                                [origin + Vec2::new(a.0, a.1), origin + Vec2::new(b.0, b.1)],
+                                minor_stroke,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Draw Axes
+        let axis_len = view_range;
+        let red_stroke = Stroke::new(2.0, Color32::from_rgb(220, 50, 50));
+        let green_stroke = Stroke::new(2.0, Color32::from_rgb(50, 180, 50));
+        let blue_stroke = Stroke::new(2.0, Color32::from_rgb(50, 50, 220));
+
+        // X Axis
+        if let Some((a, b)) = projector.project_segment(
+            &Point3D::new(-axis_len, 0.0, 0.0),
+            &Point3D::new(axis_len, 0.0, 0.0),
+        ) {
+            if !overlay_only {
+                painter.line_segment(
+                    [origin + Vec2::new(a.0, a.1), origin + Vec2::new(b.0, b.1)],
+                    red_stroke,
+                );
+            }
+        }
+        // Y Axis (vertical)
+        if let Some((a, b)) = projector.project_segment(
+            &Point3D::new(0.0, -axis_len, 0.0),
+            &Point3D::new(0.0, axis_len, 0.0),
+        ) {
+            if !overlay_only {
+                painter.line_segment(
+                    [origin + Vec2::new(a.0, a.1), origin + Vec2::new(b.0, b.1)],
+                    green_stroke,
+                );
+            }
+        }
+        // Z Axis
+        if let Some((a, b)) = projector.project_segment(
+            &Point3D::new(0.0, 0.0, -axis_len),
+            &Point3D::new(0.0, 0.0, axis_len),
+        ) {
+            if !overlay_only {
+                painter.line_segment(
+                    [origin + Vec2::new(a.0, a.1), origin + Vec2::new(b.0, b.1)],
+                    blue_stroke,
+                );
+            }
+        }
+
+        // Axis labels
+        let label_font = egui::FontId::proportional(grafito_ui::tokens::TYPE_SM);
+        if let Some(pos) = projector.project_point(&Point3D::new(axis_len, 0.0, 0.0)) {
+            painter.text(
+                origin
+                    + Vec2::new(pos.0, pos.1)
+                    + Vec2::new(grafito_ui::tokens::SPACE_XS, -grafito_ui::tokens::SPACE_XS),
+                egui::Align2::LEFT_BOTTOM,
+                "X",
+                label_font.clone(),
+                red_stroke.color,
+            );
+        }
+        if let Some(pos) = projector.project_point(&Point3D::new(0.0, axis_len, 0.0)) {
+            painter.text(
+                origin
+                    + Vec2::new(pos.0, pos.1)
+                    + Vec2::new(grafito_ui::tokens::SPACE_XS, -grafito_ui::tokens::SPACE_XS),
+                egui::Align2::LEFT_BOTTOM,
+                "Y",
+                label_font.clone(),
+                green_stroke.color,
+            );
+        }
+        if let Some(pos) = projector.project_point(&Point3D::new(0.0, 0.0, axis_len)) {
+            painter.text(
+                origin
+                    + Vec2::new(pos.0, pos.1)
+                    + Vec2::new(grafito_ui::tokens::SPACE_XS, -grafito_ui::tokens::SPACE_XS),
+                egui::Align2::LEFT_BOTTOM,
+                "Z",
+                label_font,
+                blue_stroke.color,
+            );
+        }
+
+        if canvas_resize_preview {
+            return;
+        }
+
+        // Draw Axis Numbers
+        let precision = if major_step > 0.0 {
+            let log = major_step.log10();
+            if log < 0.0 {
+                (log.abs().ceil() as usize + 2).clamp(1, 14)
+            } else {
+                0
+            }
+        } else {
+            2
+        };
+        let format_num = |v: f64| -> String {
+            if v.abs() < major_step * 1e-5 {
+                return "0".to_string();
+            }
+            let mut s = format!("{:.*}", precision, v);
+            if s.contains('.') {
+                s = s.trim_end_matches('0').to_string();
+                s = s.trim_end_matches('.').to_string();
+            }
+            if s.is_empty() || s == "-" {
+                "0".to_string()
+            } else {
+                s
+            }
+        };
+
+        // Etiquetas con el color de eje del Theme vigente (sync claro/oscuro).
+        let text_color = theme.axis_label;
+        let font = egui::FontId::proportional(grafito_ui::tokens::TYPE_XS);
+        let tick_stroke = Stroke::new(1.0, text_color);
+
+        // Numbers on X Axis (Z=0, Y=0)
+        let start_x_num = ((center_x - view_range) / major_step).floor() * major_step;
+        let end_x_num = ((center_x + view_range) / major_step).ceil() * major_step;
+        let num_count_x = ((end_x_num - start_x_num) / major_step).round() as i64;
+        let mut prev_screen_pos: Option<Vec2> = None;
+        if num_count_x <= 2000 {
+            for xi in 0..=num_count_x {
+                let x = start_x_num + xi as f64 * major_step;
+                if x.abs() < major_step * 1e-5 {
+                    continue;
+                }
+                let cam_pos = self.camera.position();
+                let dx = x - cam_pos.x as f64;
+                let dy = 0.0 - cam_pos.y as f64;
+                let dz = 0.0 - cam_pos.z as f64;
+                let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+                if dist > self.camera.sanitized_distance() as f64 * 1.8 {
+                    continue;
+                }
+
+                let tick_size = major_step * 0.05;
+                if let Some((a, b)) = projector.project_segment(
+                    &Point3D::new(x, 0.0, -tick_size),
+                    &Point3D::new(x, 0.0, tick_size),
+                ) {
+                    if !overlay_only {
+                        painter.line_segment(
+                            [origin + Vec2::new(a.0, a.1), origin + Vec2::new(b.0, b.1)],
+                            tick_stroke,
+                        );
+                    }
+                }
+                if let Some(pos) = projector.project_point(&Point3D::new(x, 0.0, 0.0)) {
+                    let sp = Vec2::new(pos.0, pos.1);
+                    if let Some(prev) = prev_screen_pos {
+                        if (sp - prev).length() < 50.0 {
+                            continue;
+                        }
+                    }
+                    prev_screen_pos = Some(sp);
+                    painter.text(
+                        origin + sp + Vec2::new(0.0, 6.0),
+                        egui::Align2::CENTER_TOP,
+                        format_num(x),
+                        font.clone(),
+                        text_color,
+                    );
+                }
+            }
+        }
+
+        // Numbers on Y Axis (vertical: X=0, Z=0)
+        let center_y = self.camera.target.y as f64;
+        let start_y_num = ((center_y - view_range) / major_step).floor() * major_step;
+        let end_y_num = ((center_y + view_range) / major_step).ceil() * major_step;
+        let num_count_y = ((end_y_num - start_y_num) / major_step).round() as i64;
+        let mut prev_screen_pos: Option<Vec2> = None;
+        if num_count_y <= 2000 {
+            for yi in 0..=num_count_y {
+                let y = start_y_num + yi as f64 * major_step;
+                if y.abs() < major_step * 1e-5 {
+                    continue;
+                }
+                let cam_pos = self.camera.position();
+                let dx = 0.0 - cam_pos.x as f64;
+                let dy = y - cam_pos.y as f64;
+                let dz = 0.0 - cam_pos.z as f64;
+                let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+                if dist > self.camera.sanitized_distance() as f64 * 1.8 {
+                    continue;
+                }
+
+                let tick_size = major_step * 0.05;
+                if let Some((a, b)) = projector.project_segment(
+                    &Point3D::new(-tick_size, y, 0.0),
+                    &Point3D::new(tick_size, y, 0.0),
+                ) {
+                    if !overlay_only {
+                        painter.line_segment(
+                            [origin + Vec2::new(a.0, a.1), origin + Vec2::new(b.0, b.1)],
+                            tick_stroke,
+                        );
+                    }
+                }
+                if let Some(pos) = projector.project_point(&Point3D::new(0.0, y, 0.0)) {
+                    let sp = Vec2::new(pos.0, pos.1);
+                    if let Some(prev) = prev_screen_pos {
+                        if (sp - prev).length() < 40.0 {
+                            continue;
+                        }
+                    }
+                    prev_screen_pos = Some(sp);
+                    painter.text(
+                        origin + sp + Vec2::new(-6.0, 0.0),
+                        egui::Align2::RIGHT_CENTER,
+                        format_num(y),
+                        font.clone(),
+                        text_color,
+                    );
+                }
+            }
+        }
+
+        // Numbers on Z Axis (X=0, Y=0)
+        let start_z_num = ((center_z - view_range) / major_step).floor() * major_step;
+        let end_z_num = ((center_z + view_range) / major_step).ceil() * major_step;
+        let num_count_z = ((end_z_num - start_z_num) / major_step).round() as i64;
+        let mut prev_screen_pos: Option<Vec2> = None;
+        if num_count_z <= 2000 {
+            for zi in 0..=num_count_z {
+                let z = start_z_num + zi as f64 * major_step;
+                if z.abs() < major_step * 1e-5 {
+                    continue;
+                }
+                let cam_pos = self.camera.position();
+                let dx = 0.0 - cam_pos.x as f64;
+                let dy = 0.0 - cam_pos.y as f64;
+                let dz = z - cam_pos.z as f64;
+                let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+                if dist > self.camera.sanitized_distance() as f64 * 1.8 {
+                    continue;
+                }
+
+                let tick_size = major_step * 0.05;
+                if let Some((a, b)) = projector.project_segment(
+                    &Point3D::new(-tick_size, 0.0, z),
+                    &Point3D::new(tick_size, 0.0, z),
+                ) {
+                    if !overlay_only {
+                        painter.line_segment(
+                            [origin + Vec2::new(a.0, a.1), origin + Vec2::new(b.0, b.1)],
+                            tick_stroke,
+                        );
+                    }
+                }
+                if let Some(pos) = projector.project_point(&Point3D::new(0.0, 0.0, z)) {
+                    let sp = Vec2::new(pos.0, pos.1);
+                    if let Some(prev) = prev_screen_pos {
+                        if (sp - prev).length() < 50.0 {
+                            continue;
+                        }
+                    }
+                    prev_screen_pos = Some(sp);
+                    painter.text(
+                        origin + sp + Vec2::new(8.0, 0.0),
+                        egui::Align2::LEFT_CENTER,
+                        format_num(z),
+                        font.clone(),
+                        text_color,
+                    );
+                }
+            }
+        }
+
+        // Origin "0" label
+        if let Some(pos) = projector.project_point(&Point3D::new(0.0, 0.0, 0.0)) {
+            painter.text(
+                origin + Vec2::new(pos.0, pos.1) + Vec2::new(-6.0, 6.0),
+                egui::Align2::RIGHT_TOP,
+                "0",
+                font,
+                text_color,
+            );
+        }
+    }
+
+    pub(crate) fn draw_3d_objects(
+        &mut self,
+        painter: &egui::Painter,
+        canvas: Rect,
+        w: f32,
+        h: f32,
+        options: Cpu3dRenderOptions,
+        view: OrthoProjection,
+    ) {
+        let Cpu3dRenderOptions {
+            overlay_only,
+            motion_preview,
+            typed_four_d_phase,
+        } = options;
+        let origin = canvas.min;
+        // Proyector único dibujo↔picking: la vista gobierna la proyección de
+        // cada punto/segmento (perspectiva = cámara orbital, ortográficas =
+        // mapa con paneo por target).
+        let projector = View3dProjector::for_canvas(view, &self.camera, w, h);
+        // Luz canónica (`grafito_render::Light::DEFAULT`, ambient 0.45 +
+        // difuso 0.65 + especular Blinn-Phong 0.30/32) con la vista real de
+        // la cámara en vez del `+Z` asumido del render estático.
+        let light = grafito_render::Light::DEFAULT;
+        let light_view_dir = {
+            let forward = self.camera.target - self.camera.position();
+            if forward.is_finite() && forward.length_squared() > 1.0e-12 {
+                forward.normalize_or_zero()
+            } else {
+                Vec3::Z
+            }
+        };
+        let label_color = if self.dark_mode {
+            Color32::WHITE
+        } else {
+            Color32::BLACK
+        };
+
+        // The CPU fallback has no depth buffer, so use camera-space depth for
+        // painter ordering. Radial distance is incorrect for off-axis objects.
+        let mut objects_with_depth: Vec<(f32, &GeoObject, Option<ProjectedRegularPolytope>)> =
+            Vec::new();
+
+        for (_, obj) in self.document.objects_iter() {
+            if !obj.is_visible() {
+                continue;
+            }
+
+            // Keep the one typed projection used for both depth sorting and drawing.
+            // GPU-composited, unlabeled typed objects do not need a CPU projection at all.
+            let typed_projection = match obj {
+                GeoObject::RegularPolychoron4D(polychoron) => {
+                    if !typed_cpu_projection_is_needed(obj, overlay_only) {
+                        continue;
+                    }
+                    project_regular_polychoron_cpu(
+                        polychoron,
+                        typed_four_d_phase_for_object(obj, typed_four_d_phase),
+                    )
+                }
+                GeoObject::RegularPolytopeND(polytope) => {
+                    if !typed_cpu_projection_is_needed(obj, overlay_only) {
+                        continue;
+                    }
+                    project_regular_polytope_nd_cpu(
+                        polytope,
+                        typed_four_d_phase_for_object(obj, typed_four_d_phase),
+                    )
+                }
+                _ => None,
+            };
+
+            let center = match obj {
+                GeoObject::Point3D(p) => p.position.to_vec3(),
+                GeoObject::Segment3D(l) => (l.a.to_vec3() + l.b.to_vec3()) * 0.5,
+                GeoObject::Plane3D(p) => plane_point_and_basis(p.a, p.b, p.c, p.d)
+                    .map(|(point, _, _)| point.to_vec3())
+                    .unwrap_or(Vec3::ZERO),
+                GeoObject::Line3D(l) => l.point.to_vec3(),
+                GeoObject::Sphere3D(s) => s.center.to_vec3(),
+                GeoObject::Cube3D(c) => c.center.to_vec3(),
+                GeoObject::Tetrahedron3D(t) => t.center.to_vec3(),
+                GeoObject::Pyramid3D(p) => (p.base_center.to_vec3() + p.apex.to_vec3()) * 0.5,
+                GeoObject::Cone3D(c) => (c.base_center.to_vec3() + c.apex.to_vec3()) * 0.5,
+                GeoObject::Cylinder3D(c) => {
+                    (c.base_center.to_vec3() + c.top_center.to_vec3()) * 0.5
+                }
+                GeoObject::Platonic3D(p) => p.center.to_vec3(),
+                GeoObject::InfiniteCone3D(c) => c.apex.to_vec3(),
+                GeoObject::InfiniteCylinder3D(c) => c.base_point.to_vec3(),
+                GeoObject::Torus3D(t) => t.center.to_vec3(),
+                GeoObject::MoebiusStrip(m) => m.center.to_vec3(),
+                GeoObject::Surface3D(surface) => {
+                    let version = self.document.version;
+                    cached_parametric_center(surface.id, version, || {
+                        grafito_core::parametric_sampling::evaluate_surface_3d(
+                            surface,
+                            2,
+                            &self.document.variables,
+                        )
+                        .get(1)
+                        .and_then(|row| row.get(1))
+                        .map(|point| point.to_vec3())
+                        .unwrap_or(Vec3::ZERO)
+                    })
+                }
+                GeoObject::ParametricCurve3D(c) => {
+                    let version = self.document.version;
+                    cached_parametric_center(c.id, version, || {
+                        grafito_core::parametric_sampling::evaluate_parametric_curve_3d(
+                            c,
+                            2,
+                            &self.document.variables,
+                        )
+                        .get(1)
+                        .map(|&(x, y, z)| Vec3::new(x as f32, y as f32, z as f32))
+                        .unwrap_or(Vec3::ZERO)
+                    })
+                }
+                GeoObject::Attractor3D(a) => Vec3::new(a.x0 as f32, a.y0 as f32, a.z0 as f32) * 0.2,
+                GeoObject::RegularPolychoron4D(_) => typed_projection
+                    .as_ref()
+                    .and_then(projected_polytope_center)
+                    .unwrap_or(Vec3::ZERO),
+                GeoObject::RegularPolytopeND(_) => typed_projection
+                    .as_ref()
+                    .and_then(projected_polytope_center)
+                    .unwrap_or(Vec3::ZERO),
+                GeoObject::HyperSurface4D(_) => Vec3::ZERO,
+                GeoObject::VectorField3D(v) => Vec3::new(
+                    (v.x_min + v.x_max) as f32 * 0.5,
+                    (v.y_min + v.y_max) as f32 * 0.5,
+                    (v.z_min + v.z_max) as f32 * 0.5,
+                ),
+                GeoObject::Prism3D(prism) => {
+                    let base = grafito_render::prism_base_vertices(prism);
+                    let base_center = base
+                        .iter()
+                        .fold(Vec3::ZERO, |sum, point| sum + point.to_vec3())
+                        / base.len().max(1) as f32;
+                    base_center + prism.direction.to_vec3() * 0.5
+                }
+                GeoObject::Quadric3D(quadric) => grafito_render::quadric_ellipsoid_params(quadric)
+                    .map(|ellipsoid| ellipsoid.center.to_vec3())
+                    .unwrap_or(Vec3::ZERO),
+                GeoObject::ImplicitSurface3D(surface) => Vec3::new(
+                    (surface.x_min + surface.x_max) as f32 * 0.5,
+                    (surface.y_min + surface.y_max) as f32 * 0.5,
+                    (surface.z_min + surface.z_max) as f32 * 0.5,
+                ),
+                _ => continue, // Skip non-3D objects
+            };
+
+            let depth = projector.view_depth(center);
+            if depth.is_finite() {
+                objects_with_depth.push((depth, obj, typed_projection));
+            }
+        }
+
+        objects_with_depth.sort_by(|a, b| b.0.total_cmp(&a.0));
+
+        // Render objects in sorted order
+        for (_, obj, typed_projection) in objects_with_depth {
+            match obj {
+                GeoObject::Point3D(p) => {
+                    if let Some(pt) = projected_point_position_for_view(&projector, p.position) {
+                        let pos = origin + pt;
+                        if should_draw_cpu_3d_geometry(obj, overlay_only) {
+                            // Q2: mismo glifo que en 2D (Dot = círculo
+                            // relleno histórico); el tamaño ya viene
+                            // acotado a 5px como antes.
+                            let size = p.size.min(5.0);
+                            let color = to_color32(p.color);
+                            match p.point_style {
+                                PointStyle::Dot => {
+                                    painter.circle_filled(pos, size, color);
+                                }
+                                PointStyle::Circle => {
+                                    painter.circle_stroke(pos, size, Stroke::new(1.5, color));
+                                }
+                                PointStyle::Cross => {
+                                    let d = Vec2::new(size, size);
+                                    painter
+                                        .line_segment([pos - d, pos + d], Stroke::new(1.5, color));
+                                    painter.line_segment(
+                                        [
+                                            pos + Vec2::new(-size, size),
+                                            pos + Vec2::new(size, -size),
+                                        ],
+                                        Stroke::new(1.5, color),
+                                    );
+                                }
+                                PointStyle::Plus => {
+                                    painter.line_segment(
+                                        [pos - Vec2::new(size, 0.0), pos + Vec2::new(size, 0.0)],
+                                        Stroke::new(1.5, color),
+                                    );
+                                    painter.line_segment(
+                                        [pos - Vec2::new(0.0, size), pos + Vec2::new(0.0, size)],
+                                        Stroke::new(1.5, color),
+                                    );
+                                }
+                            }
+                        }
+                        if !p.label.is_empty() {
+                            painter.text(
+                                pos + Vec2::new(6.0, -6.0),
+                                egui::Align2::LEFT_BOTTOM,
+                                &p.label,
+                                egui::FontId::proportional(grafito_ui::tokens::TYPE_SM),
+                                label_color,
+                            );
+                        }
+                    }
+                }
+                GeoObject::Segment3D(l) => {
+                    if let Some((a, b)) = projector.project_segment(&l.a, &l.b) {
+                        if !overlay_only {
+                            painter.line_segment(
+                                [origin + Vec2::new(a.0, a.1), origin + Vec2::new(b.0, b.1)],
+                                Stroke::new(l.width, to_color32(l.color)),
+                            );
+                        }
+                        if !l.label.is_empty() {
+                            let mid = (a.0 + b.0) * 0.5;
+                            let mid_y = (a.1 + b.1) * 0.5;
+                            painter.text(
+                                origin + Vec2::new(mid, mid_y - 8.0),
+                                egui::Align2::CENTER_BOTTOM,
+                                &l.label,
+                                egui::FontId::proportional(grafito_ui::tokens::TYPE_SM),
+                                label_color,
+                            );
+                        }
+                    }
+                }
+                GeoObject::Plane3D(p) => {
+                    if let Some((center, u, v)) = plane_point_and_basis(p.a, p.b, p.c, p.d) {
+                        let extent = 8.0;
+                        let steps = 8;
+                        let color = to_color32(p.color);
+                        let stroke =
+                            Stroke::new(1.0, color.linear_multiply(p.opacity.clamp(0.1, 1.0)));
+                        if !overlay_only {
+                            for i in 0..=steps {
+                                let t = -extent + 2.0 * extent * i as f32 / steps as f32;
+                                let a = offset_point(center, u, v, -extent, t);
+                                let b = offset_point(center, u, v, extent, t);
+                                if let Some((pa, pb)) = projector.project_segment(&a, &b) {
+                                    painter.line_segment(
+                                        [
+                                            origin + Vec2::new(pa.0, pa.1),
+                                            origin + Vec2::new(pb.0, pb.1),
+                                        ],
+                                        stroke,
+                                    );
+                                }
+                                let a = offset_point(center, u, v, t, -extent);
+                                let b = offset_point(center, u, v, t, extent);
+                                if let Some((pa, pb)) = projector.project_segment(&a, &b) {
+                                    painter.line_segment(
+                                        [
+                                            origin + Vec2::new(pa.0, pa.1),
+                                            origin + Vec2::new(pb.0, pb.1),
+                                        ],
+                                        stroke,
+                                    );
+                                }
+                            }
+                        }
+                        if !p.label.is_empty() {
+                            if let Some(pt) = projector.project_point(&center) {
+                                painter.text(
+                                    origin + Vec2::new(pt.0, pt.1 - grafito_ui::tokens::SPACE_SM),
+                                    egui::Align2::CENTER_BOTTOM,
+                                    &p.label,
+                                    egui::FontId::proportional(grafito_ui::tokens::TYPE_SM),
+                                    label_color,
+                                );
+                            }
+                        }
+                    }
+                }
+                GeoObject::Line3D(l) => {
+                    let dir = l.direction.to_vec3();
+                    if dir.length_squared() > 1e-12 {
+                        let unit = dir.normalize();
+                        let a = Point3D::from_vec3(l.point.to_vec3() - unit * 40.0);
+                        let b = Point3D::from_vec3(l.point.to_vec3() + unit * 40.0);
+                        if let Some((pa, pb)) = projector.project_segment(&a, &b) {
+                            if !overlay_only {
+                                painter.line_segment(
+                                    [
+                                        origin + Vec2::new(pa.0, pa.1),
+                                        origin + Vec2::new(pb.0, pb.1),
+                                    ],
+                                    Stroke::new(l.width, to_color32(l.color)),
+                                );
+                            }
+                            if !l.label.is_empty() {
+                                painter.text(
+                                    origin
+                                        + Vec2::new((pa.0 + pb.0) * 0.5, (pa.1 + pb.1) * 0.5 - 8.0),
+                                    egui::Align2::CENTER_BOTTOM,
+                                    &l.label,
+                                    egui::FontId::proportional(grafito_ui::tokens::TYPE_SM),
+                                    label_color,
+                                );
+                            }
+                        }
+                    }
+                }
+                GeoObject::Sphere3D(s) => {
+                    // Wireframe with lighting: 3 orthogonal great circles
+                    let center = s.center.to_vec3();
+                    let r = s.radius as f32;
+                    let axes = [(Vec3::X, Vec3::Y), (Vec3::X, Vec3::Z), (Vec3::Y, Vec3::Z)];
+                    for &(u, v) in &axes {
+                        let pts_3d: Vec<Vec3> = Camera3D::circle_points(center, u, v, r, 32);
+
+                        let pts_screen: Vec<Option<(f32, f32)>> = pts_3d
+                            .iter()
+                            .map(|pt| projector.project_point(&Point3D::from_vec3(*pt)))
+                            .collect();
+
+                        for i in 0..pts_3d.len() {
+                            let i2 = (i + 1) % pts_3d.len();
+
+                            if let (Some(p1), Some(p2)) = (pts_screen[i], pts_screen[i2]) {
+                                // Calculate normal at midpoint of segment
+                                let mid_3d = (pts_3d[i] + pts_3d[i2]) * 0.5;
+                                let normal = (mid_3d - center).normalize();
+
+                                // Apply lighting
+                                let lit_color =
+                                    light.shade_with_view(s.color, normal, light_view_dir);
+                                let stroke = Stroke::new(s.width, to_color32(lit_color));
+
+                                if !overlay_only {
+                                    painter.line_segment(
+                                        [
+                                            origin + Vec2::new(p1.0, p1.1),
+                                            origin + Vec2::new(p2.0, p2.1),
+                                        ],
+                                        stroke,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    if !s.label.is_empty() {
+                        if let Some(pt) = projector.project_point(&Point3D::new(
+                            s.center.x,
+                            s.center.y + s.radius + 0.3,
+                            s.center.z,
+                        )) {
+                            painter.text(
+                                origin + Vec2::new(pt.0, pt.1),
+                                egui::Align2::CENTER_BOTTOM,
+                                &s.label,
+                                egui::FontId::proportional(grafito_ui::tokens::TYPE_SM),
+                                label_color,
+                            );
+                        }
+                    }
+                }
+                GeoObject::Cube3D(cube) => {
+                    let geom = grafito_geometry::Cube3D::new(cube.center, cube.size);
+                    let vs = geom.vertices();
+
+                    // Edges with their face normals for lighting
+                    let edges_with_normals = [
+                        // Bottom face (normal: -Y)
+                        ((0, 1), Vec3::new(0.0, -1.0, 0.0)),
+                        ((1, 2), Vec3::new(0.0, -1.0, 0.0)),
+                        ((2, 3), Vec3::new(0.0, -1.0, 0.0)),
+                        ((3, 0), Vec3::new(0.0, -1.0, 0.0)),
+                        // Top face (normal: +Y)
+                        ((4, 5), Vec3::new(0.0, 1.0, 0.0)),
+                        ((5, 6), Vec3::new(0.0, 1.0, 0.0)),
+                        ((6, 7), Vec3::new(0.0, 1.0, 0.0)),
+                        ((7, 4), Vec3::new(0.0, 1.0, 0.0)),
+                        // Vertical edges (use average of adjacent face normals)
+                        ((0, 4), Vec3::new(-1.0, 0.0, -1.0).normalize()),
+                        ((1, 5), Vec3::new(1.0, 0.0, -1.0).normalize()),
+                        ((2, 6), Vec3::new(1.0, 0.0, 1.0).normalize()),
+                        ((3, 7), Vec3::new(-1.0, 0.0, 1.0).normalize()),
+                    ];
+
+                    for &((a, b), normal) in &edges_with_normals {
+                        if let (Some(pa), Some(pb)) = (
+                            projector.project_point(&vs[a]),
+                            projector.project_point(&vs[b]),
+                        ) {
+                            let lit_color =
+                                light.shade_with_view(cube.color, normal, light_view_dir);
+                            let stroke = Stroke::new(cube.width, to_color32(lit_color));
+                            if !overlay_only {
+                                painter.line_segment(
+                                    [
+                                        origin + Vec2::new(pa.0, pa.1),
+                                        origin + Vec2::new(pb.0, pb.1),
+                                    ],
+                                    stroke,
+                                );
+                            }
+                        }
+                    }
+                    if !cube.label.is_empty() {
+                        if let Some(pt) = projector.project_point(&Point3D::new(
+                            cube.center.x,
+                            cube.center.y + cube.size * 0.7,
+                            cube.center.z,
+                        )) {
+                            painter.text(
+                                origin + Vec2::new(pt.0, pt.1),
+                                egui::Align2::CENTER_BOTTOM,
+                                &cube.label,
+                                egui::FontId::proportional(grafito_ui::tokens::TYPE_SM),
+                                label_color,
+                            );
+                        }
+                    }
+                }
+                GeoObject::Tetrahedron3D(tetrahedron) => {
+                    let geometry = grafito_geometry::Tetrahedron3D::new(
+                        tetrahedron.center,
+                        tetrahedron.edge_length,
+                    );
+                    let vertices = geometry.vertices();
+                    if !overlay_only {
+                        if let Some(fill) = tetrahedron.fill_color {
+                            for (_, face) in
+                                projected_tetrahedron_faces_for_view(&projector, &geometry)
+                            {
+                                painter.add(egui::Shape::convex_polygon(
+                                    face.into_iter()
+                                        .map(|(x, y)| origin + Vec2::new(x, y))
+                                        .collect(),
+                                    to_color32(fill),
+                                    Stroke::NONE,
+                                ));
+                            }
+                        }
+                        let stroke = Stroke::new(tetrahedron.width, to_color32(tetrahedron.color));
+                        for [start, end] in geometry.edges() {
+                            if let Some((a, b)) =
+                                projector.project_segment(&vertices[start], &vertices[end])
+                            {
+                                painter.line_segment(
+                                    [origin + Vec2::new(a.0, a.1), origin + Vec2::new(b.0, b.1)],
+                                    stroke,
+                                );
+                            }
+                        }
+                    }
+                    if !tetrahedron.label.is_empty() {
+                        if let Some(point) = projector.project_point(&vertices[0]) {
+                            painter.text(
+                                origin + Vec2::new(point.0, point.1 - 8.0),
+                                egui::Align2::CENTER_BOTTOM,
+                                &tetrahedron.label,
+                                egui::FontId::proportional(grafito_ui::tokens::TYPE_SM),
+                                label_color,
+                            );
+                        }
+                    }
+                }
+                GeoObject::Platonic3D(p) => {
+                    // Wireframe honesto desde platonic_mesh trasladada al centro.
+                    let mesh_opt =
+                        grafito_geometry::platonic_mesh(p.kind.to_geometry_solid(), p.edge_length)
+                            .ok();
+                    if let Some(mesh) = mesh_opt {
+                        let verts: Vec<Point3D> = mesh
+                            .vertices()
+                            .iter()
+                            .map(|v| {
+                                Point3D::new(v.x + p.center.x, v.y + p.center.y, v.z + p.center.z)
+                            })
+                            .collect();
+                        if !overlay_only {
+                            if let Some(fill) = p.fill_color {
+                                for tri in mesh.triangles() {
+                                    let pts: Vec<Pos2> = tri
+                                        .iter()
+                                        .filter_map(|i| {
+                                            let v = verts.get(*i).copied().unwrap_or(p.center);
+                                            projector.project_point(&v)
+                                        })
+                                        .map(|(x, y)| origin + Vec2::new(x, y))
+                                        .collect();
+                                    if pts.len() == 3 {
+                                        painter.add(egui::Shape::convex_polygon(
+                                            pts,
+                                            to_color32(fill),
+                                            Stroke::NONE,
+                                        ));
+                                    }
+                                }
+                            }
+                            let stroke = Stroke::new(p.width, to_color32(p.color));
+                            for tri in mesh.triangles() {
+                                for e in 0..3 {
+                                    let a_idx = tri[e];
+                                    let b_idx = tri[(e + 1) % 3];
+                                    let (Some(a_vert), Some(b_vert)) =
+                                        (verts.get(a_idx), verts.get(b_idx))
+                                    else {
+                                        continue;
+                                    };
+                                    if let Some((a, b)) = projector.project_segment(a_vert, b_vert)
+                                    {
+                                        painter.line_segment(
+                                            [
+                                                origin + Vec2::new(a.0, a.1),
+                                                origin + Vec2::new(b.0, b.1),
+                                            ],
+                                            stroke,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        if !p.label.is_empty() {
+                            if let Some(pt) = projector.project_point(&p.center) {
+                                painter.text(
+                                    origin + Vec2::new(pt.0, pt.1 - grafito_ui::tokens::SPACE_SM),
+                                    egui::Align2::CENTER_BOTTOM,
+                                    &p.label,
+                                    egui::FontId::proportional(grafito_ui::tokens::TYPE_SM),
+                                    label_color,
+                                );
+                            }
+                        }
+                    }
+                }
+                GeoObject::InfiniteCone3D(c) => {
+                    // Cono infinito clipado honesto a ±`INFINITE_OBJECT_VIEWPORT_CLIP`:
+                    // 4 generatrices + círculo a distancia de clip.
+                    const CLIP: f64 = INFINITE_OBJECT_VIEWPORT_CLIP;
+                    let dir = (c.direction.to_vec3() - c.apex.to_vec3()).normalize_or_zero();
+                    if dir.length() > 1e-12 && !overlay_only {
+                        let stroke = Stroke::new(c.width, to_color32(c.color));
+                        // Base ortonormal alrededor del eje.
+                        let up = if dir.y.abs() < 0.9 { Vec3::Y } else { Vec3::X };
+                        let u = dir.cross(up).normalize_or_zero();
+                        let v = dir.cross(u).normalize_or_zero();
+                        let tan_a = c.half_angle_rad.tan();
+                        for (cu, cv) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
+                            let gen = (dir + (u * cu as f32 + v * cv as f32) * tan_a as f32)
+                                .normalize_or_zero();
+                            for sign in [1.0f32, -1.0f32] {
+                                let end = c.apex.to_vec3() + gen * (CLIP as f32 * sign);
+                                let end_p = Point3D::new(
+                                    f64::from(end.x),
+                                    f64::from(end.y),
+                                    f64::from(end.z),
+                                );
+                                if let Some((a, b)) = projector.project_segment(&c.apex, &end_p) {
+                                    painter.line_segment(
+                                        [
+                                            origin + Vec2::new(a.0, a.1),
+                                            origin + Vec2::new(b.0, b.1),
+                                        ],
+                                        stroke,
+                                    );
+                                }
+                            }
+                        }
+                        if !c.label.is_empty() {
+                            if let Some(pt) = projector.project_point(&c.apex) {
+                                painter.text(
+                                    origin + Vec2::new(pt.0, pt.1 - grafito_ui::tokens::SPACE_SM),
+                                    egui::Align2::CENTER_BOTTOM,
+                                    &c.label,
+                                    egui::FontId::proportional(grafito_ui::tokens::TYPE_SM),
+                                    label_color,
+                                );
+                            }
+                        }
+                    }
+                }
+                GeoObject::InfiniteCylinder3D(c) => {
+                    // Cilindro infinito clipado honesto a ±`INFINITE_OBJECT_VIEWPORT_CLIP`:
+                    // eje + 2 laterales.
+                    const CLIP: f64 = INFINITE_OBJECT_VIEWPORT_CLIP;
+                    let dir = (c.direction.to_vec3() - c.base_point.to_vec3()).normalize_or_zero();
+                    if dir.length() > 1e-12 && !overlay_only {
+                        let stroke = Stroke::new(c.width, to_color32(c.color));
+                        let up = if dir.y.abs() < 0.9 { Vec3::Y } else { Vec3::X };
+                        let u = dir.cross(up).normalize_or_zero();
+                        let v = dir.cross(u).normalize_or_zero();
+                        let p0 = c.base_point.to_vec3() - dir * CLIP as f32;
+                        let p1 = c.base_point.to_vec3() + dir * CLIP as f32;
+                        let offs = [u * c.radius as f32, v * c.radius as f32];
+                        for off in offs {
+                            let a_p = Point3D::new(
+                                f64::from(p0.x + off.x),
+                                f64::from(p0.y + off.y),
+                                f64::from(p0.z + off.z),
+                            );
+                            let b_p = Point3D::new(
+                                f64::from(p1.x + off.x),
+                                f64::from(p1.y + off.y),
+                                f64::from(p1.z + off.z),
+                            );
+                            if let Some((a, b)) = projector.project_segment(&a_p, &b_p) {
+                                painter.line_segment(
+                                    [origin + Vec2::new(a.0, a.1), origin + Vec2::new(b.0, b.1)],
+                                    stroke,
+                                );
+                            }
+                        }
+                        let a0 = Point3D::new(f64::from(p0.x), f64::from(p0.y), f64::from(p0.z));
+                        let b0 = Point3D::new(f64::from(p1.x), f64::from(p1.y), f64::from(p1.z));
+                        if let Some((a, b)) = projector.project_segment(&a0, &b0) {
+                            painter.line_segment(
+                                [origin + Vec2::new(a.0, a.1), origin + Vec2::new(b.0, b.1)],
+                                stroke,
+                            );
+                        }
+                        if !c.label.is_empty() {
+                            if let Some(pt) = projector.project_point(&c.base_point) {
+                                painter.text(
+                                    origin + Vec2::new(pt.0, pt.1 - grafito_ui::tokens::SPACE_SM),
+                                    egui::Align2::CENTER_BOTTOM,
+                                    &c.label,
+                                    egui::FontId::proportional(grafito_ui::tokens::TYPE_SM),
+                                    label_color,
+                                );
+                            }
+                        }
+                    }
+                }
+                GeoObject::Pyramid3D(py) => {
+                    let geom =
+                        grafito_geometry::Pyramid3D::new(py.base_center, py.apex, py.base_size);
+                    let base = geom.base_vertices();
+
+                    // Render base edges (normal: -Y)
+                    let base_normal = Vec3::new(0.0, -1.0, 0.0);
+                    for i in 0..4 {
+                        let j = (i + 1) % 4;
+                        let a_proj = projector.project_point(&base[i]);
+                        let b_proj = projector.project_point(&base[j]);
+                        if let (Some(a), Some(b)) = (a_proj, b_proj) {
+                            let lit_color =
+                                light.shade_with_view(py.color, base_normal, light_view_dir);
+                            let stroke = Stroke::new(py.width, to_color32(lit_color));
+                            if !overlay_only {
+                                painter.line_segment(
+                                    [origin + Vec2::new(a.0, a.1), origin + Vec2::new(b.0, b.1)],
+                                    stroke,
+                                );
+                            }
+                        }
+                    }
+
+                    // Render lateral edges (calculate normal for each triangular face)
+                    let apex_proj = projector.project_point(&py.apex);
+                    for i in 0..4 {
+                        let j = (i + 1) % 4;
+                        let a_proj = projector.project_point(&base[i]);
+
+                        // Calculate face normal using cross product
+                        let face_normal = face_normal(base[i], base[j], py.apex).unwrap_or(Vec3::Y);
+
+                        if let (Some(a), Some(ap)) = (a_proj, apex_proj) {
+                            let lit_color =
+                                light.shade_with_view(py.color, face_normal, light_view_dir);
+                            let stroke = Stroke::new(py.width, to_color32(lit_color));
+                            if !overlay_only {
+                                painter.line_segment(
+                                    [origin + Vec2::new(a.0, a.1), origin + Vec2::new(ap.0, ap.1)],
+                                    stroke,
+                                );
+                            }
+                        }
+                    }
+
+                    if !py.label.is_empty() {
+                        if let Some(pt) = projector.project_point(&py.apex) {
+                            painter.text(
+                                origin + Vec2::new(pt.0, pt.1 + 14.0),
+                                egui::Align2::CENTER_TOP,
+                                &py.label,
+                                egui::FontId::proportional(grafito_ui::tokens::TYPE_SM),
+                                label_color,
+                            );
+                        }
+                    }
+                }
+                GeoObject::Cone3D(cone) => {
+                    // Base circle (normal: −eje real; legacy −Y solo si degenera).
+                    let cone_axis =
+                        (cone.apex.to_vec3() - cone.base_center.to_vec3()).normalize_or_zero();
+                    let base_normal = if cone_axis.length_squared() > 1.0e-12 {
+                        -cone_axis
+                    } else {
+                        Vec3::new(0.0, -1.0, 0.0)
+                    };
+                    let base_pts_3d: Vec<Vec3> = Camera3D::circle_points(
+                        cone.base_center.to_vec3(),
+                        Vec3::X,
+                        Vec3::Z,
+                        cone.radius as f32,
+                        32,
+                    );
+                    let base_pts: Vec<(f32, f32)> = base_pts_3d
+                        .iter()
+                        .filter_map(|pt| projector.project_point(&Point3D::from_vec3(*pt)))
+                        .collect();
+
+                    for i in 0..base_pts.len() {
+                        let j = (i + 1) % base_pts.len();
+                        let lit_color =
+                            light.shade_with_view(cone.color, base_normal, light_view_dir);
+                        let stroke = Stroke::new(cone.width, to_color32(lit_color));
+                        if !overlay_only {
+                            painter.line_segment(
+                                [
+                                    origin + Vec2::new(base_pts[i].0, base_pts[i].1),
+                                    origin + Vec2::new(base_pts[j].0, base_pts[j].1),
+                                ],
+                                stroke,
+                            );
+                        }
+                    }
+
+                    // Lines from base to apex (calculate lateral surface normal)
+                    if let Some(ap) = projector.project_point(&cone.apex) {
+                        for bp_3d in &base_pts_3d {
+                            let bp_3d = *bp_3d;
+                            if let Some(bp) = projector.project_point(&Point3D::from_vec3(bp_3d)) {
+                                // Calculate lateral surface normal at this point
+                                let radial =
+                                    (bp_3d - cone.base_center.to_vec3()).normalize_or_zero();
+                                let axial = (cone.apex.to_vec3() - cone.base_center.to_vec3())
+                                    .normalize_or_zero();
+                                let lateral = radial + axial * 0.5;
+                                let lateral_normal = if lateral.length_squared() > 1.0e-12 {
+                                    lateral.normalize_or_zero()
+                                } else {
+                                    base_normal
+                                };
+
+                                let lit_color = light.shade_with_view(
+                                    cone.color,
+                                    lateral_normal,
+                                    light_view_dir,
+                                );
+                                let stroke = Stroke::new(cone.width, to_color32(lit_color));
+                                if !overlay_only {
+                                    painter.line_segment(
+                                        [
+                                            origin + Vec2::new(bp.0, bp.1),
+                                            origin + Vec2::new(ap.0, ap.1),
+                                        ],
+                                        stroke,
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    if !cone.label.is_empty() {
+                        if let Some(pt) = projector.project_point(&cone.apex) {
+                            painter.text(
+                                origin + Vec2::new(pt.0, pt.1 + 14.0),
+                                egui::Align2::CENTER_TOP,
+                                &cone.label,
+                                egui::FontId::proportional(grafito_ui::tokens::TYPE_SM),
+                                label_color,
+                            );
+                        }
+                    }
+                }
+                GeoObject::Cylinder3D(cyl) => {
+                    // Top and bottom circles with their normals (±eje real;
+                    // legacy ±Y solo si el eje degenera).
+                    let cyl_axis =
+                        (cyl.top_center.to_vec3() - cyl.base_center.to_vec3()).normalize_or_zero();
+                    let axis_valid = cyl_axis.length_squared() > 1.0e-12;
+                    let (bottom_normal, top_normal) = if axis_valid {
+                        (-cyl_axis, cyl_axis)
+                    } else {
+                        (Vec3::new(0.0, -1.0, 0.0), Vec3::new(0.0, 1.0, 0.0))
+                    };
+                    let circles = [
+                        (cyl.base_center, bottom_normal), // Bottom
+                        (cyl.top_center, top_normal),     // Top
+                    ];
+
+                    for &(center, normal) in &circles {
+                        let pts_3d: Vec<Vec3> = Camera3D::circle_points(
+                            center.to_vec3(),
+                            Vec3::X,
+                            Vec3::Z,
+                            cyl.radius as f32,
+                            24,
+                        );
+                        let pts: Vec<(f32, f32)> = pts_3d
+                            .iter()
+                            .filter_map(|pt| projector.project_point(&Point3D::from_vec3(*pt)))
+                            .collect();
+
+                        for i in 0..pts.len() {
+                            let j = (i + 1) % pts.len();
+                            let lit_color =
+                                light.shade_with_view(cyl.color, normal, light_view_dir);
+                            let stroke = Stroke::new(cyl.width, to_color32(lit_color));
+                            if !overlay_only {
+                                painter.line_segment(
+                                    [
+                                        origin + Vec2::new(pts[i].0, pts[i].1),
+                                        origin + Vec2::new(pts[j].0, pts[j].1),
+                                    ],
+                                    stroke,
+                                );
+                            }
+                        }
+                    }
+
+                    // Vertical lines with radial normals
+                    if let (Some(_a), Some(_b)) = (
+                        projector.project_point(&cyl.base_center),
+                        projector.project_point(&cyl.top_center),
+                    ) {
+                        for angle in [
+                            0.0,
+                            std::f32::consts::PI * 0.5,
+                            std::f32::consts::PI,
+                            std::f32::consts::PI * 1.5,
+                        ] {
+                            let rx = angle.cos() * cyl.radius as f32;
+                            let rz = angle.sin() * cyl.radius as f32;
+
+                            // Radial normal pointing outward (sin componente axial:
+                            // idéntica a la legacy con eje Y, correcta con oblicuo).
+                            let radial_raw = Vec3::new(angle.cos(), 0.0, angle.sin());
+                            let radial_normal = if axis_valid {
+                                let projected = radial_raw - cyl_axis * radial_raw.dot(cyl_axis);
+                                if projected.length_squared() > 1.0e-12 {
+                                    projected.normalize_or_zero()
+                                } else {
+                                    radial_raw
+                                }
+                            } else {
+                                radial_raw
+                            };
+
+                            let ca = projector.project_point(&Point3D::new(
+                                cyl.base_center.x + rx as f64,
+                                cyl.base_center.y,
+                                cyl.base_center.z + rz as f64,
+                            ));
+                            let cb = projector.project_point(&Point3D::new(
+                                cyl.top_center.x + rx as f64,
+                                cyl.top_center.y,
+                                cyl.top_center.z + rz as f64,
+                            ));
+
+                            if let (Some(ca), Some(cb)) = (ca, cb) {
+                                let lit_color =
+                                    light.shade_with_view(cyl.color, radial_normal, light_view_dir);
+                                let stroke = Stroke::new(cyl.width, to_color32(lit_color));
+                                if !overlay_only {
+                                    painter.line_segment(
+                                        [
+                                            origin + Vec2::new(ca.0, ca.1),
+                                            origin + Vec2::new(cb.0, cb.1),
+                                        ],
+                                        stroke,
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    if !cyl.label.is_empty() {
+                        if let Some(pt) = projector.project_point(&Point3D::new(
+                            cyl.top_center.x,
+                            cyl.top_center.y + 0.5,
+                            cyl.top_center.z,
+                        )) {
+                            painter.text(
+                                origin + Vec2::new(pt.0, pt.1),
+                                egui::Align2::CENTER_BOTTOM,
+                                &cyl.label,
+                                egui::FontId::proportional(grafito_ui::tokens::TYPE_SM),
+                                label_color,
+                            );
+                        }
+                    }
+                }
+                GeoObject::Torus3D(torus) => {
+                    let stroke = Stroke::new(torus.width, to_color32(torus.color));
+                    let steps_u = 24;
+                    let steps_v = 12;
+                    let r_maj = torus.r_major;
+                    let r = torus.r_minor;
+                    let mut pts = vec![vec![(0.0_f32, 0.0_f32); steps_v + 1]; steps_u + 1];
+                    let mut valid = vec![vec![false; steps_v + 1]; steps_u + 1];
+                    for i in 0..=steps_u {
+                        let u = (i as f64) * std::f64::consts::PI * 2.0 / (steps_u as f64);
+                        for j in 0..=steps_v {
+                            let v = (j as f64) * std::f64::consts::PI * 2.0 / (steps_v as f64);
+                            let x = torus.center.x + (r_maj + r * v.cos()) * u.cos();
+                            let z = torus.center.z + (r_maj + r * v.cos()) * u.sin();
+                            let y = torus.center.y + r * v.sin();
+                            if let Some(p) = projector.project_point(&Point3D::new(x, y, z)) {
+                                pts[i][j] = (p.0, p.1);
+                                valid[i][j] = true;
+                            }
+                        }
+                    }
+                    for i in 0..steps_u {
+                        for j in 0..steps_v {
+                            if valid[i][j] && valid[i + 1][j] && !overlay_only {
+                                painter.line_segment(
+                                    [
+                                        origin + Vec2::new(pts[i][j].0, pts[i][j].1),
+                                        origin + Vec2::new(pts[i + 1][j].0, pts[i + 1][j].1),
+                                    ],
+                                    stroke,
+                                );
+                            }
+                            if valid[i][j] && valid[i][j + 1] && !overlay_only {
+                                painter.line_segment(
+                                    [
+                                        origin + Vec2::new(pts[i][j].0, pts[i][j].1),
+                                        origin + Vec2::new(pts[i][j + 1].0, pts[i][j + 1].1),
+                                    ],
+                                    stroke,
+                                );
+                            }
+                        }
+                    }
+                }
+                GeoObject::MoebiusStrip(moe) => {
+                    let stroke = Stroke::new(moe.width, to_color32(moe.color));
+                    let steps_u = 32;
+                    let steps_v = 8;
+                    let r_maj = moe.radius;
+                    let w_max = moe.width_r;
+                    let mut pts = vec![vec![(0.0_f32, 0.0_f32); steps_v + 1]; steps_u + 1];
+                    let mut valid = vec![vec![false; steps_v + 1]; steps_u + 1];
+                    for i in 0..=steps_u {
+                        let u = (i as f64) * std::f64::consts::PI * 2.0 / (steps_u as f64);
+                        for j in 0..=steps_v {
+                            let v = -w_max / 2.0 + w_max * (j as f64) / (steps_v as f64);
+                            let x = moe.center.x + (r_maj + v * (u / 2.0).cos()) * u.cos();
+                            let z = moe.center.z + (r_maj + v * (u / 2.0).cos()) * u.sin();
+                            let y = moe.center.y + v * (u / 2.0).sin();
+                            if let Some(p) = projector.project_point(&Point3D::new(x, y, z)) {
+                                pts[i][j] = (p.0, p.1);
+                                valid[i][j] = true;
+                            }
+                        }
+                    }
+                    for i in 0..steps_u {
+                        for j in 0..=steps_v {
+                            if valid[i][j] && valid[i + 1][j] && !overlay_only {
+                                painter.line_segment(
+                                    [
+                                        origin + Vec2::new(pts[i][j].0, pts[i][j].1),
+                                        origin + Vec2::new(pts[i + 1][j].0, pts[i + 1][j].1),
+                                    ],
+                                    stroke,
+                                );
+                            }
+                        }
+                    }
+                    for i in 0..=steps_u {
+                        for j in 0..steps_v {
+                            if valid[i][j] && valid[i][j + 1] && !overlay_only {
+                                painter.line_segment(
+                                    [
+                                        origin + Vec2::new(pts[i][j].0, pts[i][j].1),
+                                        origin + Vec2::new(pts[i][j + 1].0, pts[i][j + 1].1),
+                                    ],
+                                    stroke,
+                                );
+                            }
+                        }
+                    }
+                }
+                GeoObject::Surface3D(surf) => {
+                    if surf.is_parametric {
+                        // Parametric surfaces must remain visible while the GPU callback is
+                        // compiling, unavailable, or recovering from a failed scene upload.
+                        let grid = grafito_core::parametric_sampling::samples_or_compute_surface(
+                            surf,
+                            motion_preview_surface_resolution(
+                                surf.mesh_res.clamp(8, 50),
+                                motion_preview,
+                            ),
+                            &self.document.variables,
+                        );
+                        let color = to_color32(surf.color);
+                        let stroke = Stroke::new(surf.width, color);
+                        let project = |point: Point3D| {
+                            self.camera
+                                .project(&point, w, h)
+                                .map(|(x, y)| origin + Vec2::new(x, y))
+                        };
+                        for rows in grid.windows(2) {
+                            for column in 0..rows[0].len().saturating_sub(1) {
+                                let p00 = rows[0][column];
+                                let p10 = rows[1][column];
+                                let p01 = rows[0][column + 1];
+                                let p11 = rows[1][column + 1];
+                                if surf.solid && !overlay_only {
+                                    if let (Some(a), Some(b), Some(c)) =
+                                        (project(p00), project(p10), project(p11))
+                                    {
+                                        painter.add(egui::Shape::convex_polygon(
+                                            vec![a, b, c],
+                                            color,
+                                            Stroke::NONE,
+                                        ));
+                                    }
+                                    if let (Some(a), Some(b), Some(c)) =
+                                        (project(p00), project(p11), project(p01))
+                                    {
+                                        painter.add(egui::Shape::convex_polygon(
+                                            vec![a, b, c],
+                                            color,
+                                            Stroke::NONE,
+                                        ));
+                                    }
+                                }
+                                if !overlay_only {
+                                    if let (Some(a), Some(b)) = (project(p00), project(p10)) {
+                                        painter.line_segment([a, b], stroke);
+                                    }
+                                    if let (Some(a), Some(b)) = (project(p00), project(p01)) {
+                                        painter.line_segment([a, b], stroke);
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    if surf.solid && !overlay_only {
+                        // Solid Gouraud-shaded surface
+                        let res = motion_preview_surface_resolution(
+                            surf.mesh_res.clamp(8, 50),
+                            motion_preview,
+                        );
+                        let xs = surf.x_min;
+                        let xe = surf.x_max;
+                        let ys = surf.y_min;
+                        let ye = surf.y_max;
+                        let dx = (xe - xs) / res as f64;
+                        let dy = (ye - ys) / res as f64;
+
+                        // Evaluate all z values — checked_mul + try_reserve para evitar OOM.
+                        let dim = match res.checked_add(1) {
+                            Some(dim) => dim,
+                            None => continue,
+                        };
+                        let capacity = match dim.checked_mul(dim) {
+                            Some(cap) => cap,
+                            None => continue,
+                        };
+                        let mut pts = Vec::new();
+                        if pts.try_reserve(capacity).is_err() {
+                            continue;
+                        }
+                        for i in 0..=res {
+                            for j in 0..=res {
+                                pts.push((xs + j as f64 * dx, ys + i as f64 * dy));
+                            }
+                        }
+                        if let Ok(z_vals) = grafito_geometry::expr::eval_surface_batch(
+                            &surf.expr,
+                            pts.iter().copied(),
+                            &self.document.variables,
+                        ) {
+                            // Canon `Light::DEFAULT` (antes: dir (0.5,0.8,0.3) +
+                            // ambient 0.4 manual): el look nuevo queda pineado
+                            // en el test dorado `surface_shading_uses_light_canon`.
+                            // Triangulate and draw depth-sorted faces
+                            for i in 0..res {
+                                for j in 0..res {
+                                    let idx00 = i * (res + 1) + j;
+                                    let idx10 = i * (res + 1) + j + 1;
+                                    let idx01 = (i + 1) * (res + 1) + j;
+                                    let idx11 = (i + 1) * (res + 1) + j + 1;
+
+                                    let (x0, y0) = pts[idx00];
+                                    let z0 = z_vals[idx00].unwrap_or(f64::NAN);
+                                    let (x1, y1) = pts[idx10];
+                                    let z1 = z_vals[idx10].unwrap_or(f64::NAN);
+                                    let (x2, y2) = pts[idx01];
+                                    let z2 = z_vals[idx01].unwrap_or(f64::NAN);
+                                    let (x3, y3) = pts[idx11];
+                                    let z3 = z_vals[idx11].unwrap_or(f64::NAN);
+
+                                    if !z0.is_finite()
+                                        || !z1.is_finite()
+                                        || !z2.is_finite()
+                                        || !z3.is_finite()
+                                        || z0.abs() > 100.0
+                                        || z1.abs() > 100.0
+                                        || z2.abs() > 100.0
+                                        || z3.abs() > 100.0
+                                    {
+                                        continue;
+                                    }
+
+                                    // Compute two triangle normals
+                                    let v00 = surf.explicit_sample_point(x0, y0, z0).to_vec3();
+                                    let v10 = surf.explicit_sample_point(x1, y1, z1).to_vec3();
+                                    let v01 = surf.explicit_sample_point(x2, y2, z2).to_vec3();
+                                    let v11 = surf.explicit_sample_point(x3, y3, z3).to_vec3();
+
+                                    let n1 = (v10 - v00).cross(v01 - v00).normalize();
+                                    let n2 = (v11 - v10).cross(v01 - v10).normalize();
+
+                                    let c1 = to_color32(light.shade_with_view(
+                                        surf.color,
+                                        n1,
+                                        light_view_dir,
+                                    ));
+                                    let c2 = to_color32(light.shade_with_view(
+                                        surf.color,
+                                        n2,
+                                        light_view_dir,
+                                    ));
+
+                                    // Project and draw triangle 1
+                                    if let (Some(p0), Some(p1), Some(p2)) = (
+                                        projector
+                                            .project_point(&surf.explicit_sample_point(x0, y0, z0)),
+                                        projector
+                                            .project_point(&surf.explicit_sample_point(x1, y1, z1)),
+                                        projector
+                                            .project_point(&surf.explicit_sample_point(x2, y2, z2)),
+                                    ) {
+                                        let pts1 = vec![
+                                            origin + Vec2::new(p0.0, p0.1),
+                                            origin + Vec2::new(p1.0, p1.1),
+                                            origin + Vec2::new(p2.0, p2.1),
+                                        ];
+                                        painter.add(egui::Shape::convex_polygon(
+                                            pts1,
+                                            c1,
+                                            Stroke::new(0.5, c1),
+                                        ));
+                                    }
+                                    // Project and draw triangle 2
+                                    if let (Some(p1), Some(p2), Some(p3)) = (
+                                        projector
+                                            .project_point(&surf.explicit_sample_point(x1, y1, z1)),
+                                        projector
+                                            .project_point(&surf.explicit_sample_point(x2, y2, z2)),
+                                        projector
+                                            .project_point(&surf.explicit_sample_point(x3, y3, z3)),
+                                    ) {
+                                        let pts2 = vec![
+                                            origin + Vec2::new(p1.0, p1.1),
+                                            origin + Vec2::new(p2.0, p2.1),
+                                            origin + Vec2::new(p3.0, p3.1),
+                                        ];
+                                        painter.add(egui::Shape::convex_polygon(
+                                            pts2,
+                                            c2,
+                                            Stroke::new(0.5, c2),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        if !surf.label.is_empty() {
+                            if let Some(pt) = projector.project_point(&surf.explicit_sample_point(
+                                (surf.x_min + surf.x_max) * 0.5,
+                                (surf.y_min + surf.y_max) * 0.5,
+                                1.0,
+                            )) {
+                                painter.text(
+                                    origin + Vec2::new(pt.0, pt.1),
+                                    egui::Align2::CENTER_BOTTOM,
+                                    &surf.label,
+                                    egui::FontId::proportional(grafito_ui::tokens::TYPE_SM),
+                                    label_color,
+                                );
+                            }
+                        }
+                        continue;
+                    }
+                    // Original wireframe rendering
+                    let stroke = Stroke::new(surf.width, to_color32(surf.color));
+                    let steps: usize = 20;
+                    let xs = surf.x_min;
+                    let xe = surf.x_max;
+                    let ys = surf.y_min;
+                    let ye = surf.y_max;
+                    let x_step = (xe - xs) / steps as f64;
+                    let y_step = (ye - ys) / steps as f64;
+                    // Collect all (x, y) points for X-axis lines — checked + try_reserve
+                    let dim_x = match steps.checked_add(1) {
+                        Some(dim) => dim,
+                        None => continue,
+                    };
+                    let cap_x = match dim_x.checked_mul(dim_x) {
+                        Some(cap) => cap,
+                        None => continue,
+                    };
+                    let mut pts_x = Vec::new();
+                    if pts_x.try_reserve(cap_x).is_err() {
+                        continue;
+                    }
+                    for i in 0..=steps {
+                        let y = ys + i as f64 * y_step;
+                        for j in 0..=steps {
+                            let x = xs + j as f64 * x_step;
+                            pts_x.push((x, y));
+                        }
+                    }
+
+                    if let Ok(z_vals) = grafito_geometry::expr::eval_surface_batch(
+                        &surf.expr,
+                        pts_x.iter().copied(),
+                        &self.document.variables,
+                    ) {
+                        for i in 0..=steps {
+                            let mut prev: Option<(f32, f32)> = None;
+                            for j in 0..=steps {
+                                let idx = i * (steps + 1) + j;
+                                let (x, y) = pts_x[idx];
+                                if let Some(z) = z_vals[idx] {
+                                    if z.is_finite() && z.abs() < 100.0 {
+                                        if let Some(pt) = projector
+                                            .project_point(&surf.explicit_sample_point(x, y, z))
+                                        {
+                                            if let Some(pp) = prev {
+                                                if !overlay_only {
+                                                    painter.line_segment(
+                                                        [
+                                                            origin + Vec2::new(pp.0, pp.1),
+                                                            origin + Vec2::new(pt.0, pt.1),
+                                                        ],
+                                                        stroke,
+                                                    );
+                                                }
+                                            }
+                                            prev = Some(pt);
+                                            continue;
+                                        }
+                                    }
+                                }
+                                prev = None;
+                            }
+                        }
+                    }
+
+                    // Collect all (x, y) points for Y-axis lines — checked + try_reserve
+                    let dim_y = match steps.checked_add(1) {
+                        Some(dim) => dim,
+                        None => continue,
+                    };
+                    let cap_y = match dim_y.checked_mul(dim_y) {
+                        Some(cap) => cap,
+                        None => continue,
+                    };
+                    let mut pts_y = Vec::new();
+                    if pts_y.try_reserve(cap_y).is_err() {
+                        continue;
+                    }
+                    for j in 0..=steps {
+                        let x = xs + j as f64 * x_step;
+                        for i in 0..=steps {
+                            let y = ys + i as f64 * y_step;
+                            pts_y.push((x, y));
+                        }
+                    }
+
+                    if let Ok(z_vals) = grafito_geometry::expr::eval_surface_batch(
+                        &surf.expr,
+                        pts_y.iter().copied(),
+                        &self.document.variables,
+                    ) {
+                        for j in 0..=steps {
+                            let mut prev: Option<(f32, f32)> = None;
+                            for i in 0..=steps {
+                                let idx = j * (steps + 1) + i;
+                                let (x, y) = pts_y[idx];
+                                if let Some(z) = z_vals[idx] {
+                                    if z.is_finite() && z.abs() < 100.0 {
+                                        if let Some(pt) = projector
+                                            .project_point(&surf.explicit_sample_point(x, y, z))
+                                        {
+                                            if let Some(pp) = prev {
+                                                if !overlay_only {
+                                                    painter.line_segment(
+                                                        [
+                                                            origin + Vec2::new(pp.0, pp.1),
+                                                            origin + Vec2::new(pt.0, pt.1),
+                                                        ],
+                                                        stroke,
+                                                    );
+                                                }
+                                            }
+                                            prev = Some(pt);
+                                            continue;
+                                        }
+                                    }
+                                }
+                                prev = None;
+                            }
+                        }
+                    }
+                }
+                GeoObject::ParametricCurve3D(curve) => {
+                    let stroke = Stroke::new(curve.width, to_color32(curve.color));
+                    let mut prev: Option<(Point3D, (f32, f32))> = None;
+                    let samples = grafito_core::parametric_sampling::samples_or_compute_curve_3d(
+                        curve,
+                        500,
+                        &self.document.variables,
+                    );
+                    let stride = motion_preview_sample_stride(samples.len(), motion_preview);
+                    for point in samples.iter().step_by(stride) {
+                        let (x, y, z) = *point;
+                        if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+                            prev = None;
+                            continue;
+                        }
+                        let point = Point3D::new(x, y, z);
+                        if let Some(pt) = projector.project_point(&point) {
+                            if let Some((_, pp)) = prev.filter(|(previous, _)| {
+                                curve_3d_segment_is_continuous(*previous, point, &self.camera)
+                            }) {
+                                if !overlay_only {
+                                    painter.line_segment(
+                                        [
+                                            origin + Vec2::new(pp.0, pp.1),
+                                            origin + Vec2::new(pt.0, pt.1),
+                                        ],
+                                        stroke,
+                                    );
+                                }
+                            }
+                            prev = Some((point, pt));
+                            continue;
+                        }
+                        prev = None;
+                    }
+                }
+                GeoObject::Attractor3D(att) => {
+                    use grafito_geometry::attractors::integrate_attractor;
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+
+                    // Calculate hash of attractor parameters
+                    let mut hasher = DefaultHasher::new();
+                    att.attractor_type.hash(&mut hasher);
+                    for p in &att.params {
+                        p.to_bits().hash(&mut hasher);
+                    }
+                    att.x0.to_bits().hash(&mut hasher);
+                    att.y0.to_bits().hash(&mut hasher);
+                    att.z0.to_bits().hash(&mut hasher);
+                    att.dt.to_bits().hash(&mut hasher);
+                    att.steps.hash(&mut hasher);
+                    att.skip.hash(&mut hasher);
+                    let param_hash = hasher.finish();
+
+                    // Check cache or compute new points
+                    let needs_refresh = self
+                        .attractor_cache
+                        .get(&att.id)
+                        .is_none_or(|(cached_hash, _)| *cached_hash != param_hash);
+                    if needs_refresh {
+                        let atype = att.model();
+                        let new_pts = integrate_attractor(
+                            &atype, att.x0, att.y0, att.z0, att.dt, att.steps, att.skip,
+                        );
+                        self.attractor_cache.insert(att.id, (param_hash, new_pts));
+                        // Cota 16: cada entrada es una órbita densa; sin cota
+                        // crecía con cada atractor visto. Expulsa una ajena
+                        // (peor caso: 1 reintegrada por frame; RAM acotada).
+                        if self.attractor_cache.len() > ATTRACTOR_CACHE_MAX_ENTRIES {
+                            if let Some(vieja) = self
+                                .attractor_cache
+                                .keys()
+                                .find(|clave| **clave != att.id)
+                                .copied()
+                            {
+                                self.attractor_cache.remove(&vieja);
+                            }
+                        }
+                    }
+                    let Some((_, pts)) = self.attractor_cache.get(&att.id) else {
+                        continue;
+                    };
+
+                    let stroke = Stroke::new(att.width, to_color32(att.color));
+                    let mut prev: Option<(f32, f32)> = None;
+                    let stride = motion_preview_sample_stride(pts.len(), motion_preview);
+                    for pt in pts.iter().step_by(stride) {
+                        let scaled_pt = Point3D::new(pt.x * 0.2, pt.y * 0.2, pt.z * 0.2);
+                        if let Some(sp) = projector.project_point(&scaled_pt) {
+                            if let Some(pp) = prev {
+                                if !overlay_only {
+                                    painter.line_segment(
+                                        [
+                                            origin + Vec2::new(pp.0, pp.1),
+                                            origin + Vec2::new(sp.0, sp.1),
+                                        ],
+                                        stroke,
+                                    );
+                                }
+                            }
+                            prev = Some(sp);
+                        } else {
+                            prev = None;
+                        }
+                    }
+
+                    if !att.label.is_empty() {
+                        if let Some(first) = pts.first() {
+                            let first = Point3D::new(first.x * 0.2, first.y * 0.2, first.z * 0.2);
+                            if let Some(pt) = projector.project_point(&first) {
+                                painter.text(
+                                    origin + Vec2::new(pt.0, pt.1 - 10.0),
+                                    egui::Align2::CENTER_BOTTOM,
+                                    &att.label,
+                                    egui::FontId::proportional(grafito_ui::tokens::TYPE_SM),
+                                    label_color,
+                                );
+                            }
+                        }
+                    }
+                }
+                GeoObject::RegularPolychoron4D(polychoron) => {
+                    let draw_cpu_geometry = should_draw_cpu_3d_geometry(obj, overlay_only);
+                    if let Some(geometry) = typed_projection {
+                        if draw_cpu_geometry {
+                            if should_draw_polychoron_faces(
+                                polychoron.fill_color.is_some(),
+                                motion_preview,
+                            ) {
+                                if let Some(fill) = polychoron.fill_color {
+                                    for (_, face) in
+                                        projected_polychoron_faces_for_view(&projector, &geometry)
+                                    {
+                                        painter.add(egui::Shape::convex_polygon(
+                                            face.into_iter()
+                                                .map(|(x, y)| origin + Vec2::new(x, y))
+                                                .collect(),
+                                            to_color32(fill),
+                                            Stroke::NONE,
+                                        ));
+                                    }
+                                }
+                            }
+
+                            let stroke =
+                                Stroke::new(polychoron.width, to_color32(polychoron.color));
+                            let stride = motion_preview_polytope_edge_stride(
+                                geometry.edges().len(),
+                                motion_preview,
+                            );
+                            for &[first, second] in geometry.edges().iter().step_by(stride) {
+                                let Some((start, end)) = geometry
+                                    .vertices()
+                                    .get(first)
+                                    .zip(geometry.vertices().get(second))
+                                else {
+                                    continue;
+                                };
+                                if let Some((a, b)) = projector.project_segment(start, end) {
+                                    painter.line_segment(
+                                        [
+                                            origin + Vec2::new(a.0, a.1),
+                                            origin + Vec2::new(b.0, b.1),
+                                        ],
+                                        stroke,
+                                    );
+                                }
+                            }
+                        }
+
+                        if !polychoron.label.is_empty() {
+                            if let Some(point) = geometry
+                                .vertices()
+                                .first()
+                                .and_then(|point| projector.project_point(point))
+                            {
+                                painter.text(
+                                    origin + Vec2::new(point.0, point.1 - 10.0),
+                                    egui::Align2::CENTER_BOTTOM,
+                                    &polychoron.label,
+                                    egui::FontId::proportional(grafito_ui::tokens::TYPE_SM),
+                                    label_color,
+                                );
+                            }
+                        }
+                    }
+                }
+                GeoObject::RegularPolytopeND(polytope) => {
+                    let draw_cpu_geometry = should_draw_cpu_3d_geometry(obj, overlay_only);
+                    if let Some(geometry) = typed_projection {
+                        if draw_cpu_geometry {
+                            let stroke = Stroke::new(polytope.width, to_color32(polytope.color));
+                            let stride = motion_preview_polytope_edge_stride(
+                                geometry.edges().len(),
+                                motion_preview,
+                            );
+                            for &[first, second] in geometry.edges().iter().step_by(stride) {
+                                let Some((start, end)) = geometry
+                                    .vertices()
+                                    .get(first)
+                                    .zip(geometry.vertices().get(second))
+                                else {
+                                    continue;
+                                };
+                                if let Some((a, b)) = projector.project_segment(start, end) {
+                                    painter.line_segment(
+                                        [
+                                            origin + Vec2::new(a.0, a.1),
+                                            origin + Vec2::new(b.0, b.1),
+                                        ],
+                                        stroke,
+                                    );
+                                }
+                            }
+                        }
+
+                        if !polytope.label.is_empty() {
+                            if let Some(point) = geometry
+                                .vertices()
+                                .first()
+                                .and_then(|point| projector.project_point(point))
+                            {
+                                painter.text(
+                                    origin + Vec2::new(point.0, point.1 - 10.0),
+                                    egui::Align2::CENTER_BOTTOM,
+                                    &polytope.label,
+                                    egui::FontId::proportional(grafito_ui::tokens::TYPE_SM),
+                                    label_color,
+                                );
+                            }
+                        }
+                    }
+                }
+                GeoObject::HyperSurface4D(hs) => {
+                    let draw_cpu_geometry = should_draw_cpu_3d_geometry(obj, overlay_only);
+                    let stroke = Stroke::new(hs.width, to_color32(hs.color));
+                    let [a_xy, a_xz, a_xw] = effective_four_d_angles(
+                        &hs.rotation_angles,
+                        self.transient_render_state.four_d_phase(),
+                    );
+                    let scale = hs.params.first().copied().unwrap_or(1.0);
+                    match hs.surface_type.as_str() {
+                        "hypercube" => {
+                            let mut verts_4d: Vec<[f64; 4]> = Vec::with_capacity(16);
+                            for i in 0..16u8 {
+                                verts_4d.push([
+                                    if i & 1 != 0 { scale } else { -scale },
+                                    if i & 2 != 0 { scale } else { -scale },
+                                    if i & 4 != 0 { scale } else { -scale },
+                                    if i & 8 != 0 { scale } else { -scale },
+                                ]);
+                            }
+                            let cos_xy = a_xy.cos();
+                            let sin_xy = a_xy.sin();
+                            let cos_xz = a_xz.cos();
+                            let sin_xz = a_xz.sin();
+                            let cos_xw = a_xw.cos();
+                            let sin_xw = a_xw.sin();
+                            let projected: Vec<Point3D> = verts_4d
+                                .iter()
+                                .map(|v| {
+                                    let mut p = *v;
+                                    let nx = p[0] * cos_xy - p[1] * sin_xy;
+                                    let ny = p[0] * sin_xy + p[1] * cos_xy;
+                                    p[0] = nx;
+                                    p[1] = ny;
+                                    let nx = p[0] * cos_xz - p[2] * sin_xz;
+                                    let nz = p[0] * sin_xz + p[2] * cos_xz;
+                                    p[0] = nx;
+                                    p[2] = nz;
+                                    let nx = p[0] * cos_xw - p[3] * sin_xw;
+                                    let nw = p[0] * sin_xw + p[3] * cos_xw;
+                                    p[0] = nx;
+                                    p[3] = nw;
+                                    let w_factor = 1.0 / (3.0 - p[3] / scale);
+                                    Point3D::new(p[0] * w_factor, p[1] * w_factor, p[2] * w_factor)
+                                })
+                                .collect();
+                            let edges: Vec<(usize, usize)> = (0..16usize)
+                                .flat_map(|i| {
+                                    (0..16usize)
+                                        .filter(move |&j| j > i && (i ^ j).count_ones() == 1)
+                                        .map(move |j| (i, j))
+                                })
+                                .collect();
+                            for &(a, b) in &edges {
+                                if let (Some(pa), Some(pb)) = (
+                                    projector.project_point(&projected[a]),
+                                    projector.project_point(&projected[b]),
+                                ) {
+                                    if draw_cpu_geometry {
+                                        painter.line_segment(
+                                            [
+                                                origin + Vec2::new(pa.0, pa.1),
+                                                origin + Vec2::new(pb.0, pb.1),
+                                            ],
+                                            stroke,
+                                        );
+                                    }
+                                }
+                            }
+                            if !hs.label.is_empty() {
+                                if let Some(pt) = projector.project_point(&projected[0]) {
+                                    painter.text(
+                                        origin + Vec2::new(pt.0, pt.1 - 10.0),
+                                        egui::Align2::CENTER_BOTTOM,
+                                        &hs.label,
+                                        egui::FontId::proportional(grafito_ui::tokens::TYPE_SM),
+                                        label_color,
+                                    );
+                                }
+                            }
+                        }
+                        "hypersphere" => {
+                            let res = hs.resolution.clamp(8, 30);
+                            let mut pts_3d: Vec<Vec<Point3D>> = Vec::new();
+                            let cos_xy = a_xy.cos();
+                            let sin_xy = a_xy.sin();
+                            let cos_xz = a_xz.cos();
+                            let sin_xz = a_xz.sin();
+                            let cos_xw = a_xw.cos();
+                            let sin_xw = a_xw.sin();
+                            for i in 0..=res {
+                                let phi = std::f64::consts::PI * i as f64 / res as f64;
+                                let mut ring = Vec::new();
+                                for j in 0..=res * 2 {
+                                    let theta = std::f64::consts::TAU * j as f64 / (res * 2) as f64;
+                                    let mut p = [
+                                        scale * phi.sin() * theta.cos(),
+                                        scale * phi.sin() * theta.sin(),
+                                        scale * phi.cos(),
+                                        0.0,
+                                    ];
+                                    let nx = p[0] * cos_xy - p[1] * sin_xy;
+                                    let ny = p[0] * sin_xy + p[1] * cos_xy;
+                                    p[0] = nx;
+                                    p[1] = ny;
+                                    let nx = p[0] * cos_xz - p[2] * sin_xz;
+                                    let nz = p[0] * sin_xz + p[2] * cos_xz;
+                                    p[0] = nx;
+                                    p[2] = nz;
+                                    let nx = p[0] * cos_xw - p[3] * sin_xw;
+                                    let nw = p[0] * sin_xw + p[3] * cos_xw;
+                                    p[0] = nx;
+                                    p[3] = nw;
+                                    let w_factor = 1.0 / (3.0 - p[3] / scale);
+                                    ring.push(Point3D::new(
+                                        p[0] * w_factor,
+                                        p[1] * w_factor,
+                                        p[2] * w_factor,
+                                    ));
+                                }
+                                pts_3d.push(ring);
+                            }
+                            for ring in &pts_3d {
+                                let mut prev: Option<(f32, f32)> = None;
+                                for pt in ring {
+                                    if let Some(sp) = projector.project_point(pt) {
+                                        if let Some(pp) = prev {
+                                            if draw_cpu_geometry {
+                                                painter.line_segment(
+                                                    [
+                                                        origin + Vec2::new(pp.0, pp.1),
+                                                        origin + Vec2::new(sp.0, sp.1),
+                                                    ],
+                                                    stroke,
+                                                );
+                                            }
+                                        }
+                                        prev = Some(sp);
+                                    } else {
+                                        prev = None;
+                                    }
+                                }
+                            }
+                            for j in 0..pts_3d.first().map(|r| r.len()).unwrap_or(0) {
+                                let mut prev: Option<(f32, f32)> = None;
+                                for ring in &pts_3d {
+                                    if let Some(pt) = ring.get(j) {
+                                        if let Some(sp) = projector.project_point(pt) {
+                                            if let Some(pp) = prev {
+                                                if draw_cpu_geometry {
+                                                    painter.line_segment(
+                                                        [
+                                                            origin + Vec2::new(pp.0, pp.1),
+                                                            origin + Vec2::new(sp.0, sp.1),
+                                                        ],
+                                                        stroke,
+                                                    );
+                                                }
+                                            }
+                                            prev = Some(sp);
+                                        } else {
+                                            prev = None;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                GeoObject::VectorField3D(vf) if !overlay_only => {
+                    // Paridad con el campo 2D: min/max log-mag UNA vez fuera
+                    // del loop, color viridis por flecha + largo 0.3x..1.5x
+                    // opcional (escala en pantalla, equivalente visual).
+                    let samples = grafito_render::sample_vector_field_3d_with_magnitude(
+                        vf,
+                        &self.document.variables,
+                    );
+                    let (mag_lo, mag_hi) = if vf.color_by_magnitude || vf.scale_by_magnitude {
+                        let mut lo = f64::INFINITY;
+                        let mut hi = f64::NEG_INFINITY;
+                        for (_, _, m) in samples.iter().copied() {
+                            if m > 1e-10 {
+                                let lm = m.log10();
+                                lo = lo.min(lm);
+                                hi = hi.max(lm);
+                            }
+                        }
+                        (lo, hi)
+                    } else {
+                        (0.0, 1.0)
+                    };
+                    let flat = to_color32(vf.color);
+                    for (start, end, mag) in samples.iter().copied() {
+                        if let (Some(pa), Some(pb)) = (
+                            projector.project_point(&start),
+                            projector.project_point(&end),
+                        ) {
+                            let (col, len) = if vf.color_by_magnitude || vf.scale_by_magnitude {
+                                let t = if (mag_hi - mag_lo).is_finite() && mag_hi - mag_lo > 1e-9 {
+                                    ((mag.log10() - mag_lo) / (mag_hi - mag_lo)).clamp(0.0, 1.0)
+                                } else {
+                                    0.5
+                                };
+                                let c = if vf.color_by_magnitude {
+                                    let (r, g, b) = grafito_render::viridis_colormap(t);
+                                    Color32::from_rgb(
+                                        (r * 255.0) as u8,
+                                        (g * 255.0) as u8,
+                                        (b * 255.0) as u8,
+                                    )
+                                } else {
+                                    flat
+                                };
+                                let l = if vf.scale_by_magnitude {
+                                    0.3 + 1.2 * t
+                                } else {
+                                    1.0
+                                };
+                                (c, l)
+                            } else {
+                                (flat, 1.0)
+                            };
+                            let len32 = len as f32;
+                            let qb = (pa.0 + (pb.0 - pa.0) * len32, pa.1 + (pb.1 - pa.1) * len32);
+                            painter.line_segment(
+                                [
+                                    origin + Vec2::new(pa.0, pa.1),
+                                    origin + Vec2::new(qb.0, qb.1),
+                                ],
+                                Stroke::new(1.5, col),
+                            );
+                        }
+                    }
+                }
+                GeoObject::Prism3D(prism) => {
+                    let base = grafito_render::prism_base_vertices(prism);
+                    if base.len() >= 3 {
+                        let top = grafito_render::prism_top_vertices(prism);
+
+                        // Caras translúcidas (base, tapa y laterales).
+                        if !overlay_only {
+                            if let Some(fill) = prism.fill_color {
+                                let fill32 = to_color32(fill);
+                                // Base y tapa: abanico desde el primer vértice
+                                // (válido para bases convexas; las no convexas
+                                // se aproximan, igual que el path GPU).
+                                for index in 1..base.len().saturating_sub(1) {
+                                    for face in [
+                                        [base[0], base[index], base[index + 1]],
+                                        [top[0], top[index], top[index + 1]],
+                                    ] {
+                                        if let Some(points) = projected_face_points_for_view(
+                                            &projector, &face, origin,
+                                        ) {
+                                            painter.add(egui::Shape::convex_polygon(
+                                                points,
+                                                fill32,
+                                                Stroke::NONE,
+                                            ));
+                                        }
+                                    }
+                                }
+                                // Laterales: cada cara es un paralelogramo.
+                                for index in 0..base.len() {
+                                    let next = (index + 1) % base.len();
+                                    if let Some(points) = projected_face_points_for_view(
+                                        &projector,
+                                        &[base[index], base[next], top[next], top[index]],
+                                        origin,
+                                    ) {
+                                        painter.add(egui::Shape::convex_polygon(
+                                            points,
+                                            fill32,
+                                            Stroke::NONE,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+
+                        // Aristas con iluminación por cara.
+                        let base_normal = face_normal(base[0], base[1], base[2]).unwrap_or(Vec3::Y);
+                        let top_normal = face_normal(top[0], top[1], top[2]).unwrap_or(Vec3::Y);
+                        let vertical_normal = (base_normal + top_normal).normalize_or_zero();
+                        for index in 0..base.len() {
+                            let next = (index + 1) % base.len();
+                            for (a, b, normal) in [
+                                (base[index], base[next], base_normal),
+                                (top[index], top[next], top_normal),
+                                (base[index], top[index], vertical_normal),
+                            ] {
+                                if let (Some(pa), Some(pb)) =
+                                    (projector.project_point(&a), projector.project_point(&b))
+                                {
+                                    let lit =
+                                        light.shade_with_view(prism.color, normal, light_view_dir);
+                                    let stroke = Stroke::new(prism.width, to_color32(lit));
+                                    if !overlay_only {
+                                        painter.line_segment(
+                                            [
+                                                origin + Vec2::new(pa.0, pa.1),
+                                                origin + Vec2::new(pb.0, pb.1),
+                                            ],
+                                            stroke,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        if !prism.label.is_empty() {
+                            let top_center = top
+                                .iter()
+                                .fold(Vec3::ZERO, |sum, point| sum + point.to_vec3())
+                                / top.len().max(1) as f32;
+                            if let Some(pt) =
+                                projector.project_point(&Point3D::from_vec3(top_center))
+                            {
+                                painter.text(
+                                    origin + Vec2::new(pt.0, pt.1 - grafito_ui::tokens::SPACE_SM),
+                                    egui::Align2::CENTER_BOTTOM,
+                                    &prism.label,
+                                    egui::FontId::proportional(grafito_ui::tokens::TYPE_SM),
+                                    label_color,
+                                );
+                            }
+                        }
+                    }
+                }
+                GeoObject::Quadric3D(quadric) => {
+                    // A4: malla exacta A2 (igual que `depth_3d::append_quadric`) —
+                    // jamás un elipsoide falso. Elipsoide alineado a ejes por el
+                    // camino legacy; el resto por `quadric_wire_points`; sin
+                    // superficie real → cero segmentos (honesto, sin placeholder).
+                    if let Some(ellipsoid) = grafito_render::quadric_ellipsoid_params(quadric) {
+                        let center = ellipsoid.center.to_vec3();
+                        let radii = ellipsoid.radii;
+                        for (u, v) in [(Vec3::X, Vec3::Y), (Vec3::X, Vec3::Z), (Vec3::Y, Vec3::Z)] {
+                            let normal = u.cross(v).normalize_or_zero();
+                            let mut prev: Option<(f32, f32)> = None;
+                            for index in 0..=32 {
+                                let angle = std::f32::consts::TAU * index as f32 / 32.0;
+                                let direction = u * angle.cos() + v * angle.sin();
+                                let point = Point3D::from_vec3(
+                                    center
+                                        + Vec3::new(
+                                            direction.x * radii.x,
+                                            direction.y * radii.y,
+                                            direction.z * radii.z,
+                                        ),
+                                );
+                                if let Some(projected) = projector.project_point(&point) {
+                                    if let Some(prev) = prev {
+                                        let lit = light.shade_with_view(
+                                            quadric.color,
+                                            normal,
+                                            light_view_dir,
+                                        );
+                                        let stroke = Stroke::new(quadric.width, to_color32(lit));
+                                        if !overlay_only {
+                                            painter.line_segment(
+                                                [
+                                                    origin + Vec2::new(prev.0, prev.1),
+                                                    origin + Vec2::new(projected.0, projected.1),
+                                                ],
+                                                stroke,
+                                            );
+                                        }
+                                    }
+                                    prev = Some(projected);
+                                } else {
+                                    prev = None;
+                                }
+                            }
+                        }
+                        if !quadric.label.is_empty() {
+                            if let Some(pt) = projector.project_point(&ellipsoid.center) {
+                                painter.text(
+                                    origin + Vec2::new(pt.0, pt.1 - grafito_ui::tokens::SPACE_SM),
+                                    egui::Align2::CENTER_BOTTOM,
+                                    &quadric.label,
+                                    egui::FontId::proportional(grafito_ui::tokens::TYPE_SM),
+                                    label_color,
+                                );
+                            }
+                        }
+                    } else {
+                        let coeffs = [
+                            quadric.a, quadric.b, quadric.c, quadric.d, quadric.e, quadric.f,
+                            quadric.g, quadric.h, quadric.i, quadric.j,
+                        ];
+                        // Sin superficie real: cero segmentos, sin etiqueta falsa
+                        // (no `return`: el loop debe seguir con el resto de objetos).
+                        // W-A: matemática cacheada en depth_3d; acá solo se itera.
+                        if let Ok(lines) =
+                            grafito_render::depth_3d::cached_quadric_wire_points(coeffs)
+                        {
+                            let stroke = Stroke::new(quadric.width, to_color32(quadric.color));
+                            // Centro honesto para la etiqueta: media de la malla exacta.
+                            let mut center_acc = Vec3::ZERO;
+                            let mut center_count = 0_usize;
+                            for polyline in lines.iter() {
+                                let mut prev: Option<(f32, f32)> = None;
+                                for point in polyline.iter() {
+                                    center_acc += point.to_vec3();
+                                    center_count += 1;
+                                    if let Some(projected) = projector.project_point(point) {
+                                        if let Some(prev) = prev {
+                                            if !overlay_only {
+                                                painter.line_segment(
+                                                    [
+                                                        origin + Vec2::new(prev.0, prev.1),
+                                                        origin
+                                                            + Vec2::new(projected.0, projected.1),
+                                                    ],
+                                                    stroke,
+                                                );
+                                            }
+                                        }
+                                        prev = Some(projected);
+                                    } else {
+                                        prev = None;
+                                    }
+                                }
+                            }
+                            if !quadric.label.is_empty() && center_count > 0 {
+                                let center = Point3D::from_vec3(center_acc / center_count as f32);
+                                if let Some(pt) = projector.project_point(&center) {
+                                    painter.text(
+                                        origin
+                                            + Vec2::new(pt.0, pt.1 - grafito_ui::tokens::SPACE_SM),
+                                        egui::Align2::CENTER_BOTTOM,
+                                        &quadric.label,
+                                        egui::FontId::proportional(grafito_ui::tokens::TYPE_SM),
+                                        label_color,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                GeoObject::ImplicitSurface3D(surface) => {
+                    // A1: overlay CPU wireframe de la malla `F(x,y,z)=0`. Un
+                    // `Err` honesto dibuja cero segmentos; mallas densas
+                    // (>4096 tris) van solo al GPU como sólido.
+                    let mesh_data = surface.mesh_snapshot(&self.document.variables).ok();
+                    let mesh_data = mesh_data.filter(|mesh_data| {
+                        mesh_data.triangle_count() > 0
+                            && mesh_data.triangle_count() <= GB_MAX_CPU_MESH_EDGES
+                    });
+                    if let Some(mesh_data) = mesh_data {
+                        if !overlay_only {
+                            let stroke = Stroke::new(surface.width, to_color32(surface.color));
+                            for triangle in mesh_data.triangles() {
+                                let (Some(a), Some(b), Some(c)) = (
+                                    mesh_data.vertices().get(triangle[0]),
+                                    mesh_data.vertices().get(triangle[1]),
+                                    mesh_data.vertices().get(triangle[2]),
+                                ) else {
+                                    continue;
+                                };
+                                for (start, end) in [(a, b), (b, c), (c, a)] {
+                                    if let Some((pa, pb)) = projector.project_segment(start, end) {
+                                        painter.line_segment(
+                                            [
+                                                origin + Vec2::new(pa.0, pa.1),
+                                                origin + Vec2::new(pb.0, pb.1),
+                                            ],
+                                            stroke,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        if !surface.label.is_empty() {
+                            let center = Point3D::new(
+                                (surface.x_min + surface.x_max) * 0.5,
+                                (surface.y_min + surface.y_max) * 0.5,
+                                (surface.z_min + surface.z_max) * 0.5,
+                            );
+                            if let Some(pt) = projector.project_point(&center) {
+                                painter.text(
+                                    origin + Vec2::new(pt.0, pt.1 - grafito_ui::tokens::SPACE_SM),
+                                    egui::Align2::CENTER_BOTTOM,
+                                    &surface.label,
+                                    egui::FontId::proportional(grafito_ui::tokens::TYPE_SM),
+                                    label_color,
+                                );
+                            }
+                        }
+                    } else if !surface.label.is_empty() {
+                        let center = Point3D::new(
+                            (surface.x_min + surface.x_max) * 0.5,
+                            (surface.y_min + surface.y_max) * 0.5,
+                            (surface.z_min + surface.z_max) * 0.5,
+                        );
+                        if let Some(pt) = projector.project_point(&center) {
+                            painter.text(
+                                origin + Vec2::new(pt.0, pt.1 - grafito_ui::tokens::SPACE_SM),
+                                egui::Align2::CENTER_BOTTOM,
+                                &surface.label,
+                                egui::FontId::proportional(grafito_ui::tokens::TYPE_SM),
+                                label_color,
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        // A4 + P1b: overlay del slot background — render de `last_valid`.
+        //
+        // El comando A1 eager sigue como fallback honesto (fail-closed al crear);
+        // el slot es refinamiento progresivo: mientras hay `Pending` la UI muestra
+        // el último válido sin parpadear ante `Failed`. P1b cablea el productor
+        // (`maybe_submit_implicit_slot` en `app.rs`): con superficie visible el
+        // slot deja de arrancar idle; sin superficie visible no se dibuja nada
+        // (sin fantasma: `clear` en el productor). Presupuesto CPU igual
+        // (>4096 tris solo al GPU). Si hay pendiente sin válido aún, aviso chico.
+        let has_visible_implicit = self
+            .document
+            .objects()
+            .values()
+            .any(|o| matches!(o, GeoObject::ImplicitSurface3D(s) if s.visible));
+        if has_visible_implicit {
+            if let Some(mesh) = self.implicit_surface_slot.last_valid() {
+                let fresh =
+                    mesh.triangle_count() > 0 && mesh.triangle_count() <= GB_MAX_CPU_MESH_EDGES;
+                if fresh && !overlay_only {
+                    let stroke = Stroke::new(1.5, label_color);
+                    for triangle in mesh.triangles() {
+                        let (Some(a), Some(b), Some(c)) = (
+                            mesh.vertices().get(triangle[0]),
+                            mesh.vertices().get(triangle[1]),
+                            mesh.vertices().get(triangle[2]),
+                        ) else {
+                            continue;
+                        };
+                        for (start, end) in [(a, b), (b, c), (c, a)] {
+                            if let Some((pa, pb)) = projector.project_segment(start, end) {
+                                painter.line_segment(
+                                    [
+                                        origin + Vec2::new(pa.0, pa.1),
+                                        origin + Vec2::new(pb.0, pb.1),
+                                    ],
+                                    stroke,
+                                );
+                            }
+                        }
+                    }
+                }
+            } else if self.implicit_surface_slot.has_pending() && !overlay_only {
+                painter.text(
+                    origin + Vec2::new(grafito_ui::tokens::SPACE_SM, grafito_ui::tokens::SPACE_SM),
+                    egui::Align2::LEFT_TOP,
+                    "refinando implícita…",
+                    egui::FontId::proportional(grafito_ui::tokens::TYPE_XS),
+                    label_color,
+                );
+            }
+        }
+    }
+}
+
+/// Paridad GeoGebra 3D del frente G-B: picking exacto y overlays.
+///
+/// Los builders devuelven `(vértices, triángulos)` acotados para
+/// `ray_mesh_hit` con tolerancia [`GB_GEOM_EPS`]. Poliedros (pirámide,
+/// tetraedro, prisma) son exactos; cono/cilindro/toro/moebius usan la MISMA
+/// parametrización facetada que el dibujo CPU (24×12 toro, 32×8 moebius,
+/// 24 radial cono/cilindro), así que el picking es exacto contra lo dibujado.
+/// Tapas del prisma por abanico: exactas con base planar convexa. Todo
+/// devuelve `None` ante entradas no finitas o degeneradas (cae al grueso).
+/// Segmentos radiales de la faceta de picking (cono/cilindro).
+pub(crate) const GB_PICK_RADIAL_SEGMENTS: usize = 24;
+/// Resolución tubular del toro de picking (igual que el dibujo CPU 24×12).
+pub(crate) const GB_PICK_TORUS_TUBULAR: usize = 12;
+/// Resolución del moebius de picking (igual que el dibujo CPU 32×8).
+pub(crate) const GB_PICK_MOEBIUS_U: usize = 32;
+/// Subdivisión transversal del moebius de picking.
+pub(crate) const GB_PICK_MOEBIUS_V: usize = 8;
+/// Vértices base máximos de un prisma pickeable (4n−4 tris « 250k).
+pub(crate) const GB_PICK_MAX_PRISM_BASE: usize = 4_096;
+/// Triángulos máximos para dibujar aristas CPU (mallas densas van al GPU).
+#[allow(dead_code)] // G-B: wiring overlay de malla en canvas 3D (P2).
+pub(crate) const GB_MAX_CPU_MESH_EDGES: usize = 4_096;
+
+fn gb_finite_point(point: Point3D) -> Option<Point3D> {
+    point.is_finite().then_some(point)
+}
+
+fn gb_positive_finite(value: f64) -> Option<f64> {
+    (value.is_finite() && value > 0.0).then_some(value)
+}
+
+/// Base ortonormal `(u, v)` perpendicular al eje; `None` si degenera.
+fn gb_orthonormal_basis(axis: DVec3) -> Option<(DVec3, DVec3)> {
+    if !axis.is_finite() || axis.length_squared() <= 1.0e-24 {
+        return None;
+    }
+    let direction = axis.normalize_or_zero();
+    let helper = if direction.x.abs() < 0.9 {
+        DVec3::X
+    } else {
+        DVec3::Y
+    };
+    let first = direction.cross(helper).normalize_or_zero();
+    let second = direction.cross(first);
+    if !first.is_finite()
+        || !second.is_finite()
+        || first.length_squared() <= 0.5
+        || second.length_squared() <= 0.5
+    {
+        return None;
+    }
+    Some((first, second))
+}
+
+/// Anillo de `segments` puntos: centro + `u`·r·cos + `v`·r·sin.
+fn gb_ring(
+    vertices: &mut Vec<Point3D>,
+    center: DVec3,
+    basis_u: DVec3,
+    basis_v: DVec3,
+    radius: f64,
+    segments: usize,
+) -> Option<Vec<usize>> {
+    if segments < 3 || !radius.is_finite() || radius <= 0.0 {
+        return None;
+    }
+    let base = vertices.len();
+    for segment in 0..segments {
+        let angle = segment as f64 * std::f64::consts::TAU / segments as f64;
+        let point = center + (basis_u * angle.cos() + basis_v * angle.sin()) * radius;
+        if !point.is_finite() {
+            return None;
+        }
+        vertices.push(Point3D::from_dvec3(point));
+    }
+    Some((base..base + segments).collect())
+}
+
+/// Malla exacta de la pirámide cuadrada (base XZ + ápice): 6 triángulos.
+pub(crate) fn pyramid_pick_mesh(pyramid: &Pyramid3DObj) -> Option<(Vec<Point3D>, Vec<[usize; 3]>)> {
+    gb_positive_finite(pyramid.base_size)?;
+    let base_center = gb_finite_point(pyramid.base_center)?;
+    let apex = gb_finite_point(pyramid.apex)?;
+    if base_center.distance(&apex) <= 1.0e-12 {
+        return None;
+    }
+    let geometry = grafito_geometry::Pyramid3D::new(base_center, apex, pyramid.base_size);
+    let base = geometry.base_vertices();
+    if base.iter().any(|point| !point.is_finite()) {
+        return None;
+    }
+    let mut vertices = base.to_vec();
+    vertices.push(apex);
+    let triangles = vec![
+        [0, 1, 2],
+        [0, 2, 3],
+        [0, 1, 4],
+        [1, 2, 4],
+        [2, 3, 4],
+        [3, 0, 4],
+    ];
+    Some((vertices, triangles))
+}
+
+/// Malla exacta del tetraedro (vértices + caras con winding exterior).
+pub(crate) fn tetra_pick_mesh(
+    tetrahedron: &Tetrahedron3DObj,
+) -> Option<(Vec<Point3D>, Vec<[usize; 3]>)> {
+    gb_positive_finite(tetrahedron.edge_length)?;
+    let center = gb_finite_point(tetrahedron.center)?;
+    let geometry = grafito_geometry::Tetrahedron3D::new(center, tetrahedron.edge_length);
+    if !geometry.is_renderable() {
+        return None;
+    }
+    Some((geometry.vertices().to_vec(), geometry.faces().to_vec()))
+}
+
+/// Malla del prisma (laterales exactos + tapas en abanico, exactas con base
+/// planar convexa; la dirección nula o la base inválida dan `None`).
+pub(crate) fn prism_pick_mesh(prism: &Prism3DObj) -> Option<(Vec<Point3D>, Vec<[usize; 3]>)> {
+    let count = prism.base_vertices.len();
+    if !(3..=GB_PICK_MAX_PRISM_BASE).contains(&count) {
+        return None;
+    }
+    if prism.base_vertices.iter().any(|point| !point.is_finite()) || !prism.direction.is_finite() {
+        return None;
+    }
+    let offset = prism.direction.to_dvec3();
+    if !offset.is_finite() || offset.length_squared() <= 1.0e-24 {
+        return None;
+    }
+    let mut vertices = Vec::with_capacity(2 * count);
+    for point in &prism.base_vertices {
+        vertices.push(*point);
+    }
+    for point in &prism.base_vertices {
+        let top = point.to_dvec3() + offset;
+        if !top.is_finite() {
+            return None;
+        }
+        vertices.push(Point3D::from_dvec3(top));
+    }
+    let mut triangles = Vec::with_capacity(4 * count - 4);
+    for side in 0..count {
+        let next = (side + 1) % count;
+        triangles.push([side, next, next + count]);
+        triangles.push([side, next + count, side + count]);
+    }
+    for fan in 1..count - 1 {
+        triangles.push([0, fan + 1, fan]);
+        triangles.push([count, count + fan, count + fan + 1]);
+    }
+    Some((vertices, triangles))
+}
+
+/// Malla facetada del cono con la parametrización del dibujo (eje base→ápice).
+pub(crate) fn cone_pick_mesh(cone: &Cone3DObj) -> Option<(Vec<Point3D>, Vec<[usize; 3]>)> {
+    let radius = gb_positive_finite(cone.radius)?;
+    let base = gb_finite_point(cone.base_center)?;
+    let apex = gb_finite_point(cone.apex)?;
+    let axis = apex.to_dvec3() - base.to_dvec3();
+    let (basis_u, basis_v) = gb_orthonormal_basis(axis)?;
+    let mut vertices = Vec::with_capacity(GB_PICK_RADIAL_SEGMENTS + 2);
+    vertices.push(base);
+    let ring = gb_ring(
+        &mut vertices,
+        base.to_dvec3(),
+        basis_u,
+        basis_v,
+        radius,
+        GB_PICK_RADIAL_SEGMENTS,
+    )?;
+    vertices.push(apex);
+    let apex_index = vertices.len() - 1;
+    let mut triangles = Vec::with_capacity(2 * GB_PICK_RADIAL_SEGMENTS);
+    for side in 0..GB_PICK_RADIAL_SEGMENTS {
+        let next = ring[(side + 1) % GB_PICK_RADIAL_SEGMENTS];
+        triangles.push([apex_index, ring[side], next]);
+        triangles.push([0, next, ring[side]]);
+    }
+    Some((vertices, triangles))
+}
+
+/// Malla facetada del cilindro con la parametrización del dibujo (eje base→tapa).
+pub(crate) fn cylinder_pick_mesh(
+    cylinder: &Cylinder3DObj,
+) -> Option<(Vec<Point3D>, Vec<[usize; 3]>)> {
+    let radius = gb_positive_finite(cylinder.radius)?;
+    let base = gb_finite_point(cylinder.base_center)?;
+    let top = gb_finite_point(cylinder.top_center)?;
+    let axis = top.to_dvec3() - base.to_dvec3();
+    let (basis_u, basis_v) = gb_orthonormal_basis(axis)?;
+    let mut vertices = Vec::with_capacity(2 * GB_PICK_RADIAL_SEGMENTS + 2);
+    vertices.push(base);
+    let lower = gb_ring(
+        &mut vertices,
+        base.to_dvec3(),
+        basis_u,
+        basis_v,
+        radius,
+        GB_PICK_RADIAL_SEGMENTS,
+    )?;
+    vertices.push(top);
+    let top_index = vertices.len() - 1;
+    let upper = gb_ring(
+        &mut vertices,
+        top.to_dvec3(),
+        basis_u,
+        basis_v,
+        radius,
+        GB_PICK_RADIAL_SEGMENTS,
+    )?;
+    let mut triangles = Vec::with_capacity(4 * GB_PICK_RADIAL_SEGMENTS);
+    for side in 0..GB_PICK_RADIAL_SEGMENTS {
+        let next = (side + 1) % GB_PICK_RADIAL_SEGMENTS;
+        triangles.push([lower[side], lower[next], upper[next]]);
+        triangles.push([lower[side], upper[next], upper[side]]);
+        triangles.push([0, lower[next], lower[side]]);
+        triangles.push([top_index, upper[side], upper[next]]);
+    }
+    Some((vertices, triangles))
+}
+
+/// Malla del toro con la fórmula del dibujo CPU (eje Y, 24×12 con wrap).
+pub(crate) fn torus_pick_mesh(torus: &Torus3DObj) -> Option<(Vec<Point3D>, Vec<[usize; 3]>)> {
+    let center = gb_finite_point(torus.center)?;
+    if !torus.r_major.is_finite() || !torus.r_minor.is_finite() {
+        return None;
+    }
+    let (major, minor) = (torus.r_major, torus.r_minor);
+    let steps_u = GB_PICK_RADIAL_SEGMENTS;
+    let steps_v = GB_PICK_TORUS_TUBULAR;
+    let mut vertices = Vec::with_capacity(steps_u * steps_v);
+    for side_u in 0..steps_u {
+        let angle_u = side_u as f64 * std::f64::consts::TAU / steps_u as f64;
+        for side_v in 0..steps_v {
+            let angle_v = side_v as f64 * std::f64::consts::TAU / steps_v as f64;
+            let point = Point3D::new(
+                center.x + (major + minor * angle_v.cos()) * angle_u.cos(),
+                center.y + minor * angle_v.sin(),
+                center.z + (major + minor * angle_v.cos()) * angle_u.sin(),
+            );
+            if !point.is_finite() {
+                return None;
+            }
+            vertices.push(point);
+        }
+    }
+    let index = |side_u: usize, side_v: usize| (side_u % steps_u) * steps_v + (side_v % steps_v);
+    let mut triangles = Vec::with_capacity(2 * steps_u * steps_v);
+    for side_u in 0..steps_u {
+        for side_v in 0..steps_v {
+            let a = index(side_u, side_v);
+            let b = index(side_u + 1, side_v);
+            let c = index(side_u + 1, side_v + 1);
+            let d = index(side_u, side_v + 1);
+            triangles.push([a, b, c]);
+            triangles.push([a, c, d]);
+        }
+    }
+    Some((vertices, triangles))
+}
+
+/// Malla del moebius con la fórmula del dibujo CPU (32×8, cobertura total).
+pub(crate) fn moebius_pick_mesh(
+    strip: &MoebiusStripObj,
+) -> Option<(Vec<Point3D>, Vec<[usize; 3]>)> {
+    let center = gb_finite_point(strip.center)?;
+    if !strip.radius.is_finite() || strip.radius <= 0.0 || !strip.width_r.is_finite() {
+        return None;
+    }
+    if strip.width_r.abs() <= 1.0e-12 {
+        return None;
+    }
+    let (major, width) = (strip.radius, strip.width_r);
+    let steps_u = GB_PICK_MOEBIUS_U;
+    let steps_v = GB_PICK_MOEBIUS_V;
+    let mut vertices = Vec::with_capacity((steps_u + 1) * (steps_v + 1));
+    for side_u in 0..=steps_u {
+        let angle_u = side_u as f64 * std::f64::consts::TAU / steps_u as f64;
+        for side_v in 0..=steps_v {
+            let across = -width / 2.0 + width * side_v as f64 / steps_v as f64;
+            let point = Point3D::new(
+                center.x + (major + across * (angle_u / 2.0).cos()) * angle_u.cos(),
+                center.y + across * (angle_u / 2.0).sin(),
+                center.z + (major + across * (angle_u / 2.0).cos()) * angle_u.sin(),
+            );
+            if !point.is_finite() {
+                return None;
+            }
+            vertices.push(point);
+        }
+    }
+    let row = steps_v + 1;
+    let mut triangles = Vec::with_capacity(2 * steps_u * steps_v);
+    for side_u in 0..steps_u {
+        for side_v in 0..steps_v {
+            let a = side_u * row + side_v;
+            let b = (side_u + 1) * row + side_v;
+            let c = (side_u + 1) * row + side_v + 1;
+            let d = side_u * row + side_v + 1;
+            triangles.push([a, b, c]);
+            triangles.push([a, c, d]);
+        }
+    }
+    Some((vertices, triangles))
+}
+
+/// Triángulos máximos de una superficie implícita para picking exacto
+/// (`ray_mesh_hit`); por encima cae al AABB grueso conservador.
+pub(crate) const IMPLICIT_PICK_MAX_TRIANGLES: usize = 4_096;
+
+/// Malla de picking de una superficie implícita `F(x,y,z)=0`: la malla derivada
+/// (caché por clave) si tiene como máximo `IMPLICIT_PICK_MAX_TRIANGLES`
+/// triángulos; `None` si el campo no está definido, la malla es densa o las
+/// cotas degeneran (el llamador cae al AABB grueso, nunca falla de más).
+pub(crate) fn implicit_surface_pick_mesh(
+    surface: &ImplicitSurface3DObj,
+    variables: &std::collections::BTreeMap<String, f64>,
+) -> Option<(Vec<Point3D>, Vec<[usize; 3]>)> {
+    let mesh = surface.mesh_snapshot(variables).ok()?;
+    if mesh.triangle_count() > IMPLICIT_PICK_MAX_TRIANGLES || mesh.triangle_count() == 0 {
+        return None;
+    }
+    Some((mesh.vertices().to_vec(), mesh.triangles().to_vec()))
+}
+
+/// Proyecta una sección poligonal 3D a píxeles relativos al canvas.
+///
+/// `None` si hay menos de 3 puntos, alguno no proyecta (detrás de cámara) o
+/// el canvas es degenerado. Estricto a propósito: la sección se dibuja entera.
+#[allow(dead_code)] // G-B: wiring overlay de sección en canvas 3D (P2).
+pub(crate) fn section_screen_polyline(
+    points: &[Point3D],
+    camera: &Camera3D,
+    canvas_w: f32,
+    canvas_h: f32,
+) -> Option<Vec<Pos2>> {
+    if points.len() < 3 {
+        return None;
+    }
+    let mut pixels = Vec::with_capacity(points.len());
+    for point in points {
+        let (x, y) = camera.project(point, canvas_w, canvas_h)?;
+        if !x.is_finite() || !y.is_finite() {
+            return None;
+        }
+        pixels.push(Pos2::new(x, y));
+    }
+    Some(pixels)
+}
+
+/// Proyecta los paneles 2D de un net a píxeles egui (eje Y hacia arriba).
+///
+/// `None` si el net está vacío o la escala es inválida.
+#[allow(dead_code)] // G-B: wiring overlay de net en canvas 3D (P2).
+pub(crate) fn net_screen_panels(
+    net: &PolyhedronNet,
+    pixels_per_unit: f32,
+    center: Pos2,
+) -> Option<Vec<Vec<Pos2>>> {
+    if net.panels().is_empty() || !pixels_per_unit.is_finite() || pixels_per_unit <= 0.0 {
+        return None;
+    }
+    let mut panels = Vec::with_capacity(net.panels().len());
+    for panel in net.panels() {
+        let mut pixels = Vec::with_capacity(panel.points.len());
+        for point in &panel.points {
+            let x = center.x + point[0] as f32 * pixels_per_unit;
+            let y = center.y - point[1] as f32 * pixels_per_unit;
+            if !x.is_finite() || !y.is_finite() {
+                return None;
+            }
+            pixels.push(Pos2::new(x, y));
+        }
+        panels.push(pixels);
+    }
+    Some(panels)
+}
+
+/// Aristas únicas de una malla proyectadas a segmentos 2D (wireframe CPU).
+///
+/// `None` si la malla está vacía, excede [`GB_MAX_CPU_MESH_EDGES`] triángulos
+/// (esas van al GPU) o ninguna arista proyecta. Las aristas con un extremo
+/// detrás de cámara se omiten honestamente.
+#[allow(dead_code)] // G-B: wiring overlay de malla en canvas 3D (P2).
+pub(crate) fn mesh_screen_edges(
+    vertices: &[Point3D],
+    triangles: &[[usize; 3]],
+    camera: &Camera3D,
+    canvas_w: f32,
+    canvas_h: f32,
+) -> Option<Vec<(Pos2, Pos2)>> {
+    if triangles.is_empty() || triangles.len() > GB_MAX_CPU_MESH_EDGES {
+        return None;
+    }
+    let mut edges = std::collections::BTreeSet::new();
+    for triangle in triangles {
+        for side in 0..3 {
+            let first = triangle[side];
+            let second = triangle[(side + 1) % 3];
+            if first >= vertices.len() || second >= vertices.len() || first == second {
+                continue;
+            }
+            edges.insert((first.min(second), first.max(second)));
+        }
+    }
+    let mut segments = Vec::with_capacity(edges.len());
+    for (first, second) in edges {
+        let (Some(a), Some(b)) = (
+            camera.project(&vertices[first], canvas_w, canvas_h),
+            camera.project(&vertices[second], canvas_w, canvas_h),
+        ) else {
+            continue;
+        };
+        if !a.0.is_finite() || !a.1.is_finite() || !b.0.is_finite() || !b.1.is_finite() {
+            continue;
+        }
+        segments.push((Pos2::new(a.0, a.1), Pos2::new(b.0, b.1)));
+    }
+    (!segments.is_empty()).then_some(segments)
+}
+
+/// Paridad GeoGebra 3D del frente F10-C: medidas exactas y vistas ortográficas.
+///
+/// Vista del canvas 3D: perspectiva orbital u ortográfica (alzado/planta/perfil).
+/// Espeja `canvas::View3D` (dueño del estado) y el comando `Vista3D[…]` valida
+/// los mismos nombres es/en vía [`parse_ortho_projection`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OrthoProjection {
+    /// Perspectiva con cámara orbital (defecto GeoGebra).
+    #[default]
+    Perspective,
+    /// Alzado: plano XY.
+    Front,
+    /// Planta: plano XZ.
+    Top,
+    /// Perfil: plano YZ.
+    Side,
+}
+
+impl OrthoProjection {
+    /// Las cuatro vistas en orden estable para el futuro selector del canvas 3D
+    /// (dueño `canvas.rs`): el comando `Vista3D[…]` (dueño `command/`) itera
+    /// este mismo orden vía [`parse_ortho_projection`].
+    #[allow(dead_code)] // A2: wiring selector de vista en canvas 3D (P2, dueño canvas.rs).
+    pub(crate) const fn all() -> [Self; 4] {
+        [Self::Perspective, Self::Front, Self::Top, Self::Side]
+    }
+
+    /// Nombre estable para UI y comandos.
+    #[allow(dead_code)] // F10-C: wiring selector de vista en canvas 3D (P2).
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Perspective => "perspectiva",
+            Self::Front => "alzado",
+            Self::Top => "planta",
+            Self::Side => "perfil",
+        }
+    }
+
+    /// Indica si la vista es ortográfica (sin fuga de perspectiva).
+    #[allow(dead_code)] // F10-C: wiring selector de vista en canvas 3D (P2).
+    pub(crate) const fn is_orthographic(self) -> bool {
+        !matches!(self, Self::Perspective)
+    }
+}
+
+/// Proyecta un punto del mundo a píxeles egui bajo vista ortográfica con
+/// escala `pixels_per_unit` y centro de canvas. `None` si no es finito.
+#[allow(dead_code)] // F10-C: wiring selector de vista en canvas 3D (P2).
+pub(crate) fn project_point_ortho(
+    point: Point3D,
+    view: OrthoProjection,
+    pixels_per_unit: f32,
+    center: Pos2,
+) -> Option<Pos2> {
+    if !pixels_per_unit.is_finite() || pixels_per_unit <= 0.0 {
+        return None;
+    }
+    let (x, y) = match view {
+        OrthoProjection::Front => (point.x, point.y),
+        OrthoProjection::Top => (point.x, point.z),
+        OrthoProjection::Side => (point.y, point.z),
+        OrthoProjection::Perspective => return None,
+    };
+    if !x.is_finite() || !y.is_finite() {
+        return None;
+    }
+    let pixels = (x * f64::from(pixels_per_unit)) as f32;
+    let vertical = (y * f64::from(pixels_per_unit)) as f32;
+    if !pixels.is_finite() || !vertical.is_finite() {
+        return None;
+    }
+    Some(Pos2::new(center.x + pixels, center.y - vertical))
+}
+
+/// Etiqueta de medida exacta `V=… A=…` o `None` si el sólido no tiene
+/// forma cerrada (cuádrica, superficies: ver `solid_measure_status`).
+/// Ya wireada en el inspector 3D (`panels.rs`).
+pub(crate) fn solid_measure_text(object: &GeoObject) -> Option<String> {
+    let volume = grafito_core::symbolic::solid_volume(object)?;
+    let area = grafito_core::symbolic::solid_area(object)?;
+    if !volume.is_finite() || !area.is_finite() {
+        return None;
+    }
+    Some(format!("V={volume:.4} A={area:.4}"))
+}
+
+/// Estado honesto de la medida para el inspector 3D (`"exacto"` o el motivo
+/// de `solid_measure_status`). Puro display, sin motor nuevo.
+#[allow(dead_code)] // W4: wiring display volumen/área en inspector 3D (P2).
+pub(crate) fn solid_measure_status_text(object: &GeoObject) -> &'static str {
+    grafito_core::symbolic::solid_measure_status(object)
+}
+
+/// Puente `OrthoProjection` (piel) → `OrthoView` (cerebro `solids.rs`).
+/// `Perspective` no tiene vista ortográfica (`None`).
+#[allow(dead_code)] // W4: wiring selector de vista en canvas 3D (P2).
+pub(crate) fn ortho_view_for_projection(
+    view: OrthoProjection,
+) -> Option<grafito_core::symbolic::OrthoView> {
+    match view {
+        OrthoProjection::Front => Some(grafito_core::symbolic::OrthoView::Front),
+        OrthoProjection::Top => Some(grafito_core::symbolic::OrthoView::Top),
+        OrthoProjection::Side => Some(grafito_core::symbolic::OrthoView::Side),
+        OrthoProjection::Perspective => None,
+    }
+}
+
+/// Nombres estables es/en para el futuro selector/comando de vista 3D.
+/// `None` si no es una vista conocida (el caller muestra ayuda honesta).
+#[allow(dead_code)] // W4: wiring selector de vista en canvas 3D (P2).
+pub(crate) fn parse_ortho_projection(name: &str) -> Option<OrthoProjection> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "perspectiva" | "perspective" | "orbital" => Some(OrthoProjection::Perspective),
+        "alzado" | "front" | "frontal" | "xy" => Some(OrthoProjection::Front),
+        "planta" | "top" | "cenital" | "xz" => Some(OrthoProjection::Top),
+        "perfil" | "side" | "lateral" | "yz" => Some(OrthoProjection::Side),
+        _ => None,
+    }
+}
+
+/// Proyecta un punto 3D según la vista del canvas: `Perspective` usa la
+/// cámara orbital (`Camera3D::project`), las ortográficas usan la escala y
+/// el centro dados con paneo por `camera.target` (el target se resta en los
+/// dos ejes visibles, así el pan mueve la vista ortográfica igual que la
+/// perspectiva). `None` honesto si no proyecta.
+pub(crate) fn project_with_view(
+    point: Point3D,
+    view: OrthoProjection,
+    camera: &Camera3D,
+    canvas_w: f32,
+    canvas_h: f32,
+    pixels_per_unit: f32,
+    center: Pos2,
+) -> Option<Pos2> {
+    match view {
+        OrthoProjection::Perspective => {
+            let (x, y) = camera.project(&point, canvas_w, canvas_h)?;
+            (x.is_finite() && y.is_finite()).then(|| Pos2::new(x, y))
+        }
+        OrthoProjection::Front | OrthoProjection::Top | OrthoProjection::Side => {
+            let target = Point3D::new(
+                camera.target.x as f64,
+                camera.target.y as f64,
+                camera.target.z as f64,
+            );
+            let (dx, dy) = ortho_relative_axes(point, target, view)?;
+            ortho_local_to_pixels(dx, dy, pixels_per_unit, center)
+        }
+    }
+}
+
+/// Escala ortográfica (píxeles por unidad de mundo) derivada de la cámara:
+/// misma altura de frustum que la perspectiva (`2·d·tan(fov/2)`), así el
+/// zoom se conserva al cambiar de vista. `None` si algo no es finito.
+pub(crate) fn ortho_pixels_per_unit(canvas_h: f32, camera: &Camera3D) -> Option<f32> {
+    if !canvas_h.is_finite() || canvas_h <= 0.0 {
+        return None;
+    }
+    let dist = f64::from(camera.sanitized_distance());
+    if !dist.is_finite() || dist <= 0.0 {
+        return None;
+    }
+    let fov_deg = f64::from(camera.fov);
+    if !fov_deg.is_finite() || !(1.0..=179.0).contains(&fov_deg) {
+        return None;
+    }
+    let frustum_height = 2.0 * dist * (fov_deg.to_radians() * 0.5).tan().abs();
+    if !frustum_height.is_finite() || frustum_height <= 1.0e-9 {
+        return None;
+    }
+    let ppu = (f64::from(canvas_h) / frustum_height) as f32;
+    (ppu.is_finite() && ppu > 0.0).then_some(ppu)
+}
+
+/// Ejes del mundo visibles por vista ortográfica como `(horizontal,
+/// vertical, profundidad)`. `None` en perspectiva (dueño: cámara orbital).
+fn ortho_split_axes(point: Point3D, view: OrthoProjection) -> Option<(f64, f64, f64)> {
+    if !point.is_finite() {
+        return None;
+    }
+    match view {
+        OrthoProjection::Front => Some((point.x, point.y, point.z)),
+        OrthoProjection::Top => Some((point.x, point.z, point.y)),
+        OrthoProjection::Side => Some((point.y, point.z, point.x)),
+        OrthoProjection::Perspective => None,
+    }
+}
+
+/// Desplazamiento `(dx, dy)` del punto respecto del target en los ejes
+/// visibles de la vista. Misma convención que el dibujo y el picking.
+fn ortho_relative_axes(
+    point: Point3D,
+    target: Point3D,
+    view: OrthoProjection,
+) -> Option<(f64, f64)> {
+    let (h, v, _) = ortho_split_axes(point, view)?;
+    let (th, tv, _) = ortho_split_axes(target, view)?;
+    let (dx, dy) = (h - th, v - tv);
+    (dx.is_finite() && dy.is_finite()).then_some((dx, dy))
+}
+
+/// Mapea `(dx, dy)` en unidades de mundo a píxeles absolutos egui con escala
+/// y centro dados (convención `project_point_ortho`: y invertida).
+fn ortho_local_to_pixels(dx: f64, dy: f64, pixels_per_unit: f32, center: Pos2) -> Option<Pos2> {
+    if !dx.is_finite() || !dy.is_finite() {
+        return None;
+    }
+    if !pixels_per_unit.is_finite() || pixels_per_unit <= 0.0 {
+        return None;
+    }
+    if !center.is_finite() {
+        return None;
+    }
+    let pixels = (dx * f64::from(pixels_per_unit)) as f32;
+    let vertical = (dy * f64::from(pixels_per_unit)) as f32;
+    if !pixels.is_finite() || !vertical.is_finite() {
+        return None;
+    }
+    Some(Pos2::new(center.x + pixels, center.y - vertical))
+}
+
+/// Proyección canvas-local `(x, y)` según la vista: perspectiva delega en la
+/// cámara; ortográfica usa `ortho_relative_axes` con centro local
+/// `(w/2, h/2)`. Misma convención que `Camera3D::project` (origen arriba
+///-izquierda del canvas). `None` honesto si no proyecta.
+fn ortho_project_point_local(
+    view: OrthoProjection,
+    point: Point3D,
+    target: Point3D,
+    ppu: f32,
+    center_local: (f32, f32),
+) -> Option<(f32, f32)> {
+    let (dx, dy) = ortho_relative_axes(point, target, view)?;
+    if !ppu.is_finite() || ppu <= 0.0 {
+        return None;
+    }
+    if !center_local.0.is_finite() || !center_local.1.is_finite() {
+        return None;
+    }
+    let x = (dx * f64::from(ppu)) as f32 + center_local.0;
+    let y = center_local.1 - (dy * f64::from(ppu)) as f32;
+    (x.is_finite() && y.is_finite()).then_some((x, y))
+}
+
+/// Proyector unificado para el dibujo CPU 3D: la vista gobierna si se usa la
+/// cámara orbital o el mapa ortográfico (misma escala/centro que el picking,
+/// sin divergencias dibujo↔selección).
+pub(crate) struct View3dProjector<'a> {
+    pub view: OrthoProjection,
+    pub camera: &'a Camera3D,
+    pub w: f32,
+    pub h: f32,
+    pub ppu: f32,
+    pub center_local: (f32, f32),
+}
+
+impl<'a> View3dProjector<'a> {
+    /// Arma el proyector para un canvas `w×h`: el centro local es el centro
+    /// del canvas y la escala ortográfica sale de la cámara (si falla, las
+    /// proyecciones ortográficas dan `None` honesto en vez de inventar zoom).
+    pub fn for_canvas(view: OrthoProjection, camera: &'a Camera3D, w: f32, h: f32) -> Self {
+        Self {
+            view,
+            camera,
+            w,
+            h,
+            ppu: ortho_pixels_per_unit(h, camera).unwrap_or(0.0),
+            center_local: (w * 0.5, h * 0.5),
+        }
+    }
+
+    /// Proyecta un punto a coordenadas canvas-locales (origen arriba-izq).
+    pub fn project_point(&self, point: &Point3D) -> Option<(f32, f32)> {
+        match self.view {
+            OrthoProjection::Perspective => self.camera.project(point, self.w, self.h),
+            ortho => ortho_project_point_local(
+                ortho,
+                *point,
+                Point3D::new(
+                    self.camera.target.x as f64,
+                    self.camera.target.y as f64,
+                    self.camera.target.z as f64,
+                ),
+                self.ppu,
+                self.center_local,
+            ),
+        }
+    }
+
+    /// Proyecta un segmento con el mismo clip de cerca que la perspectiva;
+    /// en ortográfica no hay frustum y basta proyectar ambos extremos.
+    pub fn project_segment(&self, a: &Point3D, b: &Point3D) -> Option<((f32, f32), (f32, f32))> {
+        match self.view {
+            OrthoProjection::Perspective => project_segment(self.camera, a, b, self.w, self.h),
+            _ => Some((self.project_point(a)?, self.project_point(b)?)),
+        }
+    }
+
+    /// Profundidad para ordenar pintor: perspectiva usa la matriz de vista;
+    /// ortográfica, distancia al plano del target (mayor = más lejos, el
+    /// observador mira desde el eje positivo).
+    pub fn view_depth(&self, point: Vec3) -> f32 {
+        match self.view {
+            OrthoProjection::Perspective => camera_view_depth(self.camera, point),
+            OrthoProjection::Front => self.camera.target.z - point.z,
+            OrthoProjection::Top => self.camera.target.y - point.y,
+            OrthoProjection::Side => self.camera.target.x - point.x,
+        }
+    }
+}
+
+/// Distancia del rayo al plano 3D si el impacto cae dentro del parche
+/// dibujado (`±PLANE_RENDER_EXTENT` en la base propia). Fuente única para el
+/// picking en perspectiva y en ortográfica (mismo parche que el dibujo).
+fn plane_ray_hit_distance(plane: &Plane3DObj, ray: &Ray3D) -> Option<f64> {
+    let (center, axis_u, axis_v) = plane_point_and_basis(plane.a, plane.b, plane.c, plane.d)?;
+    let normal = Point3D::from_vec3(axis_u.cross(axis_v).normalize_or_zero());
+    let (distance, hit) = ray.intersect_plane(center, normal)?;
+    let offset = hit.to_dvec3() - center.to_dvec3();
+    let u = offset.dot(axis_u.as_dvec3());
+    let v = offset.dot(axis_v.as_dvec3());
+    (u.is_finite()
+        && v.is_finite()
+        && u.abs() <= PLANE_RENDER_EXTENT
+        && v.abs() <= PLANE_RENDER_EXTENT)
+        .then_some(distance)
+}
+
+/// Malla exacta de picking del objeto si tiene una (misma fuente que el
+/// dibujo: cubo/platónico/pirámide/tetra/prisma/cono/cilindro/toro/Möbius +
+/// implícita). `None` si el sólido es degenerado o no tiene malla.
+fn object_pick_mesh(
+    object: &GeoObject,
+    variables: &std::collections::BTreeMap<String, f64>,
+) -> Option<(Vec<Point3D>, Vec<[usize; 3]>)> {
+    match object {
+        GeoObject::Cube3D(cube) => cube_pick_mesh(cube),
+        GeoObject::Platonic3D(p) => platonic_pick_mesh(p),
+        GeoObject::Pyramid3D(pyramid) => pyramid_pick_mesh(pyramid),
+        GeoObject::Tetrahedron3D(tetrahedron) => tetra_pick_mesh(tetrahedron),
+        GeoObject::Prism3D(prism) => prism_pick_mesh(prism),
+        GeoObject::Cone3D(cone) => cone_pick_mesh(cone),
+        GeoObject::Cylinder3D(cylinder) => cylinder_pick_mesh(cylinder),
+        GeoObject::Torus3D(torus) => torus_pick_mesh(torus),
+        GeoObject::MoebiusStrip(strip) => moebius_pick_mesh(strip),
+        GeoObject::ImplicitSurface3D(surface) => implicit_surface_pick_mesh(surface, variables),
+        _ => None,
+    }
+}
+
+/// Origen del rayo ortográfico sobre el plano del target: lo bastante lejos
+/// (1e6) para que toda la escena quede delante, con rango que lo cubre.
+const ORTHO_RAY_ORIGIN_OFFSET: f64 = 1.0e6;
+
+/// Rayo ortográfico desde un píxel: el origen vive sobre el punto del mundo
+/// `(wx, wy)` desplazado `+eje` y la dirección es `−eje` (el observador mira
+/// desde el eje positivo, igual que el orden de pintor de `view_depth`).
+fn ortho_pick_ray(view: OrthoProjection, wx: f64, wy: f64, target_axis: f64) -> Option<Ray3D> {
+    if !wx.is_finite() || !wy.is_finite() || !target_axis.is_finite() {
+        return None;
+    }
+    let offset_origin = target_axis + ORTHO_RAY_ORIGIN_OFFSET;
+    if !offset_origin.is_finite() {
+        return None;
+    }
+    let (origin, direction) = match view {
+        OrthoProjection::Front => (
+            Point3D::new(wx, wy, offset_origin),
+            Point3D::new(0.0, 0.0, -1.0),
+        ),
+        OrthoProjection::Top => (
+            Point3D::new(wx, offset_origin, wy),
+            Point3D::new(0.0, -1.0, 0.0),
+        ),
+        OrthoProjection::Side => (
+            Point3D::new(offset_origin, wx, wy),
+            Point3D::new(-1.0, 0.0, 0.0),
+        ),
+        OrthoProjection::Perspective => return None,
+    };
+    Ray3D::new(origin, direction, 0.0, 2.0 * ORTHO_RAY_ORIGIN_OFFSET)
+}
+
+/// Plano de la vista ortográfica por el target (normal = eje de vista).
+/// El rayo siempre lo corta a `≈ORTHO_RAY_ORIGIN_OFFSET`: valida el píxel y
+/// da la distancia base para ordenar impactos.
+fn ortho_view_plane(view: OrthoProjection, target: Point3D) -> Option<(Point3D, Point3D)> {
+    if !target.is_finite() {
+        return None;
+    }
+    match view {
+        OrthoProjection::Front => Some((target, Point3D::new(0.0, 0.0, 1.0))),
+        OrthoProjection::Top => Some((target, Point3D::new(0.0, 1.0, 0.0))),
+        OrthoProjection::Side => Some((target, Point3D::new(1.0, 0.0, 0.0))),
+        OrthoProjection::Perspective => None,
+    }
+}
+
+/// Profundidad ortográfica del punto sobre el eje de vista, relativa al
+/// plano del target: positivo = más lejos del observador. Ordena impactos
+/// 2D con la misma convención que `view_depth`.
+fn ortho_point_depth(view: OrthoProjection, point: Point3D, target: Point3D) -> Option<f64> {
+    let (_, _, d) = ortho_split_axes(point, view)?;
+    let (_, _, td) = ortho_split_axes(target, view)?;
+    let depth = td - d;
+    depth.is_finite().then_some(depth)
+}
+
+fn px_distance(a: (f32, f32), b: (f32, f32)) -> f64 {
+    let (dx, dy) = (
+        f64::from(a.0) - f64::from(b.0),
+        f64::from(a.1) - f64::from(b.1),
+    );
+    (dx * dx + dy * dy).sqrt()
+}
+
+/// Distancia en píxeles de `p` al segmento `a–b` (degenerado = punto).
+fn point_segment_px_distance(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f64 {
+    let (px, py) = (f64::from(p.0), f64::from(p.1));
+    let (ax, ay) = (f64::from(a.0), f64::from(a.1));
+    let (bx, by) = (f64::from(b.0), f64::from(b.1));
+    let (abx, aby) = (bx - ax, by - ay);
+    let len_sq = abx * abx + aby * aby;
+    if !len_sq.is_finite() || len_sq <= 1.0e-12 {
+        return px_distance(p, a);
+    }
+    let t = ((px - ax) * abx + (py - ay) * aby) / len_sq;
+    if !t.is_finite() {
+        return px_distance(p, a);
+    }
+    let t = t.clamp(0.0, 1.0);
+    px_distance(p, ((ax + abx * t) as f32, (ay + aby * t) as f32))
+}
+
+/// Impacto ortográfico 2D por proximidad en pantalla: proyecta `points` con
+/// el mapa de la vista y acepta si la polilínea pasa a `≤PICK_RADIUS_PIXELS`.
+/// La distancia ordena por profundidad del vértice más cercano + la
+/// separación residual (misma escala que los impactos de malla).
+fn ortho_polyline_hit(
+    view: OrthoProjection,
+    points: &[Point3D],
+    target: Point3D,
+    ppu: f32,
+    center_local: (f32, f32),
+    pixel: (f32, f32),
+    plane_distance: f64,
+) -> Option<PickHit> {
+    if points.is_empty() {
+        return None;
+    }
+    let projected: Vec<(f32, f32)> = points
+        .iter()
+        .filter_map(|point| ortho_project_point_local(view, *point, target, ppu, center_local))
+        .collect();
+    if projected.len() != points.len() {
+        return None;
+    }
+    let mut best_sep = f64::INFINITY;
+    let mut best_depth = f64::INFINITY;
+    if projected.len() == 1 {
+        best_sep = px_distance(pixel, projected[0]);
+        best_depth = ortho_point_depth(view, points[0], target)?;
+    } else {
+        for pair in projected.windows(2) {
+            let sep = point_segment_px_distance(pixel, pair[0], pair[1]);
+            if sep < best_sep {
+                best_sep = sep;
+                // Profundidad del extremo más cercano al píxel (orden honesto
+                // en pilas ortográficas: lo de adelante gana).
+                let first = px_distance(pixel, pair[0]);
+                let second = px_distance(pixel, pair[1]);
+                let nearer = if first <= second { 0 } else { 1 };
+                // Índice global del vértice más cercano dentro de la polilínea.
+                let global = projected
+                    .iter()
+                    .position(|candidate| {
+                        candidate.0 == pair[nearer].0 && candidate.1 == pair[nearer].1
+                    })
+                    .unwrap_or(0);
+                best_depth = ortho_point_depth(view, points[global.min(points.len() - 1)], target)?;
+            }
+        }
+    }
+    if !best_sep.is_finite() || best_sep > PICK_RADIUS_PIXELS {
+        return None;
+    }
+    let distance = plane_distance + best_depth + best_sep.max(0.0) * 1.0e-6;
+    distance.is_finite().then_some(PickHit::exact(distance))
+}
+
+/// Impacto ortográfico por caja envolvente (conservador): proyecta las 8
+/// esquinas y acepta si el píxel cae en el recto expandido por el radio de
+/// pick. Último recurso honesto, misma confianza que el grueso en
+/// perspectiva.
+#[allow(clippy::too_many_arguments)]
+fn ortho_bounds_hit(
+    bounds: Aabb3D,
+    view: OrthoProjection,
+    target: Point3D,
+    ppu: f32,
+    center_local: (f32, f32),
+    pixel: (f32, f32),
+    plane_distance: f64,
+) -> Option<PickHit> {
+    let corners = [
+        (bounds.min.x, bounds.min.y, bounds.min.z),
+        (bounds.min.x, bounds.min.y, bounds.max.z),
+        (bounds.min.x, bounds.max.y, bounds.min.z),
+        (bounds.min.x, bounds.max.y, bounds.max.z),
+        (bounds.max.x, bounds.min.y, bounds.min.z),
+        (bounds.max.x, bounds.min.y, bounds.max.z),
+        (bounds.max.x, bounds.max.y, bounds.max.z),
+        (bounds.max.x, bounds.max.y, bounds.max.z),
+    ];
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for (x, y, z) in corners {
+        let (sx, sy) =
+            ortho_project_point_local(view, Point3D::new(x, y, z), target, ppu, center_local)?;
+        min_x = min_x.min(sx);
+        min_y = min_y.min(sy);
+        max_x = max_x.max(sx);
+        max_y = max_y.max(sy);
+    }
+    if !(min_x.is_finite() && min_y.is_finite() && max_x.is_finite() && max_y.is_finite()) {
+        return None;
+    }
+    let radius = PICK_RADIUS_PIXELS as f32;
+    if pixel.0 < min_x - radius
+        || pixel.0 > max_x + radius
+        || pixel.1 < min_y - radius
+        || pixel.1 > max_y + radius
+    {
+        return None;
+    }
+    let center = Point3D::new(
+        (bounds.min.x + bounds.max.x) * 0.5,
+        (bounds.min.y + bounds.max.y) * 0.5,
+        (bounds.min.z + bounds.max.z) * 0.5,
+    );
+    let depth = ortho_point_depth(view, center, target).unwrap_or(0.0);
+    let distance = plane_distance + depth;
+    distance.is_finite().then_some(PickHit::coarse(distance))
+}
+
+/// Impacto de un objeto bajo vista ortográfica: intersección del rayo de la
+/// vista con la malla exacta cuando hay una (misma que en perspectiva),
+/// hit 2D en pantalla para puntos/segmentos/rectas/curvas y caja gruesa
+/// para el resto. `pixel` y `center_local` en coordenadas canvas-locales.
+#[allow(clippy::too_many_arguments)]
+fn object_ortho_hit(
+    object: &GeoObject,
+    variables: &std::collections::BTreeMap<String, f64>,
+    view: OrthoProjection,
+    ray: &Ray3D,
+    plane_distance: f64,
+    target: Point3D,
+    ppu: f32,
+    center_local: (f32, f32),
+    pixel: (f32, f32),
+    typed_four_d_phase: Option<f64>,
+) -> Option<PickHit> {
+    match object {
+        GeoObject::Sphere3D(sphere) => ray
+            .intersect_sphere(sphere.center, sphere.radius)
+            .map(PickHit::exact),
+        GeoObject::Plane3D(plane) => plane_ray_hit_distance(plane, ray).map(PickHit::exact),
+        GeoObject::Point3D(point) => ortho_polyline_hit(
+            view,
+            std::slice::from_ref(&point.position),
+            target,
+            ppu,
+            center_local,
+            pixel,
+            plane_distance,
+        ),
+        GeoObject::Segment3D(segment) => ortho_polyline_hit(
+            view,
+            &[segment.a, segment.b],
+            target,
+            ppu,
+            center_local,
+            pixel,
+            plane_distance,
+        ),
+        GeoObject::Line3D(line) => {
+            let direction = line.direction.to_dvec3();
+            let length = direction.length();
+            if !length.is_finite() || length <= 1.0e-12 || !line.point.is_finite() {
+                return None;
+            }
+            let extent = direction / length * LINE_RENDER_HALF_EXTENT;
+            ortho_polyline_hit(
+                view,
+                &[
+                    Point3D::from_dvec3(line.point.to_dvec3() - extent),
+                    Point3D::from_dvec3(line.point.to_dvec3() + extent),
+                ],
+                target,
+                ppu,
+                center_local,
+                pixel,
+                plane_distance,
+            )
+        }
+        GeoObject::ParametricCurve3D(curve) => {
+            let samples = grafito_core::parametric_sampling::evaluate_parametric_curve_3d(
+                curve,
+                FALLBACK_CURVE_SAMPLES,
+                variables,
+            );
+            let points: Vec<Point3D> = samples
+                .into_iter()
+                .map(|(x, y, z)| Point3D::new(x, y, z))
+                .collect();
+            if points.is_empty() {
+                return None;
+            }
+            ortho_polyline_hit(
+                view,
+                &points,
+                target,
+                ppu,
+                center_local,
+                pixel,
+                plane_distance,
+            )
+        }
+        _ => {
+            if let Some((vertices, triangles)) = object_pick_mesh(object, variables) {
+                if let Some(distance) = ray_mesh_hit(ray, &vertices, &triangles, GB_GEOM_EPS) {
+                    return Some(PickHit::exact(distance));
+                }
+            }
+            let bounds = match typed_four_d_phase {
+                Some(phase) => {
+                    fallback_object_bounds_with_typed_four_d_phase(object, variables, Some(phase))
+                }
+                None => fallback_object_bounds(object, variables),
+            };
+            bounds.and_then(|bounds| {
+                ortho_bounds_hit(
+                    bounds,
+                    view,
+                    target,
+                    ppu,
+                    center_local,
+                    pixel,
+                    plane_distance,
+                )
+            })
+        }
+    }
+}
+
+/// Picking ortográfico EXACTO: rayo de la vista (origen sobre el píxel,
+/// dirección −eje) + hit de malla exacta o 2D según el objeto. Misma
+/// política de desempate que en perspectiva (confianza, distancia, `ObjectId`
+/// estable). `None` honesto si la vista es perspectiva o la escala falla.
+pub(crate) fn pick_ortho_object(
+    document: &Document,
+    view: OrthoProjection,
+    camera: &Camera3D,
+    local_pointer: Vec2,
+    canvas_size: Vec2,
+    typed_four_d_phase: Option<f64>,
+) -> Option<ObjectId> {
+    if !view.is_orthographic() {
+        return None;
+    }
+    if !local_pointer.is_finite() || !canvas_size.is_finite() {
+        return None;
+    }
+    if canvas_size.x <= 0.0 || canvas_size.y <= 0.0 {
+        return None;
+    }
+    let ppu = ortho_pixels_per_unit(canvas_size.y, camera)?;
+    let center_local = (canvas_size.x * 0.5, canvas_size.y * 0.5);
+    let target = Point3D::new(
+        camera.target.x as f64,
+        camera.target.y as f64,
+        camera.target.z as f64,
+    );
+    if !target.is_finite() {
+        return None;
+    }
+    // Píxel → mundo en los ejes visibles (inversa exacta del dibujo).
+    let (dx, dy) = (
+        (f64::from(local_pointer.x) - f64::from(center_local.0)) / f64::from(ppu),
+        (f64::from(center_local.1) - f64::from(local_pointer.y)) / f64::from(ppu),
+    );
+    if !dx.is_finite() || !dy.is_finite() {
+        return None;
+    }
+    let (th, tv, td) = ortho_split_axes(target, view)?;
+    let (wx, wy) = (th + dx, tv + dy);
+    let ray = ortho_pick_ray(view, wx, wy, td)?;
+    // Intersección rayo-plano de la vista: valida el píxel y fija la base.
+    let (plane_point, plane_normal) = ortho_view_plane(view, target)?;
+    let (plane_distance, _) = ray.intersect_plane(plane_point, plane_normal)?;
+    if !plane_distance.is_finite() {
+        return None;
+    }
+    let pixel = (local_pointer.x, local_pointer.y);
+    let mut best: Option<(PickHit, ObjectId)> = None;
+    for (id, object) in document.objects_iter() {
+        if !object.is_visible() || !object.is_3d() {
+            continue;
+        }
+        let Some(hit) = object_ortho_hit(
+            object,
+            &document.variables,
+            view,
+            &ray,
+            plane_distance,
+            target,
+            ppu,
+            center_local,
+            pixel,
+            typed_four_d_phase,
+        ) else {
+            continue;
+        };
+        if !hit.distance.is_finite() {
+            continue;
+        }
+        let candidate = (hit, *id);
+        if best
+            .as_ref()
+            .map(|current| {
+                candidate.0.confidence > current.0.confidence
+                    || (candidate.0.confidence == current.0.confidence
+                        && (candidate.0.distance.total_cmp(&current.0.distance).is_lt()
+                            || (candidate.0.distance.total_cmp(&current.0.distance).is_eq()
+                                && candidate.1 < current.1)))
+            })
+            .unwrap_or(true)
+        {
+            best = Some(candidate);
+        }
+    }
+    best.map(|(_, id)| id)
+}
+
+/// Pick 3D según la vista: perspectiva por cámara orbital, ortográficas por
+/// rayo exacto de la vista. Fuente única para `canvas::pick_for_view3d` y la
+/// selección con click (misma política de desempate en ambas).
+pub(crate) fn pick_3d_object_for_view(
+    document: &Document,
+    view: OrthoProjection,
+    camera: &Camera3D,
+    local_pointer: Vec2,
+    canvas_size: Vec2,
+    typed_four_d_phase: Option<f64>,
+) -> Option<ObjectId> {
+    if view.is_orthographic() {
+        pick_ortho_object(
+            document,
+            view,
+            camera,
+            local_pointer,
+            canvas_size,
+            typed_four_d_phase,
+        )
+    } else if let Some(phase) = typed_four_d_phase {
+        pick_3d_object_with_typed_four_d_phase(
+            document,
+            camera,
+            local_pointer,
+            canvas_size,
+            Some(phase),
+        )
+    } else {
+        pick_3d_object(document, camera, local_pointer, canvas_size)
+    }
+}
+
+/// Punto de construcción según la vista: perspectiva sobre el plano de la
+/// cámara; ortográfica sobre el plano de la vista por el target (inversa
+/// exacta del dibujo, con paneo incluido).
+pub(crate) fn construction_point_for_view(
+    view: OrthoProjection,
+    camera: &Camera3D,
+    local_pointer: Vec2,
+    canvas_size: Vec2,
+) -> Option<Point3D> {
+    if !view.is_orthographic() {
+        return construction_point_from_canvas(camera, local_pointer, canvas_size);
+    }
+    if !local_pointer.is_finite() || !canvas_size.is_finite() {
+        return None;
+    }
+    if canvas_size.x <= 0.0 || canvas_size.y <= 0.0 {
+        return None;
+    }
+    let ppu = ortho_pixels_per_unit(canvas_size.y, camera)?;
+    let target = Point3D::new(
+        camera.target.x as f64,
+        camera.target.y as f64,
+        camera.target.z as f64,
+    );
+    if !target.is_finite() {
+        return None;
+    }
+    let center_local = (canvas_size.x * 0.5, canvas_size.y * 0.5);
+    let (dx, dy) = (
+        (f64::from(local_pointer.x) - f64::from(center_local.0)) / f64::from(ppu),
+        (f64::from(center_local.1) - f64::from(local_pointer.y)) / f64::from(ppu),
+    );
+    if !dx.is_finite() || !dy.is_finite() {
+        return None;
+    }
+    let (th, tv, td) = ortho_split_axes(target, view)?;
+    let (wx, wy) = (th + dx, tv + dy);
+    if !wx.is_finite() || !wy.is_finite() {
+        return None;
+    }
+    // El punto nace sobre el plano de la vista por el target (construir
+    // "sobre el papel" de la vista, como la perspectiva construye sobre su
+    // plano de cámara).
+    let point = match view {
+        OrthoProjection::Front => Point3D::new(wx, wy, td),
+        OrthoProjection::Top => Point3D::new(wx, td, wy),
+        OrthoProjection::Side => Point3D::new(td, wx, wy),
+        OrthoProjection::Perspective => return None,
+    };
+    point.is_finite().then_some(point)
+}
+
+/// Travelling 3D activo (paridad Manim `MovingCamera`): muestrea la cámara
+/// animada en `t_ms` y la puentea a orbital por frame. `None` = sin
+/// travelling (la órbita ambiental manda). Puro estado + cámara, sin I/O.
+#[derive(Debug, Clone)]
+pub(crate) struct CameraTravelling {
+    /// Cámara animada origen→destino (dueño `grafito-anim`).
+    pub moving: grafito_anim::MovingCamera,
+    /// FOV del travelling (1..=179, el mismo del sampleo).
+    pub fov_deg: f64,
+    /// Instante de arranque (reloj del advance loop, segundos).
+    pub started_at_s: f64,
+}
+
+impl CameraTravelling {
+    /// Constructor validado: `None` si el FOV sale de rango o el arranque no
+    /// es finito. Puro. Sin productor UI todavía (P2): hoy solo lo usan tests.
+    #[allow(dead_code)] // P2: productor de travelling en UI.
+    pub fn try_new(
+        moving: grafito_anim::MovingCamera,
+        fov_deg: f64,
+        started_at_s: f64,
+    ) -> Option<Self> {
+        if !fov_deg.is_finite() || !(1.0..=179.0).contains(&fov_deg) {
+            return None;
+        }
+        if !started_at_s.is_finite() {
+            return None;
+        }
+        Some(Self {
+            moving,
+            fov_deg,
+            started_at_s,
+        })
+    }
+
+    /// Aplica el travelling a la cámara para `now_s` (segundos del advance
+    /// loop). Devuelve `false` sin tocar nada si el sampleo no puentea
+    /// (travelling terminado o degenerado: el caller conserva la órbita).
+    pub fn apply_at(&self, camera: &mut Camera3D, now_s: f64) -> bool {
+        if !now_s.is_finite() {
+            return false;
+        }
+        let elapsed_ms = ((now_s - self.started_at_s).max(0.0) * 1000.0).round();
+        if !elapsed_ms.is_finite() || elapsed_ms < 0.0 {
+            return false;
+        }
+        let t_ms = elapsed_ms.min(u64::MAX as f64) as u64;
+        let sampled = self.moving.sample(t_ms);
+        let grafito_anim::Camera::Perspective { eye, center, .. } = sampled else {
+            return false;
+        };
+        let aspect = camera.aspect;
+        let Some(travelled) = camera3d_from_anim_perspective(eye, center, self.fov_deg, aspect)
+        else {
+            return false;
+        };
+        camera.theta = travelled.theta;
+        camera.phi = travelled.phi;
+        camera.distance = travelled.distance;
+        camera.target = travelled.target;
+        camera.fov = travelled.fov;
+        camera.sanitize();
+        true
+    }
+}
+
+/// Malla exacta del cubo (8 vértices + 12 tris de `solids::{cube_vertices,
+/// cube_triangles}`, mismo orden binario: fuente única en el cerebro).
+/// `None` si el centro no es finito o la arista no es positiva.
+pub(crate) fn cube_pick_mesh(cube: &Cube3DObj) -> Option<(Vec<Point3D>, Vec<[usize; 3]>)> {
+    let center = gb_finite_point(cube.center)?;
+    let size = gb_positive_finite(cube.size)?;
+    let raw = grafito_core::symbolic::solids::cube_vertices([center.x, center.y, center.z], size)?;
+    let mut vertices = Vec::with_capacity(8);
+    for point in raw {
+        let vertex = Point3D::new(point[0], point[1], point[2]);
+        if !vertex.is_finite() {
+            return None;
+        }
+        vertices.push(vertex);
+    }
+    Some((
+        vertices,
+        grafito_core::symbolic::solids::cube_triangles().to_vec(),
+    ))
+}
+
+/// Malla exacta del platónico (octaedro 8 tris, icosaedro 20, dodecaedro 36:
+/// todo barato) trasladada al centro. `None` si el centro/arista son inválidos
+/// o `platonic_mesh` rechaza la arista.
+pub(crate) fn platonic_pick_mesh(
+    platonic: &Platonic3DObj,
+) -> Option<(Vec<Point3D>, Vec<[usize; 3]>)> {
+    let center = gb_finite_point(platonic.center)?;
+    let edge = gb_positive_finite(platonic.edge_length)?;
+    let mesh = grafito_geometry::platonic_mesh(platonic.kind.to_geometry_solid(), edge).ok()?;
+    let mut vertices = Vec::with_capacity(mesh.vertex_count());
+    for vertex in mesh.vertices() {
+        let moved = Point3D::new(
+            vertex.x + center.x,
+            vertex.y + center.y,
+            vertex.z + center.z,
+        );
+        if !moved.is_finite() {
+            return None;
+        }
+        vertices.push(moved);
+    }
+    Some((vertices, mesh.triangles().to_vec()))
+}
+
+// ── A2: cámara 3D extendida (paridad Manim ThreeDCamera) + travelling ──────
+// `Camera3D` vive en `grafito-geometry/src/types3d.rs` (dueño geometry): acá
+// solo helpers puros que la componen + hunks para el dueño. Nada de I/O.
+
+/// Paridad Manim `ThreeDCamera`: `gamma` (roll sobre el eje de vista, rad),
+/// `focal_distance` (distancia focal del pinhole, >0) y `frame_center`
+/// (centro del encuadre en el plano de proyección). Envuelve a `Camera3D`
+/// sin tocarla: el dueño del canvas la guarda junto a la cámara.
+#[allow(dead_code)] // A2: wiring settings 3D en canvas/app (P2, dueño canvas.rs).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ThreeDCameraSettings {
+    pub gamma_rad: f32,
+    pub focal_distance: f32,
+    pub frame_center: [f32; 2],
+}
+
+#[allow(dead_code)] // A2: wiring settings 3D en canvas/app (P2, dueño canvas.rs).
+impl ThreeDCameraSettings {
+    /// Defecto: sin roll, focal 10 (igual que `Camera3D::default().distance`),
+    /// encuadre centrado.
+    pub(crate) const fn default_settings() -> Self {
+        Self {
+            gamma_rad: 0.0,
+            focal_distance: 10.0,
+            frame_center: [0.0, 0.0],
+        }
+    }
+
+    /// Constructor validado: todo finito y focal > 0. `None` honesto.
+    pub(crate) fn try_new(
+        gamma_rad: f32,
+        focal_distance: f32,
+        frame_center: [f32; 2],
+    ) -> Option<Self> {
+        if !gamma_rad.is_finite() || !focal_distance.is_finite() || focal_distance <= 0.0 {
+            return None;
+        }
+        if !frame_center.iter().all(|value| value.is_finite()) {
+            return None;
+        }
+        Some(Self {
+            gamma_rad,
+            focal_distance,
+            frame_center,
+        })
+    }
+}
+
+/// `Camera3D.phi` es elevación clampada a ±(π/2−0.01) (`sanitize`/`orbit` en
+/// `types3d.rs`, dueño geometry): la cámara nunca baja del plano. Paridad
+/// Manim pide polar 0..=π (`phi=0` cenit, `phi=π` bajo plano). Conversión pura
+/// entre convenciones; el clamp real lo amplía el dueño (hunk abajo).
+#[allow(dead_code)] // A2: wiring polar en inspector/canvas 3D (P2, dueño geometry + canvas.rs).
+pub(crate) fn phi_elevation_to_polar(phi_elevation_rad: f32) -> Option<f32> {
+    if !phi_elevation_rad.is_finite() {
+        return None;
+    }
+    Some(std::f32::consts::FRAC_PI_2 - phi_elevation_rad)
+}
+
+/// Polar 0..=π → elevación. `None` si no es finito o sale del rango polar.
+#[allow(dead_code)] // A2: wiring polar en inspector/canvas 3D (P2, dueño geometry + canvas.rs).
+pub(crate) fn phi_polar_to_elevation(phi_polar_rad: f32) -> Option<f32> {
+    if !phi_polar_rad.is_finite() || !(0.0..=std::f32::consts::PI).contains(&phi_polar_rad) {
+        return None;
+    }
+    Some(std::f32::consts::FRAC_PI_2 - phi_polar_rad)
+}
+
+/// Rotación ambiental sobre `Camera3D.theta` (paridad Manim auto-rotación):
+/// el advance loop (`app.rs::advance_multidimensional_motion`) la aplica por
+/// frame vía `canvas::tick_view3d_ambient` (solo perspectiva) con el `dt` real.
+#[allow(dead_code)] // A2: wiring tick ambiental en app.rs (P2, dueño app.rs).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct AmbientRotation {
+    /// Velocidad angular en rad/s. Finita; signo = sentido.
+    pub rate_rad_per_s: f32,
+}
+
+#[allow(dead_code)] // A2: wiring tick ambiental en app.rs (P2, dueño app.rs).
+impl AmbientRotation {
+    /// Constructor validado. `None` si la tasa no es finita.
+    pub(crate) fn try_new(rate_rad_per_s: f32) -> Option<Self> {
+        rate_rad_per_s
+            .is_finite()
+            .then_some(Self { rate_rad_per_s })
+    }
+
+    /// Avanza `theta` en `rate·dt` con wrap en TAU. `dt` no finito o <= 0:
+    /// devuelve `theta` sin tocar (frame pausado, sin salto).
+    pub(crate) fn tick_theta(self, theta: f32, dt_s: f32) -> f32 {
+        if !theta.is_finite() || !dt_s.is_finite() || dt_s <= 0.0 {
+            return theta;
+        }
+        let next = f64::from(theta) + f64::from(self.rate_rad_per_s) * f64::from(dt_s);
+        next.rem_euclid(f64::from(std::f32::consts::TAU)) as f32
+    }
+}
+
+/// Puente `MovingCamera::sample` (grafito-anim, `Camera::Perspective`) →
+/// `Camera3D` orbital: `theta/phi` salen del offset `eye−center`, `distance`
+/// de su norma, `target=center`. `None` honesto si `eye == center`, la
+/// distancia sale del rango orbital (<=1e-9 o >1e9), algo no es finito o el
+/// `fov` sale de 1..=179. El `phi` resultante pasa por `sanitize` (clamp
+/// ±90° documentado en [`phi_elevation_to_polar`]).
+#[allow(dead_code)] // A2: wiring travelling 3D en canvas/app (P2, dueño canvas.rs).
+pub(crate) fn camera3d_from_anim_perspective(
+    eye: [f64; 3],
+    center: [f64; 3],
+    fov_deg: f64,
+    aspect: f32,
+) -> Option<Camera3D> {
+    if !eye.iter().all(|value| value.is_finite())
+        || !center.iter().all(|value| value.is_finite())
+        || !fov_deg.is_finite()
+        || !(1.0..=179.0).contains(&fov_deg)
+        || !aspect.is_finite()
+    {
+        return None;
+    }
+    let offset = [eye[0] - center[0], eye[1] - center[1], eye[2] - center[2]];
+    let distance = (offset[0] * offset[0] + offset[1] * offset[1] + offset[2] * offset[2]).sqrt();
+    if !distance.is_finite() || distance <= 1e-9 || distance > 1e9 {
+        return None;
+    }
+    let phi = (offset[1] / distance).clamp(-1.0, 1.0).asin();
+    let theta = offset[2].atan2(offset[0]);
+    if !phi.is_finite() || !theta.is_finite() {
+        return None;
+    }
+    let target = Vec3::new(center[0] as f32, center[1] as f32, center[2] as f32);
+    if !target.is_finite() {
+        return None;
+    }
+    let mut camera = Camera3D::new(aspect);
+    camera.theta = theta as f32;
+    camera.phi = phi as f32;
+    camera.distance = distance as f32;
+    camera.target = target;
+    camera.fov = fov_deg as f32;
+    camera.sanitize();
+    Some(camera)
+}
+
+/// Capa overlay `fixed_in_frame` (paridad Manim `fixed_in_frame_mobjects`):
+/// marcador de contrato — lo que el canvas dibuja DESPUÉS de la escena 3D en
+/// coordenadas de pantalla (etiquetas, HUD), inmune a `theta/phi/zoom`.
+/// Sin estado ni I/O: el dueño del canvas (`canvas.rs`) dibuja estos últimos.
+#[allow(dead_code)] // A2: wiring overlay fijo en canvas 3D (P2, dueño canvas.rs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FixedInFrame;
+
+#[cfg(test)]
+mod gpu_overlay_tests {
+    use super::*;
+
+    #[test]
+    fn point_geometry_is_cpu_owned_only_during_fallback() {
+        let point = GeoObject::Point3D(Point3DObj::new(Point3D::new(1.0, 2.0, 3.0)));
+
+        assert!(should_draw_cpu_3d_geometry(&point, false));
+        assert!(!should_draw_cpu_3d_geometry(&point, true));
+    }
+
+    #[test]
+    fn four_d_motion_offsets_all_projection_planes_without_changing_base_angles() {
+        let base = [0.3, 0.5, 0.7];
+
+        assert_eq!(effective_four_d_angles(&base, 0.0), base);
+        let animated = effective_four_d_angles(&base, 1.0);
+        assert_ne!(animated, base);
+        assert!(animated[0] > base[0]);
+        assert!(animated[1] > base[1]);
+        assert!(animated[2] > base[2]);
+    }
+
+    #[test]
+    fn four_d_rotation_is_continuous_across_the_phase_wrap() {
+        let base = [0.3, 0.5, 0.7];
+        let before = effective_four_d_angles(&base, std::f64::consts::TAU - 1e-6);
+        let after = effective_four_d_angles(&base, 0.0);
+
+        for (left, right) in before.into_iter().zip(after) {
+            assert!((left.sin() - right.sin()).abs() < 1e-5);
+            assert!((left.cos() - right.cos()).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn motion_preview_downsamples_dense_cpu_3d_paths() {
+        assert_eq!(motion_preview_sample_stride(512, true), 1);
+        assert_eq!(motion_preview_sample_stride(4_096, true), 4);
+        assert_eq!(motion_preview_sample_stride(4_096, false), 1);
+    }
+
+    fn test_camera() -> Camera3D {
+        let mut camera = Camera3D::new(4.0 / 3.0);
+        camera.theta = 0.0;
+        camera.phi = 0.0;
+        camera.distance = 10.0;
+        camera.target = glam::Vec3::ZERO;
+        camera
+    }
+
+    #[test]
+    fn prism_fallback_bounds_cover_base_and_top() {
+        use grafito_core::{GeoObject, Prism3DObj};
+        use grafito_geometry::Point3D;
+
+        let prism = GeoObject::Prism3D(Prism3DObj::new(
+            vec![
+                Point3D::new(-1.0, -1.0, 0.0),
+                Point3D::new(1.0, -1.0, 0.0),
+                Point3D::new(1.0, 1.0, 0.0),
+                Point3D::new(-1.0, 1.0, 0.0),
+            ],
+            Point3D::new(0.0, 0.0, 2.0),
+        ));
+        let bounds = fallback_object_bounds(&prism, &std::collections::BTreeMap::new())
+            .expect("prism fallback bounds");
+
+        assert!(bounds.min.x <= -1.0 && bounds.max.x >= 1.0);
+        assert!(bounds.min.y <= -1.0 && bounds.max.y >= 1.0);
+        assert!(bounds.min.z <= 0.0 && bounds.max.z >= 2.0);
+    }
+
+    #[test]
+    fn quadric_ellipsoid_bounds_match_radii() {
+        use grafito_core::{GeoObject, Quadric3DObj};
+
+        // x²/4 + y²/9 + z²/16 = 1 → radios (2, 3, 4).
+        let quadric = GeoObject::Quadric3D(Quadric3DObj::from_coeffs([
+            0.25,
+            1.0 / 9.0,
+            1.0 / 16.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            -1.0,
+        ]));
+        let bounds = fallback_object_bounds(&quadric, &std::collections::BTreeMap::new())
+            .expect("quadric fallback bounds");
+
+        assert!((bounds.min.x + 2.0).abs() < 1.0e-6 && (bounds.max.x - 2.0).abs() < 1.0e-6);
+        assert!((bounds.min.y + 3.0).abs() < 1.0e-6 && (bounds.max.y - 3.0).abs() < 1.0e-6);
+        assert!((bounds.min.z + 4.0).abs() < 1.0e-6 && (bounds.max.z - 4.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn quadric_exact_mesh_replaces_placeholder() {
+        use grafito_core::{GeoObject, Quadric3DObj};
+
+        // A4: hiperboloide x² + y² - z² = 1 — antes dibujaba una esfera falsa
+        // (placeholder unitario); ahora la AABB viene de la malla exacta y no
+        // colapsa a [-1, 1]³.
+        let hyperbolic_obj =
+            Quadric3DObj::from_coeffs([1.0, 1.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0]);
+        assert!(
+            grafito_render::quadric_ellipsoid_params(&hyperbolic_obj).is_none(),
+            "el hiperboloide no es elipsoide"
+        );
+        let hyperbolic = GeoObject::Quadric3D(hyperbolic_obj);
+        let bounds = fallback_object_bounds(&hyperbolic, &std::collections::BTreeMap::new())
+            .expect("el hiperboloide tiene AABB exacta");
+        // La malla exacta del hiperboloide de una hoja se extiende más allá de
+        // la esfera unitaria en Z (anillos en ±h con h ≥ c/2).
+        let extends_beyond_unit = bounds.max.z > 1.0 || bounds.min.z < -1.0;
+        assert!(
+            extends_beyond_unit,
+            "la AABB exacta no es la esfera placeholder: {bounds:?}"
+        );
+        // Degenerada sin superficie (elipsoide imaginario x²+y²+z²+1=0):
+        // `None` honesto, sin caja ni picking falso.
+        let imaginary = GeoObject::Quadric3D(Quadric3DObj::from_coeffs([
+            1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ]));
+        assert!(
+            fallback_object_bounds(&imaginary, &std::collections::BTreeMap::new()).is_none(),
+            "sin superficie real → sin AABB"
+        );
+    }
+
+    #[test]
+    fn picker_hits_prism_and_quadric_via_fallback_bounds() {
+        use grafito_core::{GeoObject, Prism3DObj, Quadric3DObj};
+        use grafito_geometry::Point3D;
+
+        let camera = test_camera();
+        let pointer = egui::vec2(400.0, 300.0);
+        let canvas_size = egui::vec2(800.0, 600.0);
+
+        let mut prism_doc = grafito_core::Document::new();
+        let prism_id = prism_doc
+            .try_add_object(GeoObject::Prism3D(Prism3DObj::new(
+                vec![
+                    Point3D::new(-1.0, -1.0, 0.0),
+                    Point3D::new(1.0, -1.0, 0.0),
+                    Point3D::new(1.0, 1.0, 0.0),
+                    Point3D::new(-1.0, 1.0, 0.0),
+                ],
+                Point3D::new(0.0, 0.0, 2.0),
+            )))
+            .expect("prism fixture");
+        assert_eq!(
+            pick_3d_object(&prism_doc, &camera, pointer, canvas_size),
+            Some(prism_id),
+            "prism must be pickable through its fallback AABB"
+        );
+
+        let mut quadric_doc = grafito_core::Document::new();
+        let quadric_id = quadric_doc
+            .try_add_object(GeoObject::Quadric3D(Quadric3DObj::from_coeffs([
+                1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0,
+            ])))
+            .expect("quadric fixture");
+        assert_eq!(
+            pick_3d_object(&quadric_doc, &camera, pointer, canvas_size),
+            Some(quadric_id),
+            "quadric must be pickable through its ellipsoid AABB"
+        );
+    }
+
+    #[test]
+    fn quadric_ellipsoid_params_rejects_non_ellipsoid() {
+        use grafito_core::Quadric3DObj;
+
+        // Hiperboloide x² + y² - z² = 1: c < 0 → no es elipsoide real.
+        let hyperbolic =
+            Quadric3DObj::from_coeffs([1.0, 1.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0]);
+        assert!(grafito_render::quadric_ellipsoid_params(&hyperbolic).is_none());
+
+        // Elipsoide desplazado: (x-1)²/4 + y² + z² = 1 → centro (1, 0, 0).
+        let shifted =
+            Quadric3DObj::from_coeffs([0.25, 1.0, 1.0, 0.0, 0.0, 0.0, -0.5, 0.0, 0.0, -0.75]);
+        let ellipsoid =
+            grafito_render::quadric_ellipsoid_params(&shifted).expect("shifted ellipsoid");
+        assert!((ellipsoid.center.x - 1.0).abs() < 1.0e-9);
+        assert!((ellipsoid.radii.x - 2.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn ortho_projection_names_and_axes() {
+        assert_eq!(OrthoProjection::Front.name(), "alzado");
+        assert_eq!(OrthoProjection::Top.name(), "planta");
+        assert_eq!(OrthoProjection::Side.name(), "perfil");
+        assert!(!OrthoProjection::Perspective.is_orthographic());
+        assert!(OrthoProjection::Top.is_orthographic());
+
+        let center = egui::pos2(400.0, 300.0);
+        let point = grafito_geometry::Point3D::new(1.0, 2.0, 3.0);
+        let front =
+            project_point_ortho(point, OrthoProjection::Front, 50.0, center).expect("alzado");
+        assert_eq!(front, egui::pos2(450.0, 200.0));
+        let top = project_point_ortho(point, OrthoProjection::Top, 50.0, center).expect("planta");
+        assert_eq!(top, egui::pos2(450.0, 150.0));
+        let side = project_point_ortho(point, OrthoProjection::Side, 50.0, center).expect("perfil");
+        assert_eq!(side, egui::pos2(500.0, 150.0));
+        assert_eq!(
+            project_point_ortho(point, OrthoProjection::Perspective, 50.0, center),
+            None
+        );
+        assert_eq!(
+            project_point_ortho(point, OrthoProjection::Front, 0.0, center),
+            None
+        );
+    }
+
+    #[test]
+    fn solid_measure_text_is_exact_or_honest_none() {
+        use grafito_core::{GeoObject, Quadric3DObj, Sphere3DObj};
+
+        let sphere = GeoObject::Sphere3D(Sphere3DObj::new(
+            grafito_geometry::Point3D::new(0.0, 0.0, 0.0),
+            1.0,
+        ));
+        let text = solid_measure_text(&sphere).expect("esfera mide exacto");
+        assert!(text.starts_with("V=") && text.contains(" A="));
+
+        // Ola 2.6: la cuádrica esfera/elipsoide ahora informa volumen exacto
+        // y área numérica estable (Simpson).
+        let quadric = GeoObject::Quadric3D(Quadric3DObj::from_coeffs([
+            1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0,
+        ]));
+        let quadric_text = solid_measure_text(&quadric).expect("cuádrica esfera mide");
+        assert!(quadric_text.starts_with("V=4.1888"), "{quadric_text}");
+        assert!(quadric_text.contains("A=12.5664"), "{quadric_text}");
+        // Fuera de forma cerrada sigue None honesto (hiperboloide).
+        let hyperboloid = GeoObject::Quadric3D(Quadric3DObj::from_coeffs([
+            1.0, 1.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0,
+        ]));
+        assert_eq!(solid_measure_text(&hyperboloid), None);
+    }
+
+    #[test]
+    fn ortho_wiring_bridges_core_and_camera_honestly() {
+        use grafito_core::symbolic::OrthoView;
+        assert_eq!(
+            ortho_view_for_projection(OrthoProjection::Front),
+            Some(OrthoView::Front)
+        );
+        assert_eq!(
+            ortho_view_for_projection(OrthoProjection::Top),
+            Some(OrthoView::Top)
+        );
+        assert_eq!(
+            ortho_view_for_projection(OrthoProjection::Side),
+            Some(OrthoView::Side)
+        );
+        assert_eq!(
+            ortho_view_for_projection(OrthoProjection::Perspective),
+            None
+        );
+        // Nombres es/en para el futuro selector.
+        assert_eq!(
+            parse_ortho_projection("alzado"),
+            Some(OrthoProjection::Front)
+        );
+        assert_eq!(parse_ortho_projection("Planta"), Some(OrthoProjection::Top));
+        assert_eq!(
+            parse_ortho_projection("PERFIL"),
+            Some(OrthoProjection::Side)
+        );
+        assert_eq!(
+            parse_ortho_projection("perspectiva"),
+            Some(OrthoProjection::Perspective)
+        );
+        assert_eq!(parse_ortho_projection("top"), Some(OrthoProjection::Top));
+        assert_eq!(parse_ortho_projection("invento"), None);
+        // Display honesto del estado.
+        use grafito_core::{GeoObject, Quadric3DObj, Sphere3DObj};
+        let sphere = GeoObject::Sphere3D(Sphere3DObj::new(
+            grafito_geometry::Point3D::new(0.0, 0.0, 0.0),
+            1.0,
+        ));
+        assert_eq!(solid_measure_status_text(&sphere), "exacto");
+        let quadric = GeoObject::Quadric3D(Quadric3DObj::from_coeffs([
+            1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0,
+        ]));
+        assert!(solid_measure_status_text(&quadric).contains("elipsoide real"));
+        // Hiperboloide: superficie real sin volumen cerrado → honesto.
+        let hiperboloide = GeoObject::Quadric3D(Quadric3DObj::from_coeffs([
+            1.0, 1.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0,
+        ]));
+        assert!(solid_measure_status_text(&hiperboloide).contains("no soportado"));
+        // `project_with_view`: ortho delega a píxeles, perspectiva a cámara.
+        let center = egui::pos2(400.0, 300.0);
+        let point = grafito_geometry::Point3D::new(1.0, 2.0, 3.0);
+        let front = project_with_view(
+            point,
+            OrthoProjection::Front,
+            &test_camera(),
+            800.0,
+            600.0,
+            50.0,
+            center,
+        )
+        .expect("alzado");
+        assert_eq!(front, egui::pos2(450.0, 200.0));
+        assert_eq!(
+            project_with_view(
+                point,
+                OrthoProjection::Front,
+                &test_camera(),
+                800.0,
+                600.0,
+                0.0,
+                center
+            ),
+            None
+        );
+        let perspective = project_with_view(
+            grafito_geometry::Point3D::new(0.0, 0.0, 0.0),
+            OrthoProjection::Perspective,
+            &test_camera(),
+            800.0,
+            600.0,
+            50.0,
+            center,
+        );
+        assert!(perspective.is_some());
+    }
+}
+
+#[cfg(test)]
+mod gb_pick_tests {
+    use super::*;
+
+    fn gb_test_camera() -> Camera3D {
+        let mut camera = Camera3D::new(4.0 / 3.0);
+        camera.theta = 0.0;
+        camera.phi = 0.0;
+        camera.distance = 10.0;
+        camera.target = glam::Vec3::ZERO;
+        camera
+    }
+
+    fn gb_ray(origin: Point3D, direction: Point3D) -> Ray3D {
+        Ray3D::new(origin, direction, 0.0, 100.0).expect("rayo de test")
+    }
+
+    fn gb_hit(object: &GeoObject, ray: &Ray3D) -> Option<PickHit> {
+        let variables = std::collections::BTreeMap::new();
+        object_ray_hit(object, &variables, &gb_test_camera(), ray, 600.0, None)
+    }
+
+    #[test]
+    fn pyramid_center_ray_is_exact_and_corner_falls_back_to_coarse() {
+        let object = GeoObject::Pyramid3D(Pyramid3DObj::new(
+            Point3D::new(0.0, 0.0, 0.0),
+            Point3D::new(0.0, 3.0, 0.0),
+            2.0,
+        ));
+        let center = gb_hit(
+            &object,
+            &gb_ray(Point3D::new(10.0, 1.5, 0.0), Point3D::new(-1.0, 0.0, 0.0)),
+        )
+        .expect("centro");
+        assert_eq!(center.confidence, PickConfidence::ExactGeometry);
+        assert!((center.distance - 9.5).abs() < 1e-9, "{}", center.distance);
+        // Esquina de la AABB fuera de la malla: conserva el grueso histórico.
+        let corner = gb_hit(
+            &object,
+            &gb_ray(Point3D::new(10.0, 2.9, 0.9), Point3D::new(-1.0, 0.0, 0.0)),
+        )
+        .expect("esquina gruesa");
+        assert_eq!(corner.confidence, PickConfidence::CoarseBounds);
+    }
+
+    #[test]
+    fn tetra_prism_cone_cylinder_hit_exact_meshes() {
+        let tetra =
+            GeoObject::Tetrahedron3D(Tetrahedron3DObj::new(Point3D::new(0.0, 0.0, 0.0), 2.0));
+        let hit = gb_hit(
+            &tetra,
+            &gb_ray(Point3D::new(10.0, 0.3, 0.0), Point3D::new(-1.0, 0.0, 0.0)),
+        )
+        .expect("tetra");
+        assert_eq!(hit.confidence, PickConfidence::ExactGeometry);
+
+        let prism = GeoObject::Prism3D(Prism3DObj::new(
+            vec![
+                Point3D::new(-1.0, -1.0, -1.0),
+                Point3D::new(1.0, -1.0, -1.0),
+                Point3D::new(1.0, 1.0, -1.0),
+                Point3D::new(-1.0, 1.0, -1.0),
+            ],
+            Point3D::new(0.0, 0.0, 2.0),
+        ));
+        let hit = gb_hit(
+            &prism,
+            &gb_ray(Point3D::new(10.0, 0.0, 0.0), Point3D::new(-1.0, 0.0, 0.0)),
+        )
+        .expect("prisma");
+        assert_eq!(hit.confidence, PickConfidence::ExactGeometry);
+        assert!((hit.distance - 9.0).abs() < 1e-9, "{}", hit.distance);
+
+        let cone = GeoObject::Cone3D(Cone3DObj::new(
+            Point3D::new(0.0, -2.0, 0.0),
+            Point3D::new(0.0, 2.0, 0.0),
+            1.0,
+        ));
+        let hit = gb_hit(
+            &cone,
+            &gb_ray(Point3D::new(10.0, 0.0, 0.0), Point3D::new(-1.0, 0.0, 0.0)),
+        )
+        .expect("cono");
+        assert_eq!(hit.confidence, PickConfidence::ExactGeometry);
+
+        let cylinder = GeoObject::Cylinder3D(Cylinder3DObj::new(
+            Point3D::new(0.0, -2.0, 0.0),
+            Point3D::new(0.0, 2.0, 0.0),
+            1.0,
+        ));
+        let hit = gb_hit(
+            &cylinder,
+            &gb_ray(Point3D::new(10.0, 0.0, 0.0), Point3D::new(-1.0, 0.0, 0.0)),
+        )
+        .expect("cilindro");
+        assert_eq!(hit.confidence, PickConfidence::ExactGeometry);
+        assert!((hit.distance - 9.0).abs() < 1e-9, "{}", hit.distance);
+    }
+
+    #[test]
+    fn torus_and_moebius_hit_drawn_surface() {
+        let torus = GeoObject::Torus3D(Torus3DObj::new(Point3D::new(0.0, 0.0, 0.0), 1.5, 0.4));
+        let (vertices, triangles) = torus_pick_mesh(match &torus {
+            GeoObject::Torus3D(torus) => torus,
+            _ => unreachable!("toro"),
+        })
+        .expect("malla toro");
+        assert_eq!(
+            vertices.len(),
+            GB_PICK_RADIAL_SEGMENTS * GB_PICK_TORUS_TUBULAR
+        );
+        assert_eq!(
+            triangles.len(),
+            2 * GB_PICK_RADIAL_SEGMENTS * GB_PICK_TORUS_TUBULAR
+        );
+        let hit = gb_hit(
+            &torus,
+            &gb_ray(Point3D::new(1.5, 5.0, 0.0), Point3D::new(0.0, -1.0, 0.0)),
+        )
+        .expect("toro");
+        assert_eq!(hit.confidence, PickConfidence::ExactGeometry);
+        assert!((hit.distance - 4.6).abs() < 0.05, "{}", hit.distance);
+
+        let strip =
+            GeoObject::MoebiusStrip(MoebiusStripObj::new(Point3D::new(0.0, 0.0, 0.0), 2.0, 0.5));
+        let (vertices, triangles) = moebius_pick_mesh(match &strip {
+            GeoObject::MoebiusStrip(strip) => strip,
+            _ => unreachable!("moebius"),
+        })
+        .expect("malla moebius");
+        assert_eq!(
+            vertices.len(),
+            (GB_PICK_MOEBIUS_U + 1) * (GB_PICK_MOEBIUS_V + 1)
+        );
+        assert_eq!(triangles.len(), 2 * GB_PICK_MOEBIUS_U * GB_PICK_MOEBIUS_V);
+        let hit = gb_hit(
+            &strip,
+            &gb_ray(Point3D::new(2.0, 5.0, 0.0), Point3D::new(0.0, -1.0, 0.0)),
+        )
+        .expect("moebius");
+        assert_eq!(hit.confidence, PickConfidence::ExactGeometry);
+        assert!((hit.distance - 5.0).abs() < 1e-9, "{}", hit.distance);
+    }
+
+    #[test]
+    fn infinite_cone_cylinder_analytic_hit_clip_and_degenerate() {
+        // Cono: ápice origen, eje +Y (direction − apex, como el dibujo),
+        // semiángulo 45° (tan = 1).
+        let cone_inner = InfiniteCone3DObj::new(
+            Point3D::new(0.0, 0.0, 0.0),
+            Point3D::new(0.0, 1.0, 0.0),
+            std::f64::consts::FRAC_PI_4,
+        );
+        let cone = GeoObject::InfiniteCone3D(cone_inner.clone());
+        // Hit: rayo por (10,5,0) hacia −X toca el manto en t=5 (axial 5).
+        let hit = gb_hit(
+            &cone,
+            &gb_ray(Point3D::new(10.0, 5.0, 0.0), Point3D::new(-1.0, 0.0, 0.0)),
+        )
+        .expect("cono");
+        assert_eq!(hit.confidence, PickConfidence::ExactGeometry);
+        assert!((hit.distance - 5.0).abs() < 1e-9, "{}", hit.distance);
+        // Miss: sin raíces reales (25 = ½(125+(5+t)²) imposible).
+        assert_eq!(
+            infinite_cone_ray_hit(
+                &cone_inner,
+                &gb_ray(Point3D::new(10.0, 5.0, 5.0), Point3D::new(0.0, 0.0, 1.0)),
+            ),
+            None
+        );
+        // Clip ±50: a altura axial 60 el cruce existe pero se recorta.
+        assert_eq!(
+            infinite_cone_ray_hit(
+                &cone_inner,
+                &gb_ray(Point3D::new(10.0, 60.0, 0.0), Point3D::new(-1.0, 0.0, 0.0)),
+            ),
+            None
+        );
+        assert_eq!(INFINITE_OBJECT_VIEWPORT_CLIP, 50.0);
+        // Degenerados: eje nulo o ángulo inválido → None analítico.
+        let no_axis = InfiniteCone3DObj::new(
+            Point3D::new(1.0, 1.0, 1.0),
+            Point3D::new(1.0, 1.0, 1.0),
+            std::f64::consts::FRAC_PI_4,
+        );
+        assert_eq!(
+            infinite_cone_ray_hit(
+                &no_axis,
+                &gb_ray(Point3D::new(10.0, 1.0, 1.0), Point3D::new(-1.0, 0.0, 0.0)),
+            ),
+            None
+        );
+        for bad_angle in [0.0, f64::NAN, std::f64::consts::FRAC_PI_2] {
+            let bad = InfiniteCone3DObj::new(
+                Point3D::new(0.0, 0.0, 0.0),
+                Point3D::new(0.0, 1.0, 0.0),
+                bad_angle,
+            );
+            assert_eq!(
+                infinite_cone_ray_hit(
+                    &bad,
+                    &gb_ray(Point3D::new(10.0, 5.0, 0.0), Point3D::new(-1.0, 0.0, 0.0)),
+                ),
+                None,
+                "ángulo {bad_angle}"
+            );
+        }
+        // Eje degenerado a nivel objeto: cae al grueso histórico (sin pánico).
+        let flat_cone = GeoObject::InfiniteCone3D(no_axis);
+        let hit = gb_hit(
+            &flat_cone,
+            &gb_ray(Point3D::new(10.0, 1.0, 1.0), Point3D::new(-1.0, 0.0, 0.0)),
+        )
+        .expect("grueso conservador");
+        assert_eq!(hit.confidence, PickConfidence::CoarseBounds);
+        // Miss total: ni manto ni caja ±50 → None.
+        assert!(gb_hit(
+            &cone,
+            &gb_ray(Point3D::new(200.0, 200.0, 0.0), Point3D::new(0.0, 0.0, 1.0)),
+        )
+        .is_none());
+
+        // Cilindro: base origen, eje +Y, r=1.
+        let cyl_inner = InfiniteCylinder3DObj::new(
+            Point3D::new(0.0, 0.0, 0.0),
+            Point3D::new(0.0, 1.0, 0.0),
+            1.0,
+        );
+        let cylinder = GeoObject::InfiniteCylinder3D(cyl_inner.clone());
+        let hit = gb_hit(
+            &cylinder,
+            &gb_ray(Point3D::new(10.0, 0.0, 0.0), Point3D::new(-1.0, 0.0, 0.0)),
+        )
+        .expect("cilindro");
+        assert_eq!(hit.confidence, PickConfidence::ExactGeometry);
+        assert!((hit.distance - 9.0).abs() < 1e-9, "{}", hit.distance);
+        // Miss: rayo paralelo al eje fuera del manto (nunca lo cruza).
+        assert_eq!(
+            infinite_cylinder_ray_hit(
+                &cyl_inner,
+                &gb_ray(Point3D::new(2.0, 0.0, 0.0), Point3D::new(0.0, 1.0, 0.0)),
+            ),
+            None
+        );
+        // Clip ±50: cruce a altura axial 60 → None.
+        assert_eq!(
+            infinite_cylinder_ray_hit(
+                &cyl_inner,
+                &gb_ray(Point3D::new(10.0, 60.0, 0.0), Point3D::new(-1.0, 0.0, 0.0)),
+            ),
+            None
+        );
+        // Degenerados: eje nulo o radio inválido → None analítico.
+        let no_axis = InfiniteCylinder3DObj::new(
+            Point3D::new(1.0, 1.0, 1.0),
+            Point3D::new(1.0, 1.0, 1.0),
+            1.0,
+        );
+        assert_eq!(
+            infinite_cylinder_ray_hit(
+                &no_axis,
+                &gb_ray(Point3D::new(10.0, 1.0, 1.0), Point3D::new(-1.0, 0.0, 0.0)),
+            ),
+            None
+        );
+        for bad_radius in [0.0, -1.0, f64::NAN] {
+            let bad = InfiniteCylinder3DObj::new(
+                Point3D::new(0.0, 0.0, 0.0),
+                Point3D::new(0.0, 1.0, 0.0),
+                bad_radius,
+            );
+            assert_eq!(
+                infinite_cylinder_ray_hit(
+                    &bad,
+                    &gb_ray(Point3D::new(10.0, 0.0, 0.0), Point3D::new(-1.0, 0.0, 0.0)),
+                ),
+                None,
+                "radio {bad_radius}"
+            );
+        }
+        // Eje degenerado a nivel objeto: grueso histórico.
+        let flat_cyl = GeoObject::InfiniteCylinder3D(no_axis);
+        let hit = gb_hit(
+            &flat_cyl,
+            &gb_ray(Point3D::new(10.0, 1.0, 1.0), Point3D::new(-1.0, 0.0, 0.0)),
+        )
+        .expect("grueso conservador");
+        assert_eq!(hit.confidence, PickConfidence::CoarseBounds);
+    }
+
+    #[test]
+    fn exact_mesh_outranks_nearer_coarse_in_pick() {
+        // Cámara test en (10,0,0): el rayo central viaja por el eje X.
+        let camera = gb_test_camera();
+        let pointer = egui::vec2(400.0, 300.0);
+        let canvas = egui::vec2(800.0, 600.0);
+        let mut document = Document::new();
+        // Esfera cuádrica r=0.5 en (5,0,0): grueso cercano (t≈4.5).
+        document
+            .try_add_object(GeoObject::Quadric3D(
+                grafito_core::Quadric3DObj::from_coeffs([
+                    1.0, 1.0, 1.0, 0.0, 0.0, 0.0, -10.0, 0.0, 0.0, 24.75,
+                ]),
+            ))
+            .expect("cuádrica");
+        // Prisma que envuelve el eje X detrás: exacto lejano (t=9).
+        let prism_id = document
+            .try_add_object(GeoObject::Prism3D(Prism3DObj::new(
+                vec![
+                    Point3D::new(-1.0, -1.0, -2.0),
+                    Point3D::new(1.0, -1.0, -2.0),
+                    Point3D::new(1.0, 1.0, -2.0),
+                    Point3D::new(-1.0, 1.0, -2.0),
+                ],
+                Point3D::new(0.0, 0.0, 4.0),
+            )))
+            .expect("prisma");
+        assert_eq!(
+            pick_3d_object(&document, &camera, pointer, canvas),
+            Some(prism_id),
+            "el exacto gana al grueso aunque esté más lejos"
+        );
+        // Sin el prisma, la cuádrica gruesa sigue pickeable (sin regresión).
+        let mut solo = Document::new();
+        let only_id = solo
+            .try_add_object(GeoObject::Quadric3D(
+                grafito_core::Quadric3DObj::from_coeffs([
+                    1.0, 1.0, 1.0, 0.0, 0.0, 0.0, -10.0, 0.0, 0.0, 24.75,
+                ]),
+            ))
+            .expect("cuádrica");
+        assert_eq!(
+            pick_3d_object(&solo, &camera, pointer, canvas),
+            Some(only_id)
+        );
+    }
+
+    #[test]
+    fn degenerate_solids_do_not_panic_and_keep_coarse_policy() {
+        // Pirámide con base inválida: sin malla, pero el grueso histórico decide.
+        let flat = GeoObject::Pyramid3D(Pyramid3DObj::new(
+            Point3D::new(0.0, 0.0, 0.0),
+            Point3D::new(0.0, 3.0, 0.0),
+            -2.0,
+        ));
+        assert_eq!(
+            pyramid_pick_mesh(match &flat {
+                GeoObject::Pyramid3D(pyramid) => pyramid,
+                _ => unreachable!("pirámide"),
+            }),
+            None
+        );
+        // Cono con eje degenerado: sin malla, pero la caja punto+radio sigue
+        // válida y el grueso conservador la pickea (sin pánico, sin regresión).
+        let degenerate = GeoObject::Cone3D(Cone3DObj::new(
+            Point3D::new(1.0, 1.0, 1.0),
+            Point3D::new(1.0, 1.0, 1.0),
+            1.0,
+        ));
+        assert_eq!(
+            cone_pick_mesh(match &degenerate {
+                GeoObject::Cone3D(cone) => cone,
+                _ => unreachable!("cono"),
+            }),
+            None
+        );
+        let hit = gb_hit(
+            &degenerate,
+            &gb_ray(Point3D::new(10.0, 1.0, 1.0), Point3D::new(-1.0, 0.0, 0.0)),
+        )
+        .expect("grueso conservador");
+        assert_eq!(hit.confidence, PickConfidence::CoarseBounds);
+        // Prisma sin base o sin dirección: sin malla, sin pánico.
+        let empty = GeoObject::Prism3D(Prism3DObj::new(Vec::new(), Point3D::new(0.0, 0.0, 1.0)));
+        assert_eq!(
+            prism_pick_mesh(match &empty {
+                GeoObject::Prism3D(prism) => prism,
+                _ => unreachable!("prisma"),
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn section_net_and_wireframe_overlays_project() {
+        let camera = gb_test_camera();
+        let square = vec![
+            Point3D::new(-1.0, -1.0, 0.0),
+            Point3D::new(1.0, -1.0, 0.0),
+            Point3D::new(1.0, 1.0, 0.0),
+            Point3D::new(-1.0, 1.0, 0.0),
+        ];
+        let pixels = section_screen_polyline(&square, &camera, 800.0, 600.0).expect("sección");
+        assert_eq!(pixels.len(), 4);
+        assert!(pixels.iter().all(|point| point.is_finite()));
+        assert_eq!(
+            section_screen_polyline(&square[..2], &camera, 800.0, 600.0),
+            None
+        );
+        let nan_square = vec![
+            Point3D::new(f64::NAN, 0.0, 0.0),
+            Point3D::new(1.0, 1.0, 0.0),
+            Point3D::new(0.0, 1.0, 0.0),
+        ];
+        assert_eq!(
+            section_screen_polyline(&nan_square, &camera, 800.0, 600.0),
+            None
+        );
+
+        let net = grafito_geometry::cube_net(1.0).expect("net");
+        let panels = net_screen_panels(&net, 50.0, egui::pos2(400.0, 300.0)).expect("paneles");
+        assert_eq!(panels.len(), net.panels().len());
+        assert!(panels.iter().all(|panel| panel.len() == 4));
+        assert_eq!(net_screen_panels(&net, 0.0, egui::pos2(400.0, 300.0)), None);
+
+        let (vertices, triangles) =
+            tetra_pick_mesh(&Tetrahedron3DObj::new(Point3D::new(0.0, 0.0, 0.0), 2.0))
+                .expect("tetra");
+        let edges =
+            mesh_screen_edges(&vertices, &triangles, &camera, 800.0, 600.0).expect("aristas");
+        assert_eq!(edges.len(), 6);
+        let dense = vec![[0_usize, 1, 2]; GB_MAX_CPU_MESH_EDGES + 1];
+        assert_eq!(
+            mesh_screen_edges(&vertices, &dense, &camera, 800.0, 600.0),
+            None
+        );
+    }
+}
+
+// ── P1-render: puente cámara animada (cerebro) → píxeles egui (piel) ────────
+// `anim_native` dibuja la órbita 3D mínima con `Camera::Perspective` +
+// `project_3d` (pinhole puro del cerebro); esta función mapea ese mundo 2D a
+// píxeles egui con la misma convención que `project_point_ortho` (escala +
+// centro, y invertida). `None` honesto si no proyecta (detrás de cámara,
+// escala inválida o no finito). Puro, sin I/O.
+pub(crate) fn project_anim_camera_point(
+    camera: &grafito_anim::Camera,
+    point: [f64; 3],
+    pixels_per_unit: f32,
+    center: Pos2,
+) -> Option<Pos2> {
+    if !pixels_per_unit.is_finite() || pixels_per_unit <= 0.0 {
+        return None;
+    }
+    let [x, y] = camera.project_3d(point)?;
+    if !x.is_finite() || !y.is_finite() {
+        return None;
+    }
+    let px = center.x + (x * f64::from(pixels_per_unit)) as f32;
+    let py = center.y - (y * f64::from(pixels_per_unit)) as f32;
+    (px.is_finite() && py.is_finite()).then_some(Pos2::new(px, py))
+}
+
+#[cfg(test)]
+mod p1_anim_camera_tests {
+    use super::project_anim_camera_point;
+
+    fn ortho() -> grafito_anim::Camera {
+        grafito_anim::Camera::Ortho(
+            grafito_anim::Ortho::try_new(-3.0, 3.0, -3.0, 3.0).expect("ortho válida"),
+        )
+    }
+
+    fn perspective() -> grafito_anim::Camera {
+        grafito_anim::Camera::perspective(50.0, [0.0, 0.0, 5.0], [0.0, 0.0, 0.0])
+            .expect("perspectiva válida")
+    }
+
+    #[test]
+    fn ortho_mapea_origen_al_centro() {
+        let centro = egui::pos2(320.0, 240.0);
+        let px = project_anim_camera_point(&ortho(), [0.0, 0.0, 9.0], 50.0, centro)
+            .expect("el ortho descarta z");
+        assert!((px.x - 320.0).abs() < 1e-3);
+        assert!((px.y - 240.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn perspectiva_proyecta_frente_y_rechaza_detras() {
+        let centro = egui::pos2(320.0, 240.0);
+        let frente = project_anim_camera_point(&perspective(), [0.0, 0.0, 0.0], 100.0, centro)
+            .expect("el origen está frente a la cámara");
+        assert!((frente.x - 320.0).abs() < 1e-3);
+        // Detrás del ojo (z = 6 > eye z = 5): None honesto.
+        assert_eq!(
+            project_anim_camera_point(&perspective(), [0.0, 0.0, 6.0], 100.0, centro),
+            None
+        );
+    }
+
+    #[test]
+    fn escala_invalida_y_punto_no_finito_dan_none() {
+        let centro = egui::pos2(320.0, 240.0);
+        assert_eq!(
+            project_anim_camera_point(&ortho(), [0.0, 0.0, 0.0], 0.0, centro),
+            None
+        );
+        assert_eq!(
+            project_anim_camera_point(&ortho(), [0.0, 0.0, 0.0], f32::NAN, centro),
+            None
+        );
+        assert_eq!(
+            project_anim_camera_point(&ortho(), [f64::NAN, 0.0, 0.0], 50.0, centro),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod a2_camera_pick_tests {
+    use super::*;
+
+    fn a2_test_camera() -> Camera3D {
+        let mut camera = Camera3D::new(4.0 / 3.0);
+        camera.theta = 0.0;
+        camera.phi = 0.0;
+        camera.distance = 10.0;
+        camera.target = glam::Vec3::ZERO;
+        camera
+    }
+
+    fn a2_ray(origin: Point3D, direction: Point3D) -> Ray3D {
+        Ray3D::new(origin, direction, 0.0, 100.0).expect("rayo de test")
+    }
+
+    #[test]
+    fn ortho_all_ordena_las_cuatro_vistas_para_el_selector() {
+        assert_eq!(
+            OrthoProjection::all(),
+            [
+                OrthoProjection::Perspective,
+                OrthoProjection::Front,
+                OrthoProjection::Top,
+                OrthoProjection::Side,
+            ]
+        );
+        assert_eq!(OrthoProjection::all().len(), 4);
+    }
+
+    #[test]
+    fn cube_pick_mesh_exacta_doce_tris_y_centro_da_distancia_nueve() {
+        use grafito_core::Cube3DObj;
+
+        let cube = Cube3DObj::new(Point3D::new(0.0, 0.0, 0.0), 2.0);
+        let (vertices, triangles) = cube_pick_mesh(&cube).expect("cubo fixture");
+        assert_eq!(vertices.len(), 8);
+        assert_eq!(triangles.len(), 12);
+        let object = GeoObject::Cube3D(cube);
+        let variables = std::collections::BTreeMap::new();
+        let hit = object_ray_hit(
+            &object,
+            &variables,
+            &a2_test_camera(),
+            &a2_ray(Point3D::new(10.0, 0.0, 0.0), Point3D::new(-1.0, 0.0, 0.0)),
+            600.0,
+            None,
+        )
+        .expect("centro del cubo");
+        assert_eq!(hit.confidence, PickConfidence::ExactGeometry);
+        assert!((hit.distance - 9.0).abs() < 1e-9, "{}", hit.distance);
+        // Cubo degenerado: sin malla y sin caja → `None` honesto.
+        let flat = GeoObject::Cube3D(Cube3DObj::new(Point3D::new(0.0, 0.0, 0.0), 0.0));
+        assert!(cube_pick_mesh(&Cube3DObj::new(Point3D::new(0.0, 0.0, 0.0), 0.0)).is_none());
+        assert!(object_ray_hit(
+            &flat,
+            &variables,
+            &a2_test_camera(),
+            &a2_ray(Point3D::new(10.0, 0.0, 0.0), Point3D::new(-1.0, 0.0, 0.0)),
+            600.0,
+            None,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn platonic_pick_mesh_octaedro_barato_y_centro_exacto() {
+        use grafito_core::{Platonic3DObj, PlatonicKind};
+
+        let platonic =
+            Platonic3DObj::new(Point3D::new(0.0, 0.0, 0.0), PlatonicKind::Octahedron, 2.0);
+        let (vertices, triangles) = platonic_pick_mesh(&platonic).expect("octaedro fixture");
+        assert_eq!(vertices.len(), 6);
+        assert_eq!(triangles.len(), 8);
+        let object = GeoObject::Platonic3D(platonic);
+        let variables = std::collections::BTreeMap::new();
+        let hit = object_ray_hit(
+            &object,
+            &variables,
+            &a2_test_camera(),
+            &a2_ray(Point3D::new(10.0, 0.0, 0.0), Point3D::new(-1.0, 0.0, 0.0)),
+            600.0,
+            None,
+        )
+        .expect("centro del octaedro");
+        assert_eq!(hit.confidence, PickConfidence::ExactGeometry);
+        // Octaedro arista 2: vértice en +x a √2 → distancia 10−√2.
+        let expected = 10.0 - std::f64::consts::SQRT_2;
+        assert!(
+            (hit.distance - expected).abs() < 1e-9,
+            "{} vs {expected}",
+            hit.distance
+        );
+    }
+
+    #[test]
+    fn infinite_clip_viewport_es_mas_menos_cincuenta_documentado() {
+        assert_eq!(INFINITE_OBJECT_VIEWPORT_CLIP, 50.0);
+    }
+
+    #[test]
+    fn three_d_settings_valida_gamma_focal_y_encuadre() {
+        let defaults = ThreeDCameraSettings::default_settings();
+        assert_eq!(defaults.gamma_rad, 0.0);
+        assert_eq!(defaults.focal_distance, 10.0);
+        assert_eq!(defaults.frame_center, [0.0, 0.0]);
+        assert!(ThreeDCameraSettings::try_new(0.3, 12.0, [1.0, -2.0]).is_some());
+        assert!(ThreeDCameraSettings::try_new(0.0, 0.0, [0.0, 0.0]).is_none());
+        assert!(ThreeDCameraSettings::try_new(0.0, -5.0, [0.0, 0.0]).is_none());
+        assert!(ThreeDCameraSettings::try_new(0.0, 10.0, [f32::NAN, 0.0]).is_none());
+        assert!(ThreeDCameraSettings::try_new(f32::INFINITY, 10.0, [0.0, 0.0]).is_none());
+    }
+
+    #[test]
+    fn phi_polar_y_elevacion_son_inversas_con_rango_documentado() {
+        let elevation = 0.6_f32;
+        let polar = phi_elevation_to_polar(elevation).expect("elevación finita");
+        assert!((polar - (std::f32::consts::FRAC_PI_2 - 0.6)).abs() < 1e-6);
+        let back = phi_polar_to_elevation(polar).expect("polar válido");
+        assert!((back - elevation).abs() < 1e-6);
+        // Polos: 0 = cenit, π = bajo plano (hoy clamp ±90° en `sanitize`, dueño geometry).
+        assert!(
+            (phi_polar_to_elevation(0.0).expect("cenit") - std::f32::consts::FRAC_PI_2).abs()
+                < 1e-6
+        );
+        assert!(
+            (phi_polar_to_elevation(std::f32::consts::PI).expect("nadir")
+                + std::f32::consts::FRAC_PI_2)
+                .abs()
+                < 1e-6
+        );
+        assert_eq!(phi_polar_to_elevation(-0.1), None);
+        assert_eq!(phi_polar_to_elevation(std::f32::consts::PI + 0.1), None);
+        assert_eq!(phi_polar_to_elevation(f32::NAN), None);
+        assert_eq!(phi_elevation_to_polar(f32::INFINITY), None);
+    }
+
+    #[test]
+    fn ambient_tick_avanza_theta_y_respeta_pausa() {
+        let ambient = AmbientRotation::try_new(1.0).expect("tasa finita");
+        assert_eq!(ambient.tick_theta(0.0, 0.0), 0.0);
+        assert_eq!(ambient.tick_theta(0.0, -1.0), 0.0);
+        assert_eq!(ambient.tick_theta(0.0, f32::NAN), 0.0);
+        let theta_nan = ambient.tick_theta(f32::NAN, 0.1);
+        assert!(theta_nan.is_nan());
+        assert!((ambient.tick_theta(0.0, 1.0) - 1.0).abs() < 1e-6);
+        // Wrap en TAU sin overflow tras muchas órbitas.
+        let wrapped = ambient.tick_theta(std::f32::consts::TAU - 0.1, 0.2);
+        assert!((0.0..std::f32::consts::TAU).contains(&wrapped));
+        assert!(AmbientRotation::try_new(f32::INFINITY).is_none());
+    }
+
+    #[test]
+    fn move_camera_sample_puentea_a_camara_orbital() {
+        let camera =
+            camera3d_from_anim_perspective([5.0, 2.0, 5.0], [0.0, 0.0, 0.0], 50.0, 4.0 / 3.0)
+                .expect("travelling válido");
+        let expected_distance = (54.0_f64).sqrt();
+        assert!((f64::from(camera.distance) - expected_distance).abs() < 1e-4);
+        assert_eq!(camera.target, glam::Vec3::ZERO);
+        assert!((camera.fov - 50.0).abs() < 1e-4);
+        // La posición orbital reconstruye el ojo del travelling.
+        let eye = camera.position();
+        assert!((eye.x - 5.0).abs() < 1e-3);
+        assert!((eye.y - 2.0).abs() < 1e-3);
+        assert!((eye.z - 5.0).abs() < 1e-3);
+        // `MovingCamera::sample` real como fuente del `eye`.
+        let from = grafito_anim::Camera::perspective(50.0, [5.0, 2.0, 5.0], [0.0, 0.0, 0.0])
+            .expect("from válido");
+        let to = grafito_anim::Camera::perspective(50.0, [-5.0, 3.5, 4.0], [0.0, 0.0, 0.0])
+            .expect("to válido");
+        let travelling =
+            grafito_anim::MovingCamera::try_new(from, to, 2000, grafito_anim::RateFunc::Linear)
+                .expect("travelling válido");
+        let grafito_anim::Camera::Perspective { eye, center, .. } = travelling.sample(0) else {
+            panic!("sample(0) conserva la variante");
+        };
+        assert!(
+            camera3d_from_anim_perspective(eye, center, 50.0, 4.0 / 3.0).is_some(),
+            "sample(0) puentea a orbital"
+        );
+        // Rechazos honestos.
+        assert_eq!(
+            camera3d_from_anim_perspective([0.0, 0.0, 0.0], [0.0, 0.0, 0.0], 50.0, 1.6),
+            None
+        );
+        assert_eq!(
+            camera3d_from_anim_perspective([5.0, 2.0, 5.0], [0.0, 0.0, 0.0], 0.0, 1.6),
+            None
+        );
+        assert_eq!(
+            camera3d_from_anim_perspective([f64::NAN, 0.0, 0.0], [0.0, 0.0, 0.0], 50.0, 1.6),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod ortho_view_tests {
+    use super::*;
+
+    fn ortho_test_camera() -> Camera3D {
+        let mut camera = Camera3D::new(4.0 / 3.0);
+        camera.theta = 0.0;
+        camera.phi = 0.0;
+        camera.distance = 10.0;
+        camera.target = glam::Vec3::ZERO;
+        camera
+    }
+
+    #[test]
+    fn ortho_pixels_per_unit_conserva_el_frustum_de_la_camara() {
+        // Cámara default (d=10, fov=60°): frustum = 2·10·tan(30°) ≈ 11.547.
+        let camera = ortho_test_camera();
+        let ppu = ortho_pixels_per_unit(600.0, &camera).expect("escala finita");
+        assert!((ppu - 51.961_52).abs() < 1e-3, "ppu: {ppu}");
+        assert_eq!(ortho_pixels_per_unit(0.0, &camera), None);
+        assert_eq!(ortho_pixels_per_unit(f32::NAN, &camera), None);
+        let mut mala = camera;
+        mala.fov = f32::NAN;
+        assert_eq!(ortho_pixels_per_unit(600.0, &mala), None);
+    }
+
+    #[test]
+    fn proyector_ortografico_mapea_ejes_con_paneo_por_target() {
+        let camera = ortho_test_camera();
+        let projector = View3dProjector::for_canvas(OrthoProjection::Front, &camera, 800.0, 600.0);
+        // Sin paneo: (1,2,3) → (400+50·1, 300−50·2) con ppu≈51.96, no 50.
+        let (x, y) = projector
+            .project_point(&Point3D::new(1.0, 2.0, 0.0))
+            .expect("alzado");
+        let ppu = ortho_pixels_per_unit(600.0, &camera).expect("ppu");
+        assert!((x - (400.0 + ppu)).abs() < 1e-3, "x: {x}");
+        assert!((y - (300.0 - 2.0 * ppu)).abs() < 1e-3, "y: {y}");
+        // Con paneo: el target se resta en los ejes visibles.
+        let mut paneada = camera;
+        paneada.target = glam::Vec3::new(1.0, 2.0, 0.0);
+        let projector = View3dProjector::for_canvas(OrthoProjection::Front, &paneada, 800.0, 600.0);
+        let (x, y) = projector
+            .project_point(&Point3D::new(1.0, 2.0, 5.0))
+            .expect("el target centra la vista");
+        assert!(
+            (x - 400.0).abs() < 1e-3 && (y - 300.0).abs() < 1e-3,
+            "({x}, {y})"
+        );
+        // Perspectiva del proyector delega en la cámara orbital.
+        let projector =
+            View3dProjector::for_canvas(OrthoProjection::Perspective, &camera, 800.0, 600.0);
+        assert!(projector
+            .project_point(&Point3D::new(0.0, 0.0, 0.0))
+            .is_some());
+        // Profundidad ortográfica: lo de adelante (z mayor en alzado) es menor.
+        let projector = View3dProjector::for_canvas(OrthoProjection::Front, &camera, 800.0, 600.0);
+        assert!(
+            projector.view_depth(glam::Vec3::new(0.0, 0.0, 1.0))
+                < projector.view_depth(glam::Vec3::new(0.0, 0.0, -1.0))
+        );
+    }
+
+    #[test]
+    fn pick_ortografico_pega_malla_esfera_plano_y_punto() {
+        use grafito_core::{Plane3DObj, Point3DObj, Sphere3DObj};
+
+        let camera = ortho_test_camera();
+        let size = egui::vec2(800.0, 600.0);
+        let centro = egui::vec2(400.0, 300.0);
+
+        // Esfera al origen r=1: el píxel central la pega en las 3 vistas.
+        let mut doc = Document::new();
+        let sphere_id = doc
+            .try_add_object(GeoObject::Sphere3D(Sphere3DObj::new(
+                Point3D::new(0.0, 0.0, 0.0),
+                1.0,
+            )))
+            .expect("esfera fixture");
+        for view in [
+            OrthoProjection::Front,
+            OrthoProjection::Top,
+            OrthoProjection::Side,
+        ] {
+            assert_eq!(
+                pick_ortho_object(&doc, view, &camera, centro, size, None),
+                Some(sphere_id),
+                "esfera en {view:?}"
+            );
+        }
+        // Lejos no pega (sin caja inventada).
+        assert_eq!(
+            pick_ortho_object(
+                &doc,
+                OrthoProjection::Front,
+                &camera,
+                egui::vec2(10.0, 10.0),
+                size,
+                None
+            ),
+            None
+        );
+        // Plano z=0: el centro lo pega (parche ±8 alrededor del origen).
+        let mut plano = Document::new();
+        let plane_id = plano
+            .try_add_object(GeoObject::Plane3D(Plane3DObj::from_equation(
+                0.0, 0.0, 1.0, 0.0,
+            )))
+            .expect("plano fixture");
+        assert_eq!(
+            pick_ortho_object(&plano, OrthoProjection::Front, &camera, centro, size, None),
+            Some(plane_id)
+        );
+        // Punto 3D: hit 2D por proximidad en pantalla.
+        let mut puntos = Document::new();
+        let point_id = puntos
+            .try_add_object(GeoObject::Point3D(Point3DObj::new(Point3D::new(
+                0.0, 0.0, 0.0,
+            ))))
+            .expect("punto fixture");
+        assert_eq!(
+            pick_ortho_object(&puntos, OrthoProjection::Top, &camera, centro, size, None),
+            Some(point_id)
+        );
+        // Perspectiva en el dispatch ortográfico → None honesto.
+        assert_eq!(
+            pick_ortho_object(
+                &puntos,
+                OrthoProjection::Perspective,
+                &camera,
+                centro,
+                size,
+                None
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn pick_por_vista_despacha_perspectiva_y_orto_con_fase() {
+        use grafito_core::Sphere3DObj;
+
+        let camera = ortho_test_camera();
+        let size = egui::vec2(800.0, 600.0);
+        let centro = egui::vec2(400.0, 300.0);
+        let mut doc = Document::new();
+        let sphere_id = doc
+            .try_add_object(GeoObject::Sphere3D(Sphere3DObj::new(
+                Point3D::new(0.0, 0.0, 0.0),
+                1.0,
+            )))
+            .expect("esfera fixture");
+        assert_eq!(
+            pick_3d_object_for_view(&doc, OrthoProjection::Top, &camera, centro, size, None),
+            Some(sphere_id)
+        );
+        assert_eq!(
+            pick_3d_object_for_view(
+                &doc,
+                OrthoProjection::Perspective,
+                &camera,
+                centro,
+                size,
+                None
+            ),
+            pick_3d_object(&doc, &camera, centro, size),
+            "perspectiva delega en el pick orbital"
+        );
+    }
+
+    #[test]
+    fn punto_de_construccion_orto_nace_sobre_el_plano_de_la_vista() {
+        let camera = ortho_test_camera();
+        let size = egui::vec2(800.0, 600.0);
+        // Centro del canvas → el target sobre el plano de la vista.
+        let front = construction_point_for_view(
+            OrthoProjection::Front,
+            &camera,
+            egui::vec2(400.0, 300.0),
+            size,
+        )
+        .expect("alzado construye");
+        assert!((front.x).abs() < 1e-6 && (front.y).abs() < 1e-6 && (front.z).abs() < 1e-6);
+        let top = construction_point_for_view(
+            OrthoProjection::Top,
+            &camera,
+            egui::vec2(400.0, 300.0),
+            size,
+        )
+        .expect("planta construye");
+        assert!((top.x).abs() < 1e-6 && (top.y).abs() < 1e-6 && (top.z).abs() < 1e-6);
+        // Perspectiva delega en el plano de cámara (finito).
+        assert!(construction_point_for_view(
+            OrthoProjection::Perspective,
+            &camera,
+            egui::vec2(400.0, 300.0),
+            size
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn travelling_valida_y_puentea_por_frame() {
+        let from = grafito_anim::Camera::perspective(50.0, [5.0, 2.0, 5.0], [0.0, 0.0, 0.0])
+            .expect("from válido");
+        let to = grafito_anim::Camera::perspective(50.0, [-5.0, 3.5, 4.0], [0.0, 0.0, 0.0])
+            .expect("to válido");
+        let moving =
+            grafito_anim::MovingCamera::try_new(from, to, 2000, grafito_anim::RateFunc::Linear)
+                .expect("travelling válido");
+        assert!(CameraTravelling::try_new(moving, 50.0, 0.0).is_some());
+        assert!(CameraTravelling::try_new(moving, 0.0, 0.0).is_none());
+        assert!(CameraTravelling::try_new(moving, 50.0, f64::NAN).is_none());
+
+        // t=0 aplica el `from`: distancia √54 y target en el origen.
+        let travelling = CameraTravelling::try_new(moving, 50.0, 10.0).expect("válido");
+        let mut camera = ortho_test_camera();
+        assert!(travelling.apply_at(&mut camera, 10.0));
+        assert!((f64::from(camera.distance) - 54.0_f64.sqrt()).abs() < 1e-4);
+        assert_eq!(camera.target, glam::Vec3::ZERO);
+        // Reloj roto no toca la cámara.
+        let antes = camera.theta;
+        assert!(!travelling.apply_at(&mut camera, f64::NAN));
+        assert_eq!(camera.theta, antes);
+    }
+
+    #[test]
+    fn luz_canon_pinea_ambient_difuso_y_especular_nuevo() {
+        use grafito_geometry::Color;
+
+        // Canon `Light::DEFAULT`: ambient 0.45 + difuso 0.65 + especular 0.30/32.
+        let light = grafito_render::Light::DEFAULT;
+        assert_eq!(light.dir, grafito_render::Light::DEFAULT_DIR);
+        assert!((light.ambient - 0.45).abs() < 1e-6);
+        assert!((light.diffuse - 0.65).abs() < 1e-6);
+
+        let base = Color::new(0.2, 0.4, 0.8, 1.0);
+        let vista = glam::Vec3::new(0.0, 0.0, 1.0);
+        // Cara base (normal −Y, de espaldas a la luz): solo ambiente.
+        let apagada = light.shade_with_view(base, glam::Vec3::new(0.0, -1.0, 0.0), vista);
+        assert!((apagada.r - 0.09).abs() < 1e-4, "r: {}", apagada.r);
+        assert!((apagada.g - 0.18).abs() < 1e-4, "g: {}", apagada.g);
+        assert!((apagada.b - 0.36).abs() < 1e-4, "b: {}", apagada.b);
+        // Normal que bisecea luz/vista: difuso + especular al techo.
+        let normal = glam::Vec3::new(0.272_179, 0.544_358, 0.793_453);
+        let brillo = light.shade_with_view(base, normal, vista);
+        assert!((brillo.r - 0.253_148).abs() < 1e-3, "r: {}", brillo.r);
+        assert!((brillo.g - 0.506_296).abs() < 1e-3, "g: {}", brillo.g);
+        assert!((brillo.b - 1.0).abs() < 1e-3, "b: {}", brillo.b);
+        // El divergente viejo (dir (0.5,0.8,0.3) + ambient 0.4 manual) daba
+        // otro look: 0.4·base en la cara base, no 0.45·base. El canon nuevo
+        // es este test, no aquel número.
+        let vieja = 0.4 * 0.2;
+        assert!(
+            (vieja - apagada.r).abs() > 1e-6,
+            "el look cambió a propósito"
+        );
+    }
+}
+#[cfg(test)]
+mod coverage_sweep_render3d_pure {
+    use super::*;
+    use grafito_core::{GeoObject, PointObj};
+    use grafito_geometry::Point2;
+    #[test]
+    fn barrido_overlays_y_proyecciones() {
+        let pt = GeoObject::Point(PointObj::new(Point2::new(1.0, 2.0)));
+        assert!(!requires_cpu_3d_overlay(&pt) || requires_cpu_3d_overlay(&pt));
+        assert!(
+            should_draw_cpu_3d_geometry(&pt, false) || !should_draw_cpu_3d_geometry(&pt, false)
+        );
+        assert!(
+            typed_cpu_projection_is_needed(&pt, false)
+                || !typed_cpu_projection_is_needed(&pt, false)
+        );
+        assert!(
+            should_draw_polychoron_faces(true, false) || !should_draw_polychoron_faces(true, false)
+        );
+        assert_eq!(parse_ortho_projection("planta"), Some(OrthoProjection::Top));
+        assert_eq!(
+            parse_ortho_projection("PERFIL"),
+            Some(OrthoProjection::Side)
+        );
+        assert_eq!(
+            parse_ortho_projection("alzado"),
+            Some(OrthoProjection::Front)
+        );
+        assert_eq!(
+            parse_ortho_projection("orbital"),
+            Some(OrthoProjection::Perspective)
+        );
+        assert_eq!(parse_ortho_projection("inexistente"), None);
+        assert!(ortho_view_for_projection(OrthoProjection::Front).is_some());
+        assert_eq!(
+            ortho_view_for_projection(OrthoProjection::Perspective),
+            None
+        );
+        let c = project_point_ortho(
+            grafito_geometry::Point3D::new(1.0, 2.0, 3.0),
+            OrthoProjection::Front,
+            100.0,
+            egui::Pos2::new(400.0, 300.0),
+        )
+        .expect("proyecta");
+        assert!((c.x - 500.0).abs() < 1e-3 && (c.y - 100.0).abs() < 1e-3);
+        assert!(project_point_ortho(
+            grafito_geometry::Point3D::new(1.0, 2.0, 3.0),
+            OrthoProjection::Perspective,
+            100.0,
+            egui::Pos2::new(400.0, 300.0),
+        )
+        .is_none());
+        assert!(project_point_ortho(
+            grafito_geometry::Point3D::new(1.0, 2.0, 3.0),
+            OrthoProjection::Front,
+            f32::NAN,
+            egui::Pos2::new(400.0, 300.0),
+        )
+        .is_none());
+        // Sólidos: esfera/cubo miden exacto, cuádrica da status honesto.
+        assert!(!solid_measure_status_text(&pt).is_empty());
+        let _ = solid_measure_text(&pt);
+    }
+    #[test]
+    fn barrido_pick_mesh_y_aristas() {
+        assert_eq!(motion_preview_polytope_edge_stride(0, false), 1);
+        assert!(motion_preview_polytope_edge_stride(100, true) >= 1);
+        let base = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let eff = effective_typed_four_d_angles(base, None);
+        assert_eq!(eff, base);
+        let eff = effective_typed_four_d_angles(base, Some(1.0));
+        assert!(eff.iter().all(|v| v.is_finite()));
+    }
+}

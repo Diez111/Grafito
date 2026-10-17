@@ -1,0 +1,3070 @@
+//! Análisis matemático de funciones y curvas.
+//!
+//! Provee rutinas numéricas robustas para encontrar raíces, extremos,
+//! puntos de inflexión, interceptos, asíntotas y aproximaciones de Taylor.
+//! Las funciones son puras: no dependen de UI ni de estado de documento.
+//!
+//! Asesoría matemática: Aivo382 (almironi780@gmail.com)
+
+use crate::ast::{parse_ast, Expr};
+use crate::expr::{
+    eval_batch_1d, eval_batch_2d, eval_function, eval_function_with_vars, prepare_function_ast,
+};
+use crate::integral::composite_simpson;
+use crate::{line_param_at_point, LineKind, Point2};
+use std::collections::BTreeMap;
+use std::fmt;
+
+const DEFAULT_SAMPLES: usize = 800;
+const DEFAULT_REFINE_ITER: usize = 30;
+const TOL: f64 = 1e-9;
+const EPS: f64 = 1e-6;
+/// Maximum grid intervals accepted by a public `AnalysisOptions` request.
+pub const MAX_ANALYSIS_SAMPLES: usize = 10_000;
+
+/// Failure returned when function analysis exceeds its fixed sampling budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnalysisError {
+    /// The requested sample count exceeds the analysis budget.
+    SampleLimitExceeded { requested: usize, maximum: usize },
+    /// A bounded sample count could not produce a representable point count.
+    SampleCountOverflow,
+    /// A bounded sample grid could not be reserved.
+    AllocationFailed,
+}
+
+impl fmt::Display for AnalysisError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SampleLimitExceeded { requested, maximum } => {
+                write!(f, "se solicitaron {requested} muestras, máximo {maximum}")
+            }
+            Self::SampleCountOverflow => {
+                write!(f, "la cantidad de puntos de análisis no es representable")
+            }
+            Self::AllocationFailed => write!(f, "no se pudo reservar memoria para las muestras"),
+        }
+    }
+}
+
+/// Tipo de característica encontrada por el análisis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnalysisFeature {
+    Root,
+    YIntercept,
+    XIntercept,
+    LocalMaximum,
+    LocalMinimum,
+    Inflection,
+    VerticalAsymptote,
+    HorizontalAsymptote,
+    ObliqueAsymptote,
+    Intersection,
+    Equilibrium,
+    Centroid,
+}
+
+impl AnalysisFeature {
+    pub fn label(&self) -> &'static str {
+        match self {
+            AnalysisFeature::Root => "Raíz",
+            AnalysisFeature::YIntercept => "Intersección Y",
+            AnalysisFeature::XIntercept => "Intersección X",
+            AnalysisFeature::LocalMaximum => "Máximo",
+            AnalysisFeature::LocalMinimum => "Mínimo",
+            AnalysisFeature::Inflection => "Punto de inflexión",
+            AnalysisFeature::VerticalAsymptote => "Asíntota vertical",
+            AnalysisFeature::HorizontalAsymptote => "Asíntota horizontal",
+            AnalysisFeature::ObliqueAsymptote => "Asíntota oblicua",
+            AnalysisFeature::Intersection => "Intersección",
+            AnalysisFeature::Equilibrium => "Equilibrio",
+            AnalysisFeature::Centroid => "Centroide",
+        }
+    }
+}
+
+/// Resultado de una característica de análisis en el plano.
+#[derive(Debug, Clone)]
+pub struct AnalysisResult {
+    pub feature: AnalysisFeature,
+    pub point: Point2,
+    /// Valor adicional asociado (por ejemplo, la pendiente de una asíntota oblicua).
+    pub value: Option<f64>,
+    /// Posición secundaria para elementos que no son puntos (extremos de asíntotas).
+    pub secondary: Option<Point2>,
+    /// Etiqueta descriptiva legible.
+    pub label: String,
+}
+
+/// Opciones para un análisis de función.
+#[derive(Debug, Clone)]
+pub struct AnalysisOptions {
+    pub domain_min: f64,
+    pub domain_max: f64,
+    pub samples: usize,
+    pub find_roots: bool,
+    pub find_extrema: bool,
+    pub find_inflections: bool,
+    pub find_y_intercept: bool,
+    pub find_asymptotes: bool,
+}
+
+impl Default for AnalysisOptions {
+    fn default() -> Self {
+        Self {
+            domain_min: -20.0,
+            domain_max: 20.0,
+            samples: DEFAULT_SAMPLES,
+            find_roots: true,
+            find_extrema: true,
+            find_inflections: true,
+            find_y_intercept: true,
+            find_asymptotes: true,
+        }
+    }
+}
+
+/// Analiza una función explícita `y = f(x)`.
+///
+/// Esta API de compatibilidad devuelve una lista vacía si se rechaza el
+/// presupuesto de muestras; use [`try_analyze_function`] para el error.
+pub fn analyze_function(
+    expr: &str,
+    vars: &BTreeMap<String, f64>,
+    opts: &AnalysisOptions,
+) -> Vec<AnalysisResult> {
+    try_analyze_function(expr, vars, opts).unwrap_or_default()
+}
+
+/// Fallible variant of [`analyze_function`] with an explicit sampling budget.
+pub fn try_analyze_function(
+    expr: &str,
+    vars: &BTreeMap<String, f64>,
+    opts: &AnalysisOptions,
+) -> Result<Vec<AnalysisResult>, AnalysisError> {
+    let samples = opts.samples.max(4);
+    if samples > MAX_ANALYSIS_SAMPLES {
+        return Err(AnalysisError::SampleLimitExceeded {
+            requested: samples,
+            maximum: MAX_ANALYSIS_SAMPLES,
+        });
+    }
+    let point_count = samples
+        .checked_add(1)
+        .ok_or(AnalysisError::SampleCountOverflow)?;
+    let mut results = Vec::new();
+
+    if opts.find_y_intercept && opts.domain_min <= 0.0 && opts.domain_max >= 0.0 {
+        if let Ok(y0) = eval_function_with_vars(expr, 0.0, vars) {
+            if y0.is_finite() {
+                results.push(AnalysisResult {
+                    feature: AnalysisFeature::YIntercept,
+                    point: Point2::new(0.0, y0),
+                    value: Some(y0),
+                    secondary: None,
+                    label: format!("Intersección Y: (0.00, {:.4})", y0),
+                });
+            }
+        }
+    }
+
+    if opts.find_asymptotes {
+        results.extend(find_asymptotes(
+            expr,
+            vars,
+            opts.domain_min,
+            opts.domain_max,
+            samples,
+        ));
+    }
+
+    let mut xs = Vec::new();
+    xs.try_reserve_exact(point_count)
+        .map_err(|_| AnalysisError::AllocationFailed)?;
+    for i in 0..=samples {
+        let t = i as f64 / samples as f64;
+        let x = opts.domain_min + t * (opts.domain_max - opts.domain_min);
+        xs.push(x);
+    }
+    let ys = match eval_batch_1d(expr, "x", xs.iter().copied(), vars) {
+        Ok(batch) => batch
+            .into_iter()
+            .map(|y| y.filter(|v| v.is_finite()))
+            .collect(),
+        Err(_) => vec![None; xs.len()],
+    };
+
+    if opts.find_roots {
+        results.extend(extract_roots(expr, vars, &xs, &ys, opts));
+    }
+
+    if opts.find_extrema {
+        results.extend(extract_extrema(expr, vars, &xs, &ys, opts));
+    }
+
+    if opts.find_inflections {
+        results.extend(extract_inflections(expr, vars, &xs, &ys, opts));
+    }
+
+    Ok(results)
+}
+
+fn f64_or_nan(expr: &str, x: f64, vars: &BTreeMap<String, f64>) -> f64 {
+    eval_function_with_vars(expr, x, vars).unwrap_or(f64::NAN)
+}
+
+fn f64_or_nan_var(expr: &str, var: &str, t: f64, vars: &BTreeMap<String, f64>) -> f64 {
+    eval_batch_1d(expr, var, std::iter::once(t), vars)
+        .ok()
+        .and_then(|mut res| res.pop().flatten())
+        .unwrap_or(f64::NAN)
+}
+
+fn finite_or_nan(y: Option<f64>) -> f64 {
+    y.filter(|v| v.is_finite()).unwrap_or(f64::NAN)
+}
+
+fn derivative_var(expr: &str, var: &str, t: f64, vars: &BTreeMap<String, f64>) -> f64 {
+    let h = (t.abs().max(1.0) * EPS).max(1e-12);
+    let f = |t: f64| f64_or_nan_var(expr, var, t, vars);
+    let f1 = f(t - 2.0 * h);
+    let f2 = f(t - h);
+    let f3 = f(t + h);
+    let f4 = f(t + 2.0 * h);
+    if [f1, f2, f3, f4].iter().all(|v| v.is_finite()) {
+        (f1 - 8.0 * f2 + 8.0 * f3 - f4) / (12.0 * h)
+    } else {
+        f64::NAN
+    }
+}
+
+fn second_derivative_var(expr: &str, var: &str, t: f64, vars: &BTreeMap<String, f64>) -> f64 {
+    let h = (t.abs().max(1.0) * EPS).max(1e-12);
+    let f = |t: f64| f64_or_nan_var(expr, var, t, vars);
+    let fm = f(t - h);
+    let f0 = f(t);
+    let fp = f(t + h);
+    if fm.is_finite() && f0.is_finite() && fp.is_finite() {
+        (fm - 2.0 * f0 + fp) / (h * h)
+    } else {
+        f64::NAN
+    }
+}
+
+fn derivative(expr: &str, x: f64, vars: &BTreeMap<String, f64>) -> f64 {
+    derivative_var(expr, "x", x, vars)
+}
+
+/// Ola 2.1: derivada exacta por CAS (`symbolic::derivative`) para el análisis
+/// de y = f(x). `None` cuando el CAS no puede derivar: el llamador cae a la
+/// vía numérica histórica de diferencias finitas.
+fn symbolic_derivative_expr(expr: &str) -> Option<String> {
+    let derivative = crate::symbolic::derivative(expr, "x").ok()?;
+    let clean = derivative.trim();
+    if clean.is_empty() {
+        return None;
+    }
+    Some(clean.to_string())
+}
+
+/// Evaluador de una derivada (simbólica si existe, numérica si no).
+fn derivative_evaluator<'a>(
+    expr: &'a str,
+    symbolic: &'a Option<String>,
+) -> impl Fn(f64, &BTreeMap<String, f64>) -> f64 + 'a {
+    move |x: f64, vars: &BTreeMap<String, f64>| match symbolic {
+        Some(d) => f64_or_nan(d, x, vars),
+        None => derivative(expr, x, vars),
+    }
+}
+
+fn second_derivative(expr: &str, x: f64, vars: &BTreeMap<String, f64>) -> f64 {
+    second_derivative_var(expr, "x", x, vars)
+}
+
+fn newton_refine<F, G>(mut x: f64, f: F, df: G, max_iter: usize) -> Option<f64>
+where
+    F: Fn(f64) -> f64,
+    G: Fn(f64) -> f64,
+{
+    for _ in 0..max_iter {
+        let fx = f(x);
+        if fx.abs() < TOL {
+            return Some(x);
+        }
+        let dfx = df(x);
+        if dfx.abs() < 1e-15 {
+            return None;
+        }
+        x -= fx / dfx;
+    }
+    None
+}
+
+fn bisect<F: Fn(f64) -> f64>(f: F, mut a: f64, mut b: f64, max_iter: usize) -> Option<f64> {
+    let mut fa = f(a);
+    let fb = f(b);
+    if fa * fb > 0.0 {
+        return None;
+    }
+    for _ in 0..max_iter {
+        let mid = (a + b) * 0.5;
+        let fm = f(mid);
+        if fm.abs() < TOL {
+            return Some(mid);
+        }
+        if fa * fm <= 0.0 {
+            b = mid;
+        } else {
+            a = mid;
+            fa = fm;
+        }
+    }
+    Some((a + b) * 0.5)
+}
+
+fn extract_roots(
+    expr: &str,
+    vars: &BTreeMap<String, f64>,
+    xs: &[f64],
+    ys: &[Option<f64>],
+    _opts: &AnalysisOptions,
+) -> Vec<AnalysisResult> {
+    let mut roots = Vec::new();
+    let symbolic_df = symbolic_derivative_expr(expr);
+    let df_eval = derivative_evaluator(expr, &symbolic_df);
+    for i in 1..xs.len() {
+        let x0 = xs[i - 1];
+        let x1 = xs[i];
+        let y0 = finite_or_nan(ys[i - 1]);
+        let y1 = finite_or_nan(ys[i]);
+
+        if y1 == 0.0 && y1.is_finite() {
+            roots.push(x1);
+        } else if (y0.is_finite() && y1.is_finite()) && (y0 * y1 <= 0.0 && (y0 != 0.0 || y1 != 0.0))
+        {
+            let f = |x: f64| f64_or_nan(expr, x, vars);
+            let df = |x: f64| df_eval(x, vars);
+            let root = newton_refine(x1, f, df, DEFAULT_REFINE_ITER)
+                .or_else(|| bisect(f, x0, x1, DEFAULT_REFINE_ITER))
+                .unwrap_or(x1);
+            roots.push(root);
+        }
+    }
+
+    roots.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    roots.dedup_by(|a, b| (*a - *b).abs() < 1e-5);
+
+    roots
+        .into_iter()
+        .map(|x| AnalysisResult {
+            feature: AnalysisFeature::Root,
+            point: Point2::new(x, 0.0),
+            value: None,
+            secondary: None,
+            label: format!("Raíz: ({:.4}, 0.00)", x),
+        })
+        .collect()
+}
+
+fn extract_extrema(
+    expr: &str,
+    vars: &BTreeMap<String, f64>,
+    xs: &[f64],
+    _ys: &[Option<f64>],
+    _opts: &AnalysisOptions,
+) -> Vec<AnalysisResult> {
+    let mut extrema = Vec::new();
+    let symbolic_df = symbolic_derivative_expr(expr);
+    let df_eval = derivative_evaluator(expr, &symbolic_df);
+    let df = |x: f64| df_eval(x, vars);
+    // Clasificación por segunda derivada exacta cuando el CAS puede (más
+    // robusta que el signo del bracket, que falla si la muestra cae justo
+    // sobre la raíz); si no, segunda derivada numérica.
+    let symbolic_d2 = symbolic_df
+        .as_ref()
+        .and_then(|d1| symbolic_derivative_expr(d1));
+    let d2_at = |x: f64| match &symbolic_d2 {
+        Some(d2) => f64_or_nan(d2, x, vars),
+        None => second_derivative(expr, x, vars),
+    };
+
+    for i in 1..xs.len() {
+        let x0 = xs[i - 1];
+        let x1 = xs[i];
+        let d0 = df(x0);
+        let d1 = df(x1);
+
+        if d0.is_finite() && d1.is_finite() && d0 * d1 <= 0.0 && (d0 != 0.0 || d1 != 0.0) {
+            let root = newton_refine(x1, df, d2_at, DEFAULT_REFINE_ITER)
+                .or_else(|| bisect(df, x0, x1, DEFAULT_REFINE_ITER))
+                .unwrap_or(x1);
+            if let Ok(y) = eval_function_with_vars(expr, root, vars) {
+                if y.is_finite() {
+                    let second = d2_at(root);
+                    let feature = if second < 0.0 {
+                        AnalysisFeature::LocalMaximum
+                    } else if second > 0.0 {
+                        AnalysisFeature::LocalMinimum
+                    } else if d0 > 0.0 {
+                        AnalysisFeature::LocalMaximum
+                    } else {
+                        AnalysisFeature::LocalMinimum
+                    };
+                    extrema.push(AnalysisResult {
+                        feature,
+                        point: Point2::new(root, y),
+                        value: Some(y),
+                        secondary: None,
+                        label: format!(
+                            "{}: ({:.4}, {:.4})",
+                            if feature == AnalysisFeature::LocalMaximum {
+                                "Máximo"
+                            } else {
+                                "Mínimo"
+                            },
+                            root,
+                            y
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    extrema.sort_by(|a, b| {
+        a.point
+            .x
+            .partial_cmp(&b.point.x)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    extrema.dedup_by(|a, b| (a.point.x - b.point.x).abs() < 1e-5);
+    extrema
+}
+
+fn extract_inflections(
+    expr: &str,
+    vars: &BTreeMap<String, f64>,
+    xs: &[f64],
+    _ys: &[Option<f64>],
+    _opts: &AnalysisOptions,
+) -> Vec<AnalysisResult> {
+    let mut inflections = Vec::new();
+    // Ola 2.1: segunda y tercera derivada exactas cuando el CAS puede;
+    // fallback numérico idéntico al histórico si no.
+    let symbolic_d2 = symbolic_derivative_expr(expr).and_then(|d1| symbolic_derivative_expr(&d1));
+    let symbolic_d3 = symbolic_d2
+        .as_ref()
+        .and_then(|d2| symbolic_derivative_expr(d2));
+    let d2f = |x: f64| match &symbolic_d2 {
+        Some(d2) => f64_or_nan(d2, x, vars),
+        None => second_derivative(expr, x, vars),
+    };
+    let d3f = |x: f64| {
+        if let Some(d3) = &symbolic_d3 {
+            return f64_or_nan(d3, x, vars);
+        }
+        let h = (x.abs().max(1.0) * EPS).max(1e-12);
+        let v0 = d2f(x - 2.0 * h);
+        let v1 = d2f(x - h);
+        let v2 = d2f(x + h);
+        let v3 = d2f(x + 2.0 * h);
+        if [v0, v1, v2, v3].iter().all(|v| v.is_finite()) {
+            (v0 - 8.0 * v1 + 8.0 * v2 - v3) / (12.0 * h)
+        } else {
+            f64::NAN
+        }
+    };
+
+    for i in 1..xs.len() {
+        let x0 = xs[i - 1];
+        let x1 = xs[i];
+        let d0 = d2f(x0);
+        let d1 = d2f(x1);
+
+        if d0.is_finite() && d1.is_finite() && d0 * d1 <= 0.0 && (d0 != 0.0 || d1 != 0.0) {
+            let root = newton_refine(x1, d2f, d3f, DEFAULT_REFINE_ITER)
+                .or_else(|| bisect(d2f, x0, x1, DEFAULT_REFINE_ITER))
+                .unwrap_or((x0 + x1) * 0.5);
+            if let Ok(y) = eval_function_with_vars(expr, root, vars) {
+                if y.is_finite() {
+                    inflections.push(AnalysisResult {
+                        feature: AnalysisFeature::Inflection,
+                        point: Point2::new(root, y),
+                        value: Some(y),
+                        secondary: None,
+                        label: format!("Inflexión: ({:.4}, {:.4})", root, y),
+                    });
+                }
+            }
+        }
+    }
+
+    inflections.sort_by(|a, b| {
+        a.point
+            .x
+            .partial_cmp(&b.point.x)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    inflections.dedup_by(|a, b| (a.point.x - b.point.x).abs() < 1e-5);
+    inflections
+}
+
+fn find_asymptotes(
+    expr: &str,
+    vars: &BTreeMap<String, f64>,
+    domain_min: f64,
+    domain_max: f64,
+    samples: usize,
+) -> Vec<AnalysisResult> {
+    let mut results = Vec::new();
+
+    // Asíntotas verticales: un NaN solo indica que el dominio no está definido;
+    // para publicar una asíntota exigimos crecimiento bilateral al acercarnos.
+    let mut sampled = Vec::with_capacity(samples + 1);
+    for i in 0..=samples {
+        let x = domain_min + (i as f64 / samples as f64) * (domain_max - domain_min);
+        let y = f64_or_nan(expr, x, vars);
+        sampled.push((x, y));
+    }
+
+    let proves_vertical_growth = |candidate: f64, interval_width: f64| {
+        let precision = f64::EPSILON * candidate.abs().max(1.0) * 32.0;
+        let near_offset = (interval_width.abs() * 1e-6).max(precision);
+        let far_offset = (interval_width.abs() * 0.1).max(near_offset * 32.0);
+        let left_near = f64_or_nan(expr, candidate - near_offset, vars);
+        let right_near = f64_or_nan(expr, candidate + near_offset, vars);
+        let left_far = f64_or_nan(expr, candidate - far_offset, vars);
+        let right_far = f64_or_nan(expr, candidate + far_offset, vars);
+        [left_near, right_near, left_far, right_far]
+            .iter()
+            .all(|value| value.is_finite())
+            && left_near.abs() > left_far.abs().max(1.0) * 8.0
+            && right_near.abs() > right_far.abs().max(1.0) * 8.0
+    };
+
+    let mut vertical_candidates = Vec::new();
+    for pair in sampled.windows(2) {
+        let (lo, flo) = pair[0];
+        let (hi, fhi) = pair[1];
+        if !flo.is_finite()
+            || !fhi.is_finite()
+            || flo == 0.0
+            || fhi == 0.0
+            || flo.is_sign_negative() == fhi.is_sign_negative()
+        {
+            continue;
+        }
+
+        let mut left = lo;
+        let mut right = hi;
+        let mut f_left = flo;
+        let mut root = false;
+        for _ in 0..48 {
+            let mid = (left + right) * 0.5;
+            let f_mid = f64_or_nan(expr, mid, vars);
+            if !f_mid.is_finite() {
+                left = mid;
+                right = mid;
+                break;
+            }
+            if f_mid == 0.0 {
+                root = true;
+                break;
+            }
+            if f_mid.is_sign_negative() == f_left.is_sign_negative() {
+                left = mid;
+                f_left = f_mid;
+            } else {
+                right = mid;
+            }
+        }
+        let candidate = (left + right) * 0.5;
+        if !root && proves_vertical_growth(candidate, hi - lo) {
+            vertical_candidates.push(candidate);
+        }
+    }
+
+    for window in sampled.windows(3) {
+        let (left_x, left_y) = window[0];
+        let (candidate, middle_y) = window[1];
+        let (right_x, right_y) = window[2];
+        if !middle_y.is_finite()
+            && left_y.is_finite()
+            && right_y.is_finite()
+            && proves_vertical_growth(candidate, right_x - left_x)
+        {
+            vertical_candidates.push(candidate);
+        }
+    }
+
+    vertical_candidates.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    vertical_candidates.dedup_by(|a, b| (*a - *b).abs() < 1e-7);
+    for asymptote_x in vertical_candidates {
+        results.push(AnalysisResult {
+            feature: AnalysisFeature::VerticalAsymptote,
+            point: Point2::new(asymptote_x, 0.0),
+            value: None,
+            secondary: None,
+            label: format!("Asíntota vertical: x = {:.4}", asymptote_x),
+        });
+    }
+
+    // Asíntotas horizontales: una muestra finita no demuestra un límite. Las
+    // muestras separadas por tres órdenes de magnitud deben estabilizarse.
+    const LIMIT_SAMPLES: [f64; 3] = [1e9, 1e12, 1e15];
+    const LIMIT_ABS_TOLERANCE: f64 = 1e-7;
+    const LIMIT_REL_TOLERANCE: f64 = 1e-9;
+    let horizontal_limit = |direction: f64| {
+        let values: Option<Vec<f64>> = LIMIT_SAMPLES
+            .iter()
+            .map(|scale| {
+                let value = f64_or_nan(expr, direction * scale, vars);
+                value.is_finite().then_some(value)
+            })
+            .collect();
+        let values = values?;
+        let limit = *values.last()?;
+        let scale = values
+            .iter()
+            .fold(1.0_f64, |maximum, value| maximum.max(value.abs()));
+        let tolerance = LIMIT_ABS_TOLERANCE + LIMIT_REL_TOLERANCE * scale;
+        values
+            .iter()
+            .all(|value| (value - limit).abs() <= tolerance)
+            .then_some(limit)
+    };
+
+    let y_pos = horizontal_limit(1.0);
+    let y_neg = horizontal_limit(-1.0);
+    if let Some(y_pos) = y_pos {
+        results.push(AnalysisResult {
+            feature: AnalysisFeature::HorizontalAsymptote,
+            point: Point2::new(0.0, y_pos),
+            value: Some(y_pos),
+            secondary: Some(Point2::new(1.0, y_pos)),
+            label: format!("Asíntota horizontal: y = {:.4}", y_pos),
+        });
+    }
+    if let Some(y_neg) =
+        y_neg.filter(|y_neg| y_pos.is_none_or(|y_pos| (y_neg - y_pos).abs() > LIMIT_ABS_TOLERANCE))
+    {
+        results.push(AnalysisResult {
+            feature: AnalysisFeature::HorizontalAsymptote,
+            point: Point2::new(0.0, y_neg),
+            value: Some(y_neg),
+            secondary: Some(Point2::new(1.0, y_neg)),
+            label: format!("Asíntota horizontal: y = {:.4}", y_neg),
+        });
+    }
+
+    results
+}
+
+/// Encuentra raíces de una función escalar `g(t)` a partir de muestras uniformes,
+/// refinando con Newton/bisección.
+fn find_scalar_roots<G, DG>(ts: &[f64], gs: &[Option<f64>], g: G, dg: DG) -> Vec<f64>
+where
+    G: Fn(f64) -> f64,
+    DG: Fn(f64) -> f64,
+{
+    let mut roots = Vec::new();
+    for i in 1..ts.len() {
+        let t0 = ts[i - 1];
+        let t1 = ts[i];
+        let g0 = finite_or_nan(gs[i - 1]);
+        let g1 = finite_or_nan(gs[i]);
+        if g1 == 0.0 && g1.is_finite() {
+            roots.push(t1);
+        } else if g0.is_finite() && g1.is_finite() && g0 * g1 <= 0.0 && (g0 != 0.0 || g1 != 0.0) {
+            let root = newton_refine(t1, &g, &dg, DEFAULT_REFINE_ITER)
+                .or_else(|| bisect(&g, t0, t1, DEFAULT_REFINE_ITER))
+                .unwrap_or(t1);
+            roots.push(root);
+        }
+    }
+    roots.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    roots.dedup_by(|a, b| (*a - *b).abs() < 1e-5);
+    roots
+}
+
+/// Analiza una curva paramétrica 2D `(x(t), y(t))` en el intervalo `[t_min, t_max]`.
+pub fn analyze_parametric_curve2d(
+    expr_x: &str,
+    expr_y: &str,
+    t_min: f64,
+    t_max: f64,
+    vars: &BTreeMap<String, f64>,
+    features: &[AnalysisFeature],
+) -> Vec<AnalysisResult> {
+    let mut results = Vec::new();
+    if t_min >= t_max {
+        return results;
+    }
+
+    let samples = DEFAULT_SAMPLES;
+    let mut ts = Vec::with_capacity(samples + 1);
+    for i in 0..=samples {
+        let t = t_min + (i as f64 / samples as f64) * (t_max - t_min);
+        ts.push(t);
+    }
+
+    let xs = eval_batch_1d(expr_x, "t", ts.iter().copied(), vars)
+        .unwrap_or_else(|_| vec![None; samples + 1]);
+    let ys = eval_batch_1d(expr_y, "t", ts.iter().copied(), vars)
+        .unwrap_or_else(|_| vec![None; samples + 1]);
+
+    let eval_x = |t: f64| f64_or_nan_var(expr_x, "t", t, vars);
+    let eval_y = |t: f64| f64_or_nan_var(expr_y, "t", t, vars);
+    let dx_dt = |t: f64| derivative_var(expr_x, "t", t, vars);
+    let dy_dt = |t: f64| derivative_var(expr_y, "t", t, vars);
+    let d2x_dt2 = |t: f64| second_derivative_var(expr_x, "t", t, vars);
+    let d2y_dt2 = |t: f64| second_derivative_var(expr_y, "t", t, vars);
+
+    if features.contains(&AnalysisFeature::Root) {
+        let roots = find_scalar_roots(&ts, &ys, eval_y, dy_dt);
+        for t in roots {
+            let x = eval_x(t);
+            if x.is_finite() {
+                results.push(AnalysisResult {
+                    feature: AnalysisFeature::Root,
+                    point: Point2::new(x, 0.0),
+                    value: Some(x),
+                    secondary: None,
+                    label: format!("Raíz: ({:.4}, 0.00)", x),
+                });
+            }
+        }
+    }
+
+    if features.contains(&AnalysisFeature::YIntercept) {
+        let roots = find_scalar_roots(&ts, &xs, eval_x, dx_dt);
+        for t in roots {
+            let y = eval_y(t);
+            if y.is_finite() {
+                results.push(AnalysisResult {
+                    feature: AnalysisFeature::YIntercept,
+                    point: Point2::new(0.0, y),
+                    value: Some(y),
+                    secondary: None,
+                    label: format!("Intersección Y: (0.00, {:.4})", y),
+                });
+            }
+        }
+    }
+
+    let find_extrema = |expr: &str,
+                        coord: &str,
+                        coord_name: &str,
+                        get_point: &dyn Fn(f64, f64) -> Point2,
+                        get_other: &dyn Fn(f64) -> f64| {
+        let mut out = Vec::new();
+        let d = |t: f64| derivative_var(expr, coord, t, vars);
+        let d2 = |t: f64| second_derivative_var(expr, coord, t, vars);
+        let values: Vec<Option<f64>> = ts
+            .iter()
+            .map(|&t| {
+                let v = d(t);
+                if v.is_finite() {
+                    Some(v)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let roots = find_scalar_roots(&ts, &values, d, d2);
+        for t in roots {
+            let c = f64_or_nan_var(expr, coord, t, vars);
+            let other = get_other(t);
+            if c.is_finite() && other.is_finite() {
+                let d2v = d2(t);
+                let feature = if d2v < 0.0 {
+                    AnalysisFeature::LocalMaximum
+                } else {
+                    AnalysisFeature::LocalMinimum
+                };
+                out.push(AnalysisResult {
+                    feature,
+                    point: get_point(c, other),
+                    value: Some(c),
+                    secondary: None,
+                    label: format!(
+                        "{} {}: ({:.4}, {:.4})",
+                        if feature == AnalysisFeature::LocalMaximum {
+                            "Máximo"
+                        } else {
+                            "Mínimo"
+                        },
+                        coord_name,
+                        get_point(c, other).x,
+                        get_point(c, other).y
+                    ),
+                });
+            }
+        }
+        out
+    };
+
+    if features.contains(&AnalysisFeature::LocalMaximum)
+        || features.contains(&AnalysisFeature::LocalMinimum)
+    {
+        results.extend(find_extrema(expr_x, "t", "X", &Point2::new, &eval_y));
+        results.extend(find_extrema(
+            expr_y,
+            "t",
+            "Y",
+            &|y, x| Point2::new(x, y),
+            &eval_x,
+        ));
+    }
+
+    if features.contains(&AnalysisFeature::Inflection) {
+        // Curvatura simplificada: buscamos raíces de d/dt(x' y'' - y' x'').
+        let curvature_numerator = |t: f64| {
+            let dx = dx_dt(t);
+            let dy = dy_dt(t);
+            let d2x = d2x_dt2(t);
+            let d2y = d2y_dt2(t);
+            if [dx, dy, d2x, d2y].iter().all(|v| v.is_finite()) {
+                dx * d2y - dy * d2x
+            } else {
+                f64::NAN
+            }
+        };
+        let dk = |t: f64| {
+            let h = (t.abs().max(1.0) * EPS).max(1e-12);
+            let v0 = curvature_numerator(t - h);
+            let v1 = curvature_numerator(t + h);
+            if v0.is_finite() && v1.is_finite() {
+                (v1 - v0) / (2.0 * h)
+            } else {
+                f64::NAN
+            }
+        };
+        let values: Vec<Option<f64>> = ts
+            .iter()
+            .map(|&t| {
+                let v = curvature_numerator(t);
+                if v.is_finite() {
+                    Some(v)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let roots = find_scalar_roots(&ts, &values, curvature_numerator, dk);
+        for t in roots {
+            let x = eval_x(t);
+            let y = eval_y(t);
+            if x.is_finite() && y.is_finite() {
+                results.push(AnalysisResult {
+                    feature: AnalysisFeature::Inflection,
+                    point: Point2::new(x, y),
+                    value: None,
+                    secondary: None,
+                    label: format!("Inflexión: ({:.4}, {:.4})", x, y),
+                });
+            }
+        }
+    }
+
+    results.sort_by(|a, b| {
+        a.point
+            .x
+            .partial_cmp(&b.point.x)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    results.dedup_by(|a, b| {
+        (a.point.x - b.point.x).abs() < 1e-5 && (a.point.y - b.point.y).abs() < 1e-5
+    });
+    results
+}
+
+/// Analiza una curva polar `r = f(t)` en el intervalo `[t_min, t_max]`.
+pub fn analyze_polar_curve(
+    expr_r: &str,
+    t_min: f64,
+    t_max: f64,
+    vars: &BTreeMap<String, f64>,
+    features: &[AnalysisFeature],
+) -> Vec<AnalysisResult> {
+    let mut results = Vec::new();
+    if t_min >= t_max {
+        return results;
+    }
+
+    let eval_r = |t: f64| f64_or_nan_var(expr_r, "t", t, vars);
+    let dr = |t: f64| derivative_var(expr_r, "t", t, vars);
+
+    let samples = DEFAULT_SAMPLES;
+    let mut ts = Vec::with_capacity(samples + 1);
+    for i in 0..=samples {
+        let t = t_min + (i as f64 / samples as f64) * (t_max - t_min);
+        ts.push(t);
+    }
+
+    let rs = eval_batch_1d(expr_r, "t", ts.iter().copied(), vars)
+        .unwrap_or_else(|_| vec![None; samples + 1]);
+
+    if features.contains(&AnalysisFeature::Root) {
+        let roots = find_scalar_roots(&ts, &rs, eval_r, dr);
+        for t in roots {
+            results.push(AnalysisResult {
+                feature: AnalysisFeature::Root,
+                point: Point2::new(0.0, 0.0),
+                value: Some(t),
+                secondary: None,
+                label: format!("Raíz polar: t = {:.4}", t),
+            });
+        }
+    }
+
+    if features.contains(&AnalysisFeature::LocalMaximum)
+        || features.contains(&AnalysisFeature::LocalMinimum)
+    {
+        let d_values: Vec<Option<f64>> = ts
+            .iter()
+            .map(|&t| {
+                let v = dr(t);
+                if v.is_finite() {
+                    Some(v)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let d2r = |t: f64| second_derivative_var(expr_r, "t", t, vars);
+        let roots = find_scalar_roots(&ts, &d_values, dr, d2r);
+        for t in roots {
+            let r = eval_r(t);
+            if r.is_finite() {
+                let d2 = d2r(t);
+                let feature = if d2 < 0.0 {
+                    AnalysisFeature::LocalMaximum
+                } else {
+                    AnalysisFeature::LocalMinimum
+                };
+                let x = r * t.cos();
+                let y = r * t.sin();
+                results.push(AnalysisResult {
+                    feature,
+                    point: Point2::new(x, y),
+                    value: Some(r),
+                    secondary: None,
+                    label: format!(
+                        "{} polar: ({:.4}, {:.4})",
+                        if feature == AnalysisFeature::LocalMaximum {
+                            "Máximo"
+                        } else {
+                            "Mínimo"
+                        },
+                        x,
+                        y
+                    ),
+                });
+            }
+        }
+    }
+
+    results
+}
+
+/// Analiza una curva implícita `lhs op rhs` (se evalúa `lhs - rhs`).
+pub fn analyze_implicit_curve(
+    lhs: &str,
+    rhs: &str,
+    view_bounds: (f64, f64, f64, f64),
+    vars: &BTreeMap<String, f64>,
+    features: &[AnalysisFeature],
+) -> Vec<AnalysisResult> {
+    let mut results = Vec::new();
+    let (xmin, xmax, ymin, ymax) = view_bounds;
+    if xmin >= xmax || ymin >= ymax {
+        return results;
+    }
+
+    let f = format!("({}) - ({})", lhs, rhs);
+    let samples = 400;
+
+    if features.contains(&AnalysisFeature::Root) {
+        let xs: Vec<f64> = (0..=samples)
+            .map(|i| xmin + (i as f64 / samples as f64) * (xmax - xmin))
+            .collect();
+        let fs =
+            eval_batch_2d(&f, "x", "y", xs.iter().map(|&x| (x, 0.0)), vars).unwrap_or_default();
+        let g = |x: f64| {
+            eval_batch_2d(&f, "x", "y", std::iter::once((x, 0.0)), vars)
+                .ok()
+                .and_then(|mut v| v.pop().flatten())
+                .unwrap_or(f64::NAN)
+        };
+        let dg = |x: f64| derivative_var(&f, "x", x, vars);
+        let roots = find_scalar_roots(&xs, &fs, g, dg);
+        for x in roots {
+            results.push(AnalysisResult {
+                feature: AnalysisFeature::Root,
+                point: Point2::new(x, 0.0),
+                value: None,
+                secondary: None,
+                label: format!("Raíz: ({:.4}, 0.00)", x),
+            });
+        }
+    }
+
+    if features.contains(&AnalysisFeature::YIntercept) {
+        let ys: Vec<f64> = (0..=samples)
+            .map(|i| ymin + (i as f64 / samples as f64) * (ymax - ymin))
+            .collect();
+        let fs =
+            eval_batch_2d(&f, "x", "y", ys.iter().map(|&y| (0.0, y)), vars).unwrap_or_default();
+        let g = |y: f64| {
+            eval_batch_2d(&f, "x", "y", std::iter::once((0.0, y)), vars)
+                .ok()
+                .and_then(|mut v| v.pop().flatten())
+                .unwrap_or(f64::NAN)
+        };
+        let dg = |y: f64| derivative_var(&f, "y", y, vars);
+        let roots = find_scalar_roots(&ys, &fs, g, dg);
+        for y in roots {
+            results.push(AnalysisResult {
+                feature: AnalysisFeature::YIntercept,
+                point: Point2::new(0.0, y),
+                value: None,
+                secondary: None,
+                label: format!("Intersección Y: (0.00, {:.4})", y),
+            });
+        }
+    }
+
+    results
+}
+
+/// Analiza un campo vectorial 2D `(u(x,y), v(x,y))` buscando puntos de equilibrio.
+pub fn analyze_vector_field2d(
+    expr_u: &str,
+    expr_v: &str,
+    view_bounds: (f64, f64, f64, f64),
+    vars: &BTreeMap<String, f64>,
+    features: &[AnalysisFeature],
+) -> Vec<AnalysisResult> {
+    let mut results = Vec::new();
+    if !features.contains(&AnalysisFeature::Root) {
+        return results;
+    }
+    let (xmin, xmax, ymin, ymax) = view_bounds;
+    if xmin >= xmax || ymin >= ymax {
+        return results;
+    }
+
+    let grid = 80usize;
+    let mut us = vec![vec![f64::NAN; grid + 1]; grid + 1];
+    let mut vs = vec![vec![f64::NAN; grid + 1]; grid + 1];
+    let mut pts = Vec::with_capacity((grid + 1) * (grid + 1));
+    for i in 0..=grid {
+        for j in 0..=grid {
+            let x = xmin + (i as f64 / grid as f64) * (xmax - xmin);
+            let y = ymin + (j as f64 / grid as f64) * (ymax - ymin);
+            pts.push((x, y));
+        }
+    }
+    let u_vals = eval_batch_2d(expr_u, "x", "y", pts.clone().into_iter(), vars).unwrap_or_default();
+    let v_vals = eval_batch_2d(expr_v, "x", "y", pts.clone().into_iter(), vars).unwrap_or_default();
+    for (idx, (_, (u, v))) in pts.iter().zip(u_vals.into_iter().zip(v_vals)).enumerate() {
+        if let (Some(u), Some(v)) = (u, v) {
+            us[idx / (grid + 1)][idx % (grid + 1)] = u;
+            vs[idx / (grid + 1)][idx % (grid + 1)] = v;
+        }
+    }
+
+    let eval_uv = |x: f64, y: f64| -> (f64, f64) {
+        let u = eval_batch_2d(expr_u, "x", "y", std::iter::once((x, y)), vars)
+            .ok()
+            .and_then(|mut v| v.pop().flatten())
+            .unwrap_or(f64::NAN);
+        let v = eval_batch_2d(expr_v, "x", "y", std::iter::once((x, y)), vars)
+            .ok()
+            .and_then(|mut v| v.pop().flatten())
+            .unwrap_or(f64::NAN);
+        (u, v)
+    };
+
+    for i in 0..grid {
+        for j in 0..grid {
+            let u00 = us[i][j];
+            let u10 = us[i + 1][j];
+            let u01 = us[i][j + 1];
+            let u11 = us[i + 1][j + 1];
+            let v00 = vs[i][j];
+            let v10 = vs[i + 1][j];
+            let v01 = vs[i][j + 1];
+            let v11 = vs[i + 1][j + 1];
+            if [u00, u10, u01, u11, v00, v10, v01, v11]
+                .iter()
+                .any(|v| !v.is_finite())
+            {
+                continue;
+            }
+            let u_min = u00.min(u10).min(u01).min(u11);
+            let u_max = u00.max(u10).max(u01).max(u11);
+            let v_min = v00.min(v10).min(v01).min(v11);
+            let v_max = v00.max(v10).max(v01).max(v11);
+            if u_min * u_max > 0.0 || v_min * v_max > 0.0 {
+                continue;
+            }
+            // Refinamiento simple por bisección en la celda.
+            let mut lo_x = xmin + (i as f64 / grid as f64) * (xmax - xmin);
+            let mut hi_x = xmin + ((i + 1) as f64 / grid as f64) * (xmax - xmin);
+            let mut lo_y = ymin + (j as f64 / grid as f64) * (ymax - ymin);
+            let mut hi_y = ymin + ((j + 1) as f64 / grid as f64) * (ymax - ymin);
+            let mut best = ((lo_x + hi_x) * 0.5, (lo_y + hi_y) * 0.5, f64::INFINITY);
+            for _ in 0..20 {
+                let mid_x = (lo_x + hi_x) * 0.5;
+                let mid_y = (lo_y + hi_y) * 0.5;
+                let (u, v) = eval_uv(mid_x, mid_y);
+                let err = u.abs() + v.abs();
+                if err < best.2 {
+                    best = (mid_x, mid_y, err);
+                }
+                let (u_left, _) = eval_uv(lo_x, mid_y);
+                let (u_right, _) = eval_uv(hi_x, mid_y);
+                if u_left.is_finite() && u_right.is_finite() && (u_right - u_left).abs() > 1e-15 {
+                    if u_left * u > 0.0 {
+                        lo_x = mid_x;
+                    } else {
+                        hi_x = mid_x;
+                    }
+                }
+                let (_, v_bottom) = eval_uv(mid_x, lo_y);
+                let (_, v_top) = eval_uv(mid_x, hi_y);
+                if v_bottom.is_finite() && v_top.is_finite() && (v_top - v_bottom).abs() > 1e-15 {
+                    if v_bottom * v > 0.0 {
+                        lo_y = mid_y;
+                    } else {
+                        hi_y = mid_y;
+                    }
+                }
+            }
+            if best.2 < 1e-2 {
+                results.push(AnalysisResult {
+                    feature: AnalysisFeature::Root,
+                    point: Point2::new(best.0, best.1),
+                    value: None,
+                    secondary: None,
+                    label: format!("Equilibrio: ({:.4}, {:.4})", best.0, best.1),
+                });
+            }
+        }
+    }
+
+    results.sort_by(|a, b| {
+        a.point
+            .x
+            .partial_cmp(&b.point.x)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    results.dedup_by(|a, b| {
+        (a.point.x - b.point.x).abs() < 1e-3 && (a.point.y - b.point.y).abs() < 1e-3
+    });
+    results
+}
+
+/// Máximo orden admitido por las APIs públicas de Taylor.
+pub const MAX_TAYLOR_ORDER: usize = 64;
+/// Máximo de nodos que puede tener una derivada intermedia de Taylor.
+pub const MAX_TAYLOR_AST_NODES: usize = 32_768;
+/// Trabajo acumulado máximo de una expansión de Taylor, medido en nodos.
+pub const MAX_TAYLOR_WORK_UNITS: usize = 131_072;
+
+// Cada regla de derivación nativa emite una cantidad acotada de subárboles
+// clonados. El factor conservador se verifica antes de materializar `diff`.
+const MAX_TAYLOR_DERIVATIVE_NODE_GROWTH: usize = 64;
+
+fn validate_taylor_order(order: usize) -> Result<(), String> {
+    if order > MAX_TAYLOR_ORDER {
+        return Err(format!(
+            "Taylor order {order} exceeds maximum {MAX_TAYLOR_ORDER}"
+        ));
+    }
+    Ok(())
+}
+
+/// Calcula coeficientes de Taylor desde un AST sin permitir expansiones
+/// intermedias que superen los presupuestos públicos de nodos o trabajo.
+pub fn taylor_coefficients_from_ast(
+    expression: &Expr,
+    variable: &str,
+    center: f64,
+    order: usize,
+) -> Result<Vec<f64>, String> {
+    validate_taylor_order(order)?;
+    if !center.is_finite() {
+        return Err("Taylor center must be finite".to_string());
+    }
+
+    let initial_nodes = expression.node_count();
+    if initial_nodes > MAX_TAYLOR_AST_NODES {
+        return Err(format!(
+            "Taylor AST node budget exceeded: {initial_nodes} nodes, maximum {MAX_TAYLOR_AST_NODES}"
+        ));
+    }
+
+    let capacity = order
+        .checked_add(1)
+        .ok_or_else(|| "Taylor order overflowed coefficient capacity".to_string())?;
+    let mut coefficients = Vec::with_capacity(capacity);
+    let mut current = expression.simplify();
+    let mut work_units = 0usize;
+    let mut factorial = 1.0f64;
+
+    for degree in 0..=order {
+        let current_nodes = current.node_count();
+        work_units = work_units
+            .checked_add(current_nodes)
+            .ok_or_else(|| "Taylor work budget overflowed".to_string())?;
+        if work_units > MAX_TAYLOR_WORK_UNITS {
+            return Err(format!(
+                "Taylor work budget exceeded: {work_units} units, maximum {MAX_TAYLOR_WORK_UNITS}"
+            ));
+        }
+
+        let value = current.eval_at(variable, center);
+        if !value.is_finite() {
+            return Err(format!(
+                "Taylor expression is not finite at {variable} = {center}"
+            ));
+        }
+        coefficients.push(value / factorial);
+
+        if degree == order {
+            break;
+        }
+
+        let derivative_upper_bound = current_nodes
+            .checked_mul(MAX_TAYLOR_DERIVATIVE_NODE_GROWTH)
+            .ok_or_else(|| "Taylor derivative node budget overflowed".to_string())?;
+        if derivative_upper_bound > MAX_TAYLOR_AST_NODES {
+            return Err(format!(
+                "Taylor derivative expansion exceeds AST node budget: at most {derivative_upper_bound} nodes, maximum {MAX_TAYLOR_AST_NODES}"
+            ));
+        }
+        let projected_work = work_units
+            .checked_add(derivative_upper_bound)
+            .ok_or_else(|| "Taylor work budget overflowed".to_string())?;
+        if projected_work > MAX_TAYLOR_WORK_UNITS {
+            return Err(format!(
+                "Taylor work budget exceeded: projected {projected_work} units, maximum {MAX_TAYLOR_WORK_UNITS}"
+            ));
+        }
+
+        current = current.diff(variable).simplify();
+        if current.node_count() > MAX_TAYLOR_AST_NODES {
+            return Err(format!(
+                "Taylor derivative exceeds AST node budget: {} nodes, maximum {MAX_TAYLOR_AST_NODES}",
+                current.node_count()
+            ));
+        }
+        work_units = projected_work;
+        factorial *= (degree + 1) as f64;
+    }
+
+    Ok(coefficients)
+}
+
+/// Calcula los coeficientes del polinomio de Taylor de orden `n` alrededor de `center`.
+pub fn taylor_coefficients(
+    expr: &str,
+    vars: &BTreeMap<String, f64>,
+    center: f64,
+    order: usize,
+) -> Result<Vec<f64>, String> {
+    validate_taylor_order(order)?;
+    let ast = parse_ast(expr)
+        .map_err(|error| format!("No se pudo calcular Taylor de '{expr}': {error}"))?;
+    let ast = ast.substitute_vars(vars, &["x"]);
+    taylor_coefficients_from_ast(&ast, "x", center, order)
+}
+
+/// Genera una cadena legible para el polinomio de Taylor.
+pub fn taylor_series_string(
+    expr: &str,
+    vars: &BTreeMap<String, f64>,
+    center: f64,
+    order: usize,
+) -> Result<String, String> {
+    validate_taylor_order(order)?;
+    let coeffs = taylor_coefficients(expr, vars, center, order)?;
+    let mut terms = Vec::new();
+    for (k, c) in coeffs.iter().enumerate() {
+        if c.abs() < 1e-12 {
+            continue;
+        }
+        let term = if k == 0 {
+            format!("{:.4}", c)
+        } else if center == 0.0 {
+            format!("{:.4}*x^{}", c, k)
+        } else {
+            format!("{:.4}*(x-{:.4})^{}", c, center, k)
+        };
+        terms.push(term);
+    }
+    if terms.is_empty() {
+        return Ok("0".to_string());
+    }
+    Ok(terms.join(" + "))
+}
+
+// ============================================================================
+// Análisis polimórfico para tipos de objeto no-Function.
+// ============================================================================
+//
+// Grafito representa cónicas, polígonos, curvas paramétricas, polares,
+// implícitas y campos vectoriales con sus propios structs. Las siguientes
+// funciones producen `AnalysisResult` directamente desde esos structs sin
+// pasar por la representación paramétrica universal. Cada función aplica el
+// discriminante analítico de la cónica o un muestreo denso + bisección sobre
+// el dominio visible y registra los hallazgos en las features solicitadas.
+
+/// Línea: intersección con los ejes cartesianos.
+pub fn analyze_line(
+    start: Point2,
+    end: Point2,
+    kind: LineKind,
+    features: &[AnalysisFeature],
+) -> Vec<AnalysisResult> {
+    let mut results = Vec::new();
+    let dx = end.x - start.x;
+    let dy = end.y - start.y;
+    if dx.abs() < 1e-15 && dy.abs() < 1e-15 {
+        return results;
+    }
+
+    if features.contains(&AnalysisFeature::YIntercept) {
+        // x = 0 => start.x + t*dx = 0
+        if dx.abs() > 1e-15 {
+            let t = -start.x / dx;
+            if kind.contains_t(t) {
+                let y = start.y + t * dy;
+                results.push(AnalysisResult {
+                    feature: AnalysisFeature::YIntercept,
+                    point: Point2::new(0.0, y),
+                    value: Some(y),
+                    secondary: None,
+                    label: format!("Intersección Y: (0.00, {:.4})", y),
+                });
+            }
+        }
+    }
+
+    if (features.contains(&AnalysisFeature::XIntercept)
+        || features.contains(&AnalysisFeature::Root))
+        && dy.abs() > 1e-15
+    {
+        let t = -start.y / dy;
+        if kind.contains_t(t) {
+            let x = start.x + t * dx;
+            results.push(AnalysisResult {
+                feature: AnalysisFeature::XIntercept,
+                point: Point2::new(x, 0.0),
+                value: Some(0.0),
+                secondary: None,
+                label: format!("Intersección X: ({:.4}, 0.00)", x),
+            });
+        }
+    }
+
+    results
+}
+
+/// Círculo: cortes con ejes cartesianos (resolviendo `(x-cx)² + (y-cy)² = r²`).
+pub fn analyze_circle(
+    center: Point2,
+    radius: f64,
+    features: &[AnalysisFeature],
+) -> Vec<AnalysisResult> {
+    let mut results = Vec::new();
+    if radius <= 0.0 {
+        return results;
+    }
+    let r2 = radius * radius;
+    let dx2 = r2 - center.y * center.y;
+    let dy2 = r2 - center.x * center.x;
+
+    if (features.contains(&AnalysisFeature::XIntercept)
+        || features.contains(&AnalysisFeature::Root))
+        && dx2 >= 0.0
+    {
+        let dx = dx2.sqrt();
+        results.push(AnalysisResult {
+            feature: AnalysisFeature::XIntercept,
+            point: Point2::new(center.x - dx, 0.0),
+            value: Some(0.0),
+            secondary: None,
+            label: format!("Intersección X: ({:.4}, 0.00)", center.x - dx),
+        });
+        if dx > 1e-12 {
+            results.push(AnalysisResult {
+                feature: AnalysisFeature::XIntercept,
+                point: Point2::new(center.x + dx, 0.0),
+                value: Some(0.0),
+                secondary: None,
+                label: format!("Intersección X: ({:.4}, 0.00)", center.x + dx),
+            });
+        }
+    }
+    if features.contains(&AnalysisFeature::YIntercept) && dy2 >= 0.0 {
+        let dy = dy2.sqrt();
+        results.push(AnalysisResult {
+            feature: AnalysisFeature::YIntercept,
+            point: Point2::new(0.0, center.y - dy),
+            value: Some(center.y - dy),
+            secondary: None,
+            label: format!("Intersección Y: (0.00, {:.4})", center.y - dy),
+        });
+        if dy > 1e-12 {
+            results.push(AnalysisResult {
+                feature: AnalysisFeature::YIntercept,
+                point: Point2::new(0.0, center.y + dy),
+                value: Some(center.y + dy),
+                secondary: None,
+                label: format!("Intersección Y: (0.00, {:.4})", center.y + dy),
+            });
+        }
+    }
+
+    // Extremos locales del borde: x máximo/mínimo, y máximo/mínimo.
+    if features.contains(&AnalysisFeature::LocalMaximum) {
+        results.push(AnalysisResult {
+            feature: AnalysisFeature::LocalMaximum,
+            point: Point2::new(center.x, center.y + radius),
+            value: Some(center.y + radius),
+            secondary: None,
+            label: format!("Máximo Y: ({:.4}, {:.4})", center.x, center.y + radius),
+        });
+    }
+    if features.contains(&AnalysisFeature::LocalMinimum) {
+        results.push(AnalysisResult {
+            feature: AnalysisFeature::LocalMinimum,
+            point: Point2::new(center.x, center.y - radius),
+            value: Some(center.y - radius),
+            secondary: None,
+            label: format!("Mínimo Y: ({:.4}, {:.4})", center.x, center.y - radius),
+        });
+    }
+
+    results
+}
+
+fn real_quadratic_roots(a: f64, b: f64, c: f64) -> Vec<f64> {
+    if !a.is_finite() || !b.is_finite() || !c.is_finite() {
+        return Vec::new();
+    }
+    let scale = a.abs().max(b.abs()).max(c.abs()).max(1.0);
+    let a = a / scale;
+    let b = b / scale;
+    let c = c / scale;
+    let coefficient_tolerance = 64.0 * f64::EPSILON;
+
+    if a.abs() <= coefficient_tolerance {
+        if b.abs() <= coefficient_tolerance {
+            return Vec::new();
+        }
+        let root = -c / b;
+        return root.is_finite().then_some(root).into_iter().collect();
+    }
+
+    let discriminant = b * b - 4.0 * a * c;
+    let discriminant_tolerance =
+        64.0 * f64::EPSILON * (b * b + (4.0 * a * c).abs()).max(f64::MIN_POSITIVE);
+    if discriminant < -discriminant_tolerance {
+        return Vec::new();
+    }
+    if discriminant.abs() <= discriminant_tolerance {
+        let root = -b / (2.0 * a);
+        return root.is_finite().then_some(root).into_iter().collect();
+    }
+
+    let sqrt_discriminant = discriminant.max(0.0).sqrt();
+    let q = -0.5 * (b + sqrt_discriminant.copysign(b));
+    if q == 0.0 {
+        return Vec::new();
+    }
+    let mut roots = vec![q / a, c / q];
+    roots.retain(|root| root.is_finite());
+    roots.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    roots.dedup_by(|left, right| {
+        (*left - *right).abs() <= 1e-12 * left.abs().max(right.abs()).max(1.0)
+    });
+    roots
+}
+
+/// Elipse rotada: extremos verticales y cortes analíticos con ambos ejes.
+pub fn analyze_ellipse(
+    center: Point2,
+    rx: f64,
+    ry: f64,
+    angle: f64,
+    features: &[AnalysisFeature],
+) -> Vec<AnalysisResult> {
+    let mut results = Vec::new();
+    if rx <= 0.0 || ry <= 0.0 {
+        return results;
+    }
+    let (s, c) = angle.sin_cos();
+    let rx2 = rx * rx;
+    let ry2 = ry * ry;
+    if !rx2.is_finite() || !ry2.is_finite() || rx2 == 0.0 || ry2 == 0.0 {
+        return results;
+    }
+    let mxx = c * c / rx2 + s * s / ry2;
+    let mxy = s * c * (1.0 / rx2 - 1.0 / ry2);
+    let myy = s * s / rx2 + c * c / ry2;
+
+    if features.contains(&AnalysisFeature::XIntercept) || features.contains(&AnalysisFeature::Root)
+    {
+        let dy = -center.y;
+        for offset in real_quadratic_roots(mxx, 2.0 * mxy * dy, myy * dy * dy - 1.0) {
+            let x = center.x + offset;
+            if x.is_finite() {
+                results.push(AnalysisResult {
+                    feature: AnalysisFeature::XIntercept,
+                    point: Point2::new(x, 0.0),
+                    value: Some(0.0),
+                    secondary: None,
+                    label: format!("Intersección X: ({x:.4}, 0.00)"),
+                });
+            }
+        }
+    }
+
+    if features.contains(&AnalysisFeature::YIntercept) {
+        let dx = -center.x;
+        for offset in real_quadratic_roots(myy, 2.0 * mxy * dx, mxx * dx * dx - 1.0) {
+            let y = center.y + offset;
+            if y.is_finite() {
+                results.push(AnalysisResult {
+                    feature: AnalysisFeature::YIntercept,
+                    point: Point2::new(0.0, y),
+                    value: Some(y),
+                    secondary: None,
+                    label: format!("Intersección Y: (0.00, {y:.4})"),
+                });
+            }
+        }
+    }
+
+    let y_amplitude = (rx * s).hypot(ry * c);
+    if y_amplitude.is_finite() && y_amplitude > 0.0 {
+        let local_x = rx2 * s / y_amplitude;
+        let local_y = ry2 * c / y_amplitude;
+        let maximum = Point2::new(
+            center.x + local_x * c - local_y * s,
+            center.y + local_x * s + local_y * c,
+        );
+        let minimum = Point2::new(2.0 * center.x - maximum.x, 2.0 * center.y - maximum.y);
+        if features.contains(&AnalysisFeature::LocalMaximum) {
+            results.push(AnalysisResult {
+                feature: AnalysisFeature::LocalMaximum,
+                point: maximum,
+                value: Some(maximum.y),
+                secondary: None,
+                label: format!("Máximo Y: ({:.4}, {:.4})", maximum.x, maximum.y),
+            });
+        }
+        if features.contains(&AnalysisFeature::LocalMinimum) {
+            results.push(AnalysisResult {
+                feature: AnalysisFeature::LocalMinimum,
+                point: minimum,
+                value: Some(minimum.y),
+                secondary: None,
+                label: format!("Mínimo Y: ({:.4}, {:.4})", minimum.x, minimum.y),
+            });
+        }
+    }
+
+    results
+}
+
+/// Parábola rotada: cortes con ejes y extremo vertical cuando existe.
+pub fn analyze_parabola(
+    vertex: Point2,
+    p: f64,
+    angle: f64,
+    features: &[AnalysisFeature],
+) -> Vec<AnalysisResult> {
+    let mut results = Vec::new();
+    if !p.is_finite() || p.abs() < 1e-15 || !angle.is_finite() {
+        return results;
+    }
+    let (s, c) = angle.sin_cos();
+
+    if features.contains(&AnalysisFeature::XIntercept) || features.contains(&AnalysisFeature::Root)
+    {
+        let vy = vertex.y;
+        for offset in real_quadratic_roots(
+            c * c,
+            s * (4.0 * p - 2.0 * c * vy),
+            s * s * vy * vy + 4.0 * p * c * vy,
+        ) {
+            let x = vertex.x + offset;
+            if x.is_finite() {
+                results.push(AnalysisResult {
+                    feature: AnalysisFeature::XIntercept,
+                    point: Point2::new(x, 0.0),
+                    value: Some(0.0),
+                    secondary: None,
+                    label: format!("Intersección X: ({x:.4}, 0.00)"),
+                });
+            }
+        }
+    }
+
+    if features.contains(&AnalysisFeature::YIntercept) {
+        let vx = vertex.x;
+        for offset in real_quadratic_roots(
+            s * s,
+            -2.0 * s * c * vx - 4.0 * p * c,
+            c * c * vx * vx - 4.0 * p * s * vx,
+        ) {
+            let y = vertex.y + offset;
+            if y.is_finite() {
+                results.push(AnalysisResult {
+                    feature: AnalysisFeature::YIntercept,
+                    point: Point2::new(0.0, y),
+                    value: Some(y),
+                    secondary: None,
+                    label: format!("Intersección Y: (0.00, {y:.4})"),
+                });
+            }
+        }
+    }
+
+    if c.abs() > 1e-12 {
+        let t = -2.0 * p * s / c;
+        let local_y = t * t / (4.0 * p);
+        let point = Point2::new(
+            vertex.x + t * c - local_y * s,
+            vertex.y + t * s + local_y * c,
+        );
+        if point.x.is_finite() && point.y.is_finite() {
+            let feature = if c / p > 0.0 {
+                AnalysisFeature::LocalMinimum
+            } else {
+                AnalysisFeature::LocalMaximum
+            };
+            if features.contains(&feature) {
+                let label = if feature == AnalysisFeature::LocalMinimum {
+                    "Mínimo Y"
+                } else {
+                    "Máximo Y"
+                };
+                results.push(AnalysisResult {
+                    feature,
+                    point,
+                    value: Some(point.y),
+                    secondary: None,
+                    label: format!("{label}: ({:.4}, {:.4})", point.x, point.y),
+                });
+            }
+        }
+    }
+    results
+}
+
+/// Hipérbola rotada: cortes, asíntotas y extremos verticales por rama.
+pub fn analyze_hyperbola(
+    center: Point2,
+    a: f64,
+    b: f64,
+    horizontal: bool,
+    angle: f64,
+    features: &[AnalysisFeature],
+) -> Vec<AnalysisResult> {
+    let mut results = Vec::new();
+    if a <= 0.0 || b <= 0.0 || !angle.is_finite() {
+        return results;
+    }
+    let (s, c) = angle.sin_cos();
+    let (transverse_x, transverse_y, conjugate_x, conjugate_y) = if horizontal {
+        (c, s, -s, c)
+    } else {
+        (-s, c, c, s)
+    };
+    let a2 = a * a;
+    let b2 = b * b;
+    if !a2.is_finite() || !b2.is_finite() || a2 == 0.0 || b2 == 0.0 {
+        return results;
+    }
+    let mxx = transverse_x * transverse_x / a2 - conjugate_x * conjugate_x / b2;
+    let mxy = transverse_x * transverse_y / a2 - conjugate_x * conjugate_y / b2;
+    let myy = transverse_y * transverse_y / a2 - conjugate_y * conjugate_y / b2;
+
+    if features.contains(&AnalysisFeature::XIntercept) || features.contains(&AnalysisFeature::Root)
+    {
+        let dy = -center.y;
+        for offset in real_quadratic_roots(mxx, 2.0 * mxy * dy, myy * dy * dy - 1.0) {
+            let x = center.x + offset;
+            if x.is_finite() {
+                results.push(AnalysisResult {
+                    feature: AnalysisFeature::XIntercept,
+                    point: Point2::new(x, 0.0),
+                    value: Some(0.0),
+                    secondary: None,
+                    label: format!("Intersección X: ({x:.4}, 0.00)"),
+                });
+            }
+        }
+    }
+
+    if features.contains(&AnalysisFeature::YIntercept) {
+        let dx = -center.x;
+        for offset in real_quadratic_roots(myy, 2.0 * mxy * dx, mxx * dx * dx - 1.0) {
+            let y = center.y + offset;
+            if y.is_finite() {
+                results.push(AnalysisResult {
+                    feature: AnalysisFeature::YIntercept,
+                    point: Point2::new(0.0, y),
+                    value: Some(y),
+                    secondary: None,
+                    label: format!("Intersección Y: (0.00, {y:.4})"),
+                });
+            }
+        }
+    }
+
+    if mxx < 0.0 {
+        let dy = a * b * (-mxx).sqrt();
+        let dx = -(mxy / mxx) * dy;
+        let upper = Point2::new(center.x + dx, center.y + dy);
+        let lower = Point2::new(center.x - dx, center.y - dy);
+        if upper.x.is_finite() && upper.y.is_finite() && lower.x.is_finite() && lower.y.is_finite()
+        {
+            if features.contains(&AnalysisFeature::LocalMinimum) {
+                results.push(AnalysisResult {
+                    feature: AnalysisFeature::LocalMinimum,
+                    point: upper,
+                    value: Some(upper.y),
+                    secondary: None,
+                    label: format!("Mínimo Y: ({:.4}, {:.4})", upper.x, upper.y),
+                });
+            }
+            if features.contains(&AnalysisFeature::LocalMaximum) {
+                results.push(AnalysisResult {
+                    feature: AnalysisFeature::LocalMaximum,
+                    point: lower,
+                    value: Some(lower.y),
+                    secondary: None,
+                    label: format!("Máximo Y: ({:.4}, {:.4})", lower.x, lower.y),
+                });
+            }
+        }
+    }
+
+    if features.contains(&AnalysisFeature::ObliqueAsymptote) {
+        for sign in [-1.0, 1.0] {
+            let direction_x = a * transverse_x + sign * b * conjugate_x;
+            let direction_y = a * transverse_y + sign * b * conjugate_y;
+            if !direction_x.is_finite() || !direction_y.is_finite() {
+                continue;
+            }
+            let secondary = Point2::new(center.x + direction_x, center.y + direction_y);
+            let (value, label) = if direction_x.abs() < 1e-12 {
+                (None, format!("Asíntota vertical: x = {:.4}", center.x))
+            } else {
+                let slope = direction_y / direction_x;
+                (
+                    Some(slope),
+                    format!(
+                        "Asíntota: y = {:.4}·(x - {:.4}) + {:.4}",
+                        slope, center.x, center.y
+                    ),
+                )
+            };
+            results.push(AnalysisResult {
+                feature: AnalysisFeature::ObliqueAsymptote,
+                point: center,
+                value,
+                secondary: Some(secondary),
+                label,
+            });
+        }
+    }
+    results
+}
+
+/// Polígono: centroide, área y, si la feature X/Y-Intercept está activa, los
+/// cruces con los ejes cartesianos (resueltos segmento a segmento).
+pub fn analyze_polygon(vertices: &[Point2], features: &[AnalysisFeature]) -> Vec<AnalysisResult> {
+    let mut results = Vec::new();
+    if vertices.len() < 3 {
+        return results;
+    }
+    let n = vertices.len() as f64;
+
+    if features.contains(&AnalysisFeature::Centroid) {
+        let cx = vertices.iter().map(|v| v.x).sum::<f64>() / n;
+        let cy = vertices.iter().map(|v| v.y).sum::<f64>() / n;
+        // Área firmada para asociarla al centroide.
+        let mut area2 = 0.0;
+        for i in 0..vertices.len() {
+            let a = vertices[i];
+            let b = vertices[(i + 1) % vertices.len()];
+            area2 += a.x * b.y - b.x * a.y;
+        }
+        let area = area2.abs() * 0.5;
+        results.push(AnalysisResult {
+            feature: AnalysisFeature::Centroid,
+            point: Point2::new(cx, cy),
+            value: Some(area),
+            secondary: None,
+            label: format!("Centroide: ({:.4}, {:.4})  A = {:.4}", cx, cy, area),
+        });
+    }
+
+    if features.contains(&AnalysisFeature::XIntercept) || features.contains(&AnalysisFeature::Root)
+    {
+        for i in 0..vertices.len() {
+            let a = vertices[i];
+            let b = vertices[(i + 1) % vertices.len()];
+            if ((a.y >= 0.0 && b.y >= 0.0) || (a.y <= 0.0 && b.y <= 0.0))
+                && (a.y != 0.0 || b.y != 0.0)
+            {
+                continue;
+            }
+            let t = -a.y / (b.y - a.y);
+            if (0.0..=1.0).contains(&t) {
+                let x = a.x + t * (b.x - a.x);
+                results.push(AnalysisResult {
+                    feature: AnalysisFeature::XIntercept,
+                    point: Point2::new(x, 0.0),
+                    value: None,
+                    secondary: None,
+                    label: format!("Intersección X: ({:.4}, 0.00)", x),
+                });
+            }
+        }
+    }
+
+    if features.contains(&AnalysisFeature::YIntercept) {
+        for i in 0..vertices.len() {
+            let a = vertices[i];
+            let b = vertices[(i + 1) % vertices.len()];
+            if ((a.x >= 0.0 && b.x >= 0.0) || (a.x <= 0.0 && b.x <= 0.0))
+                && (a.x != 0.0 || b.x != 0.0)
+            {
+                continue;
+            }
+            let t = -a.x / (b.x - a.x);
+            if (0.0..=1.0).contains(&t) {
+                let y = a.y + t * (b.y - a.y);
+                results.push(AnalysisResult {
+                    feature: AnalysisFeature::YIntercept,
+                    point: Point2::new(0.0, y),
+                    value: Some(y),
+                    secondary: None,
+                    label: format!("Intersección Y: (0.00, {:.4})", y),
+                });
+            }
+        }
+    }
+
+    results
+}
+
+/// Intersecciones entre dos objetos cualesquiera, despachadas por tipo.
+///
+/// Devuelve los puntos de cruce 2D. Para `Function × Function` reusamos
+/// bisección + Newton sobre `f1(x) - f2(x)`. Para parejas con discriminante
+/// analítico (línea, cónica) resolvemos el sistema. Para el resto se hace
+/// un barrido denso.
+pub fn analyze_intersection(
+    a: &IntersectionCurve<'_>,
+    b: &IntersectionCurve<'_>,
+    view_bounds: (f64, f64, f64, f64),
+    vars: &BTreeMap<String, f64>,
+) -> Vec<Point2> {
+    match (a, b) {
+        (
+            IntersectionCurve::Line {
+                s: s1,
+                e: e1,
+                kind: kind1,
+            },
+            IntersectionCurve::Line {
+                s: s2,
+                e: e2,
+                kind: kind2,
+            },
+        ) => line_line_intersection(*s1, *e1, *s2, *e2)
+            .into_iter()
+            .filter(|point| {
+                kind1.contains_t(line_param_at_point(*point, *s1, *e1))
+                    && kind2.contains_t(line_param_at_point(*point, *s2, *e2))
+            })
+            .collect(),
+        (IntersectionCurve::Line { s, e, kind }, IntersectionCurve::Circle { center, radius })
+        | (IntersectionCurve::Circle { center, radius }, IntersectionCurve::Line { s, e, kind }) => {
+            line_circle_intersection(*s, *e, *center, *radius)
+                .into_iter()
+                .filter(|point| kind.contains_t(line_param_at_point(*point, *s, *e)))
+                .collect()
+        }
+        (
+            IntersectionCurve::Circle {
+                center: c1,
+                radius: r1,
+            },
+            IntersectionCurve::Circle {
+                center: c2,
+                radius: r2,
+            },
+        ) => circle_circle_intersection(*c1, *r1, *c2, *r2),
+        (IntersectionCurve::Function { expr }, IntersectionCurve::Line { s, e, kind })
+        | (IntersectionCurve::Line { s, e, kind }, IntersectionCurve::Function { expr }) => {
+            function_line_intersection(expr, *s, *e, view_bounds, vars)
+                .into_iter()
+                .filter(|point| kind.contains_t(line_param_at_point(*point, *s, *e)))
+                .collect()
+        }
+        (IntersectionCurve::Function { expr: e1 }, IntersectionCurve::Function { expr: e2 }) => {
+            function_function_intersection(e1, e2, view_bounds, vars)
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Curva representable por una de las fórmulas usadas en `analyze_intersection`.
+/// Se mantiene minimal: solo los tipos con discriminante analítico.
+#[derive(Debug, Clone)]
+pub enum IntersectionCurve<'a> {
+    Line {
+        s: Point2,
+        e: Point2,
+        kind: LineKind,
+    },
+    Circle {
+        center: Point2,
+        radius: f64,
+    },
+    Function {
+        expr: &'a str,
+    },
+}
+
+fn line_line_intersection(s1: Point2, e1: Point2, s2: Point2, e2: Point2) -> Vec<Point2> {
+    let d1x = e1.x - s1.x;
+    let d1y = e1.y - s1.y;
+    let d2x = e2.x - s2.x;
+    let d2y = e2.y - s2.y;
+    let denom = d1x * d2y - d1y * d2x;
+    if denom.abs() < 1e-15 {
+        return Vec::new();
+    }
+    let dx = s2.x - s1.x;
+    let dy = s2.y - s1.y;
+    let t = (dx * d2y - dy * d2x) / denom;
+    vec![Point2::new(s1.x + t * d1x, s1.y + t * d1y)]
+}
+
+fn line_circle_intersection(s: Point2, e: Point2, center: Point2, radius: f64) -> Vec<Point2> {
+    let dx = e.x - s.x;
+    let dy = e.y - s.y;
+    let fx = s.x - center.x;
+    let fy = s.y - center.y;
+    let a = dx * dx + dy * dy;
+    let b = 2.0 * (fx * dx + fy * dy);
+    let c = fx * fx + fy * fy - radius * radius;
+    let disc = b * b - 4.0 * a * c;
+    if disc < 0.0 || a.abs() < 1e-15 {
+        return Vec::new();
+    }
+    let sd = disc.sqrt();
+    let t1 = (-b - sd) / (2.0 * a);
+    let t2 = (-b + sd) / (2.0 * a);
+    let mut out = Vec::new();
+    for t in [t1, t2] {
+        if t.is_finite() {
+            out.push(Point2::new(s.x + t * dx, s.y + t * dy));
+        }
+    }
+    out
+}
+
+fn circle_circle_intersection(c1: Point2, r1: f64, c2: Point2, r2: f64) -> Vec<Point2> {
+    let d = c1.distance(&c2);
+    if d < 1e-15 || d > r1 + r2 || d < (r1 - r2).abs() {
+        return Vec::new();
+    }
+    let a = (r1 * r1 - r2 * r2 + d * d) / (2.0 * d);
+    let h2 = r1 * r1 - a * a;
+    if h2 < 0.0 {
+        return Vec::new();
+    }
+    let h = h2.sqrt();
+    let px = c1.x + a * (c2.x - c1.x) / d;
+    let py = c1.y + a * (c2.y - c1.y) / d;
+    if h < 1e-12 {
+        return vec![Point2::new(px, py)];
+    }
+    vec![
+        Point2::new(px + h * (c2.y - c1.y) / d, py - h * (c2.x - c1.x) / d),
+        Point2::new(px - h * (c2.y - c1.y) / d, py + h * (c2.x - c1.x) / d),
+    ]
+}
+
+fn function_function_intersection(
+    expr_a: &str,
+    expr_b: &str,
+    view_bounds: (f64, f64, f64, f64),
+    vars: &BTreeMap<String, f64>,
+) -> Vec<Point2> {
+    let (xmin, xmax, _, _) = view_bounds;
+    let f = |x: f64| -> f64 {
+        let ya = eval_function_with_vars(expr_a, x, vars).unwrap_or(f64::NAN);
+        let yb = eval_function_with_vars(expr_b, x, vars).unwrap_or(f64::NAN);
+        if ya.is_finite() && yb.is_finite() {
+            ya - yb
+        } else {
+            f64::NAN
+        }
+    };
+    let df = |x: f64| -> f64 {
+        let h = (x.abs().max(1.0) * EPS).max(1e-12);
+        (f(x + h) - f(x - h)) / (2.0 * h)
+    };
+    let n = 400;
+    let xs: Vec<f64> = (0..=n)
+        .map(|i| xmin + (i as f64 / n as f64) * (xmax - xmin))
+        .collect();
+    let yas =
+        eval_batch_1d(expr_a, "x", xs.iter().copied(), vars).unwrap_or_else(|_| vec![None; n + 1]);
+    let ybs =
+        eval_batch_1d(expr_b, "x", xs.iter().copied(), vars).unwrap_or_else(|_| vec![None; n + 1]);
+
+    let get_f = |i: usize| -> f64 {
+        if let (Some(a), Some(b)) = (yas[i], ybs[i]) {
+            if a.is_finite() && b.is_finite() {
+                a - b
+            } else {
+                f64::NAN
+            }
+        } else {
+            f64::NAN
+        }
+    };
+
+    let mut out = Vec::new();
+    let mut prev_x = xs[0];
+    let mut prev_f = get_f(0);
+    for (i, x) in xs.iter().enumerate().take(n + 1).skip(1) {
+        let x = *x;
+        let fx = get_f(i);
+        if !fx.is_finite() {
+            prev_x = x;
+            prev_f = fx;
+            continue;
+        }
+        if prev_f.is_finite() && prev_f * fx <= 0.0 && (prev_f != 0.0 || fx != 0.0) {
+            let root = newton_refine(x, f, df, DEFAULT_REFINE_ITER)
+                .or_else(|| bisect(f, prev_x, x, DEFAULT_REFINE_ITER))
+                .unwrap_or(x);
+            if let Ok(ya) = eval_function_with_vars(expr_a, root, vars) {
+                if ya.is_finite() {
+                    out.push(Point2::new(root, ya));
+                }
+            }
+        }
+        prev_x = x;
+        prev_f = fx;
+    }
+    out
+}
+
+fn function_line_intersection(
+    expr: &str,
+    s: Point2,
+    e: Point2,
+    view_bounds: (f64, f64, f64, f64),
+    vars: &BTreeMap<String, f64>,
+) -> Vec<Point2> {
+    let (xmin, xmax, _, _) = view_bounds;
+    let dx = e.x - s.x;
+    if dx.abs() < 1e-15 {
+        // Línea vertical x = sx; resolver f(sx).
+        if let Ok(y) = eval_function_with_vars(expr, s.x, vars) {
+            if y.is_finite() {
+                return vec![Point2::new(s.x, y)];
+            }
+        }
+        return Vec::new();
+    }
+    let m = (e.y - s.y) / dx;
+    let b = s.y - m * s.x;
+    let f_line = |x: f64| -> f64 {
+        eval_function_with_vars(expr, x, vars)
+            .ok()
+            .filter(|v| v.is_finite())
+            .map(|v| v - (m * x + b))
+            .unwrap_or(f64::NAN)
+    };
+    let df = |x: f64| -> f64 {
+        let h = (x.abs().max(1.0) * EPS).max(1e-12);
+        (f_line(x + h) - f_line(x - h)) / (2.0 * h)
+    };
+    let n = 400;
+    let xs: Vec<f64> = (0..=n)
+        .map(|i| xmin + (i as f64 / n as f64) * (xmax - xmin))
+        .collect();
+    let ys =
+        eval_batch_1d(expr, "x", xs.iter().copied(), vars).unwrap_or_else(|_| vec![None; n + 1]);
+
+    let get_f = |i: usize| -> f64 {
+        if let Some(y) = ys[i] {
+            if y.is_finite() {
+                y - (m * xs[i] + b)
+            } else {
+                f64::NAN
+            }
+        } else {
+            f64::NAN
+        }
+    };
+
+    let mut out = Vec::new();
+    let mut prev_x = xs[0];
+    let mut prev_f = get_f(0);
+    for (i, x) in xs.iter().enumerate().take(n + 1).skip(1) {
+        let x = *x;
+        let fx = get_f(i);
+        if !fx.is_finite() {
+            prev_x = x;
+            prev_f = fx;
+            continue;
+        }
+        if prev_f.is_finite() && prev_f * fx <= 0.0 && (prev_f != 0.0 || fx != 0.0) {
+            let root = newton_refine(x, f_line, df, DEFAULT_REFINE_ITER)
+                .or_else(|| bisect(f_line, prev_x, x, DEFAULT_REFINE_ITER))
+                .unwrap_or(x);
+            if let Ok(y) = eval_function_with_vars(expr, root, vars) {
+                if y.is_finite() {
+                    out.push(Point2::new(root, y));
+                }
+            }
+        }
+        prev_x = x;
+        prev_f = fx;
+    }
+    out
+}
+
+/// Equilibrios de un campo vectorial 2D con clasificación opcional.
+/// La clasificación usa el Jacobiano numérico en el punto de equilibrio.
+pub fn analyze_vector_field_equilibrium_class(
+    expr_u: &str,
+    expr_v: &str,
+    point: Point2,
+    vars: &BTreeMap<String, f64>,
+) -> Option<String> {
+    let h = 1e-5;
+    let eval_u = |x: f64, _y: f64| -> f64 {
+        eval_function_with_vars(expr_u, x, vars)
+            .ok()
+            .filter(|v| v.is_finite())
+            .unwrap_or(f64::NAN)
+    };
+    let eval_v = |x: f64, _y: f64| -> f64 {
+        eval_function_with_vars(expr_v, x, vars)
+            .ok()
+            .filter(|v| v.is_finite())
+            .unwrap_or(f64::NAN)
+    };
+    let j00 = (eval_u(point.x + h, point.y) - eval_u(point.x - h, point.y)) / (2.0 * h);
+    let j01 = (eval_u(point.x, point.y + h) - eval_u(point.x, point.y - h)) / (2.0 * h);
+    let j10 = (eval_v(point.x + h, point.y) - eval_v(point.x - h, point.y)) / (2.0 * h);
+    let j11 = (eval_v(point.x, point.y + h) - eval_v(point.x, point.y - h)) / (2.0 * h);
+    if ![j00, j01, j10, j11].iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    let trace = j00 + j11;
+    let det = j00 * j11 - j01 * j10;
+    let disc = trace * trace - 4.0 * det;
+    if disc < 0.0 {
+        if trace.abs() < 1e-6 {
+            Some("Centro".to_string())
+        } else if trace < 0.0 {
+            Some("Estable (espiral)".to_string())
+        } else {
+            Some("Inestable (espiral)".to_string())
+        }
+    } else if det < 0.0 {
+        Some("Silla".to_string())
+    } else if trace < 0.0 {
+        Some("Nodo estable".to_string())
+    } else {
+        Some("Nodo inestable".to_string())
+    }
+}
+
+// ============================================================================
+// Herramientas de cálculo: tangente, normal, longitud de arco, curvatura,
+// volumen y superficie de revolución.
+// ============================================================================
+//
+// Estas rutinas obtienen `f'(x)` y `f''(x)` por derivación simbólica
+// (`crate::symbolic::derivative`) sobre el AST nativo, y los evalúan
+// numéricamente con `crate::expr::eval_function`. Las integrales se reducen
+// con la regla de Simpson compuesta (`crate::integral::composite_simpson`).
+
+/// Cantidad de muestras por defecto para las cuadraturas de Simpson de las
+// herramientas de revolución y longitud de arco.
+const TOOL_SAMPLES: usize = 2000;
+
+/// Evaluación segura de `f(x)` (variable `x`). Devuelve `Err` si la
+/// expresión no parsea o si el resultado no es finito.
+fn tool_eval_finite(expr: &str, x: f64) -> Result<f64, String> {
+    let y = eval_function(expr, x)?;
+    if !y.is_finite() {
+        return Err(format!("f({x}) no es finito"));
+    }
+    Ok(y)
+}
+
+/// Derivada simbólica de `expr` respecto de `x`, evaluada en `x_val`.
+fn tool_derivative_at(expr: &str, x_val: f64) -> Result<f64, String> {
+    let d = crate::symbolic::derivative(expr, "x")?;
+    tool_eval_finite(&d, x_val)
+}
+
+/// Segunda derivada de `expr` respecto de `x` en `x_val`.
+///
+/// Intenta la derivación simbólica dos veces; si falla, cae a una segunda
+/// diferencia central numérica.
+fn tool_second_derivative_at(expr: &str, x_val: f64) -> Result<f64, String> {
+    match crate::symbolic::derivative(expr, "x")
+        .and_then(|d1| crate::symbolic::derivative(&d1, "x"))
+    {
+        Ok(d2) => tool_eval_finite(&d2, x_val),
+        Err(_) => {
+            let h = (x_val.abs().max(1.0) * 1e-6).max(1e-12);
+            let fm = tool_eval_finite(expr, x_val - h)?;
+            let f0 = tool_eval_finite(expr, x_val)?;
+            let fp = tool_eval_finite(expr, x_val + h)?;
+            Ok((fm - 2.0 * f0 + fp) / (h * h))
+        }
+    }
+}
+
+/// Integra `g(x)` en `[a, b]` con la regla de Simpson compuesta sobre `n`
+/// muestras uniformes.
+///
+/// El integrando `g` ya debe capturar un AST preparado fuera del loop
+/// (`prepare_function_ast` + `eval_at` por punto, sin re-parsear ni allocs).
+/// Cada muestra se valida finita en batch ANTES de llamar a
+/// `composite_simpson`: un `Div` 1/0 del AST nativo produce `NaN` (nunca `Inf`)
+/// y aquí se convierte en `Err` de dominio, nunca en un `Inf` silencioso.
+/// `n` está acotado por el llamante (`TOOL_SAMPLES` = 2000), así el
+/// `with_capacity` no puede OOM.
+fn tool_simpson<F: Fn(f64) -> f64>(g: F, a: f64, b: f64, n: usize) -> Result<f64, String> {
+    if (b - a).abs() < 1e-15 {
+        return Ok(0.0);
+    }
+    let n = n.max(2);
+    let dx = (b - a) / (n - 1) as f64;
+    if !dx.is_finite() || dx == 0.0 {
+        return Err("la cuadratura no es finita".to_string());
+    }
+    let mut ys = Vec::with_capacity(n);
+    for i in 0..n {
+        let value = g(a + i as f64 * dx);
+        if !value.is_finite() {
+            return Err("el integrando no es finito: singularidad en el dominio".to_string());
+        }
+        ys.push(value);
+    }
+    let area = composite_simpson(&ys, dx);
+    if !area.is_finite() {
+        return Err("la cuadratura no es finita".to_string());
+    }
+    Ok(area)
+}
+
+/// Tangente a `f(x)` en `x = x0`.
+///
+/// Devuelve `(x0, f(x0), pendiente)` donde `pendiente = f'(x0)` se obtiene por
+/// derivación simbólica sobre el AST nativo.
+///
+/// # Ejemplo
+/// ```
+/// use grafito_geometry::analysis::tangent_line_at;
+/// let (x, y, m) = tangent_line_at("x^2", 1.0).unwrap();
+/// assert!((m - 2.0).abs() < 1e-9);
+/// ```
+pub fn tangent_line_at(expr: &str, x: f64) -> Result<(f64, f64, f64), String> {
+    let y = tool_eval_finite(expr, x)?;
+    let slope = tool_derivative_at(expr, x)?;
+    Ok((x, y, slope))
+}
+
+/// Normal a `f(x)` en `x = x0` (recta perpendicular a la tangente).
+///
+/// Devuelve `(x0, f(x0), pendiente_normal)` donde `pendiente_normal = -1/f'(x0)`.
+/// Si `f'(x0) ≈ 0` la normal es vertical y la pendiente devuelta es `+INFINITY`.
+///
+/// # Ejemplo
+/// ```
+/// use grafito_geometry::analysis::normal_line_at;
+/// let (_, _, m) = normal_line_at("x^2", 1.0).unwrap();
+/// assert!((m + 0.5).abs() < 1e-9);
+/// ```
+pub fn normal_line_at(expr: &str, x: f64) -> Result<(f64, f64, f64), String> {
+    let y = tool_eval_finite(expr, x)?;
+    let slope = tool_derivative_at(expr, x)?;
+    let normal_slope = if slope.abs() < 1e-12 {
+        f64::INFINITY
+    } else {
+        -1.0 / slope
+    };
+    Ok((x, y, normal_slope))
+}
+
+/// Longitud de arco de `f(x)` en `[a, b]`: `∫_a^b sqrt(1 + f'(x)²) dx`.
+///
+/// Usa derivación simbólica para `f'` y la regla de Simpson compuesta para la
+/// cuadratura.
+///
+/// # Ejemplo
+/// ```
+/// use grafito_geometry::analysis::arc_length;
+/// let l = arc_length("x", 0.0, 1.0).unwrap();
+/// assert!((l - 2.0_f64.sqrt()).abs() < 1e-6);
+/// ```
+pub fn arc_length(expr: &str, a: f64, b: f64) -> Result<f64, String> {
+    if !a.is_finite() || !b.is_finite() {
+        return Err("la longitud de arco requiere extremos finitos".to_string());
+    }
+    let d = crate::symbolic::derivative(expr, "x")?;
+    // Hoist: un solo `prepare_function_ast` fuera del loop. Antes cada una de
+    // las 2000 muestras llamaba a `eval_function(&d, xv)`, que re-parseaba `d`
+    // (preprocess + parse_ast + substitute + simplify por punto). Ahora cada
+    // punto es solo `eval_at` sobre el AST ya preparado (sin allocs).
+    // Fallback a `eval_function` solo si el AST no se pudo preparar, para no
+    // perder la sintaxis que únicamente cubre el path lento de evalexpr.
+    let prepared = prepare_function_ast(&d, &BTreeMap::new(), &["x"]).ok();
+    let g = |xv: f64| {
+        let dp = match &prepared {
+            Some(ast) => ast.eval_at("x", xv),
+            None => eval_function(&d, xv).unwrap_or(f64::NAN),
+        };
+        (1.0 + dp * dp).sqrt()
+    };
+    let length = tool_simpson(g, a, b, TOOL_SAMPLES)?;
+    if !length.is_finite() {
+        return Err("la longitud de arco no es finita".to_string());
+    }
+    Ok(length)
+}
+
+/// Curvatura de `f(x)` en `x = x0`: `κ = |f''(x0)| / (1 + f'(x0)²)^(3/2)`.
+///
+/// Usa derivación simbólica dos veces; si la segunda derivada simbólica falla,
+/// cae a una aproximación numérica. Devuelve `INFINITY` cuando el denominador
+/// es cero (punto de inflexión con tangente horizontal y curvatura no definida
+/// por esta fórmula).
+///
+/// # Ejemplo
+/// ```
+/// use grafito_geometry::analysis::curvature_at;
+/// // y = x² tiene curvatura máxima en el vértice: κ(0) = |2| / 1 = 2.
+/// let k = curvature_at("x^2", 0.0).unwrap();
+/// assert!((k - 2.0).abs() < 1e-6);
+/// ```
+pub fn curvature_at(expr: &str, x: f64) -> Result<f64, String> {
+    let fp = tool_derivative_at(expr, x)?;
+    let fpp = tool_second_derivative_at(expr, x)?;
+    let denom = (1.0 + fp * fp).powf(1.5);
+    if denom < 1e-15 {
+        return Ok(f64::INFINITY);
+    }
+    Ok(fpp.abs() / denom)
+}
+
+/// Volumen de revolución de `f(x)` alrededor del eje X en `[a, b]`:
+/// `V = π · ∫_a^b f(x)² dx`.
+///
+/// # Ejemplo
+/// ```
+/// use grafito_geometry::analysis::volume_of_revolution;
+/// let v = volume_of_revolution("x", 0.0, 1.0).unwrap();
+/// assert!((v - std::f64::consts::PI / 3.0).abs() < 1e-6);
+/// ```
+pub fn volume_of_revolution(expr: &str, a: f64, b: f64) -> Result<f64, String> {
+    if !a.is_finite() || !b.is_finite() {
+        return Err("el volumen de revolución requiere extremos finitos".to_string());
+    }
+    // Hoist idéntico al de `arc_length`: AST preparado una vez, `eval_at` por
+    // punto; fallback a `eval_function` si el AST no se pudo preparar.
+    let prepared = prepare_function_ast(expr, &BTreeMap::new(), &["x"]).ok();
+    let g = |xv: f64| {
+        let y = match &prepared {
+            Some(ast) => ast.eval_at("x", xv),
+            None => eval_function(expr, xv).unwrap_or(f64::NAN),
+        };
+        y * y
+    };
+    let volume = std::f64::consts::PI * tool_simpson(g, a, b, TOOL_SAMPLES)?;
+    if !volume.is_finite() {
+        return Err("el volumen de revolución no es finito".to_string());
+    }
+    Ok(volume)
+}
+
+/// Área de la superficie de revolución de `f(x)` alrededor del eje X en
+/// `[a, b]`: `S = 2π · ∫_a^b |f(x)| · sqrt(1 + f'(x)²) dx`.
+///
+/// # Ejemplo
+/// ```
+/// use grafito_geometry::analysis::surface_of_revolution;
+/// // f(x) = x en [0, 1]: S = 2π · √2 · ∫₀¹ x dx = π·√2.
+/// let s = surface_of_revolution("x", 0.0, 1.0).unwrap();
+/// assert!((s - std::f64::consts::PI * 2.0_f64.sqrt()).abs() < 1e-6);
+/// ```
+pub fn surface_of_revolution(expr: &str, a: f64, b: f64) -> Result<f64, String> {
+    if !a.is_finite() || !b.is_finite() {
+        return Err("la superficie de revolución requiere extremos finitos".to_string());
+    }
+    let d = crate::symbolic::derivative(expr, "x")?;
+    // Hoist doble: `f` y `f'` se preparan una vez fuera del loop (antes eran
+    // 2×2000 re-parseos por llamada); fallback a `eval_function` por punto
+    // solo si algún AST no se pudo preparar.
+    let prepared_f = prepare_function_ast(expr, &BTreeMap::new(), &["x"]).ok();
+    let prepared_d = prepare_function_ast(&d, &BTreeMap::new(), &["x"]).ok();
+    let g = |xv: f64| {
+        let y = match &prepared_f {
+            Some(ast) => ast.eval_at("x", xv),
+            None => eval_function(expr, xv).unwrap_or(f64::NAN),
+        };
+        let dp = match &prepared_d {
+            Some(ast) => ast.eval_at("x", xv),
+            None => eval_function(&d, xv).unwrap_or(f64::NAN),
+        };
+        2.0 * std::f64::consts::PI * y.abs() * (1.0 + dp * dp).sqrt()
+    };
+    let surface = tool_simpson(g, a, b, TOOL_SAMPLES)?;
+    if !surface.is_finite() {
+        return Err("la superficie de revolución no es finita".to_string());
+    }
+    Ok(surface)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_vars() -> BTreeMap<String, f64> {
+        BTreeMap::new()
+    }
+
+    #[test]
+    fn taylor_apis_reject_orders_above_the_public_limit() {
+        assert!(taylor_coefficients("x", &empty_vars(), 0.0, 65).is_err());
+        assert!(taylor_series_string("x", &empty_vars(), 0.0, 65).is_err());
+    }
+
+    #[test]
+    fn taylor_analysis_rejects_growth_before_expanding_an_accepted_order() {
+        let expression = std::iter::repeat_n("sin(x)", 16)
+            .collect::<Vec<_>>()
+            .join("*");
+
+        let error = taylor_coefficients(&expression, &empty_vars(), 0.0, 64)
+            .expect_err("accepted orders still require a bounded derivative workload");
+
+        assert!(error.contains("budget"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn test_roots_parabola() {
+        let results = analyze_function("x^2 - 4", &empty_vars(), &AnalysisOptions::default());
+        let roots: Vec<_> = results
+            .iter()
+            .filter(|r| r.feature == AnalysisFeature::Root)
+            .collect();
+        assert_eq!(roots.len(), 2);
+        let xs: Vec<f64> = roots.iter().map(|r| r.point.x).collect();
+        assert!(xs.iter().any(|x| (x + 2.0).abs() < 1e-3));
+        assert!(xs.iter().any(|x| (x - 2.0).abs() < 1e-3));
+    }
+
+    #[test]
+    fn test_y_intercept() {
+        let results = analyze_function("2*x + 3", &empty_vars(), &AnalysisOptions::default());
+        let yint = results
+            .iter()
+            .find(|r| r.feature == AnalysisFeature::YIntercept)
+            .unwrap();
+        assert!((yint.point.y - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_extrema_sine() {
+        let opts = AnalysisOptions {
+            domain_min: -5.0,
+            domain_max: 5.0,
+            ..Default::default()
+        };
+        let results = analyze_function("sin(x)", &empty_vars(), &opts);
+        let maxima: Vec<_> = results
+            .iter()
+            .filter(|r| r.feature == AnalysisFeature::LocalMaximum)
+            .collect();
+        let minima: Vec<_> = results
+            .iter()
+            .filter(|r| r.feature == AnalysisFeature::LocalMinimum)
+            .collect();
+        assert!(!maxima.is_empty());
+        assert!(!minima.is_empty());
+        assert!(maxima
+            .iter()
+            .any(|r| (r.point.x - std::f64::consts::FRAC_PI_2).abs() < 0.1));
+    }
+
+    #[test]
+    fn test_inflection_cubic() {
+        let results = analyze_function("x^3", &empty_vars(), &AnalysisOptions::default());
+        let infl = results
+            .iter()
+            .find(|r| r.feature == AnalysisFeature::Inflection);
+        assert!(infl.is_some(), "se esperaba al menos un punto de inflexión");
+        assert!(infl.unwrap().point.x.abs() < 1e-3);
+    }
+
+    /// Ola 2.1: la derivada simbólica del CAS se usa cuando existe y la
+    /// clasificación de extremos sigue siendo correcta.
+    #[test]
+    fn ola21_symbolic_derivative_is_used_for_analysis() {
+        // Derivada exacta: d/dx (x³ − 3x) = 3x² − 3 → en 2 vale 9.
+        let symbolic = symbolic_derivative_expr("x^3 - 3*x").expect("CAS deriva el polinomio");
+        assert!(
+            (f64_or_nan(&symbolic, 2.0, &empty_vars()) - 9.0).abs() < 1e-9,
+            "derivada exacta en 2: {symbolic}"
+        );
+        // Expresión no derivable: fallback numérico (None), sin pánico.
+        assert!(symbolic_derivative_expr("desconocida(x)").is_none());
+        // Análisis real: extremos en ±1 para x³ − 3x.
+        let options = AnalysisOptions {
+            find_roots: false,
+            find_extrema: true,
+            find_inflections: false,
+            ..AnalysisOptions::default()
+        };
+        let results = analyze_function("x^3 - 3*x", &empty_vars(), &options);
+        let mut extrema: Vec<(f64, AnalysisFeature)> = results
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r.feature,
+                    AnalysisFeature::LocalMaximum | AnalysisFeature::LocalMinimum
+                )
+            })
+            .map(|r| (r.point.x, r.feature))
+            .collect();
+        extrema.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        assert_eq!(extrema.len(), 2, "dos extremos: {extrema:?}");
+        assert!((extrema[0].0 + 1.0).abs() < 1e-4, "máximo en -1");
+        assert_eq!(extrema[0].1, AnalysisFeature::LocalMaximum);
+        assert!((extrema[1].0 - 1.0).abs() < 1e-4, "mínimo en 1");
+        assert_eq!(extrema[1].1, AnalysisFeature::LocalMinimum);
+    }
+
+    #[test]
+    fn test_asymptote_rational() {
+        let results = analyze_function("1/x", &empty_vars(), &AnalysisOptions::default());
+        let vas = results
+            .iter()
+            .filter(|r| r.feature == AnalysisFeature::VerticalAsymptote)
+            .collect::<Vec<_>>();
+        assert!(!vas.is_empty());
+        assert!(vas.iter().any(|r| r.point.x.abs() < 0.1));
+    }
+
+    #[test]
+    fn asymptote_analysis_does_not_mistake_finite_samples_for_limits() {
+        for expression in ["x", "sin(x)", "log(x)"] {
+            let results = analyze_function(expression, &empty_vars(), &AnalysisOptions::default());
+            assert!(
+                results
+                    .iter()
+                    .all(|result| result.feature != AnalysisFeature::HorizontalAsymptote),
+                "{expression} must not gain a horizontal asymptote from one finite sample"
+            );
+        }
+
+        let rational = analyze_function("1/x", &empty_vars(), &AnalysisOptions::default());
+        assert!(rational.iter().any(|result| {
+            result.feature == AnalysisFeature::HorizontalAsymptote
+                && result.value.is_some_and(|value| value.abs() < 1e-7)
+        }));
+    }
+
+    #[test]
+    fn vertical_asymptotes_require_unbounded_behavior_on_both_sides() {
+        let square_root = analyze_function("sqrt(x)", &empty_vars(), &AnalysisOptions::default());
+        assert!(square_root
+            .iter()
+            .all(|result| result.feature != AnalysisFeature::VerticalAsymptote));
+
+        let shifted_pole = analyze_function(
+            "1 / (x - 0.12345)",
+            &empty_vars(),
+            &AnalysisOptions::default(),
+        );
+        assert!(shifted_pole.iter().any(|result| {
+            result.feature == AnalysisFeature::VerticalAsymptote
+                && (result.point.x - 0.12345).abs() < 1e-6
+        }));
+    }
+
+    #[test]
+    fn function_analysis_rejects_unbounded_samples_before_allocating() {
+        let options = AnalysisOptions {
+            samples: usize::MAX,
+            ..AnalysisOptions::default()
+        };
+        assert!(matches!(
+            try_analyze_function("x", &empty_vars(), &options),
+            Err(AnalysisError::SampleLimitExceeded {
+                requested: usize::MAX,
+                maximum: MAX_ANALYSIS_SAMPLES,
+            })
+        ));
+        assert!(analyze_function("x", &empty_vars(), &options).is_empty());
+    }
+
+    #[test]
+    fn test_analyze_circle_intersects_axis() {
+        // (x-2)^2 + (y-1)^2 = 9
+        let results = analyze_circle(
+            Point2::new(2.0, 1.0),
+            3.0,
+            &[AnalysisFeature::XIntercept, AnalysisFeature::YIntercept],
+        );
+        let xs: Vec<f64> = results
+            .iter()
+            .filter(|r| r.feature == AnalysisFeature::XIntercept)
+            .map(|r| r.point.x)
+            .collect();
+        // r² - cy² = 9 - 1 = 8 => x = 2 ± √8
+        assert!(xs.contains(&(2.0_f64 - 8.0_f64.sqrt())));
+        assert!(xs.contains(&(2.0_f64 + 8.0_f64.sqrt())));
+        let ys: Vec<f64> = results
+            .iter()
+            .filter(|r| r.feature == AnalysisFeature::YIntercept)
+            .map(|r| r.point.y)
+            .collect();
+        // (y - 1)^2 = 9 - 4 = 5  =>  y = 1 ± √5
+        assert!(ys
+            .iter()
+            .any(|y| (*y - (1.0 - 5.0_f64.sqrt())).abs() < 1e-9));
+        assert!(ys
+            .iter()
+            .any(|y| (*y - (1.0 + 5.0_f64.sqrt())).abs() < 1e-9));
+    }
+
+    #[test]
+    fn conic_axis_intercepts_use_the_translated_equations() {
+        let ellipse = analyze_ellipse(
+            Point2::new(2.0, 0.0),
+            1.0,
+            1.0,
+            0.0,
+            &[AnalysisFeature::YIntercept],
+        );
+        assert!(ellipse
+            .iter()
+            .all(|result| result.feature != AnalysisFeature::YIntercept));
+
+        let parabola = analyze_parabola(
+            Point2::new(0.0, -1.0),
+            1.0,
+            0.0,
+            &[AnalysisFeature::XIntercept],
+        );
+        let parabola_roots: Vec<f64> = parabola.iter().map(|result| result.point.x).collect();
+        assert!(parabola_roots.iter().any(|x| (*x - 2.0).abs() < 1e-12));
+        assert!(parabola_roots.iter().any(|x| (*x + 2.0).abs() < 1e-12));
+
+        let hyperbola = analyze_hyperbola(
+            Point2::new(0.0, 2.0),
+            1.0,
+            1.0,
+            true,
+            0.0,
+            &[AnalysisFeature::XIntercept],
+        );
+        let hyperbola_roots: Vec<f64> = hyperbola.iter().map(|result| result.point.x).collect();
+        assert!(hyperbola_roots
+            .iter()
+            .any(|x| (*x - 5.0_f64.sqrt()).abs() < 1e-12));
+        assert!(hyperbola_roots
+            .iter()
+            .any(|x| (*x + 5.0_f64.sqrt()).abs() < 1e-12));
+    }
+
+    #[test]
+    fn rotated_conic_analysis_matches_the_render_transform() {
+        let angle = std::f64::consts::FRAC_PI_4;
+        let ellipse = analyze_ellipse(
+            Point2::new(0.0, 0.0),
+            3.0,
+            2.0,
+            angle,
+            &[
+                AnalysisFeature::XIntercept,
+                AnalysisFeature::YIntercept,
+                AnalysisFeature::LocalMaximum,
+                AnalysisFeature::LocalMinimum,
+            ],
+        );
+        let expected_axis = (72.0_f64 / 13.0).sqrt();
+        let expected_maximum = Point2::new(5.0 / 26.0_f64.sqrt(), 26.0_f64.sqrt() / 2.0);
+        assert!(ellipse.iter().any(|result| {
+            result.feature == AnalysisFeature::XIntercept
+                && (result.point.x - expected_axis).abs() < 1e-12
+        }));
+        assert!(ellipse.iter().any(|result| {
+            result.feature == AnalysisFeature::YIntercept
+                && (result.point.y - expected_axis).abs() < 1e-12
+        }));
+        assert!(ellipse.iter().any(|result| {
+            result.feature == AnalysisFeature::LocalMaximum
+                && result.point.distance(&expected_maximum) < 1e-12
+        }));
+
+        let parabola = analyze_parabola(
+            Point2::new(0.0, 0.0),
+            1.0,
+            angle,
+            &[
+                AnalysisFeature::XIntercept,
+                AnalysisFeature::YIntercept,
+                AnalysisFeature::LocalMinimum,
+            ],
+        );
+        let expected_parabola_minimum =
+            Point2::new(-(3.0 * 2.0_f64.sqrt() / 2.0), -(2.0_f64.sqrt() / 2.0));
+        assert!(parabola.iter().any(|result| {
+            result.feature == AnalysisFeature::XIntercept
+                && (result.point.x + 4.0 * 2.0_f64.sqrt()).abs() < 1e-12
+        }));
+        assert!(parabola.iter().any(|result| {
+            result.feature == AnalysisFeature::YIntercept
+                && (result.point.y - 4.0 * 2.0_f64.sqrt()).abs() < 1e-12
+        }));
+        assert!(parabola.iter().any(|result| {
+            result.feature == AnalysisFeature::LocalMinimum
+                && result.point.distance(&expected_parabola_minimum) < 1e-12
+        }));
+
+        let hyperbola = analyze_hyperbola(
+            Point2::new(0.0, 0.0),
+            2.0,
+            1.0,
+            true,
+            angle,
+            &[
+                AnalysisFeature::XIntercept,
+                AnalysisFeature::YIntercept,
+                AnalysisFeature::LocalMaximum,
+                AnalysisFeature::LocalMinimum,
+            ],
+        );
+        let expected_hyperbola_minimum =
+            Point2::new(5.0 * 6.0_f64.sqrt() / 6.0, 6.0_f64.sqrt() / 2.0);
+        assert!(hyperbola.iter().all(|result| {
+            result.feature != AnalysisFeature::XIntercept
+                && result.feature != AnalysisFeature::YIntercept
+        }));
+        assert!(hyperbola.iter().any(|result| {
+            result.feature == AnalysisFeature::LocalMinimum
+                && result.point.distance(&expected_hyperbola_minimum) < 1e-12
+        }));
+    }
+
+    #[test]
+    fn line_analysis_uses_the_correct_axis_equations() {
+        let results = analyze_line(
+            Point2::new(-1.0, 2.0),
+            Point2::new(1.0, 4.0),
+            LineKind::Segment,
+            &[AnalysisFeature::XIntercept, AnalysisFeature::YIntercept],
+        );
+
+        assert!(results.iter().any(|result| {
+            result.feature == AnalysisFeature::YIntercept
+                && result.point.x.abs() < 1e-12
+                && (result.point.y - 3.0).abs() < 1e-12
+        }));
+        assert!(results
+            .iter()
+            .all(|result| result.feature != AnalysisFeature::XIntercept));
+    }
+
+    #[test]
+    fn test_analyze_polygon_centroid() {
+        let tri = vec![
+            Point2::new(0.0, 0.0),
+            Point2::new(4.0, 0.0),
+            Point2::new(2.0, 3.0),
+        ];
+        let results = analyze_polygon(&tri, &[AnalysisFeature::Centroid]);
+        let c = results
+            .iter()
+            .find(|r| r.feature == AnalysisFeature::Centroid)
+            .expect("centroide");
+        assert!((c.point.x - 2.0).abs() < 1e-9);
+        assert!((c.point.y - 1.0).abs() < 1e-9);
+        // área = 6
+        assert!((c.value.unwrap() - 6.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_analyze_intersection_function_line() {
+        // f(x) = x² intersecta y = 2x - 1 en x = 1
+        let view = (-5.0, 5.0, -5.0, 5.0);
+        let pts = analyze_intersection(
+            &IntersectionCurve::Function { expr: "x^2" },
+            &IntersectionCurve::Line {
+                s: Point2::new(0.0, -1.0),
+                e: Point2::new(1.0, 1.0),
+                kind: LineKind::Line,
+            },
+            view,
+            &empty_vars(),
+        );
+        assert!(!pts.is_empty(), "se esperaba al menos un punto");
+        assert!(pts.iter().any(|p| (p.x - 1.0).abs() < 1e-6));
+    }
+
+    #[test]
+    fn intersection_analysis_does_not_extend_segments() {
+        let view = (-5.0, 5.0, -5.0, 5.0);
+        let points = analyze_intersection(
+            &IntersectionCurve::Line {
+                s: Point2::new(0.0, 0.0),
+                e: Point2::new(1.0, 0.0),
+                kind: LineKind::Segment,
+            },
+            &IntersectionCurve::Line {
+                s: Point2::new(2.0, -1.0),
+                e: Point2::new(2.0, 1.0),
+                kind: LineKind::Segment,
+            },
+            view,
+            &empty_vars(),
+        );
+
+        assert!(points.is_empty());
+    }
+
+    #[test]
+    fn intersection_analysis_filters_circle_function_and_ray_line_candidates() {
+        let view = (-5.0, 5.0, -5.0, 5.0);
+        let segment = IntersectionCurve::Line {
+            s: Point2::new(2.0, 0.0),
+            e: Point2::new(3.0, 0.0),
+            kind: LineKind::Segment,
+        };
+        let circle = IntersectionCurve::Circle {
+            center: Point2::new(0.0, 0.0),
+            radius: 1.0,
+        };
+        assert!(analyze_intersection(&segment, &circle, view, &empty_vars()).is_empty());
+
+        let function = IntersectionCurve::Function { expr: "x^2" };
+        let horizontal_segment = IntersectionCurve::Line {
+            s: Point2::new(2.0, 1.0),
+            e: Point2::new(3.0, 1.0),
+            kind: LineKind::Segment,
+        };
+        assert!(
+            analyze_intersection(&function, &horizontal_segment, view, &empty_vars()).is_empty()
+        );
+
+        let ray = IntersectionCurve::Line {
+            s: Point2::new(1.0, 0.0),
+            e: Point2::new(2.0, 0.0),
+            kind: LineKind::Ray,
+        };
+        let vertical_line = IntersectionCurve::Line {
+            s: Point2::new(0.0, -1.0),
+            e: Point2::new(0.0, 1.0),
+            kind: LineKind::Line,
+        };
+        assert!(analyze_intersection(&ray, &vertical_line, view, &empty_vars()).is_empty());
+    }
+
+    #[test]
+    fn test_analyze_intersection_circle_circle_tangent() {
+        // dos círculos tangentes externos en (1, 0)
+        let pts = analyze_intersection(
+            &IntersectionCurve::Circle {
+                center: Point2::new(0.0, 0.0),
+                radius: 1.0,
+            },
+            &IntersectionCurve::Circle {
+                center: Point2::new(2.0, 0.0),
+                radius: 1.0,
+            },
+            (-5.0, 5.0, -5.0, 5.0),
+            &empty_vars(),
+        );
+        assert_eq!(pts.len(), 1, "tangentes externos dan 1 punto");
+        assert!((pts[0].x - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_analyze_xintercept_parametric() {
+        // círculo unitario (cos t, sin t) corta el eje X en t=0, π, 2π
+        let opts = AnalysisOptions {
+            domain_min: 0.0,
+            domain_max: std::f64::consts::TAU,
+            ..Default::default()
+        };
+        let results = analyze_parametric_curve2d(
+            "cos(t)",
+            "sin(t)",
+            0.0,
+            std::f64::consts::TAU,
+            &empty_vars(),
+            &[AnalysisFeature::Root, AnalysisFeature::XIntercept],
+        );
+        // Root devuelve cortes con y=0 (eje X) y XIntercept añade lo mismo.
+        let xs: Vec<f64> = results
+            .iter()
+            .filter(|r| {
+                r.feature == AnalysisFeature::XIntercept || r.feature == AnalysisFeature::Root
+            })
+            .map(|r| r.point.x)
+            .collect();
+        assert!(xs.contains(&1.0));
+        assert!(xs.contains(&-1.0));
+        let _ = opts;
+    }
+
+    // ========================================================================
+    // Tests de las herramientas de cálculo (tangente, normal, arco, curvatura,
+    // volumen y superficie de revolución).
+    // ========================================================================
+
+    #[test]
+    fn test_tangent_line_at_parabola() {
+        // f(x) = x² en x = 1: f(1) = 1, f'(x) = 2x → pendiente 2.
+        let (x, y, m) = tangent_line_at("x^2", 1.0).expect("tangente");
+        assert!((x - 1.0).abs() < 1e-12);
+        assert!((y - 1.0).abs() < 1e-9);
+        assert!((m - 2.0).abs() < 1e-9, "pendiente esperada 2, got {m}");
+    }
+
+    #[test]
+    fn test_normal_line_at_parabola() {
+        // f(x) = x² en x = 1: pendiente normal = -1/f' = -1/2 = -0.5.
+        let (_, _, m) = normal_line_at("x^2", 1.0).expect("normal");
+        assert!(
+            (m + 0.5).abs() < 1e-9,
+            "pendiente normal esperada -0.5, got {m}"
+        );
+    }
+
+    #[test]
+    fn test_normal_line_at_horizontal_tangent_is_vertical() {
+        // f(x) = x² en x = 0: f'(0) = 0 → normal vertical → pendiente INFINITY.
+        let (_, _, m) = normal_line_at("x^2", 0.0).expect("normal");
+        assert!(m.is_infinite(), "normal vertical esperada, got {m}");
+    }
+
+    #[test]
+    fn test_arc_length_straight_line() {
+        // f(x) = x en [0, 1]: ∫₀¹ sqrt(1 + 1²) dx = sqrt(2).
+        let l = arc_length("x", 0.0, 1.0).expect("arco");
+        assert!(
+            (l - 2.0_f64.sqrt()).abs() < 1e-6,
+            "longitud esperada sqrt(2), got {l}"
+        );
+    }
+
+    #[test]
+    fn test_arc_length_parabola() {
+        // f(x) = x² en [0, 1]: ∫₀¹ sqrt(1 + 4x²) dx ≈ 1.4789428.
+        let expected = 0.5 * 5.0_f64.sqrt() + 0.25 * (2.0 + 5.0_f64.sqrt()).ln();
+        let l = arc_length("x^2", 0.0, 1.0).expect("arco");
+        assert!((l - expected).abs() < 1e-4, "esperada {expected}, got {l}");
+    }
+
+    #[test]
+    fn arc_length_reports_domain_error_on_singularity_instead_of_inf() {
+        // f(x) = 1/x en [0, 1]: el polo cae exactamente sobre la muestra
+        // i=0 (x=0). El AST nativo evalúa `Div` 1/0 como NaN (nunca Inf) y el
+        // gate finito en batch de `tool_simpson` lo convierte en Err.
+        let err = arc_length("1/x", 0.0, 1.0).expect_err("singularidad debe ser Err, no Inf");
+        assert!(
+            !err.is_empty(),
+            "el error de dominio debe explicar la causa"
+        );
+        // Extremos no finitos también son Err inmediato, no NaN/Inf.
+        assert!(arc_length("x", f64::NAN, 1.0).is_err());
+        assert!(arc_length("x", 0.0, f64::INFINITY).is_err());
+    }
+
+    #[test]
+    fn test_curvature_at_parabola_vertex() {
+        // y = x² en x = 0: f'(0) = 0, f''(0) = 2 → κ = |2| / (1 + 0)^(3/2) = 2.
+        //
+        // Nota: el vértice de una parábola es el punto de MÁXIMA curvatura, no
+        // cero. Que f'(0) = 0 (tangente horizontal) no implica curvatura nula:
+        // la curvatura depende de f''. Por eso κ(0) = 2 y el radio de curvatura
+        // es R = 1/κ = 0.5.
+        let k = curvature_at("x^2", 0.0).expect("curvatura");
+        assert!((k - 2.0).abs() < 1e-6, "curvatura esperada 2, got {k}");
+    }
+
+    #[test]
+    fn test_curvature_at_line_is_zero() {
+        // f(x) = 2x + 1 es una recta: f'' = 0 → κ = 0 en todo punto.
+        let k = curvature_at("2*x + 1", 3.0).expect("curvatura");
+        assert!(k.abs() < 1e-6, "curvatura de una recta esperada 0, got {k}");
+    }
+
+    #[test]
+    fn test_volume_of_revolution_line() {
+        // f(x) = x en [0, 1]: V = π ∫₀¹ x² dx = π/3.
+        let v = volume_of_revolution("x", 0.0, 1.0).expect("volumen");
+        assert!(
+            (v - std::f64::consts::PI / 3.0).abs() < 1e-6,
+            "volumen esperado π/3, got {v}"
+        );
+    }
+
+    #[test]
+    fn test_surface_of_revolution_line() {
+        // f(x) = x en [0, 1]: S = 2π ∫₀¹ x·sqrt(1 + 1²) dx = 2π·sqrt(2)·(1/2) = π·sqrt(2).
+        let s = surface_of_revolution("x", 0.0, 1.0).expect("superficie");
+        let expected = std::f64::consts::PI * 2.0_f64.sqrt();
+        assert!(
+            (s - expected).abs() < 1e-6,
+            "superficie esperada {expected}, got {s}"
+        );
+    }
+
+    #[test]
+    fn test_volume_of_revolution_parabola() {
+        // f(x) = x² en [0, 2]: V = π ∫₀² x⁴ dx = π · 32/5.
+        let v = volume_of_revolution("x^2", 0.0, 2.0).expect("volumen");
+        let expected = std::f64::consts::PI * 32.0 / 5.0;
+        assert!((v - expected).abs() < 1e-5, "esperado {expected}, got {v}");
+    }
+
+    #[test]
+    fn test_tangent_line_at_invalid_expression_errors() {
+        // f(x) = 1/x en x = 0 → f(0) no es finito → error.
+        assert!(tangent_line_at("1/x", 0.0).is_err());
+    }
+}

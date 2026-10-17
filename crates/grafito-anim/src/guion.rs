@@ -1,0 +1,2697 @@
+//! Director de guion: contrato LLM → player (F2 slice 1).
+//!
+//! El LLM emite [`GuionTexto`] (todo String/números, serializable); la
+//! validación vive en [`Guion::try_new`] y produce [`Guion`] con
+//! [`Scene`], [`Resolution`] y [`AnimDuration`] tipados. El lowering a
+//! [`PlayItem`] es puro ([`compilar_paso`]) y NUNCA se expone `PlayItem`
+//! crudo al LLM.
+//!
+//! Presupuestos (heredados del crate, no inventados):
+//! - actos `1..=GUION_MAX_ACTOS`, pasos por acto `1..=ACTO_MAX_PASOS`
+//! - pasos aplanados `<= PLAYLIST_MAX_STEPS` (8, reuso directo)
+//! - frames por paso `4..=16`, total `<= 96` (`PLAYLIST_MAX_FRAMES_TOTAL`)
+//! - set `w*h*4*total <= 64 MiB` (paridad con `ScenePlayer::try_play`)
+//! - `Resolution` único por guion, `run 100..=60000 ms` (P0 long-form),
+//!   `wait_after 0..=10000 ms`, concepto `<= 500` chars
+//! - template solo de [`CANONICAL_TEMPLATES`] (saneado, alias histórico
+//!   `pythagoras → pitagoras`)
+//! - `math_expr` inválida → `None` (no `Err`: el paso se conserva); el
+//!   CAS-gate real lo hace pedagogía después ([`math_expr_valida_para_cas`]
+//!   es solo el hook de forma).
+//!
+//! Cerebro puro: sin egui, sin wgpu, sin I/O, sin red.
+
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+use crate::player::{
+    CreateAnim, FadeAnim, GrowFromCenterAnim, IndicateAnim, PlayItem, TrackerMap,
+    UpdateFromTracker, WaitAnim, WriteAnim,
+};
+use crate::protocol::{
+    AnimDuration, AnimRequest, AnimationGroup, ExportFormat, Playlist, PlaylistStep, Resolution,
+    CANONICAL_TEMPLATES, MAX_TIMELINE_DURATION_MS, PLAYLIST_MAX_FRAMES_TOTAL, PLAYLIST_MAX_STEPS,
+    PLAYLIST_MAX_WAIT_MS,
+};
+use crate::scene::{Mobject, Ortho, RateFunc, Scene, MAX_SCENE_LAYERS};
+
+/// Actos por guion: `1..=GUION_MAX_ACTOS`.
+pub const GUION_MAX_ACTOS: usize = 5;
+/// Mínimo de actos (un guion vacío no es guion).
+pub const GUION_MIN_ACTOS: usize = 1;
+/// Pasos por acto: `1..=ACTO_MAX_PASOS`.
+pub const ACTO_MAX_PASOS: usize = 3;
+/// Frames por paso: `PASO_MIN_FRAMES..=PASO_MAX_FRAMES`.
+pub const PASO_MIN_FRAMES: usize = 4;
+/// Frames por paso: `PASO_MIN_FRAMES..=PASO_MAX_FRAMES`.
+pub const PASO_MAX_FRAMES: usize = 16;
+/// Tope de memoria estimada del set (`w*h*4*total`, paridad player).
+pub const GUION_MAX_MEMORIA_BYTES: usize = 64 * 1024 * 1024;
+/// Título de acto: `<= 80` chars.
+pub const TITULO_MAX_CHARS: usize = 80;
+/// Concepto del guion y texto del paso: `<= 500` chars.
+pub const CONCEPTO_MAX_CHARS: usize = 500;
+/// `math_expr`: corta, `<= 200` bytes (forma local; el CAS decide después).
+///
+/// Cuenta BYTES para unificar la unidad con el gate real
+/// (`grafito-pedagogy::verify_math_expr`, `teaching.rs:284-294`, también
+/// bytes): antes acá se contaban chars y una expresión multibyte (p. ej.
+/// `α*x²…`) podía pasar el pre-gate y caer en el gate real.
+pub const MATH_EXPR_MAX_BYTES: usize = 200;
+/// Pista de pizarra: `<= 200` chars.
+pub const WHITEBOARD_MAX_CHARS: usize = 200;
+/// Entradas máximas en `params` (anti-OOM de wire).
+pub const PARAMS_MAX_ENTRIES: usize = 16;
+/// Clave de `params`: `<= 64` chars.
+pub const PARAMS_MAX_KEY_CHARS: usize = 64;
+/// `voiceover`: narración del paso, `<= 40` palabras (forma local).
+pub const VOICEOVER_MAX_PALABRAS: usize = 40;
+/// Guion corto: mínimo de palabras de voz total (informativo, no `Err`).
+pub const SHORT_MIN_PALABRAS: usize = 110;
+/// Guion corto: máximo de palabras de voz total (informativo, no `Err`).
+pub const SHORT_MAX_PALABRAS: usize = 130;
+/// `run_ms` de paso animado (paridad `AnimDuration` 0.1..=60 s, P0 long-form).
+pub const PASO_MIN_RUN_MS: u64 = 100;
+/// `run_ms` de paso animado (paridad `AnimDuration` 0.1..=60 s, P0 long-form).
+pub const PASO_MAX_RUN_MS: u64 = 60_000;
+/// Fondo por defecto de la base de acto (blanco).
+pub const FONDO_POR_DEFECTO: [u8; 3] = [255, 255, 255];
+
+/// Error honesto del director (todo en español, sin pánicos).
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum GuionError {
+    /// Guion/acto/paso mal formado (campo + motivo).
+    #[error("guion inválido ({campo}): {motivo}")]
+    Invalido {
+        /// Campo que falló (`actos`, `pasos`, `template`, …).
+        campo: &'static str,
+        /// Motivo en español.
+        motivo: String,
+    },
+    /// La bajada a [`PlayItem`] falló (constructor del player).
+    #[error("bajada a player falló: {motivo}")]
+    Bajada {
+        /// Motivo en español (viene del `SceneError`).
+        motivo: String,
+    },
+}
+
+impl From<crate::scene::SceneError> for GuionError {
+    fn from(e: crate::scene::SceneError) -> Self {
+        Self::Bajada {
+            motivo: e.to_string(),
+        }
+    }
+}
+
+impl From<crate::protocol::ProtocolError> for GuionError {
+    fn from(e: crate::protocol::ProtocolError) -> Self {
+        Self::Invalido {
+            campo: "viewport",
+            motivo: e.to_string(),
+        }
+    }
+}
+
+fn invalido(campo: &'static str, motivo: String) -> GuionError {
+    GuionError::Invalido { campo, motivo }
+}
+
+/// Efecto de un paso (lo único que elige el LLM; el `PlayItem` lo arma
+/// [`compilar_paso`]). Serializable para el wire del guion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EfectoPaso {
+    /// Traza progresiva.
+    Create,
+    /// Revelado de texto.
+    Write,
+    /// Aparición por alfa.
+    Fade,
+    /// Escala 0→1 desde el centroide.
+    Grow,
+    /// Pulso ×1.2.
+    Indicate,
+    /// Barrido de tracker.
+    Tracker,
+    /// Espera silenciosa.
+    Wait,
+}
+
+impl EfectoPaso {
+    /// Parsea el efecto del LLM (minúsculas, con alias en español).
+    /// `Err` honesto si no matchea.
+    pub fn parsear(raw: &str) -> Result<Self, GuionError> {
+        match raw.trim().to_lowercase().as_str() {
+            "create" | "crear" | "traza" => Ok(Self::Create),
+            "write" | "escribir" | "texto" => Ok(Self::Write),
+            "fade" | "aparecer" => Ok(Self::Fade),
+            "grow" | "crecer" => Ok(Self::Grow),
+            "indicate" | "indicar" | "pulso" => Ok(Self::Indicate),
+            "tracker" => Ok(Self::Tracker),
+            "wait" | "espera" | "pausa" => Ok(Self::Wait),
+            otro => Err(invalido(
+                "efecto",
+                format!(
+                    "efecto desconocido {otro:?}: usá create|write|fade|grow|indicate|tracker|wait"
+                ),
+            )),
+        }
+    }
+
+    /// ¿Es espera silenciosa?
+    pub fn es_espera(self) -> bool {
+        matches!(self, Self::Wait)
+    }
+}
+
+/// Frontera entre actos (evita saturar las 32 capas):
+/// o se conserva lo dibujado o se limpia a la base del acto que arranca.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Frontera {
+    /// Seguir dibujando sobre las capas actuales.
+    Conservar,
+    /// Limpiar a la base del acto ([`aplicar_frontera`]).
+    Limpiar,
+}
+
+/// Escena base de un acto: cámara canónica + capas iniciales + fondo.
+///
+/// La frontera [`Frontera::Limpiar`] restaura exactamente esta escena.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EscenaBase {
+    /// Escena inicial del acto (1..=32 capas validadas).
+    pub escena: Scene,
+}
+
+impl EscenaBase {
+    /// Constructor validado (re-valida vía `Scene::try_new`: la
+    /// deserialización puede bypasear los límites).
+    pub fn try_new(escena: Scene) -> Result<Self, GuionError> {
+        let escena = Scene::try_new(escena.camera, escena.layers, escena.bg)
+            .map_err(|e| invalido("escena", format!("base inválida: {e}")))?;
+        Ok(Self { escena })
+    }
+
+    /// Base por defecto: cámara 16:9 + ejes + fondo dado.
+    pub fn por_defecto(bg: [u8; 3]) -> Self {
+        Self {
+            escena: Scene {
+                camera: Ortho::default_16_9(),
+                layers: vec![Mobject::Axes],
+                bg,
+            },
+        }
+    }
+
+    /// Cantidad de capas de la base.
+    pub fn capas(&self) -> usize {
+        self.escena.layers.len()
+    }
+}
+
+/// Hook de forma para `math_expr`: valida sintaxis local barata.
+///
+/// Hoy es SOLO forma (no corre el CAS): no vacía, `<= 200` BYTES (misma
+/// unidad que `grafito-pedagogy::verify_math_expr`, para que una expresión
+/// que pasa acá no caiga allá por el contador), sin `=∫Σ→`, sin controles,
+/// paréntesis balanceados y al menos un alfanumérico. El CAS-gate real lo
+/// hace pedagogía después.
+pub fn math_expr_valida_para_cas(expr: &str) -> bool {
+    let t = expr.trim();
+    if t.is_empty() || t.len() > MATH_EXPR_MAX_BYTES {
+        return false;
+    }
+    if t.contains(['=', '∫', 'Σ', '→']) {
+        return false;
+    }
+    if t.chars().any(|c| c.is_control()) {
+        return false;
+    }
+    // Balanceo exacto (sin pánicos: `t` está acotado a 200 bytes, el
+    // `i32` no puede desbordar con ese largo).
+    let mut n: i32 = 0;
+    for c in t.chars() {
+        if c == '(' {
+            n += 1;
+        } else if c == ')' {
+            n -= 1;
+            if n < 0 {
+                return false;
+            }
+        }
+    }
+    if n != 0 {
+        return false;
+    }
+    t.chars().any(|c| c.is_alphanumeric())
+}
+
+/// Sanea `math_expr` del LLM: `None` entra → `None` sale; inválida →
+/// `None` (NO es `Err`: el paso se conserva sin matemática).
+pub fn sanear_math_expr(raw: Option<String>) -> Option<String> {
+    raw.and_then(|e| {
+        let t = e.trim().to_string();
+        if math_expr_valida_para_cas(&t) {
+            Some(t)
+        } else {
+            None
+        }
+    })
+}
+
+/// Sanea `voiceover` del LLM: `None`/vacío → `None` (hueco silencioso
+/// legítimo); con más de [`VOICEOVER_MAX_PALABRAS`] palabras o con
+/// controles → `Err` en español. Colapsa blancos (determinista).
+pub fn sanear_voiceover(raw: Option<String>) -> Result<Option<String>, GuionError> {
+    let Some(s) = raw else {
+        return Ok(None);
+    };
+    let t = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if t.is_empty() {
+        return Ok(None);
+    }
+    if t.chars().any(|c| c.is_control()) {
+        return Err(invalido(
+            "voiceover",
+            "la narración trae caracteres de control: usá texto plano".to_string(),
+        ));
+    }
+    let n = t.split_whitespace().count();
+    if n > VOICEOVER_MAX_PALABRAS {
+        return Err(invalido(
+            "voiceover",
+            format!("{n} palabras (válido 0..={VOICEOVER_MAX_PALABRAS}): acortá la narración"),
+        ));
+    }
+    Ok(Some(t))
+}
+
+/// Cuenta palabras separadas por blancos (misma cuenta que el reparto de
+/// [`crate::captions::voiceover_segments`]). Pura.
+pub fn cuenta_palabras_voz(texto: &str) -> usize {
+    texto.split_whitespace().count()
+}
+
+/// Sanea `template_hint` a canónico; fuera de la allowlist es `Err`.
+fn sanear_template(hint: &str) -> Result<String, GuionError> {
+    let t = hint.trim().to_lowercase();
+    // Alias histórico (paridad con `sanitize_template` del protocolo).
+    let t = if t == "pythagoras" {
+        "pitagoras".to_string()
+    } else {
+        t
+    };
+    if CANONICAL_TEMPLATES.contains(&t.as_str()) {
+        Ok(t)
+    } else {
+        Err(invalido(
+            "template",
+            format!("{hint:?} no está en la lista canónica: elegí una de {CANONICAL_TEMPLATES:?}"),
+        ))
+    }
+}
+
+/// Valida `params`: `<= 16` entradas, clave `1..=64` chars, valor finito.
+fn sanear_params(raw: BTreeMap<String, f64>) -> Result<BTreeMap<String, f64>, GuionError> {
+    if raw.len() > PARAMS_MAX_ENTRIES {
+        return Err(invalido(
+            "params",
+            format!("{} entradas (válido 0..={PARAMS_MAX_ENTRIES})", raw.len()),
+        ));
+    }
+    let mut out = BTreeMap::new();
+    for (k, v) in raw {
+        let k = k.trim().to_string();
+        if k.is_empty() || k.chars().count() > PARAMS_MAX_KEY_CHARS {
+            return Err(invalido(
+                "params",
+                format!("clave {k:?} fuera de 1..={PARAMS_MAX_KEY_CHARS} chars"),
+            ));
+        }
+        if !v.is_finite() {
+            return Err(invalido("params", format!("{k} no es finito")));
+        }
+        out.insert(k, v);
+    }
+    Ok(out)
+}
+
+/// Paso tal cual lo emite el LLM (todo String/números, serializable).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PasoTexto {
+    /// Narración del paso (`1..=500` chars).
+    pub texto: String,
+    /// Matemática opcional (inválida → `None`, sin `Err`).
+    pub math_expr: Option<String>,
+    /// Pista de pizarra (`<= 200` chars, puede vacía).
+    pub whiteboard_hint: String,
+    /// Plantilla (solo canónicas, saneada).
+    pub template_hint: String,
+    /// Parámetros numéricos finitos.
+    pub params: BTreeMap<String, f64>,
+    /// Efecto como string (`create|write|fade|grow|indicate|tracker|wait`).
+    pub efecto: String,
+    /// Frames del paso (`4..=16`).
+    pub frames: usize,
+    /// Corrida en ms (animado `100..=60000` P0 long-form; espera `1..=10000`).
+    pub run_ms: u64,
+    /// Silencio posterior (`0..=10000`; la espera sola exige `0`).
+    pub wait_after_ms: u64,
+    /// Voz en off del paso (`None`/vacía = hueco silencioso legítimo;
+    /// `<= 40` palabras validadas).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voiceover: Option<String>,
+}
+
+/// Acto tal cual lo emite el LLM.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActoTexto {
+    /// Título (`1..=80` chars).
+    pub titulo: String,
+    /// Fondo de la base (`None` = blanco).
+    pub fondo: Option<[u8; 3]>,
+    /// `true` = limpiar a la base al arrancar el acto.
+    pub limpiar: bool,
+    /// Pasos (`1..=ACTO_MAX_PASOS`).
+    pub pasos: Vec<PasoTexto>,
+}
+
+/// Guion tal cual lo emite el LLM (serializable, sin tipos del player).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuionTexto {
+    /// Concepto (`<= 500` chars; vacío = "matemática").
+    pub concepto: String,
+    /// Ancho del viewport (único para todo el guion, `64..=4096`).
+    pub width: u32,
+    /// Alto del viewport (único para todo el guion, `64..=4096`).
+    pub height: u32,
+    /// Actos (`1..=GUION_MAX_ACTOS`).
+    pub actos: Vec<ActoTexto>,
+}
+
+impl GuionTexto {
+    /// Palabras totales de voz (`voiceover` de cada paso, informativa).
+    /// Pura.
+    pub fn total_voiceover_words(&self) -> usize {
+        self.actos
+            .iter()
+            .flat_map(|a| a.pasos.iter())
+            .filter_map(|p| p.voiceover.as_deref())
+            .map(cuenta_palabras_voz)
+            .sum()
+    }
+
+    /// ¿El total de voz cae en el rango del guion corto
+    /// (`110..=130`)? Informativa: nunca es `Err`, solo `bool`. Pura.
+    pub fn validate_short_len(&self) -> bool {
+        (SHORT_MIN_PALABRAS..=SHORT_MAX_PALABRAS).contains(&self.total_voiceover_words())
+    }
+}
+
+/// Paso validado (salida de la validación, entrada de [`compilar_paso`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PasoGuion {
+    /// Narración saneada.
+    pub texto: String,
+    /// Matemática saneada (`None` si el LLM mandó inválida: el paso sigue).
+    pub math_expr: Option<String>,
+    /// Pista de pizarra saneada.
+    pub whiteboard_hint: String,
+    /// Plantilla canónica.
+    pub template: String,
+    /// Parámetros finitos.
+    pub params: BTreeMap<String, f64>,
+    /// Efecto tipado.
+    pub efecto: EfectoPaso,
+    /// Frames (`4..=16`).
+    pub frames: usize,
+    /// Corrida en ms.
+    pub run_ms: u64,
+    /// Silencio posterior en ms.
+    pub wait_after_ms: u64,
+    /// Voz en off saneada (`None` = hueco silencioso legítimo).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voiceover: Option<String>,
+}
+
+impl PasoGuion {
+    /// Valida un paso del LLM (todo `Err` en español; `math_expr`
+    /// inválida → `None`, nunca `Err`).
+    pub fn try_new(raw: PasoTexto) -> Result<Self, GuionError> {
+        let texto = raw.texto.trim().to_string();
+        if texto.is_empty() || texto.chars().count() > CONCEPTO_MAX_CHARS {
+            return Err(invalido(
+                "texto",
+                format!(
+                    "texto de {} chars (válido 1..={CONCEPTO_MAX_CHARS})",
+                    texto.chars().count()
+                ),
+            ));
+        }
+        let whiteboard_hint = raw.whiteboard_hint.trim().to_string();
+        if whiteboard_hint.chars().count() > WHITEBOARD_MAX_CHARS {
+            return Err(invalido(
+                "whiteboard_hint",
+                format!(
+                    "pista de {} chars (válido 0..={WHITEBOARD_MAX_CHARS})",
+                    whiteboard_hint.chars().count()
+                ),
+            ));
+        }
+        let template = sanear_template(&raw.template_hint)?;
+        let params = sanear_params(raw.params)?;
+        let efecto = EfectoPaso::parsear(&raw.efecto)?;
+        if !(PASO_MIN_FRAMES..=PASO_MAX_FRAMES).contains(&raw.frames) {
+            return Err(invalido(
+                "frames",
+                format!(
+                    "pediste {} fotogramas (válido {PASO_MIN_FRAMES}..={PASO_MAX_FRAMES})",
+                    raw.frames
+                ),
+            ));
+        }
+        if raw.wait_after_ms > PLAYLIST_MAX_WAIT_MS {
+            return Err(invalido(
+                "wait_after_ms",
+                format!(
+                    "{} excede el máximo de {PLAYLIST_MAX_WAIT_MS}",
+                    raw.wait_after_ms
+                ),
+            ));
+        }
+        if efecto.es_espera() {
+            // Paridad con `PlaylistStep::pausa`: la espera sola no lleva
+            // silencio posterior y su corrida es `1..=10000`.
+            if raw.wait_after_ms != 0 {
+                return Err(invalido(
+                    "wait_after_ms",
+                    "la espera sola no lleva silencio posterior: usá otro paso".to_string(),
+                ));
+            }
+            if raw.run_ms == 0 || raw.run_ms > PLAYLIST_MAX_WAIT_MS {
+                return Err(invalido(
+                    "run_ms",
+                    format!(
+                        "espera de {} fuera de 1..={PLAYLIST_MAX_WAIT_MS}",
+                        raw.run_ms
+                    ),
+                ));
+            }
+        } else if !(PASO_MIN_RUN_MS..=PASO_MAX_RUN_MS).contains(&raw.run_ms) {
+            return Err(invalido(
+                "run_ms",
+                format!(
+                    "{} fuera de {PASO_MIN_RUN_MS}..={PASO_MAX_RUN_MS}",
+                    raw.run_ms
+                ),
+            ));
+        }
+        let voiceover = sanear_voiceover(raw.voiceover)?;
+        Ok(Self {
+            texto,
+            math_expr: sanear_math_expr(raw.math_expr),
+            whiteboard_hint,
+            template,
+            params,
+            efecto,
+            frames: raw.frames,
+            run_ms: raw.run_ms,
+            wait_after_ms: raw.wait_after_ms,
+            voiceover,
+        })
+    }
+
+    /// Hook CAS: ¿la matemática del paso es apta para el gate de
+    /// pedagogía? (hoy = forma local; el CAS real decide después).
+    pub fn math_expr_valida_para_cas(&self) -> bool {
+        self.math_expr
+            .as_deref()
+            .is_some_and(math_expr_valida_para_cas)
+    }
+}
+
+/// Acto validado.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Acto {
+    /// Título saneado.
+    pub titulo: String,
+    /// Base de escena del acto.
+    pub escena: EscenaBase,
+    /// Pasos validados (`1..=ACTO_MAX_PASOS`).
+    pub pasos: Vec<PasoGuion>,
+    /// Frontera al arrancar el acto.
+    pub frontera: Frontera,
+}
+
+impl Acto {
+    /// Valida un acto del LLM.
+    pub fn try_new(raw: ActoTexto) -> Result<Self, GuionError> {
+        let titulo = raw.titulo.trim().to_string();
+        if titulo.is_empty() || titulo.chars().count() > TITULO_MAX_CHARS {
+            return Err(invalido(
+                "titulo",
+                format!(
+                    "título de {} chars (válido 1..={TITULO_MAX_CHARS})",
+                    titulo.chars().count()
+                ),
+            ));
+        }
+        if raw.pasos.is_empty() || raw.pasos.len() > ACTO_MAX_PASOS {
+            return Err(invalido(
+                "pasos",
+                format!(
+                    "acto con {} pasos (válido 1..={ACTO_MAX_PASOS})",
+                    raw.pasos.len()
+                ),
+            ));
+        }
+        let mut pasos = Vec::with_capacity(raw.pasos.len());
+        for p in raw.pasos {
+            pasos.push(PasoGuion::try_new(p)?);
+        }
+        let escena = EscenaBase::por_defecto(raw.fondo.unwrap_or(FONDO_POR_DEFECTO));
+        let frontera = if raw.limpiar {
+            Frontera::Limpiar
+        } else {
+            Frontera::Conservar
+        };
+        Ok(Self {
+            titulo,
+            escena,
+            pasos,
+            frontera,
+        })
+    }
+}
+
+/// Comprueba que todas las resoluciones son la misma (viewport único) y la
+/// devuelve tipada. Mezcla → `Err` honesto.
+///
+/// B4.4: el [`Guion`] NO la usa en `try_new` — su `GuionTexto` trae un solo
+/// par (width, height) por construcción y el mixto es imposible ahí. Esta
+/// función vive para la composición multi-fuente (varias resoluciones de
+/// pasos/actos sueltos reunidos por el llamador), donde la divergencia sí
+/// puede existir.
+pub fn comprobar_viewport_unico(resoluciones: &[(u32, u32)]) -> Result<Resolution, GuionError> {
+    let Some(primera) = resoluciones.first() else {
+        return Err(invalido(
+            "viewport",
+            "sin resoluciones: pasame al menos 1".to_string(),
+        ));
+    };
+    for r in resoluciones {
+        if r != primera {
+            return Err(invalido(
+                "viewport",
+                format!(
+                    "viewport mixto: {}x{} vs {}x{} (el guion usa una sola resolución)",
+                    r.0, r.1, primera.0, primera.1
+                ),
+            ));
+        }
+    }
+    Ok(Resolution::try_new(primera.0, primera.1)?)
+}
+
+/// Guion validado: concepto + actos + [`Scene`] + [`Resolution`] +
+/// [`AnimDuration`] tipados. Solo se construye vía [`Guion::try_new`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Guion {
+    /// Concepto normalizado (`<= 500` chars).
+    pub concepto: String,
+    /// Actos validados.
+    pub actos: Vec<Acto>,
+    /// Escena inicial (base del primer acto).
+    pub escena: Scene,
+    /// Resolución única del guion.
+    pub resolution: Resolution,
+    /// Duración total (suma `run + wait_after`, `0.1..=60 s` P0 long-form).
+    pub duracion: AnimDuration,
+}
+
+impl Guion {
+    /// Valida el guion del LLM (todo `Err` en español, sin pánicos).
+    pub fn try_new(raw: GuionTexto) -> Result<Self, GuionError> {
+        if raw.actos.len() < GUION_MIN_ACTOS || raw.actos.len() > GUION_MAX_ACTOS {
+            return Err(invalido(
+                "actos",
+                format!(
+                    "guion con {} actos (válido {GUION_MIN_ACTOS}..={GUION_MAX_ACTOS})",
+                    raw.actos.len()
+                ),
+            ));
+        }
+        // B4.4: viewport único POR CONSTRUCCIÓN — `GuionTexto` trae un solo
+        // par (width, height) para todo el guion, así que el viewport mixto
+        // es imposible acá (el chequeo con 1 elemento siempre pasaba y era
+        // código muerto). La detección multi-viewport vive donde sí puede
+        // divergir: `comprobar_viewport_unico` (composición multi-fuente) y
+        // `AnimationGroup::plan_remuestreo` (viewport mixto → `Err`).
+        let resolution = Resolution::try_new(raw.width, raw.height)?;
+        let mut actos = Vec::with_capacity(raw.actos.len());
+        for a in raw.actos {
+            actos.push(Acto::try_new(a)?);
+        }
+        let total_pasos: usize = actos.iter().map(|a| a.pasos.len()).sum();
+        if total_pasos > PLAYLIST_MAX_STEPS {
+            return Err(invalido(
+                "pasos",
+                format!(
+                    "{total_pasos} pasos exceden el tope de {PLAYLIST_MAX_STEPS}: partí el guion en dos"
+                ),
+            ));
+        }
+        let total_frames: usize = actos.iter().flat_map(|a| &a.pasos).map(|p| p.frames).sum();
+        if total_frames > PLAYLIST_MAX_FRAMES_TOTAL {
+            return Err(invalido(
+                "frames",
+                format!(
+                    "el total {total_frames} excede {PLAYLIST_MAX_FRAMES_TOTAL}: bajá pasos o fotogramas"
+                ),
+            ));
+        }
+        // Presupuesto de memoria del set (paridad con el player: 64 MiB).
+        // `u32 → usize` vía `try_from` (sin `as`, sin truncar en 16-bit).
+        let pixeles = usize::try_from(resolution.width)
+            .ok()
+            .and_then(|w| usize::try_from(resolution.height).ok().map(|h| (w, h)))
+            .and_then(|(w, h)| w.checked_mul(h))
+            .and_then(|p| p.checked_mul(4))
+            .and_then(|p| p.checked_mul(total_frames));
+        match pixeles {
+            Some(bytes) if bytes <= GUION_MAX_MEMORIA_BYTES => {}
+            _ => {
+                return Err(invalido(
+                    "memoria",
+                    format!(
+                        "el set {}x{}x4x{total_frames} excede 64 MiB: bajá resolución o fotogramas",
+                        resolution.width, resolution.height
+                    ),
+                ));
+            }
+        }
+        let total_ms: u64 = actos
+            .iter()
+            .flat_map(|a| &a.pasos)
+            .map(|p| p.run_ms.saturating_add(p.wait_after_ms))
+            .fold(0, |acc, d| acc.saturating_add(d));
+        let secs = total_ms as f64 / 1000.0;
+        let duracion = AnimDuration::try_new(secs)
+            .map_err(|e| invalido("duracion", format!("total {total_ms} ms inválido: {e}")))?;
+        let concepto = crate::protocol::normalize_concept(&raw.concepto);
+        // La escena inicial es la base del primer acto (hay ≥1 por el
+        // chequeo de actos de arriba).
+        let escena = actos
+            .first()
+            .map(|a| a.escena.escena.clone())
+            .ok_or_else(|| {
+                invalido(
+                    "actos",
+                    "sin actos tras validar: no debería pasar".to_string(),
+                )
+            })?;
+        Ok(Self {
+            concepto,
+            actos,
+            escena,
+            resolution,
+            duracion,
+        })
+    }
+
+    /// Concepto normalizado.
+    pub fn concepto(&self) -> &str {
+        &self.concepto
+    }
+
+    /// Actos validados.
+    pub fn actos(&self) -> &[Acto] {
+        &self.actos
+    }
+
+    /// Resolución única.
+    pub fn resolution(&self) -> Resolution {
+        self.resolution
+    }
+
+    /// Duración total.
+    pub fn duracion(&self) -> AnimDuration {
+        self.duracion
+    }
+
+    /// Escena inicial (base del primer acto).
+    pub fn escena(&self) -> &Scene {
+        &self.escena
+    }
+
+    /// Pasos aplanados totales.
+    pub fn total_pasos(&self) -> usize {
+        self.actos.iter().map(|a| a.pasos.len()).sum()
+    }
+
+    /// Frames totales del guion.
+    pub fn total_frames(&self) -> usize {
+        self.actos
+            .iter()
+            .flat_map(|a| &a.pasos)
+            .map(|p| p.frames)
+            .sum()
+    }
+
+    /// Duración total en ms (`run + wait_after` saturada).
+    pub fn duracion_total_ms(&self) -> u64 {
+        self.actos
+            .iter()
+            .flat_map(|a| a.pasos.iter())
+            .map(|p| p.run_ms.saturating_add(p.wait_after_ms))
+            .fold(0, |acc, d| acc.saturating_add(d))
+    }
+
+    /// Palabras totales de voz (`voiceover` de cada paso, informativa).
+    /// Pura.
+    pub fn total_voiceover_words(&self) -> usize {
+        self.actos
+            .iter()
+            .flat_map(|a| a.pasos.iter())
+            .filter_map(|p| p.voiceover.as_deref())
+            .map(cuenta_palabras_voz)
+            .sum()
+    }
+
+    /// ¿El total de voz cae en el rango del guion corto
+    /// (`110..=130`)? Informativa: nunca es `Err`, solo `bool`. Pura.
+    pub fn validate_short_len(&self) -> bool {
+        (SHORT_MIN_PALABRAS..=SHORT_MAX_PALABRAS).contains(&self.total_voiceover_words())
+    }
+
+    /// Baja todo el guion a items del player (puro, en orden de actos).
+    /// La frontera la aplica el llamador con [`aplicar_frontera`].
+    ///
+    /// B4.5: paridad con [`Guion::a_playlist`] — si los pasos animados
+    /// traen N distinto se valida el remuestreo al máximo vía
+    /// [`AnimationGroup::plan_remuestreo`] (vecino más cercano, viewport
+    /// mixto → `Err`, jamás reescaleo silencioso). Las esperas no tienen
+    /// set que componer y se excluyen igual que en `a_playlist`.
+    pub fn items_para(&self, escena: &Scene) -> Result<Vec<PlayItem>, GuionError> {
+        let animados: Vec<&PasoGuion> = self
+            .actos
+            .iter()
+            .flat_map(|a| a.pasos.iter())
+            .filter(|p| !p.efecto.es_espera())
+            .collect();
+        if animados.len() >= 2
+            && animados
+                .iter()
+                .map(|p| p.frames)
+                .collect::<Vec<_>>()
+                .windows(2)
+                .any(|w| w[0] != w[1])
+        {
+            let (ancho, alto) = self.resolution.as_tuple();
+            let frames: Vec<usize> = animados.iter().map(|p| p.frames).collect();
+            let tamanos = vec![(ancho as usize, alto as usize); animados.len()];
+            let indices: Vec<usize> = (0..animados.len()).collect();
+            let grupo = AnimationGroup::try_new(indices, 0.0)
+                .map_err(|e| invalido("frames", format!("remuestreo imposible: {e}")))?;
+            grupo
+                .plan_remuestreo(&frames, &tamanos)
+                .map_err(|e| invalido("frames", format!("remuestreo imposible: {e}")))?;
+        }
+        let mut out = Vec::with_capacity(self.total_pasos());
+        for acto in &self.actos {
+            for paso in &acto.pasos {
+                out.push(compilar_paso(paso, escena)?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Baja el guion a [`Playlist`] estilo Manim (compilador acto→playlist).
+    ///
+    /// Aplana los actos en orden (`<= PLAYLIST_MAX_STEPS` steps): cada paso
+    /// animado arma su [`AnimRequest`] (`template` canónico + `params` del
+    /// paso + `canvas` único + `duration_ms = run_ms`); cada espera (`Wait`)
+    /// baja a [`PlaylistStep::pausa`] (silencio puro, 0 frames propios — por
+    /// eso se construye paso a paso en vez de `build_animations_with_timings`,
+    /// que no expresa pausas; la construcción es equivalente: mismos rangos
+    /// `run 100..=60000` (P0) / `wait 0..=10000` y `Playlist::try_new` final).
+    /// Si dos pasos animados traen N distinto se valida el remuestreo al
+    /// máximo vía [`AnimationGroup::plan_remuestreo`] (vecino más cercano,
+    /// sin inventar píxeles; viewport mixto → `Err`, jamás reescaleo
+    /// silencioso). Presupuesto: `total <= 96` (`validate_frame_counts`) y
+    /// `estimate_set_bytes <= 64 MiB`, si no `Err` honesto en español.
+    /// Puro, sin I/O, sin pánicos (todo `Err` es `String` en español porque
+    /// este compilador cruza al adaptador de pedagogía sin acoplar errores
+    /// tipados).
+    pub fn a_playlist(&self) -> Result<Playlist, String> {
+        let pasos: Vec<&PasoGuion> = self.actos.iter().flat_map(|a| a.pasos.iter()).collect();
+        if pasos.is_empty() {
+            return Err("guion sin pasos: pasame al menos 1 paso".to_string());
+        }
+        if pasos.len() > PLAYLIST_MAX_STEPS {
+            return Err(format!(
+                "{} pasos exceden el tope de {PLAYLIST_MAX_STEPS}: partí el guion en dos",
+                pasos.len()
+            ));
+        }
+        let (ancho, alto) = self.resolution.as_tuple();
+        let mut steps = Vec::with_capacity(pasos.len());
+        for paso in &pasos {
+            if paso.efecto.es_espera() {
+                steps.push(
+                    PlaylistStep::pausa(paso.run_ms).map_err(|e| format!("pausa inválida: {e}"))?,
+                );
+            } else {
+                let request = AnimRequest {
+                    template: paso.template.clone(),
+                    concept: self.concepto.clone(),
+                    params: paso.params.clone(),
+                    spec: None,
+                    export: ExportFormat::Gif,
+                    canvas: (ancho, alto),
+                    duration_ms: paso.run_ms,
+                    audio: None,
+                };
+                steps.push(
+                    PlaylistStep::anim(request, paso.run_ms, paso.wait_after_ms)
+                        .map_err(|e| format!("step inválido: {e}"))?,
+                );
+            }
+        }
+        let lista = Playlist::try_new(steps).map_err(|e| format!("playlist inválida: {e}"))?;
+        // La pausa aporta 0 frames propios (congela el último); el animado
+        // aporta los suyos. Así `validate_frame_counts` ve pausas en 0.
+        let frames: Vec<usize> = pasos
+            .iter()
+            .map(|p| if p.efecto.es_espera() { 0 } else { p.frames })
+            .collect();
+        let tamanos: Vec<(usize, usize)> = vec![(ancho as usize, alto as usize); pasos.len()];
+        // N distinto entre animados → remuestreo al máximo (vecino más
+        // cercano). Solo sobre animados (la pausa no tiene set que componer).
+        let animados: Vec<usize> = frames
+            .iter()
+            .enumerate()
+            .filter_map(|(i, f)| if *f > 0 { Some(i) } else { None })
+            .collect();
+        let n_distinto = animados
+            .iter()
+            .map(|i| frames[*i])
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|w| w[0] != w[1]);
+        if n_distinto && animados.len() >= 2 {
+            let grupo = AnimationGroup::try_new(animados, 0.0)
+                .map_err(|e| format!("grupo inválido: {e}"))?;
+            grupo
+                .plan_remuestreo(&frames, &tamanos)
+                .map_err(|e| format!("remuestreo imposible: {e}"))?;
+        }
+        let total = lista
+            .validate_frame_counts(&frames)
+            .map_err(|e| format!("frames inválidos: {e}"))?;
+        match Playlist::estimate_set_bytes(ancho as usize, alto as usize, total) {
+            Some(bytes) if bytes <= GUION_MAX_MEMORIA_BYTES => Ok(lista),
+            Some(bytes) => Err(format!(
+                "el set ({bytes} bytes) excede 64 MiB: bajá resolución o fotogramas"
+            )),
+            None => Err(
+                "el set desborda el contador (tope 64 MiB): bajá resolución o fotogramas"
+                    .to_string(),
+            ),
+        }
+    }
+}
+
+/// Copy del guion corto por familia de concepto: los 6 beats (hook, intriga,
+/// clímax 1..3, payoff) con `(texto, voz)` propios y una pista de pizarra
+/// común. La ESTRUCTURA no cambia entre familias (4 actos / 6 pasos /
+/// 48 frames / 25.7 s): cambia el copy, para que el guion no sea genérico
+/// para todo concepto.
+struct BeatsCorto {
+    /// Pista de pizarra de los 6 pasos (`<= 200` chars).
+    pizarra: &'static str,
+    /// `(texto, voz)` por beat: hook, intriga, clímax 1..3, payoff.
+    beats: [(&'static str, &'static str); 6],
+}
+
+/// Copy de cálculo (derivada / integral / Taylor): "una idea simple atrás de
+/// una cuenta que parece magia".
+static BEATS_CALCULO: BeatsCorto = BeatsCorto {
+    pizarra: "ejes y curva",
+    beats: [
+        (
+            "Hook: la idea antes que la cuenta",
+            "Che, mirá esto con atención: una idea simple se esconde atrás de una cuenta que parece magia y ya vas a verla.",
+        ),
+        (
+            "Intriga: el patrón que se repite",
+            "Fijate bien: el mismo truco se repite en cada caso, siempre igual. Bancame un toque que te lo muestro paso a paso.",
+        ),
+        (
+            "Clímax 1: el punto de partida",
+            "Primero mirá el punto de partida: todo arranca quieto, ordenado, con un solo dato firme y ningún misterio a la vista.",
+        ),
+        (
+            "Clímax 2: movemos una sola cosa",
+            "Ahora prestá atención al cambio: movemos una sola cosa y todo lo demás se acomoda solito detrás.",
+        ),
+        (
+            "Clímax 3: un mismo gesto",
+            "¿Ves? Esa es la idea entera: un mismo gesto explica cada paso, del más fácil al más retorcido.",
+        ),
+        (
+            "Payoff: miralo de nuevo y comprobalo",
+            "Y acá viene lo lindo: si lo entendiste una vez, ya lo tenés para siempre. Miralo de nuevo y comprobalo vos.",
+        ),
+    ],
+};
+
+/// Copy de análisis complejo (conforme / Möbius): "el plano que se deforma
+/// sin romper ángulos".
+static BEATS_COMPLEJO: BeatsCorto = BeatsCorto {
+    pizarra: "plano complejo y grilla",
+    beats: [
+        (
+            "Hook: el plano que se deforma",
+            "Che, mirá esto con atención: un plano entero se dobla y estira como si fuera de goma, y no se rompe nada.",
+        ),
+        (
+            "Intriga: lo que no cambia",
+            "Fijate bien: las curvas se deforman pero los ángulos quedan igualitos. Bancame un toque que te lo muestro paso a paso.",
+        ),
+        (
+            "Clímax 1: el punto de partida",
+            "Primero mirá el punto de partida: una grilla tranquila, cuadrada, ordenadita, y ningún misterio a la vista.",
+        ),
+        (
+            "Clímax 2: movemos una sola cosa",
+            "Ahora prestá atención al cambio: movemos una sola fórmula y toda la grilla se acomoda solita detrás.",
+        ),
+        (
+            "Clímax 3: un mismo gesto",
+            "¿Ves? Esa es la idea entera: un mismo gesto explica cada curva, de la más simple a la más retorcida.",
+        ),
+        (
+            "Payoff: miralo de nuevo y comprobalo",
+            "Y acá viene lo lindo: si entendiste el gesto, ya lo tenés para siempre. Miralo de nuevo y comprobalo vos.",
+        ),
+    ],
+};
+
+/// Copy de dinámica (logística / campo gradiente): "una regla chiquita que
+/// mueve un sistema entero".
+static BEATS_DINAMICA: BeatsCorto = BeatsCorto {
+    pizarra: "campo de flechas y curva",
+    beats: [
+        (
+            "Hook: un sistema que se desboca",
+            "Che, mirá esto con atención: una regla re chiquita mueve un sistema entero y se arma un lío bárbaro a la vista.",
+        ),
+        (
+            "Intriga: el patrón que se repite",
+            "Fijate bien: hay un patrón que se repite en cada rincón del sistema. Bancame un toque que te lo muestro paso a paso.",
+        ),
+        (
+            "Clímax 1: el punto de partida",
+            "Primero mirá el punto de partida: todo arranca quieto, ordenado, con una sola flechita y ningún misterio a la vista.",
+        ),
+        (
+            "Clímax 2: movemos una sola cosa",
+            "Ahora prestá atención al cambio: movemos una sola cosa y todo lo demás se acomoda solito detrás.",
+        ),
+        (
+            "Clímax 3: un mismo gesto",
+            "¿Ves? Esa es la idea entera: un mismo gesto explica cada resultado, del más manso al más caótico.",
+        ),
+        (
+            "Payoff: miralo de nuevo y comprobalo",
+            "Y acá viene lo lindo: si agarraste la idea, ya la tenés para siempre. Miralo de nuevo y comprobalo vos.",
+        ),
+    ],
+};
+
+/// Copy de series (Fourier / Euler): "una suma de piezas simples que arma una
+/// figura".
+static BEATS_SERIES: BeatsCorto = BeatsCorto {
+    pizarra: "piezas de la suma y su forma",
+    beats: [
+        (
+            "Hook: una suma que dibuja",
+            "Che, mirá esto con atención: una suma larguita de piezas re simples arma una figura que parece magia.",
+        ),
+        (
+            "Intriga: el patrón que se repite",
+            "Fijate bien: las mismas piezas se repiten siempre, ordenadas por peso. Bancame un toque que te lo muestro paso a paso.",
+        ),
+        (
+            "Clímax 1: el punto de partida",
+            "Primero mirá el punto de partida: arranca quieto, ordenado, con una sola pieza puesta y ningún misterio a la vista.",
+        ),
+        (
+            "Clímax 2: movemos una sola cosa",
+            "Ahora prestá atención al cambio: sumamos una sola pieza y todo lo demás se acomoda solito detrás.",
+        ),
+        (
+            "Clímax 3: un mismo gesto",
+            "¿Ves? Esa es la idea entera: un mismo gesto explica cada pieza, de la más gruesa a la más finita.",
+        ),
+        (
+            "Payoff: miralo de nuevo y comprobalo",
+            "Y acá viene lo lindo: si agarraste la idea, ya la tenés para siempre. Mirá la suma otra vez y comprobalo vos.",
+        ),
+    ],
+};
+
+/// Copy de forma y estructura (Pitágoras / subespacio / fractal): "una regla
+/// que se repite en cada escala".
+static BEATS_FORMA: BeatsCorto = BeatsCorto {
+    pizarra: "figura y sus copias",
+    beats: [
+        (
+            "Hook: una forma que se repite",
+            "Che, mirá esto con atención: una figura se repite en cada escala y se arma un dibujo que parece magia.",
+        ),
+        (
+            "Intriga: el patrón que se repite",
+            "Fijate bien: la misma regla aparece en chico y en grande, siempre igual. Bancame un toque que te lo muestro paso a paso.",
+        ),
+        (
+            "Clímax 1: el punto de partida",
+            "Primero mirá el punto de partida: una forma simple, ordenada, con una sola regla clara y ningún misterio a la vista.",
+        ),
+        (
+            "Clímax 2: movemos una sola cosa",
+            "Ahora prestá atención al cambio: movemos una sola cosa y todo lo demás se acomoda solito detrás.",
+        ),
+        (
+            "Clímax 3: un mismo gesto",
+            "¿Ves? Esa es la idea entera: un mismo gesto explica cada trozo, del más grande al más chiquito.",
+        ),
+        (
+            "Payoff: miralo de nuevo y comprobalo",
+            "Y acá viene lo lindo: si agarraste la idea, ya la tenés para siempre. Miralo de nuevo y comprobalo vos.",
+        ),
+    ],
+};
+
+/// Copy universal (placeholder honesto): el histórico "parece magia, pero
+/// tiene un truco cortito".
+static BEATS_UNIVERSAL: BeatsCorto = BeatsCorto {
+    pizarra: "ejes y curva",
+    beats: [
+        (
+            "Hook: mirá el truco de cerca",
+            "Che, mirá esto con atención: parece magia, pero tiene un truco cortito que ya mismo vas a ver.",
+        ),
+        (
+            "Intriga: el patrón que se repite",
+            "Fijate bien: hay un patrón que se repite siempre igual. Bancame un toque que te lo muestro paso a paso.",
+        ),
+        (
+            "Clímax 1: el punto de partida",
+            "Primero mirá bien el punto de partida: todo arranca quieto, ordenado, sin ningún misterio a la vista.",
+        ),
+        (
+            "Clímax 2: movemos una sola cosa",
+            "Ahora prestá atención al cambio: movemos una sola cosa y todo lo demás se acomoda solito detrás.",
+        ),
+        (
+            "Clímax 3: un mismo gesto",
+            "¿Ves? Esa es la idea entera: un mismo gesto explica cada caso, del más fácil al más retorcido.",
+        ),
+        (
+            "Payoff: miralo de nuevo y comprobalo",
+            "Y acá viene lo lindo: si lo entendiste una vez, ya lo tenés para siempre. Miralo de nuevo y comprobalo vos.",
+        ),
+    ],
+};
+
+/// Familia de copy de una plantilla canónica (13 → 6 familias).
+fn familia_corto(template: &str) -> &'static BeatsCorto {
+    match template {
+        "derivative-slope" | "integral-area" | "taylor-series" => &BEATS_CALCULO,
+        "conformal-map" | "mobius-transform" => &BEATS_COMPLEJO,
+        "logistic-bifurcation" | "gradient-field" => &BEATS_DINAMICA,
+        "euler" | "fourier" => &BEATS_SERIES,
+        "pitagoras" | "subspace" | "fractal" => &BEATS_FORMA,
+        _ => &BEATS_UNIVERSAL,
+    }
+}
+
+/// Arma un guion corto de 4 beats para `concepto` (P1-core voiceover).
+///
+/// Beats: hook 0-3 s (1 paso de 2500 ms) → intriga (1 paso) → clímax
+/// (3 micro-pasos) → payoff+loop (1 paso). Textos en español rioplatense
+/// con voz en off de 111-121 palabras totales (rango corto 110-130); la
+/// plantilla es la de [`crate::protocol::template_for_concept`] y pasa
+/// literal cualquiera de las 70 [`CANONICAL_TEMPLATES`] (13 con copy propio +
+/// resto universal; antes solo 5 y el
+/// resto se degradaba a `universal`). El copy (texto + voz + pizarra) es el
+/// de la familia del concepto (función privada de familia corta): 6 familias, mismo esqueleto.
+///
+/// Presupuestos intactos: 4 actos (`<= 5`), 6 pasos (`<= 8`), 48 frames
+/// (`<= 96`), 640×480×4×48 ≈ 56 MiB (`<= 64 MiB`), 25.7 s (`0.1..=60 s`).
+/// Pura, sin I/O, sin pánicos (y byte-idéntica por construcción: el output
+/// serializado va pineado por hash en `tests::short_script_golden_hash`).
+pub fn short_script(concepto: &str) -> Result<GuionTexto, GuionError> {
+    let norm = crate::protocol::normalize_concept(concepto);
+    let resuelta = crate::protocol::template_for_concept(&norm);
+    // Las 69 canónicas pasan literales (13 con copy propio, resto universal); fuera de la lista (imposible hoy:
+    // `template_for_concept` solo devuelve canónicas) → fallback honesto.
+    let template = if CANONICAL_TEMPLATES.contains(&resuelta) {
+        resuelta.to_string()
+    } else {
+        "universal".to_string()
+    };
+    let copy = familia_corto(&template);
+    // Estructura fija por beat (efecto | frames | run_ms); el `wait_after`
+    // es 200 ms fijo. El copy sale de `copy.beats` según la familia.
+    const ESTRUCTURA: [(&str, usize, u64); 6] = [
+        ("write", 8, 2500),
+        ("fade", 8, 5000),
+        ("create", 8, 4000),
+        ("tracker", 8, 4000),
+        ("indicate", 8, 4000),
+        ("grow", 8, 5000),
+    ];
+    let mut actos: Vec<ActoTexto> = Vec::with_capacity(4);
+    let mut indice = 0usize;
+    // Reparto de los 6 pasos en 4 actos: 1 + 1 + 3 + 1.
+    for (titulo, cantidad) in [
+        ("Hook", 1usize),
+        ("Intriga", 1),
+        ("Clímax", 3),
+        ("Payoff", 1),
+    ] {
+        let mut pasos = Vec::with_capacity(cantidad);
+        for _ in 0..cantidad {
+            let (texto, voiceover) = copy.beats[indice];
+            let (efecto, frames, run_ms) = ESTRUCTURA[indice];
+            pasos.push(PasoTexto {
+                texto: texto.to_string(),
+                math_expr: None,
+                whiteboard_hint: copy.pizarra.to_string(),
+                template_hint: template.clone(),
+                params: BTreeMap::new(),
+                efecto: efecto.to_string(),
+                frames,
+                run_ms,
+                wait_after_ms: 200,
+                voiceover: Some(voiceover.to_string()),
+            });
+            indice += 1;
+        }
+        actos.push(ActoTexto {
+            titulo: titulo.to_string(),
+            fondo: None,
+            limpiar: false,
+            pasos,
+        });
+    }
+    let guion = GuionTexto {
+        concepto: norm,
+        width: 640,
+        height: 480,
+        actos,
+    };
+    // Chequeo interno barato (sin `Guion::try_new` completo para no
+    // duplicar su costo): la voz debe caer en el rango corto.
+    if !guion.validate_short_len() {
+        return Err(invalido(
+            "voiceover",
+            format!(
+                "el corto trae {} palabras (válido {SHORT_MIN_PALABRAS}..={SHORT_MAX_PALABRAS})",
+                guion.total_voiceover_words()
+            ),
+        ));
+    }
+    Ok(guion)
+}
+
+// ── Guion largo 60 s (long-form estilo 3b1b) ─────────────────────────────
+// Estructura Manim (`Scene.construct` + `play(run_time)` + `Wait`, ver
+// `docs.manim.community/.../scene/Scene.html` y `.../animation/Wait.html`):
+// cada beat es un `play` con su `run_time` y la pregunta socrática es un
+// `Wait` que congela el cuadro (`PlaylistStep::pausa`, 0 frames propios).
+// Pacing 3b1b (AMS Notices 2022, Sanderson): el hook es "una sola imagen
+// que hace una pregunta", ritmo lento y deliberado con "pausa para
+// reflexionar" antes de la respuesta — de ahí el beat `Pregunta` con su
+// duración propia y su continuación en el beat siguiente.
+// Arco: hook → desarrollo → clímax → cierre (4 actos / 8 pasos).
+
+/// Guion largo: mínimo de palabras de voz total (informativo, no `Err`).
+pub const LONG_MIN_PALABRAS: usize = 140;
+/// Guion largo: máximo de palabras de voz total (informativo, no `Err`).
+pub const LONG_MAX_PALABRAS: usize = 175;
+/// Guion largo: duración total objetivo en ms (60 s = tope del timeline).
+pub const LONG_TOTAL_MS: u64 = 60_000;
+/// Garantía de presupuesto en compilación: el largo nunca supera el
+/// timeline (si alguien mueve el pacing, esto deja de compilar).
+const _: () = assert!(LONG_TOTAL_MS <= MAX_TIMELINE_DURATION_MS);
+/// Índice del beat-pregunta socrática dentro del guion largo.
+pub const PREGUNTA_LARGO_INDICE: usize = 2;
+/// Duración del beat-pregunta (`Wait` 1..=10000, congela el último frame).
+pub const PREGUNTA_LARGO_RUN_MS: u64 = 2600;
+/// Frames por paso del guion largo (8 × 6 = 48, mismo set que el corto).
+pub const LONG_FRAMES_POR_PASO: usize = 6;
+/// `pacing`: `run_ms` por beat del guion largo (hook de 8 s, pregunta de
+/// 2.6 s, resto de 8 s).
+/// La suma es [`LONG_TOTAL_MS`] (ver [`duracion_total_largo_ms`]).
+pub const PACING_LARGO_RUN_MS: [u64; 8] = [8000, 8000, 2600, 8000, 8000, 8000, 8000, 8000];
+/// `pacing`: `wait_after_ms` por beat (la pregunta no lleva espera posterior,
+/// paridad con `PlaylistStep::pausa`).
+pub const PACING_LARGO_WAIT_MS: [u64; 8] = [200, 200, 0, 200, 200, 200, 200, 200];
+/// Efectos por beat del guion largo (el índice 2 es la pregunta: `Wait`).
+const EFECTOS_LARGO: [&str; 8] = [
+    "write", "fade", "wait", "create", "tracker", "indicate", "grow", "fade",
+];
+
+/// Duración total del guion largo en ms (`Σ run + wait_after`, saturada).
+/// Pura. Por construcción es [`LONG_TOTAL_MS`] (`<= MAX_TIMELINE_DURATION_MS`).
+pub fn duracion_total_largo_ms() -> u64 {
+    let mut total: u64 = 0;
+    for i in 0..PACING_LARGO_RUN_MS.len() {
+        total = total
+            .saturating_add(PACING_LARGO_RUN_MS[i])
+            .saturating_add(PACING_LARGO_WAIT_MS[i]);
+    }
+    total
+}
+
+/// Beat-pregunta socrática: pregunta que congela el cuadro (`Wait`) con su
+/// duración propia y la continuación (apertura del beat que la responde).
+/// Pura, sin I/O, sin pánicos.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BeatPregunta {
+    /// Texto del beat-pregunta (el que ve el espectador en la pausa).
+    pub pregunta: String,
+    /// Duración de la pausa en ms (siempre [`PREGUNTA_LARGO_RUN_MS`]).
+    pub espera_ms: u64,
+    /// Apertura del beat siguiente (la respuesta arranca acá).
+    pub continuacion: String,
+}
+
+/// Beat-pregunta del guion largo para `template` (canónico o alias
+/// `pythagoras`; desconocido → familia universal, jamás `Err`).
+/// Pura.
+pub fn beat_pregunta(template: &str) -> BeatPregunta {
+    let copy = familia_largo_por_nombre(template);
+    BeatPregunta {
+        pregunta: copy.beats[PREGUNTA_LARGO_INDICE].0.to_string(),
+        espera_ms: PREGUNTA_LARGO_RUN_MS,
+        continuacion: copy.beats[PREGUNTA_LARGO_INDICE + 1].0.to_string(),
+    }
+}
+
+/// Copy del guion largo por familia: los 8 beats del arco (hook, desarrollo
+/// 1, pregunta, desarrollo 2/respuesta, clímax 1..2, cierre 1..2) con
+/// `(texto, voz)` propios y una pista de pizarra común. Misma idea que
+/// `BeatsCorto`: la ESTRUCTURA no cambia entre familias (4 actos / 8 pasos
+/// / 48 frames / 60 s); cambia el copy.
+struct BeatsLargo {
+    /// Pista de pizarra de los 8 pasos (`<= 200` chars).
+    pizarra: &'static str,
+    /// `(texto, voz)` por beat (el índice 2 es la pregunta socrática).
+    beats: [(&'static str, &'static str); 8],
+}
+
+/// Copy largo de cálculo: "una idea simple atrás de una cuenta que parece
+/// magia", con pregunta sobre lo que se mantiene igual.
+static BEATS_LARGO_CALCULO: BeatsLargo = BeatsLargo {
+    pizarra: "ejes y curva animada",
+    beats: [
+        (
+            "Hook largo: la idea antes que la cuenta",
+            "Che, mirá esto con atención: una idea simple se esconde atrás de una cuenta que parece magia, y en este minuto la vas a ver nacer.",
+        ),
+        (
+            "Desarrollo: el patrón que se repite",
+            "Fijate bien: el mismo truco aparece en cada ejemplo, siempre igual, y si lo agarrás una vez lo reconocés en todos lados.",
+        ),
+        (
+            "Pregunta: ¿qué se mantiene igual si movés todo?",
+            "Pregunta para vos: si movés todo el dibujo de lugar, ¿qué es lo único que se mantiene igual? Pensalo unos segundos.",
+        ),
+        (
+            "Desarrollo: la respuesta, paso a paso",
+            "La respuesta es la pendiente: cada pedacito se porta como una recta cortita, y esa recta manda sobre toda la curva.",
+        ),
+        (
+            "Clímax 1: el punto que se mueve",
+            "Ahora mirá el punto que se mueve: la recta lo acompaña a cada paso y nunca lo deja solo en la curva.",
+        ),
+        (
+            "Clímax 2: un mismo gesto para todo",
+            "¿Ves? Un mismo gesto explica cada caso, del más fácil al más retorcido, sin cambiar nunca la idea.",
+        ),
+        (
+            "Cierre: la idea en una frase",
+            "Entonces la idea en una frase: lo curvo se entiende con rectas chiquitas, y eso es todo el cálculo.",
+        ),
+        (
+            "Payoff: miralo de nuevo y comprobalo",
+            "Y acá viene lo lindo: si lo entendiste una vez, ya lo tenés para siempre. Miralo de nuevo y comprobalo vos.",
+        ),
+    ],
+};
+
+/// Copy largo de análisis complejo: "el plano que se deforma sin romper
+/// ángulos", con pregunta sobre el ángulo que sobrevive.
+static BEATS_LARGO_COMPLEJO: BeatsLargo = BeatsLargo {
+    pizarra: "plano complejo y grilla animada",
+    beats: [
+        (
+            "Hook largo: el plano que se deforma",
+            "Che, mirá esto con atención: un plano entero se dobla y se estira como si fuera de goma, y nada se rompe en el camino.",
+        ),
+        (
+            "Desarrollo: lo que no cambia nunca",
+            "Fijate bien: las curvas se deforman pero los ángulos quedan igualitos, y esa es la pista que vamos a seguir.",
+        ),
+        (
+            "Pregunta: ¿qué ángulo sobrevive al doblez?",
+            "Pregunta para vos: si doblás el plano como una goma, ¿qué ángulo sobrevive igualito? Pensalo unos segundos.",
+        ),
+        (
+            "Desarrollo: la respuesta, paso a paso",
+            "La respuesta es el ángulo: cada cruce se porta como dos rectas cortitas, y ese cruce manda sobre toda la grilla.",
+        ),
+        (
+            "Clímax 1: la grilla que se acomoda",
+            "Ahora mirá la grilla que se mueve: cada cuadradito se deforma solito y ningún ángulo se deja torcer.",
+        ),
+        (
+            "Clímax 2: un mismo gesto para todo",
+            "¿Ves? Un mismo gesto explica cada curva, de la más simple a la más retorcida, sin cambiar nunca la idea.",
+        ),
+        (
+            "Cierre: la idea en una frase",
+            "Entonces la idea en una frase: deformar sin romper ángulos, y eso es todo el análisis complejo.",
+        ),
+        (
+            "Payoff: miralo de nuevo y comprobalo",
+            "Y acá viene lo lindo: si entendiste el gesto, ya lo tenés para siempre. Miralo de nuevo y comprobalo vos.",
+        ),
+    ],
+};
+
+/// Copy largo de dinámica: "una regla chiquita que mueve un sistema entero",
+/// con pregunta sobre el destino de cada flecha.
+static BEATS_LARGO_DINAMICA: BeatsLargo = BeatsLargo {
+    pizarra: "campo de flechas animado",
+    beats: [
+        (
+            "Hook largo: un sistema que se desboca",
+            "Che, mirá esto con atención: una regla re chiquita mueve un sistema entero, y en este minuto vas a ver cómo se desboca.",
+        ),
+        (
+            "Desarrollo: el patrón que se repite",
+            "Fijate bien: hay un patrón que se repite en cada rincón del sistema, y si lo agarrás ya entendés el lío entero.",
+        ),
+        (
+            "Pregunta: ¿a dónde termina cada flecha?",
+            "Pregunta para vos: si soltás un puntito en cualquier lado, ¿a dónde termina después de mucho tiempo? Pensalo unos segundos.",
+        ),
+        (
+            "Desarrollo: la respuesta, paso a paso",
+            "La respuesta son los destinos: cada zona tiene un punto que atrae todo, y las flechas mandan hacia ese lugar.",
+        ),
+        (
+            "Clímax 1: el punto que atrae todo",
+            "Ahora mirá el punto que atrae: todo lo de alrededor cae hacia él, rapidito al principio y despacio al final.",
+        ),
+        (
+            "Clímax 2: un mismo gesto para todo",
+            "¿Ves? Un mismo gesto explica cada resultado, del más manso al más caótico, sin cambiar nunca la idea.",
+        ),
+        (
+            "Cierre: la idea en una frase",
+            "Entonces la idea en una frase: reglas chiquitas deciden destinos grandes, y eso es toda la dinámica.",
+        ),
+        (
+            "Payoff: miralo de nuevo y comprobalo",
+            "Y acá viene lo lindo: si agarraste la idea, ya la tenés para siempre. Miralo de nuevo y comprobalo vos.",
+        ),
+    ],
+};
+
+/// Copy largo de series: "una suma de piezas simples que arma una figura",
+/// con pregunta sobre cuántas piezas alcanzan.
+static BEATS_LARGO_SERIES: BeatsLargo = BeatsLargo {
+    pizarra: "piezas de la suma animada",
+    beats: [
+        (
+            "Hook largo: una suma que dibuja",
+            "Che, mirá esto con atención: una suma larguita de piezas re simples arma una figura que parece magia de verdad.",
+        ),
+        (
+            "Desarrollo: las piezas por peso",
+            "Fijate bien: las mismas piezas se repiten siempre, ordenadas por peso, y cada una aporta un detalle nuevo.",
+        ),
+        (
+            "Pregunta: ¿cuántas piezas alcanzan?",
+            "Pregunta para vos: si sumás de a una pieza por vez, ¿cuántas alcanzan para reconocer la figura? Pensalo unos segundos.",
+        ),
+        (
+            "Desarrollo: la respuesta, paso a paso",
+            "La respuesta es el peso: cada pieza nueva corrige un poco la forma, y la suma manda sobre el dibujo entero.",
+        ),
+        (
+            "Clímax 1: la forma que aparece",
+            "Ahora mirá la forma que aparece: sumamos una sola pieza y todo el dibujo se acomoda solito detrás.",
+        ),
+        (
+            "Clímax 2: un mismo gesto para todo",
+            "¿Ves? Un mismo gesto explica cada pieza, de la más gruesa a la más finita, sin cambiar nunca la idea.",
+        ),
+        (
+            "Cierre: la idea en una frase",
+            "Entonces la idea en una frase: piezas simples sumadas con paciencia arman cualquier figura que quieras.",
+        ),
+        (
+            "Payoff: mirá la suma y comprobalo",
+            "Y acá viene lo lindo: si agarraste la idea, ya la tenés para siempre. Mirá la suma otra vez y comprobalo vos.",
+        ),
+    ],
+};
+
+/// Copy largo de forma y estructura: "una regla que se repite en cada
+/// escala", con pregunta sobre el zoom.
+static BEATS_LARGO_FORMA: BeatsLargo = BeatsLargo {
+    pizarra: "figura y sus copias animadas",
+    beats: [
+        (
+            "Hook largo: una forma que se repite",
+            "Che, mirá esto con atención: una figura se repite en cada escala, y en este minuto vas a ver hasta dónde llega.",
+        ),
+        (
+            "Desarrollo: la regla en chico y en grande",
+            "Fijate bien: la misma regla aparece en chico y en grande, siempre igual, y eso ordena todo el dibujo.",
+        ),
+        (
+            "Pregunta: ¿qué ves si hacés zoom?",
+            "Pregunta para vos: si hacés zoom bien adentro del dibujo, ¿qué creés que vas a encontrar? Pensalo unos segundos.",
+        ),
+        (
+            "Desarrollo: la respuesta, paso a paso",
+            "La respuesta es la copia: cada pedacito repite la forma grande, y esa repetición manda sobre todo el dibujo.",
+        ),
+        (
+            "Clímax 1: el zoom que no termina",
+            "Ahora mirá el zoom que no termina: cada nivel esconde otro igual, y el dibujo nunca se queda sin detalle.",
+        ),
+        (
+            "Clímax 2: un mismo gesto para todo",
+            "¿Ves? Un mismo gesto explica cada trozo, del más grande al más chiquito, sin cambiar nunca la idea.",
+        ),
+        (
+            "Cierre: la idea en una frase",
+            "Entonces la idea en una frase: una regla repetida en cada escala arma un infinito que se puede dibujar.",
+        ),
+        (
+            "Payoff: miralo de nuevo y comprobalo",
+            "Y acá viene lo lindo: si agarraste la idea, ya la tenés para siempre. Miralo de nuevo y comprobalo vos.",
+        ),
+    ],
+};
+
+/// Copy largo universal (placeholder honesto): el histórico "parece magia,
+/// pero tiene un truco cortito", con pregunta sobre la parte que se repite.
+static BEATS_LARGO_UNIVERSAL: BeatsLargo = BeatsLargo {
+    pizarra: "ejes y curva animada",
+    beats: [
+        (
+            "Hook largo: mirá el truco de cerca",
+            "Che, mirá esto con atención: parece magia, pero tiene un truco cortito que en este minuto vas a ver.",
+        ),
+        (
+            "Desarrollo: el patrón que se repite",
+            "Fijate bien: hay un patrón que se repite siempre igual, y si lo agarrás ya entendés todo el truco.",
+        ),
+        (
+            "Pregunta: ¿qué parte se repite?",
+            "Pregunta para vos: si mirás cada paso con lupa, ¿qué parte se repite siempre igual? Pensalo unos segundos.",
+        ),
+        (
+            "Desarrollo: la respuesta, paso a paso",
+            "La respuesta es el gesto: cada paso repite el mismo movimiento chiquito, y ese gesto manda sobre todo.",
+        ),
+        (
+            "Clímax 1: el punto de partida",
+            "Primero mirá bien el punto de partida: todo arranca quieto, ordenado, sin ningún misterio a la vista.",
+        ),
+        (
+            "Clímax 2: un mismo gesto para todo",
+            "¿Ves? Un mismo gesto explica cada caso, del más fácil al más retorcido, sin cambiar nunca la idea.",
+        ),
+        (
+            "Cierre: la idea en una frase",
+            "Entonces la idea en una frase: un truco cortito repetido con cuidado explica el dibujo entero.",
+        ),
+        (
+            "Payoff: miralo de nuevo y comprobalo",
+            "Y acá viene lo lindo: si lo entendiste una vez, ya lo tenés para siempre. Miralo de nuevo y comprobalo vos.",
+        ),
+    ],
+};
+
+/// Familia de copy largo de una plantilla canónica (mismo agrupamiento que
+/// `familia_corto`: 13 → 6 familias).
+fn familia_largo(template: &str) -> &'static BeatsLargo {
+    match template {
+        "derivative-slope" | "integral-area" | "taylor-series" => &BEATS_LARGO_CALCULO,
+        "conformal-map" | "mobius-transform" => &BEATS_LARGO_COMPLEJO,
+        "logistic-bifurcation" | "gradient-field" => &BEATS_LARGO_DINAMICA,
+        "euler" | "fourier" => &BEATS_LARGO_SERIES,
+        "pitagoras" | "subspace" | "fractal" => &BEATS_LARGO_FORMA,
+        _ => &BEATS_LARGO_UNIVERSAL,
+    }
+}
+
+/// Resuelve la familia con nombre ya saneado (alias histórico `pythagoras` →
+/// `pitagoras`; desconocido → universal). Pura, sin `Err`.
+fn familia_largo_por_nombre(template: &str) -> &'static BeatsLargo {
+    let t = template.trim().to_lowercase();
+    let t = if t == "pythagoras" {
+        "pitagoras"
+    } else {
+        t.as_str()
+    };
+    // `familia_largo` devuelve `&'static`: no arrastra el borrow local.
+    familia_largo(t)
+}
+
+/// Títulos alternativos por familia (3 opciones cada una, `<= 80` chars).
+static TITULOS_CALCULO: [&str; 3] = [
+    "La idea antes que la cuenta",
+    "Una recta manda sobre la curva",
+    "Lo curvo se entiende en chiquito",
+];
+/// Títulos alternativos por familia (3 opciones cada una, `<= 80` chars).
+static TITULOS_COMPLEJO: [&str; 3] = [
+    "El plano que se deforma sin romperse",
+    "Ángulos que no cambian nunca",
+    "Una fórmula mueve toda la grilla",
+];
+/// Títulos alternativos por familia (3 opciones cada una, `<= 80` chars).
+static TITULOS_DINAMICA: [&str; 3] = [
+    "Una regla chiquita, un lío bárbaro",
+    "El sistema que se desboca solo",
+    "Flechitas que deciden el destino",
+];
+/// Títulos alternativos por familia (3 opciones cada una, `<= 80` chars).
+static TITULOS_SERIES: [&str; 3] = [
+    "Una suma que dibuja figuras",
+    "Piezas simples, figura mágica",
+    "Cada pieza pesa lo justo",
+];
+/// Títulos alternativos por familia (3 opciones cada una, `<= 80` chars).
+static TITULOS_FORMA: [&str; 3] = [
+    "La forma que se repite en cada escala",
+    "Una regla en chico y en grande",
+    "El pedazo explica el todo",
+];
+/// Títulos alternativos por familia (3 opciones cada una, `<= 80` chars).
+static TITULOS_UNIVERSAL: [&str; 3] = [
+    "Mirá el truco de cerca",
+    "El patrón que se repite",
+    "Una idea que queda para siempre",
+];
+
+/// Tres títulos alternativos para `template` (canónico o alias; desconocido
+/// → universal). Puros, deterministas (pineados por golden).
+pub fn titulos_para(template: &str) -> [&'static str; 3] {
+    let t = template.trim().to_lowercase();
+    let t = if t == "pythagoras" {
+        "pitagoras"
+    } else {
+        t.as_str()
+    };
+    match t {
+        "derivative-slope" | "integral-area" | "taylor-series" => TITULOS_CALCULO,
+        "conformal-map" | "mobius-transform" => TITULOS_COMPLEJO,
+        "logistic-bifurcation" | "gradient-field" => TITULOS_DINAMICA,
+        "euler" | "fourier" => TITULOS_SERIES,
+        "pitagoras" | "subspace" | "fractal" => TITULOS_FORMA,
+        _ => TITULOS_UNIVERSAL,
+    }
+}
+
+/// Ganchos alternativos por familia (3 opciones cada una).
+static GANCHOS_CALCULO: [&str; 3] = [
+    "Parece magia, pero es una sola idea",
+    "Todo arranca quieto y ordenado",
+    "Movemos una cosa y todo acompaña",
+];
+/// Ganchos alternativos por familia (3 opciones cada una).
+static GANCHOS_COMPLEJO: [&str; 3] = [
+    "Un plano de goma que no se rompe",
+    "Las curvas ceden, los ángulos no",
+    "Una fórmula y se mueve todo",
+];
+/// Ganchos alternativos por familia (3 opciones cada una).
+static GANCHOS_DINAMICA: [&str; 3] = [
+    "Una reglita mueve un sistema entero",
+    "El caos también tiene patrón",
+    "Una flechita cambia el final",
+];
+/// Ganchos alternativos por familia (3 opciones cada una).
+static GANCHOS_SERIES: [&str; 3] = [
+    "Sumar piezas simples arma figuras",
+    "Las piezas se ordenan por peso",
+    "De a una, la forma aparece",
+];
+/// Ganchos alternativos por familia (3 opciones cada una).
+static GANCHOS_FORMA: [&str; 3] = [
+    "Chico y grande obedecen la misma regla",
+    "El dibujo se repite sin fin",
+    "Cada trozo cuenta la misma historia",
+];
+/// Ganchos alternativos por familia (3 opciones cada una).
+static GANCHOS_UNIVERSAL: [&str; 3] = [
+    "Parece magia, tiene truco cortito",
+    "Hay un patrón que se repite",
+    "Lo ves una vez y queda",
+];
+
+/// Tres ganchos alternativos para `template` (canónico o alias; desconocido
+/// → universal). Puros, deterministas (pineados por golden).
+pub fn ganchos_para(template: &str) -> [&'static str; 3] {
+    let t = template.trim().to_lowercase();
+    let t = if t == "pythagoras" {
+        "pitagoras"
+    } else {
+        t.as_str()
+    };
+    match t {
+        "derivative-slope" | "integral-area" | "taylor-series" => GANCHOS_CALCULO,
+        "conformal-map" | "mobius-transform" => GANCHOS_COMPLEJO,
+        "logistic-bifurcation" | "gradient-field" => GANCHOS_DINAMICA,
+        "euler" | "fourier" => GANCHOS_SERIES,
+        "pitagoras" | "subspace" | "fractal" => GANCHOS_FORMA,
+        _ => GANCHOS_UNIVERSAL,
+    }
+}
+
+/// Arma un guion largo de 60 s para `concepto` (arco hook→desarrollo→
+/// clímax→cierre con pregunta socrática).
+///
+/// Beats: hook (1 paso) → desarrollo (2 pasos: contexto + pregunta `Wait`) →
+/// clímax (3 pasos: respuesta + 2 clímax) → cierre (2 pasos). Textos en
+/// español rioplatense con voz en off `140..=175` palabras totales; la
+/// plantilla es la de [`crate::protocol::template_for_concept`] y pasa
+/// literal cualquiera de las 70 [`CANONICAL_TEMPLATES`] (13 con copy propio +
+/// resto universal). El copy es el de la
+/// familia del concepto (función privada de familia larga): 6 familias, mismo esqueleto.
+///
+/// Presupuestos intactos: 4 actos (`<= 5`), 8 pasos (`<= 8`), 48 frames
+/// (`<= 96`), 640×480×4×48 ≈ 56 MiB (`<= 64 MiB`), 60 s exactos
+/// (`0.1..=60 s`, `<= MAX_TIMELINE_DURATION_MS`). Pura, sin I/O, sin pánicos
+/// (y byte-idéntica por construcción: el output serializado va pineado por
+/// hash en `tests::long_script_golden_hash`).
+pub fn long_script(concepto: &str) -> Result<GuionTexto, GuionError> {
+    let norm = crate::protocol::normalize_concept(concepto);
+    let resuelta = crate::protocol::template_for_concept(&norm);
+    // Las 69 canónicas pasan literales (13 con copy propio, resto universal); fuera de la lista (imposible hoy:
+    // `template_for_concept` solo devuelve canónicas) → fallback honesto.
+    let template = if CANONICAL_TEMPLATES.contains(&resuelta) {
+        resuelta.to_string()
+    } else {
+        "universal".to_string()
+    };
+    let copy = familia_largo(&template);
+    let mut actos: Vec<ActoTexto> = Vec::with_capacity(4);
+    let mut indice = 0usize;
+    // Reparto de los 8 pasos en 4 actos: 1 + 2 + 3 + 2.
+    for (titulo, cantidad) in [
+        ("Hook", 1usize),
+        ("Desarrollo", 2),
+        ("Clímax", 3),
+        ("Cierre", 2),
+    ] {
+        let mut pasos = Vec::with_capacity(cantidad);
+        for _ in 0..cantidad {
+            let (texto, voiceover) = copy.beats[indice];
+            let (run_ms, wait_after_ms) =
+                (PACING_LARGO_RUN_MS[indice], PACING_LARGO_WAIT_MS[indice]);
+            pasos.push(PasoTexto {
+                texto: texto.to_string(),
+                math_expr: None,
+                whiteboard_hint: copy.pizarra.to_string(),
+                template_hint: template.clone(),
+                params: BTreeMap::new(),
+                efecto: EFECTOS_LARGO[indice].to_string(),
+                frames: LONG_FRAMES_POR_PASO,
+                run_ms,
+                wait_after_ms,
+                voiceover: Some(voiceover.to_string()),
+            });
+            indice += 1;
+        }
+        actos.push(ActoTexto {
+            titulo: titulo.to_string(),
+            fondo: None,
+            limpiar: false,
+            pasos,
+        });
+    }
+    let guion = GuionTexto {
+        concepto: norm,
+        width: 640,
+        height: 480,
+        actos,
+    };
+    // Chequeo interno barato (sin `Guion::try_new` completo para no
+    // duplicar su costo): la voz debe caer en el rango largo.
+    if !(LONG_MIN_PALABRAS..=LONG_MAX_PALABRAS).contains(&guion.total_voiceover_words()) {
+        return Err(invalido(
+            "voiceover",
+            format!(
+                "el largo trae {} palabras (válido {LONG_MIN_PALABRAS}..={LONG_MAX_PALABRAS})",
+                guion.total_voiceover_words()
+            ),
+        ));
+    }
+    Ok(guion)
+}
+
+impl GuionTexto {
+    /// ¿El total de voz cae en el rango del guion largo
+    /// (`140..=175`)? Informativa: nunca es `Err`, solo `bool`. Pura.
+    pub fn validate_long_len(&self) -> bool {
+        (LONG_MIN_PALABRAS..=LONG_MAX_PALABRAS).contains(&self.total_voiceover_words())
+    }
+}
+
+impl Guion {
+    /// ¿El total de voz cae en el rango del guion largo
+    /// (`140..=175`)? Informativa: nunca es `Err`, solo `bool`. Pura.
+    pub fn validate_long_len(&self) -> bool {
+        (LONG_MIN_PALABRAS..=LONG_MAX_PALABRAS).contains(&self.total_voiceover_words())
+    }
+}
+
+/// Aplica la frontera del acto a la escena viva (puro, sin I/O):
+/// `Conservar` no toca nada; `Limpiar` restaura la base del acto.
+pub fn aplicar_frontera(escena: &mut Scene, acto: &Acto) -> Result<(), GuionError> {
+    match acto.frontera {
+        Frontera::Conservar => {
+            if escena.layers.is_empty() || escena.layers.len() > MAX_SCENE_LAYERS {
+                return Err(invalido(
+                    "escena",
+                    format!(
+                        "{} capas (válido 1..={MAX_SCENE_LAYERS})",
+                        escena.layers.len()
+                    ),
+                ));
+            }
+            Ok(())
+        }
+        Frontera::Limpiar => {
+            escena.camera = acto.escena.escena.camera;
+            escena.layers = acto.escena.escena.layers.clone();
+            escena.bg = acto.escena.escena.bg;
+            if escena.layers.is_empty() || escena.layers.len() > MAX_SCENE_LAYERS {
+                return Err(invalido(
+                    "escena",
+                    format!(
+                        "base con {} capas (válido 1..={MAX_SCENE_LAYERS})",
+                        escena.layers.len()
+                    ),
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Escapa texto para el SVG opaco del `Write` (sin parser de trazos).
+fn escapar_svg(texto: &str) -> String {
+    texto
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Mobject base para el lowering: la matemática válida manda
+/// (`FunctionGraph` tal cual, nunca inventada); si no, la primera capa
+/// de la escena viva; si no hay, un punto honesto en el origen.
+fn mobject_base(paso: &PasoGuion, escena: &Scene) -> Mobject {
+    if let Some(expr) = paso.math_expr.as_deref() {
+        return Mobject::FunctionGraph {
+            expr: expr.to_string(),
+        };
+    }
+    escena
+        .layers
+        .first()
+        .cloned()
+        .unwrap_or(Mobject::Dot { x: 0.0, y: 0.0 })
+}
+
+/// Polilínea para `Create`: la del mobject si es polígono, si no un
+/// cuadrado canónico (traza visible garantizada).
+fn poly_para(base: &Mobject) -> Vec<[f64; 2]> {
+    if let Mobject::Polygon { pts } = base {
+        if pts.len() >= 2 {
+            return pts.clone();
+        }
+    }
+    vec![[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, -1.0]]
+}
+
+/// Texto opaco para `Write`: el `Tex` de la escena si hay uno, si no un
+/// SVG mínimo con el texto del paso escapado.
+fn tex_para(paso: &PasoGuion, escena: &Scene) -> Mobject {
+    for capa in &escena.layers {
+        if matches!(capa, Mobject::Tex { .. }) {
+            return capa.clone();
+        }
+    }
+    Mobject::Tex {
+        svg: format!("<svg><text>{}</text></svg>", escapar_svg(&paso.texto)),
+    }
+}
+
+/// Baja un paso validado a un item del player (puro, sin I/O).
+///
+/// NO se expone `PlayItem` crudo al LLM: el LLM solo elige [`EfectoPaso`]
+/// y este lowering lo materializa con la escena viva como contexto.
+pub fn compilar_paso(paso: &PasoGuion, escena: &Scene) -> Result<PlayItem, GuionError> {
+    let tasa = RateFunc::Smooth;
+    let base = mobject_base(paso, escena);
+    let item = match paso.efecto {
+        EfectoPaso::Create => {
+            let poly = poly_para(&base);
+            PlayItem::Create(CreateAnim::try_new(
+                poly,
+                paso.frames,
+                paso.run_ms,
+                tasa,
+                false,
+            )?)
+        }
+        EfectoPaso::Write => {
+            let tex = tex_para(paso, escena);
+            PlayItem::Write(WriteAnim::try_new(tex, paso.frames, paso.run_ms, tasa)?)
+        }
+        EfectoPaso::Fade => PlayItem::Fade(FadeAnim::try_new(
+            base,
+            true,
+            paso.frames,
+            paso.run_ms,
+            tasa,
+        )?),
+        EfectoPaso::Grow => PlayItem::GrowFromCenter(GrowFromCenterAnim::try_new(
+            base,
+            paso.frames,
+            paso.run_ms,
+            tasa,
+        )?),
+        EfectoPaso::Indicate => {
+            PlayItem::Indicate(IndicateAnim::try_new(base, paso.frames, paso.run_ms, tasa)?)
+        }
+        EfectoPaso::Tracker => PlayItem::Tracker(UpdateFromTracker::try_new(
+            base,
+            0.0,
+            1.0,
+            paso.frames,
+            paso.run_ms,
+            tasa,
+            TrackerMap::Opacity { lo: 0.0, hi: 1.0 },
+        )?),
+        EfectoPaso::Wait => PlayItem::Wait(WaitAnim::try_new(paso.frames)?),
+    };
+    Ok(item)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn paso_texto(efecto: &str, frames: usize) -> PasoTexto {
+        PasoTexto {
+            texto: "derivada paso a paso".to_string(),
+            math_expr: Some("x^2 + 1".to_string()),
+            whiteboard_hint: "ejes".to_string(),
+            template_hint: "derivative-slope".to_string(),
+            params: BTreeMap::new(),
+            efecto: efecto.to_string(),
+            frames,
+            run_ms: 1000,
+            wait_after_ms: 200,
+            voiceover: None,
+        }
+    }
+
+    fn acto_texto(titulo: &str, pasos: Vec<PasoTexto>) -> ActoTexto {
+        ActoTexto {
+            titulo: titulo.to_string(),
+            fondo: None,
+            limpiar: false,
+            pasos,
+        }
+    }
+
+    fn guion_texto(actos: Vec<ActoTexto>) -> GuionTexto {
+        GuionTexto {
+            concepto: "derivada".to_string(),
+            width: 640,
+            height: 480,
+            actos,
+        }
+    }
+
+    #[test]
+    fn rechaza_guion_sin_actos() {
+        let r = Guion::try_new(guion_texto(vec![]));
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn rechaza_guion_con_seis_actos() {
+        let actos: Vec<ActoTexto> = (0..6)
+            .map(|i| acto_texto(&format!("acto {i}"), vec![paso_texto("create", 4)]))
+            .collect();
+        let r = Guion::try_new(guion_texto(actos));
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn rechaza_acto_sin_pasos() {
+        let r = Guion::try_new(guion_texto(vec![acto_texto("vacío", vec![])]));
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn rechaza_acto_con_cuatro_pasos() {
+        let pasos: Vec<PasoTexto> = (0..4).map(|_| paso_texto("fade", 4)).collect();
+        let r = Guion::try_new(guion_texto(vec![acto_texto("lleno", pasos)]));
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn rechaza_frames_sobre_96() {
+        // 8 pasos (tope) × 16 frames = 128 > 96.
+        let actos = vec![
+            acto_texto(
+                "a",
+                vec![
+                    paso_texto("create", 16),
+                    paso_texto("fade", 16),
+                    paso_texto("grow", 16),
+                ],
+            ),
+            acto_texto(
+                "b",
+                vec![
+                    paso_texto("write", 16),
+                    paso_texto("indicate", 16),
+                    paso_texto("tracker", 16),
+                ],
+            ),
+            acto_texto("c", vec![paso_texto("create", 16), paso_texto("fade", 16)]),
+        ];
+        let r = Guion::try_new(guion_texto(actos));
+        let e = r.expect_err("128 frames deben fallar");
+        assert!(e.to_string().contains("96"));
+    }
+
+    #[test]
+    fn rechaza_viewport_mixto() {
+        let r = comprobar_viewport_unico(&[(640, 480), (800, 600)]);
+        assert!(r.is_err());
+        let ok = comprobar_viewport_unico(&[(640, 480), (640, 480)]);
+        assert!(ok.is_ok());
+    }
+
+    #[test]
+    fn viewport_unico_por_construccion() {
+        // B4.4: `GuionTexto` solo admite UN par (width, height) para todo el
+        // guion — no hay campo por paso/acto donde el viewport pueda
+        // divergir, así que el mixto es imposible por construcción. El
+        // `Guion` validado expone exactamente ese par, y la resolución
+        // repetida por paso pasa `comprobar_viewport_unico` (la función
+        // queda para composición multi-fuente, ver su doc).
+        let g = Guion::try_new(guion_texto(vec![
+            acto_texto("a", vec![paso_texto("create", 8)]),
+            acto_texto("b", vec![paso_texto("fade", 12)]),
+        ]))
+        .expect("guion válido");
+        assert_eq!(g.resolution.as_tuple(), (640, 480));
+        let por_paso: Vec<(u32, u32)> = g
+            .actos
+            .iter()
+            .flat_map(|a| a.pasos.iter())
+            .map(|_| g.resolution.as_tuple())
+            .collect();
+        assert_eq!(por_paso.len(), g.total_pasos());
+        let unica = comprobar_viewport_unico(&por_paso).expect("único por construcción");
+        assert_eq!(unica.as_tuple(), (640, 480));
+    }
+
+    #[test]
+    fn items_para_valida_remuestreo_con_n_distinto() {
+        // B4.5: paridad con `a_playlist` — N distinto (8 vs 12) valida el
+        // plan de remuestreo al máximo en `items_para`, no solo en playlist.
+        let mut p12 = paso_texto("fade", 12);
+        p12.template_hint = "integral-area".to_string();
+        let g = Guion::try_new(guion_texto(vec![
+            acto_texto("a", vec![paso_texto("create", 8), p12]),
+            acto_texto("b", vec![paso_texto("grow", 8), paso_texto("write", 12)]),
+        ]))
+        .expect("guion válido");
+        let escena = EscenaBase::por_defecto(FONDO_POR_DEFECTO).escena;
+        let items = g.items_para(&escena).expect("items con N distinto");
+        assert_eq!(items.len(), 4);
+        let frames: Vec<usize> = items.iter().map(PlayItem::frames).collect();
+        assert_eq!(frames, vec![8, 12, 8, 12]);
+    }
+
+    #[test]
+    fn math_invalida_se_conserva_como_none() {
+        let mut p = paso_texto("write", 4);
+        p.math_expr = Some("x = ∫ f → Σ".to_string());
+        let paso = PasoGuion::try_new(p).expect("el paso se conserva");
+        assert_eq!(paso.math_expr, None);
+        assert!(!paso.math_expr_valida_para_cas());
+    }
+
+    #[test]
+    fn rechaza_template_fuera_de_allowlist() {
+        let mut p = paso_texto("create", 4);
+        p.template_hint = "hollywood-3d".to_string();
+        let r = PasoGuion::try_new(p);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn camino_feliz_y_lowering_puro() {
+        let g = Guion::try_new(guion_texto(vec![acto_texto(
+            "apertura",
+            vec![paso_texto("create", 8)],
+        )]))
+        .expect("guion mínimo válido");
+        assert_eq!(g.total_pasos(), 1);
+        assert_eq!(g.total_frames(), 8);
+        assert_eq!(g.resolution.as_tuple(), (640, 480));
+        let escena = EscenaBase::por_defecto(FONDO_POR_DEFECTO).escena;
+        let item = compilar_paso(&g.actos[0].pasos[0], &escena).expect("lowering puro");
+        assert_eq!(item.frames(), 8);
+        let items = g.items_para(&escena).expect("guion compila");
+        assert_eq!(items.len(), 1);
+    }
+
+    #[test]
+    fn frontera_limpiar_restaura_la_base() {
+        let g = Guion::try_new(guion_texto(vec![acto_texto(
+            "apertura",
+            vec![paso_texto("fade", 4)],
+        )]))
+        .expect("guion válido");
+        let mut viva = EscenaBase::por_defecto([10, 20, 30]).escena;
+        viva.layers.push(Mobject::Dot { x: 1.0, y: 2.0 });
+        viva.layers.push(Mobject::Dot { x: 3.0, y: 4.0 });
+        assert_eq!(viva.layers.len(), 3);
+        let mut acto = g.actos[0].clone();
+        acto.frontera = Frontera::Limpiar;
+        aplicar_frontera(&mut viva, &acto).expect("limpia a la base");
+        assert_eq!(viva.layers.len(), acto.escena.capas());
+        assert_eq!(viva.bg, FONDO_POR_DEFECTO);
+    }
+
+    #[test]
+    fn hook_cas_solo_forma() {
+        assert!(math_expr_valida_para_cas("x^2 + 1"));
+        assert!(!math_expr_valida_para_cas("x = 1"));
+        assert!(!math_expr_valida_para_cas("∫ f"));
+        assert!(!math_expr_valida_para_cas("((x)"));
+        assert!(!math_expr_valida_para_cas(""));
+    }
+
+    /// Regresión del contador desunificado: `math_expr` se mide en BYTES,
+    /// la misma unidad que el gate real (`grafito-pedagogy::verify_math_expr`,
+    /// `teaching.rs:284-294`). Antes acá se contaban chars y una expresión
+    /// multibyte de 200 chars (400 bytes) pasaba el pre-gate para caer
+    /// después en el gate real.
+    #[test]
+    fn math_expr_se_mide_en_bytes_como_el_gate_de_pedagogia() {
+        let multibyte = "α*x²".repeat(50); // 200 chars, 350 bytes
+        assert_eq!(multibyte.chars().count(), 200);
+        assert!(multibyte.len() > MATH_EXPR_MAX_BYTES);
+        assert!(
+            !math_expr_valida_para_cas(&multibyte),
+            "200 chars multibyte exceden los 200 bytes del gate real"
+        );
+        // Frontera exacta en bytes: 200 pasa, 201 no.
+        assert!(math_expr_valida_para_cas(&"x".repeat(MATH_EXPR_MAX_BYTES)));
+        assert!(!math_expr_valida_para_cas(
+            &"x".repeat(MATH_EXPR_MAX_BYTES + 1)
+        ));
+    }
+
+    #[test]
+    fn a_playlist_aplana_con_n_distinto_y_presupuesta() {
+        // 2 actos × 2 pasos = 4 steps, N distinto (8 vs 12) → remuestreo.
+        let mut p12 = paso_texto("fade", 12);
+        p12.template_hint = "integral-area".to_string();
+        let g = Guion::try_new(guion_texto(vec![
+            acto_texto("a", vec![paso_texto("create", 8), p12]),
+            acto_texto("b", vec![paso_texto("grow", 8), paso_texto("write", 12)]),
+        ]))
+        .expect("guion válido");
+        let lista = g.a_playlist().expect("playlist válida");
+        assert_eq!(lista.len(), 4);
+        assert_eq!(lista.total_duration_ms(), g.duracion_total_ms());
+        assert_eq!(lista.total_duration_ms(), 4 * (1000 + 200));
+        // Orden de actos: templates en orden de emisión.
+        let templates: Vec<&str> = lista
+            .steps
+            .iter()
+            .filter_map(|s| s.request.as_ref().map(|r| r.template.as_str()))
+            .collect();
+        assert_eq!(
+            templates,
+            vec![
+                "derivative-slope",
+                "integral-area",
+                "derivative-slope",
+                "derivative-slope"
+            ]
+        );
+        // Presupuesto: 40 frames en 640×480 dentro de 64 MiB.
+        let bytes = Playlist::estimate_set_bytes(640, 480, 40).expect("sin desborde");
+        assert!(bytes <= GUION_MAX_MEMORIA_BYTES);
+    }
+
+    #[test]
+    fn a_playlist_espera_baja_a_pausa_con_cero_frames() {
+        let mut espera = paso_texto("wait", 4);
+        espera.run_ms = 1000;
+        espera.wait_after_ms = 0;
+        let g = Guion::try_new(guion_texto(vec![acto_texto(
+            "a",
+            vec![paso_texto("create", 8), espera],
+        )]))
+        .expect("guion válido");
+        let lista = g.a_playlist().expect("playlist válida");
+        assert_eq!(lista.len(), 2);
+        assert!(lista.steps[1].is_wait());
+        assert_eq!(lista.validate_frame_counts(&[8, 0]).expect("frames"), 8);
+    }
+
+    #[test]
+    fn voiceover_40_pasa_y_41_falla() {
+        // 40 palabras ok, 41 es `Err`; vacío/None = silencio legítimo.
+        let voz40 = (0..40)
+            .map(|i| format!("palabra{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut p = paso_texto("create", 4);
+        p.voiceover = Some(voz40);
+        assert!(PasoGuion::try_new(p)
+            .expect("40 palabras")
+            .voiceover
+            .is_some());
+        let voz41 = (0..41)
+            .map(|i| format!("palabra{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut p = paso_texto("create", 4);
+        p.voiceover = Some(voz41);
+        assert!(PasoGuion::try_new(p).is_err());
+        let mut p = paso_texto("create", 4);
+        p.voiceover = Some("   ".to_string());
+        assert_eq!(PasoGuion::try_new(p).expect("vacío").voiceover, None);
+        let p = paso_texto("create", 4);
+        assert_eq!(PasoGuion::try_new(p).expect("none").voiceover, None);
+        // Wire viejo sin `voiceover` deserializa a `None` (serde default).
+        let sin_voz: PasoTexto = serde_json::from_str(
+            r#"{"texto":"t","math_expr":null,"whiteboard_hint":"","template_hint":"derivative-slope","params":{},"efecto":"create","frames":4,"run_ms":1000,"wait_after_ms":200}"#,
+        )
+        .unwrap();
+        assert!(sin_voz.voiceover.is_none());
+    }
+
+    #[test]
+    fn short_script_cuatro_beats_presupuestos_y_rango() {
+        for concepto in [
+            "serie de taylor del seno",
+            "integral del área bajo la curva",
+            "derivada como pendiente",
+            "mapeo conforme complejo",
+            "teorema de pitágoras",
+            "tarea sin matemática",
+        ] {
+            let crudo = short_script(concepto).expect("corto válido");
+            // 4 actos / 6 pasos / 48 frames / 640×480 / 25.7 s.
+            assert_eq!(crudo.actos.len(), 4, "{concepto}");
+            let pasos: usize = crudo.actos.iter().map(|a| a.pasos.len()).sum();
+            assert_eq!(pasos, 6, "{concepto}");
+            assert_eq!(
+                crudo.actos[0].titulo, "Hook",
+                "el primer beat es el hook: {concepto}"
+            );
+            assert_eq!(crudo.actos[3].titulo, "Payoff", "{concepto}");
+            // Rango corto informativo en crudo y validado.
+            assert!(crudo.validate_short_len(), "{concepto}");
+            let g = Guion::try_new(crudo).expect("el corto valida entero");
+            assert_eq!(g.total_pasos(), 6);
+            assert_eq!(g.total_frames(), 48);
+            assert_eq!(g.duracion_total_ms(), 25_700);
+            assert!(g.validate_short_len());
+            assert!((SHORT_MIN_PALABRAS..=SHORT_MAX_PALABRAS).contains(&g.total_voiceover_words()));
+            // Plantilla coherente al concepto (las 13 canónicas).
+            let primera = g.actos[0].pasos[0].template.clone();
+            assert!(
+                [
+                    "taylor-series",
+                    "integral-area",
+                    "derivative-slope",
+                    "conformal-map",
+                    "pitagoras",
+                    "universal",
+                ]
+                .contains(&primera.as_str()),
+                "template {primera} fuera del set corto: {concepto}"
+            );
+            assert!(g
+                .actos
+                .iter()
+                .flat_map(|a| a.pasos.iter())
+                .all(|p| p.template == primera));
+        }
+        // Coherencia puntual: taylor e integral resuelven a la suya.
+        let taylor = short_script("serie de taylor del seno").unwrap();
+        assert_eq!(taylor.actos[0].pasos[0].template_hint, "taylor-series");
+        let integral = short_script("integral del área").unwrap();
+        assert_eq!(integral.actos[0].pasos[0].template_hint, "integral-area");
+        let libre = short_script("tarea sin matemática").unwrap();
+        assert_eq!(libre.actos[0].pasos[0].template_hint, "universal");
+    }
+
+    /// Regresión del degradado a `universal`: el corto usa la plantilla
+    /// canónica de las 13 (`CANONICAL_TEMPLATES`), no solo 5 de ellas.
+    /// Antes `fourier`, `euler`, `subspace`, `fractal`, `gradient-field`,
+    /// `mobius-transform` y `logistic-bifurcation` caían a `universal`.
+    #[test]
+    fn short_script_usa_las_13_canonicas() {
+        let casos: [(&str, &str); 13] = [
+            ("derivada como pendiente", "derivative-slope"),
+            ("integral del área", "integral-area"),
+            ("serie de taylor del seno", "taylor-series"),
+            ("mapeo conforme complejo", "conformal-map"),
+            ("teorema de pitágoras", "pitagoras"),
+            ("crecimiento exponencial exp(x)", "euler"),
+            ("series de fourier", "fourier"),
+            ("logística y bifurcación", "logistic-bifurcation"),
+            ("campo gradiente", "gradient-field"),
+            ("transformación de möbius", "mobius-transform"),
+            ("tarea sin matemática", "universal"),
+            ("combinación lineal y subespacio", "subspace"),
+            ("fractal de koch", "fractal"),
+        ];
+        for (concepto, esperado) in casos {
+            let g = short_script(concepto).expect("corto válido");
+            assert_eq!(
+                g.actos[0].pasos[0].template_hint, esperado,
+                "{concepto} debe resolver a {esperado}"
+            );
+            assert!(
+                CANONICAL_TEMPLATES.contains(&g.actos[0].pasos[0].template_hint.as_str()),
+                "{esperado} es canónica"
+            );
+        }
+    }
+
+    /// Regresión del copy genérico: los beats (texto + voz) varían por
+    /// familia de concepto; antes los 6 beats eran idénticos para cualquier
+    /// concepto ("Che, mirá esto con atención: parece magia…").
+    #[test]
+    fn short_script_varia_los_beats_por_familia() {
+        let familias = [
+            "derivada como pendiente",
+            "mapeo conforme complejo",
+            "logística y bifurcación",
+            "series de fourier",
+            "fractal de koch",
+            "tarea sin matemática",
+        ];
+        let mut hooks: Vec<(String, String)> = Vec::new();
+        for concepto in familias {
+            let g = short_script(concepto).expect("corto válido");
+            let hook = &g.actos[0].pasos[0];
+            assert!(!hook.texto.is_empty(), "{concepto}");
+            assert!(hook.voiceover.as_deref().is_some_and(|v| !v.is_empty()));
+            hooks.push((
+                hook.texto.clone(),
+                hook.voiceover.clone().unwrap_or_default(),
+            ));
+        }
+        // 6 familias → 6 hooks distintos entre sí (texto y voz).
+        for i in 0..hooks.len() {
+            for j in (i + 1)..hooks.len() {
+                assert_ne!(
+                    hooks[i], hooks[j],
+                    "el hook de la familia {i} debe diferir del de la {j}"
+                );
+            }
+        }
+    }
+
+    /// Golden byte-a-byte del corto: `short_script` es puro y determinista
+    /// (`BTreeMap` en params, copy fijo por familia), así que el
+    /// `GuionTexto` serializado va pineado por hash FNV-1a 64 (uno por cada
+    /// una de las 13 canónicas). Cualquier cambio de copy/tiempos/plantilla
+    /// rompe el pin a propósito: si el cambio es querido, se re-pinea con
+    /// justificación.
+    #[test]
+    fn short_script_golden_hash() {
+        let casos: [(&str, u64); 13] = [
+            ("derivada como pendiente", 0x279683f1d18c1d25),
+            ("integral del área", 0xbad1cf0267c6fe76),
+            ("serie de taylor del seno", 0x126fa8cb2b0de96f),
+            ("mapeo conforme complejo", 0xa5cf3f264725d64b),
+            ("teorema de pitágoras", 0x3e1be9ec53499091),
+            ("crecimiento exponencial exp(x)", 0x884e009bace7042f),
+            ("series de fourier", 0x2921ef2ff6bb195f),
+            ("logística y bifurcación", 0x576a4b8be1f7a1c7),
+            ("campo gradiente", 0x3dd994c7622e089d),
+            ("transformación de möbius", 0x6e5d47da1f50374e),
+            ("tarea sin matemática", 0xf5fcc3afcb60cf79),
+            ("combinación lineal y subespacio", 0x502044c6213ea445),
+            ("fractal de koch", 0xada5cdc950a0dffb),
+        ];
+        for (concepto, esperado) in casos {
+            let g = short_script(concepto).expect("corto válido");
+            let json = serde_json::to_string(&g).expect("serializa");
+            assert_eq!(
+                fnv1a64(json.as_bytes()),
+                esperado,
+                "golden roto para {concepto}: si el cambio es querido, re-pineá con justificación"
+            );
+        }
+    }
+
+    /// FNV-1a 64 puro (sin deps): el hash del JSON serializado del corto.
+    fn fnv1a64(bytes: &[u8]) -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for b in bytes {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+
+    /// Pacing del largo: las duraciones por beat suman el total sin pasarse
+    /// del tope del timeline, y el beat-pregunta es un `Wait` con duración
+    /// y continuación propias.
+    #[test]
+    fn largo_pacing_suma_sesenta_sin_pasarse_del_tope() {
+        assert_eq!(PACING_LARGO_RUN_MS.len(), 8);
+        assert_eq!(PACING_LARGO_WAIT_MS.len(), 8);
+        assert_eq!(duracion_total_largo_ms(), LONG_TOTAL_MS);
+        assert_eq!(LONG_TOTAL_MS, 60_000);
+        assert!(duracion_total_largo_ms() <= MAX_TIMELINE_DURATION_MS);
+        // El beat-pregunta es espera pura: congela sin silencio posterior.
+        assert_eq!(PREGUNTA_LARGO_INDICE, 2);
+        assert_eq!(EFECTOS_LARGO[PREGUNTA_LARGO_INDICE], "wait");
+        assert_eq!(
+            PACING_LARGO_RUN_MS[PREGUNTA_LARGO_INDICE],
+            PREGUNTA_LARGO_RUN_MS
+        );
+        assert_eq!(PACING_LARGO_WAIT_MS[PREGUNTA_LARGO_INDICE], 0);
+        // Animados en 100..=60000, esperas en 1..=10000 (paridad playlist).
+        for (i, efecto) in EFECTOS_LARGO.iter().enumerate() {
+            if *efecto == "wait" {
+                assert!((1..=PLAYLIST_MAX_WAIT_MS).contains(&PACING_LARGO_RUN_MS[i]));
+            } else {
+                assert!((PASO_MIN_RUN_MS..=PASO_MAX_RUN_MS).contains(&PACING_LARGO_RUN_MS[i]));
+            }
+            assert!(PACING_LARGO_WAIT_MS[i] <= PLAYLIST_MAX_WAIT_MS);
+        }
+    }
+
+    #[test]
+    fn beat_pregunta_trae_duracion_y_continuacion() {
+        for template in CANONICAL_TEMPLATES {
+            let beat = beat_pregunta(template);
+            assert!(!beat.pregunta.is_empty(), "{template}");
+            assert_eq!(beat.espera_ms, PREGUNTA_LARGO_RUN_MS);
+            assert!(!beat.continuacion.is_empty(), "{template}");
+            // La continuación es la apertura del beat que responde.
+            let copy = familia_largo_por_nombre(template);
+            assert_eq!(beat.pregunta, copy.beats[PREGUNTA_LARGO_INDICE].0);
+            assert_eq!(beat.continuacion, copy.beats[PREGUNTA_LARGO_INDICE + 1].0);
+            assert!(
+                beat.pregunta.contains('?'),
+                "la pregunta pregunta: {template}"
+            );
+        }
+        // Alias y desconocido no rompen (universal honesto).
+        assert_eq!(
+            beat_pregunta("pythagoras").pregunta,
+            beat_pregunta("pitagoras").pregunta
+        );
+        assert!(!beat_pregunta("hollywood-3d").pregunta.is_empty());
+    }
+
+    #[test]
+    fn titulos_y_ganchos_tres_por_familia_y_distintos() {
+        let mut vistos: Vec<&str> = Vec::new();
+        for template in CANONICAL_TEMPLATES {
+            let titulos = titulos_para(template);
+            let ganchos = ganchos_para(template);
+            assert_eq!(titulos.len(), 3, "{template}");
+            assert_eq!(ganchos.len(), 3, "{template}");
+            for t in titulos {
+                assert!(!t.is_empty(), "{template}");
+                assert!(t.chars().count() <= TITULO_MAX_CHARS, "{t}");
+            }
+            for g in ganchos {
+                assert!(!g.is_empty(), "{template}");
+            }
+            assert!(
+                titulos[0] != titulos[1] && titulos[1] != titulos[2] && titulos[0] != titulos[2]
+            );
+            assert!(
+                ganchos[0] != ganchos[1] && ganchos[1] != ganchos[2] && ganchos[0] != ganchos[2]
+            );
+            vistos.extend(titulos);
+            vistos.extend(ganchos);
+        }
+        // 6 familias × 6 variantes = 36 textos todos distintos.
+        let mut unicos = vistos.clone();
+        unicos.sort_unstable();
+        unicos.dedup();
+        assert_eq!(unicos.len(), 36, "cada familia tiene su propio copy");
+        // Alias y desconocido: pitagoras y universal honestos.
+        assert_eq!(titulos_para("pythagoras"), titulos_para("pitagoras"));
+        assert_eq!(ganchos_para("hollywood-3d"), ganchos_para("universal"));
+    }
+
+    /// Golden de títulos/ganchos: copy puro y determinista, pineado por
+    /// hash FNV-1a 64 por plantilla canónica (igual que el corto).
+    #[test]
+    fn titulos_ganchos_golden_hash() {
+        let casos: [(&str, u64); 13] = [
+            ("derivative-slope", 0x2300253e34c2e606),
+            ("integral-area", 0x2300253e34c2e606),
+            ("taylor-series", 0x2300253e34c2e606),
+            ("conformal-map", 0xbb81565a0b0633c2),
+            ("pitagoras", 0x1ce1c0776019ce1c),
+            ("euler", 0x19e19c959d60e9b4),
+            ("fourier", 0x19e19c959d60e9b4),
+            ("logistic-bifurcation", 0x6f6f8aa5113a813),
+            ("gradient-field", 0x6f6f8aa5113a813),
+            ("mobius-transform", 0xbb81565a0b0633c2),
+            ("universal", 0x2140006cf5df60cb),
+            ("subspace", 0x1ce1c0776019ce1c),
+            ("fractal", 0x1ce1c0776019ce1c),
+        ];
+        for (template, esperado) in casos {
+            let json = serde_json::to_string(&(titulos_para(template), ganchos_para(template)))
+                .expect("serializa");
+            assert_eq!(
+                fnv1a64(json.as_bytes()),
+                esperado,
+                "golden roto para {template}: si el cambio es querido, re-pineá con justificación"
+            );
+        }
+    }
+
+    #[test]
+    fn long_script_arco_presupuestos_y_rango() {
+        for concepto in [
+            "serie de taylor del seno",
+            "integral del área bajo la curva",
+            "derivada como pendiente",
+            "mapeo conforme complejo",
+            "teorema de pitágoras",
+            "tarea sin matemática",
+            "logística y bifurcación",
+            "series de fourier",
+        ] {
+            let crudo = long_script(concepto).expect("largo válido");
+            // 4 actos / 8 pasos / 48 frames / 640×480 / 60 s.
+            assert_eq!(crudo.actos.len(), 4, "{concepto}");
+            let pasos: usize = crudo.actos.iter().map(|a| a.pasos.len()).sum();
+            assert_eq!(pasos, 8, "{concepto}");
+            assert_eq!(
+                crudo
+                    .actos
+                    .iter()
+                    .map(|a| a.pasos.len())
+                    .collect::<Vec<_>>(),
+                vec![1, 2, 3, 2],
+                "arco 1+2+3+2: {concepto}"
+            );
+            assert_eq!(crudo.actos[0].titulo, "Hook", "{concepto}");
+            assert_eq!(crudo.actos[1].titulo, "Desarrollo", "{concepto}");
+            assert_eq!(crudo.actos[2].titulo, "Clímax", "{concepto}");
+            assert_eq!(crudo.actos[3].titulo, "Cierre", "{concepto}");
+            assert!(crudo.validate_long_len(), "{concepto}");
+            let g = Guion::try_new(crudo).expect("el largo valida entero");
+            assert_eq!(g.total_pasos(), 8);
+            assert_eq!(g.total_frames(), 48);
+            assert_eq!(g.duracion_total_ms(), LONG_TOTAL_MS);
+            assert_eq!(g.duracion_total_ms(), duracion_total_largo_ms());
+            assert!(g.validate_long_len());
+            assert!(
+                (LONG_MIN_PALABRAS..=LONG_MAX_PALABRAS).contains(&g.total_voiceover_words()),
+                "{} palabras fuera de rango: {concepto}",
+                g.total_voiceover_words()
+            );
+            // Cada paso: voz <= 40 palabras, sin math que exceda 200 bytes.
+            for paso in g.actos.iter().flat_map(|a| a.pasos.iter()) {
+                let n = paso.voiceover.as_deref().map_or(0, cuenta_palabras_voz);
+                assert!(n <= VOICEOVER_MAX_PALABRAS, "{n} palabras en {concepto}");
+                assert!(paso
+                    .math_expr
+                    .as_deref()
+                    .is_none_or(|e| e.len() <= MATH_EXPR_MAX_BYTES));
+            }
+            // El beat 2 es la pregunta (`Wait` que congela, 0 frames propios).
+            let lista = g.a_playlist().expect("playlist del largo");
+            assert_eq!(lista.len(), 8);
+            assert!(lista.steps[PREGUNTA_LARGO_INDICE].is_wait());
+            assert_eq!(lista.total_duration_ms(), LONG_TOTAL_MS);
+        }
+    }
+
+    /// Regresión del copy genérico largo: los hooks varían por familia.
+    #[test]
+    fn long_script_varia_los_beats_por_familia() {
+        let familias = [
+            "derivada como pendiente",
+            "mapeo conforme complejo",
+            "logística y bifurcación",
+            "series de fourier",
+            "fractal de koch",
+            "tarea sin matemática",
+        ];
+        let mut hooks: Vec<(String, String)> = Vec::new();
+        for concepto in familias {
+            let g = long_script(concepto).expect("largo válido");
+            let hook = &g.actos[0].pasos[0];
+            assert!(!hook.texto.is_empty(), "{concepto}");
+            assert!(hook.voiceover.as_deref().is_some_and(|v| !v.is_empty()));
+            hooks.push((
+                hook.texto.clone(),
+                hook.voiceover.clone().unwrap_or_default(),
+            ));
+        }
+        for i in 0..hooks.len() {
+            for j in (i + 1)..hooks.len() {
+                assert_ne!(
+                    hooks[i], hooks[j],
+                    "el hook largo de la familia {i} debe diferir del de la {j}"
+                );
+            }
+        }
+    }
+
+    /// El largo también valida con errores honestos: una voz de 41 palabras
+    /// en un paso del largo es `Err` (no silencio parcial).
+    #[test]
+    fn long_script_con_voz_de_41_palabras_falla_honesto() {
+        let mut crudo = long_script("derivada como pendiente").expect("largo válido");
+        let voz41 = (0..41)
+            .map(|i| format!("palabra{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        crudo.actos[0].pasos[0].voiceover = Some(voz41);
+        assert!(Guion::try_new(crudo).is_err());
+    }
+
+    /// Golden byte-a-byte del largo: `long_script` es puro y determinista,
+    /// pineado por hash FNV-1a 64 (uno por cada una de las 13 canónicas).
+    #[test]
+    fn long_script_golden_hash() {
+        let casos: [(&str, u64); 13] = [
+            ("derivada como pendiente", 0x374c02adc4212f9),
+            ("integral del área", 0x8e48cee38cc76ef2),
+            ("serie de taylor del seno", 0x6d7b980139e4807d),
+            ("mapeo conforme complejo", 0x37b6f8f39997cdcc),
+            ("teorema de pitágoras", 0x73d19e17b6861b8f),
+            ("crecimiento exponencial exp(x)", 0x4d4ec1a770f4d3ef),
+            ("series de fourier", 0x368b26ce2d69ec05),
+            ("logística y bifurcación", 0x48da8dcc924abe0b),
+            ("campo gradiente", 0x73653bcea9bfbf59),
+            ("transformación de möbius", 0x836ca4d6b5ca3b37),
+            ("tarea sin matemática", 0xd0074b0e47bdfe91),
+            ("combinación lineal y subespacio", 0x640f397f433a4955),
+            ("fractal de koch", 0xcd9a84c037b1a1d1),
+        ];
+        for (concepto, esperado) in casos {
+            let g = long_script(concepto).expect("largo válido");
+            let json = serde_json::to_string(&g).expect("serializa");
+            assert_eq!(
+                fnv1a64(json.as_bytes()),
+                esperado,
+                "golden roto para {concepto}: si el cambio es querido, re-pineá con justificación"
+            );
+        }
+    }
+
+    #[test]
+    fn voiceover_segments_reparte_proporcional_y_salta_silencios() {
+        use crate::captions::voiceover_segments;
+        let crudo = short_script("derivada como pendiente").unwrap();
+        let g = Guion::try_new(crudo).expect("corto válido");
+        let pasos: Vec<PasoGuion> = g
+            .actos
+            .iter()
+            .flat_map(|a| a.pasos.iter().cloned())
+            .collect();
+        let durs: Vec<u32> = pasos.iter().map(|p| p.run_ms as u32).collect();
+        let pista = voiceover_segments(&pasos, &durs).expect("pista de voz");
+        assert_eq!(pista.len(), 6);
+        pista.validate().expect("pista válida");
+        // Ventanas acumuladas en orden sin solapar.
+        assert_eq!(pista.segments[0].start_ms, 0);
+        assert_eq!(pista.segments[0].end_ms, 2500);
+        assert_eq!(pista.segments[1].start_ms, 2500);
+        // Karaoke por palabra suma la ventana entera.
+        for seg in &pista.segments {
+            let total: u32 = seg.palabras.iter().map(|(_, i, f)| f - i).sum();
+            assert_eq!(total, seg.end_ms - seg.start_ms);
+        }
+        // Paso sin voz = hueco silencioso legítimo (se salta, el cursor avanza).
+        let mut pasos_mudos = pasos.clone();
+        pasos_mudos[1].voiceover = None;
+        let pista = voiceover_segments(&pasos_mudos, &durs).expect("pista con hueco");
+        assert_eq!(pista.len(), 5);
+        assert_eq!(pista.segments[1].start_ms, durs[0] + durs[1]);
+        // Ventanas desparejas = `Err`.
+        assert!(voiceover_segments(&pasos, &durs[..3]).is_err());
+        // SRT/ASS de la voz del corto no fallan.
+        let pista = voiceover_segments(&pasos, &durs).expect("pista");
+        assert!(!pista.to_srt().unwrap().is_empty());
+        assert!(pista.to_ass().unwrap().contains("{\\k"));
+    }
+}

@@ -1,0 +1,6 @@
+#!/bin/bash
+set -e
+
+# Cache refreshes belong in postrm, after dpkg has removed the payload.
+
+exit 0
