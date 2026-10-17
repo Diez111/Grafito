@@ -2642,7 +2642,7 @@ dependencies = [
  "log",
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -2784,7 +2784,7 @@ dependencies = [
  "rstar",
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "uuid",
  "windows-sys 0.52.0",
 ]
@@ -2828,7 +2828,7 @@ dependencies = [
  "grafito-geometry",
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -2855,7 +2855,7 @@ dependencies = [
  "grafito-geometry",
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
