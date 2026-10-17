@@ -27,7 +27,7 @@ num-traits = "0.2"
 
 [dev-dependencies]
 # Sin `html_reports` (ver grafito-anim: plotters fuera de `cargo test`).
-criterion = "0.5"
+criterion = "0.8"
 proptest = "1"
 
 [[bench]]
