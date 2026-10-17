@@ -3116,6 +3116,10 @@ mod tests {
             };
             let ctx = egui::Context::default();
             tema.apply(&ctx);
+            // `Style::debug` es `#[cfg(debug_assertions)]` en egui: el bench
+            // compila con el perfil release (sin debug_assertions), así que
+            // el overlay de widgets interactivos solo se enciende en dev/test debug.
+            #[cfg(debug_assertions)]
             ctx.style_mut(|s| s.debug.show_interactive_widgets = true);
             for correcta in [true, false] {
                 let ejercicio =
