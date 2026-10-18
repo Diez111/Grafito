@@ -578,6 +578,7 @@ mod tests {
     }
 
     // F14.4.3: `restore_env` bajo `TEST_ENV_LOCK` (single-thread).
+    #[cfg(unix)] // write_stub crea shell scripts (#/bin/sh): unix-only
     #[allow(unsafe_code)]
     #[test]
     fn stub_proved_y_failed() {
@@ -616,6 +617,7 @@ mod tests {
 
     // F14.4.3: `restore_env` bajo `TEST_ENV_LOCK` (single-thread).
     #[allow(unsafe_code)]
+    #[cfg(unix)] // write_stub crea shell scripts: unix-only
     #[test]
     fn submit_guarda_y_recurso_lee() {
         let (_g, dir, old_ledger, old_bin) = lock_and_isolate("submit");
