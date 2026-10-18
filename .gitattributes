@@ -1,1 +1,6 @@
-# GPG Signing Active
+* text=auto eol=lf
+*.png binary
+*.ttf binary
+*.ico binary
+*.ggb binary
+*.woff2 binary
