@@ -1845,7 +1845,8 @@ fn cantidad_movimiento_p_igual_m_por_v() {
     );
     // Solo lectura: no crea objetos.
     assert_eq!(document.objects_iter().count(), 0, "sin dibujo");
-    for mala in ["CantidadMovimiento[-1, 20]"] {
+    let mala = "CantidadMovimiento[-1, 20]";
+    {
         match run(&mut document, mala) {
             CommandOutcome::Error(m) => assert!(m.contains("CantidadMovimiento"), "{m}"),
             other => panic!("{mala} debe dar Error, dio {other:?}"),
