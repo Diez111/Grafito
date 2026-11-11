@@ -19,7 +19,7 @@ iroh = { version = "1", features = ["tls-ring"], optional = true }
 tokio = { version = "1", features = ["rt", "net", "time"], optional = true }
 # Token de admisión del aula: HKDF-SHA256 del código `AULA-XXXXXX` (A1). MIT/
 # Apache, sin std extra; solo computación pura (PII local, nada de red acá).
-hkdf = { version = "0.12", optional = true }
+hkdf = { version = "0.13", optional = true }
 sha2 = { version = "0.10", optional = true }
 
 [features]
