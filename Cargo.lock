@@ -1563,7 +1563,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c54e03a951783e8b327515db3f2a2fd0e3bed362a96b066f341ce66ed49b4ead"
 dependencies = [
  "data-encoding",
- "syn 1.0.109",
+ "syn 3.0.4",
 ]
 
 [[package]]
@@ -1840,7 +1840,7 @@ dependencies = [
  "objc2-foundation 0.2.2",
  "parking_lot",
  "percent-encoding",
- "pollster",
+ "pollster 0.3.0",
  "puffin",
  "raw-window-handle",
  "static_assertions",
@@ -2682,7 +2682,7 @@ dependencies = [
  "log",
  "lru",
  "num-complex",
- "pollster",
+ "pollster 1.0.1",
  "printpdf",
  "puffin",
  "puffin_http",
@@ -2840,7 +2840,7 @@ dependencies = [
  "grafito-command",
  "grafito-core",
  "grafito-geometry",
- "pollster",
+ "pollster 1.0.1",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2897,7 +2897,7 @@ dependencies = [
  "lru",
  "lyon",
  "num-complex",
- "pollster",
+ "pollster 1.0.1",
  "rayon",
  "wgpu",
 ]
@@ -5413,6 +5413,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "22686f4785f02a4fcc856d3b3bb19bf6c8160d103f7a99cc258bddd0251dc7f2"
 
 [[package]]
+name = "pollster"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc6355899e1c9462875b6757c79f3caa011a1fdae12bbb1a2e72dd1f234f8336"
+
+[[package]]
 name = "polyval"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6060,7 +6066,7 @@ dependencies = [
  "objc",
  "objc-foundation",
  "objc_id",
- "pollster",
+ "pollster 0.3.0",
  "raw-window-handle",
  "urlencoding",
  "wasm-bindgen",
@@ -6923,7 +6929,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
@@ -8001,7 +8007,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
