@@ -27,7 +27,7 @@ workspace = true
 
 [dev-dependencies]
 # Sin `html_reports` (ver grafito-anim: plotters fuera de `cargo test`).
-criterion = "0.5"
+criterion = "0.8"
 
 [[bench]]
 name = "assistant_blocks"

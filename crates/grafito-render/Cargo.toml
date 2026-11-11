@@ -25,7 +25,7 @@ pollster.workspace = true
 
 [dev-dependencies]
 # Sin `html_reports` (ver grafito-anim: plotters fuera de `cargo test`).
-criterion = "0.5"
+criterion = "0.8"
 wgpu.workspace = true
 # S3 ui-polish: solo para el bench s3_dashed_* de render_scenarios.rs
 # (Shape/Strike reales del loop dashed). Crate ya en el lock vía workspace.
