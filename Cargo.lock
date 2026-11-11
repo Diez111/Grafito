@@ -1563,7 +1563,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c54e03a951783e8b327515db3f2a2fd0e3bed362a96b066f341ce66ed49b4ead"
 dependencies = [
  "data-encoding",
- "syn 1.0.109",
+ "syn 3.0.4",
 ]
 
 [[package]]
@@ -2387,7 +2387,7 @@ dependencies = [
  "rand 0.10.2",
  "rand_pcg",
  "robust",
- "rstar",
+ "rstar 0.12.2",
  "sif-itree",
  "spade",
 ]
@@ -2401,7 +2401,7 @@ dependencies = [
  "approx",
  "num-traits",
  "rayon",
- "rstar",
+ "rstar 0.12.2",
  "serde",
  "spade",
  "thiserror 2.0.20",
@@ -2781,7 +2781,7 @@ dependencies = [
  "num-complex",
  "proptest",
  "rayon",
- "rstar",
+ "rstar 0.13.0",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -6110,6 +6110,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rstar"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5912b862fa5ffb462607bfd1e35036c458c537921f508c8235a83d5f3987edfe"
+dependencies = [
+ "heapless",
+ "num-traits",
+ "smallvec",
+]
+
+[[package]]
 name = "rug"
 version = "1.30.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6923,7 +6934,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
@@ -8001,7 +8012,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

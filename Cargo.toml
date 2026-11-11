@@ -89,7 +89,7 @@ rayon = "1.10"
 lru = "0.18"
 
 # Spatial indexing
-rstar = "0.12"
+rstar = "0.13"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
